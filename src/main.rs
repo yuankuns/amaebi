@@ -7,6 +7,7 @@ mod client;
 mod copilot;
 mod daemon;
 mod ipc;
+mod tools;
 
 #[tokio::main]
 async fn main() -> Result<()> {

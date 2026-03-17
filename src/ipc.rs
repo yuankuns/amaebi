@@ -22,6 +22,8 @@ pub enum Response {
     Done,
     /// A hard error the client should display, then exit non-zero.
     Error { message: String },
+    /// The agent is about to invoke a tool — the client may display this.
+    ToolUse { name: String },
 }
 
 /// Write one `Response` frame as a JSON line to `writer`.

@@ -50,6 +50,10 @@ pub async fn run(socket: PathBuf, prompt: String) -> Result<()> {
             Response::Error { message } => {
                 anyhow::bail!("{message}");
             }
+            Response::ToolUse { name } => {
+                // Tool notifications go to stderr so stdout stays clean for the AI response.
+                eprintln!("[tool] {name}");
+            }
         }
     }
 
