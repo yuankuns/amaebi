@@ -53,3 +53,21 @@ The agent must expose these tools to the GitHub Copilot LLM:
 
 ## Special Note on Copilot API
 Remember that the GitHub Copilot Chat API sometimes splits the text response and `tool_calls` into different `choices` array elements (e.g., `choices[0]` has `content`, `choices[1]` has `tool_calls`). The parser must check all choices.
+
+## Phase 4: Subagent Orchestration & Sandboxing (Advanced)
+To support complex, multi-step tasks without blocking the main event loop or risking destructive commands on the host:
+
+1. **Subagent Spawning**:
+   - The daemon can spawn child subagents (e.g., as background threads or isolated processes) to handle long-running coding tasks or deep research.
+   - Introduce a tool: `spawn_subagent(task_description)` which returns a subagent ID.
+
+2. **Sandboxing (Docker/Containers)**:
+   - When a subagent needs to run shell commands or compile untrusted code, it should optionally be routed to an isolated sandbox.
+   - E.g., Use lightweight container APIs (or run via an external runner like Docker) to execute `shell_command` within a safe, isolated directory.
+
+## Execution & Native Commands
+To act as a capable assistant without relying entirely on tmux side-effects, the Agent needs a robust native command execution tool:
+1. `shell_command`: A primary tool to run bash/sh commands natively on the host system or sandbox.
+   - This allows the agent to run `grep`, `find`, `systemctl restart`, `git`, or any other background operation without taking over the user's active tmux pane.
+   - Standard output and standard error should be captured and returned to the LLM.
+   - For commands requiring elevated privileges (like restarting system services), the tool should politely ask the user via the client before proceeding, or handle `sudo` via proper escalation paths.
