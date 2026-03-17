@@ -109,7 +109,7 @@ async fn fetch_api_token(http: &reqwest::Client) -> Result<CachedToken> {
         .header("Accept", "application/json")
         .header(
             "User-Agent",
-            concat!("tmux-copilot/", env!("CARGO_PKG_VERSION")),
+            concat!("amaebi/", env!("CARGO_PKG_VERSION")),
         )
         .send()
         .await

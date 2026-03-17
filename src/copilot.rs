@@ -288,7 +288,7 @@ where
         .header("Editor-Version", "vscode/1.90.0")
         .header(
             "User-Agent",
-            concat!("tmux-copilot/", env!("CARGO_PKG_VERSION")),
+            concat!("amaebi/", env!("CARGO_PKG_VERSION")),
         )
         .json(&body)
         .send()

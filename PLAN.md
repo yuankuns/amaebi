@@ -5,15 +5,15 @@ Build a headless, ultra-lightweight, memory-efficient AI assistant for `tmux` us
 It connects to the GitHub Copilot API as its "brain" and uses `tmux` as its "eyes and hands".
 
 ## Architecture (C/S over Unix Socket)
-To keep memory usage extremely low per terminal window, the application uses a Daemon-Client architecture compiled into a single binary (`tmux-copilot`).
+To keep memory usage extremely low per terminal window, the application uses a Daemon-Client architecture compiled into a single binary (`amaebi`).
 
-1. **Daemon (`tmux-copilot daemon`)**:
+1. **Daemon (`amaebi daemon`)**:
    - Runs in the background (memory footprint < 15MB).
-   - Listens on a Unix Domain Socket (e.g., `/tmp/tmux-copilot.sock`).
+   - Listens on a Unix Domain Socket (e.g., `/tmp/amaebi.sock`).
    - Handles the GitHub Copilot API connection (OAuth token reading, HTTP/SSE streaming).
    - Manages the Agentic Loop (Parse `tool_calls` -> Execute tool -> Send tool result back).
 
-2. **Client (`tmux-copilot ask "<prompt>"`)**:
+2. **Client (`amaebi ask "<prompt>"`)**:
    - Extremely lightweight, short-lived process.
    - Connects to the Unix socket, sends the user's prompt (along with the current `$TMUX_PANE` environment variable for context).
    - Streams the daemon's text responses to `stdout` in real-time.

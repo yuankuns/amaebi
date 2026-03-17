@@ -8,7 +8,7 @@ use crate::ipc::{Request, Response};
 pub async fn run(socket: PathBuf, prompt: String) -> Result<()> {
     let stream = UnixStream::connect(&socket).await.with_context(|| {
         format!(
-            "connecting to daemon at {} — is it running? (`tmux-copilot daemon`)",
+            "connecting to daemon at {} — is it running? (`amaebi daemon`)",
             socket.display()
         )
     })?;

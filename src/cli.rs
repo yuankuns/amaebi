@@ -1,12 +1,12 @@
 use std::path::PathBuf;
 
-pub const DEFAULT_SOCKET: &str = "/tmp/tmux-copilot.sock";
+pub const DEFAULT_SOCKET: &str = "/tmp/amaebi.sock";
 
 #[derive(clap::Parser, Debug)]
 #[command(
-    name = "tmux-copilot",
+    name = "amaebi",
     version,
-    about = "Headless AI assistant for tmux backed by GitHub Copilot"
+    about = "Tiny, memory-efficient AI assistant for tmux backed by GitHub Copilot"
 )]
 pub struct Cli {
     #[command(subcommand)]

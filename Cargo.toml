@@ -1,10 +1,10 @@
 [package]
-name = "tmux-copilot"
+name = "amaebi"
 version = "0.1.0"
 edition = "2021"
 
 [[bin]]
-name = "tmux-copilot"
+name = "amaebi"
 path = "src/main.rs"
 
 [dependencies]
