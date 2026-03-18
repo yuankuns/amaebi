@@ -37,15 +37,45 @@ fn truncate(s: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+/// Maximum size of `memory.jsonl` before it is rotated to `memory.jsonl.old`.
+pub const MAX_FILE_BYTES: u64 = 1024 * 1024; // 1 MiB
+
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
 /// Append a user/assistant pair to the memory file.
-pub fn append(user_prompt: &str, assistant_response: &str) -> Result<()> {
+///
+/// Returns the [`MemoryEntry`] that was written so callers can update
+/// an in-memory cache without re-reading the file.
+///
+/// If `memory.jsonl` exceeds [`MAX_FILE_BYTES`] before the write it is
+/// atomically renamed to `memory.jsonl.old` and a fresh file is started.
+pub fn append(user_prompt: &str, assistant_response: &str) -> Result<MemoryEntry> {
     let path = memory_path()?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
+    }
+
+    // Rotate if the file exceeds the size limit.
+    if path.exists() {
+        let meta = std::fs::metadata(&path)
+            .with_context(|| format!("checking size of {}", path.display()))?;
+        if meta.len() > MAX_FILE_BYTES {
+            let old_path = path.with_file_name("memory.jsonl.old");
+            std::fs::rename(&path, &old_path).with_context(|| {
+                format!("rotating {} to {}", path.display(), old_path.display())
+            })?;
+            tracing::info!(
+                bytes = meta.len(),
+                old_path = %old_path.display(),
+                "memory file exceeded limit; rotated"
+            );
+        }
     }
 
     let entry = MemoryEntry {
@@ -70,15 +100,14 @@ pub fn append(user_prompt: &str, assistant_response: &str) -> Result<()> {
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
         .with_context(|| format!("setting permissions on {}", path.display()))?;
 
-    // Advisory exclusive lock so that concurrent processes (or a future
-    // multi-daemon scenario) cannot interleave partial writes.
+    // Advisory exclusive lock so that concurrent processes cannot interleave writes.
     file.lock_exclusive()
         .with_context(|| format!("locking {}", path.display()))?;
     file.write_all(line.as_bytes())?;
     file.unlock()
         .with_context(|| format!("unlocking {}", path.display()))?;
 
-    Ok(())
+    Ok(entry)
 }
 
 /// Load the last `n` entries from the memory file.
@@ -196,10 +225,13 @@ pub fn count() -> Result<usize> {
     file.lock_shared()
         .with_context(|| format!("locking {}", path.display()))?;
 
-    let count = std::io::BufReader::new(&file)
-        .lines()
-        .filter(|l| l.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false))
-        .count();
+    let mut count = 0usize;
+    for line in std::io::BufReader::new(&file).lines() {
+        let line = line.with_context(|| format!("reading {}", path.display()))?;
+        if !line.trim().is_empty() {
+            count += 1;
+        }
+    }
 
     file.unlock()
         .with_context(|| format!("unlocking {}", path.display()))?;
