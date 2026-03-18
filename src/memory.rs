@@ -27,6 +27,31 @@ pub fn memory_path() -> Result<PathBuf> {
     Ok(amaebi_home()?.join("memory.jsonl"))
 }
 
+/// Path to the advisory lock file used to serialise all memory I/O.
+fn lock_path() -> Result<PathBuf> {
+    Ok(amaebi_home()?.join("memory.lock"))
+}
+
+/// Open (creating if necessary) the memory lock file.
+///
+/// All callers must call [`FileExt::lock_exclusive`] or
+/// [`FileExt::lock_shared`] on the returned handle before accessing
+/// `memory.jsonl`.
+fn open_lock_file() -> Result<std::fs::File> {
+    let path = lock_path()?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(&path)
+        .with_context(|| format!("opening lock file {}", path.display()))
+}
+
 fn truncate(s: &str) -> String {
     if s.len() <= 200 {
         s.to_string()
@@ -52,8 +77,10 @@ pub const MAX_FILE_BYTES: u64 = 1024 * 1024; // 1 MiB
 /// Returns the [`MemoryEntry`] that was written so callers can update
 /// an in-memory cache without re-reading the file.
 ///
-/// If `memory.jsonl` exceeds [`MAX_FILE_BYTES`] before the write it is
-/// atomically renamed to `memory.jsonl.old` and a fresh file is started.
+/// If adding the new entry would cause `memory.jsonl` to reach or exceed
+/// [`MAX_FILE_BYTES`] it is atomically renamed to `memory.jsonl.old` and a
+/// fresh file is started.  The entire rotate-then-write sequence is protected
+/// by an exclusive lock on `memory.lock` so concurrent writers cannot race.
 pub fn append(user_prompt: &str, assistant_response: &str) -> Result<MemoryEntry> {
     let path = memory_path()?;
     if let Some(parent) = path.parent() {
@@ -67,68 +94,60 @@ pub fn append(user_prompt: &str, assistant_response: &str) -> Result<MemoryEntry
         assistant: truncate(assistant_response),
     };
 
-    // Build the complete JSONL line before touching the file so the lock is
-    // held for the minimum time possible.
+    // Build the complete JSONL line before acquiring any lock so the critical
+    // section is as short as possible.
     let mut line = serde_json::to_string(&entry)?;
     line.push('\n');
 
-    // Open (or create) the file and acquire the exclusive lock BEFORE any size
-    // check or rename to eliminate the TOCTOU race between checking size and
-    // rotating — without the lock a concurrent writer could append between our
-    // check and the rename, losing that entry.
-    let file = std::fs::OpenOptions::new()
+    // Acquire an exclusive advisory lock via the dedicated lock file.  This
+    // serialises all writers (including across processes) and covers the entire
+    // size-check → optional-rotate → write sequence, eliminating every TOCTOU
+    // race between concurrent appenders.
+    let lock_file = open_lock_file()?;
+    lock_file
+        .lock_exclusive()
+        .context("acquiring exclusive memory lock")?;
+
+    // Check current file size under the lock.  Include the bytes we are about
+    // to write so that the post-write size stays within MAX_FILE_BYTES.
+    let current_size = if path.exists() {
+        std::fs::metadata(&path)
+            .with_context(|| format!("checking size of {}", path.display()))?
+            .len()
+    } else {
+        0
+    };
+
+    if current_size + line.len() as u64 >= MAX_FILE_BYTES {
+        // Rotate while holding the lock — no other writer can sneak in.
+        let old_path = path.with_file_name("memory.jsonl.old");
+        std::fs::rename(&path, &old_path)
+            .with_context(|| format!("rotating {} to {}", path.display(), old_path.display()))?;
+        tracing::info!(
+            bytes = current_size,
+            old_path = %old_path.display(),
+            "memory file exceeded limit; rotated"
+        );
+    }
+
+    // Open (or create) the data file and write the entry.
+    let mut data_file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .mode(0o600)
         .open(&path)
         .with_context(|| format!("opening {}", path.display()))?;
 
-    file.lock_exclusive()
-        .with_context(|| format!("locking {}", path.display()))?;
-
-    // Check size under the lock; use the open file handle to avoid a second
-    // path lookup.
-    let size = file
-        .metadata()
-        .with_context(|| format!("checking size of {}", path.display()))?
-        .len();
-
-    let mut file = if size > MAX_FILE_BYTES {
-        // Unlock before rename so the OS can reclaim the old inode cleanly.
-        file.unlock()
-            .with_context(|| format!("unlocking {} before rotation", path.display()))?;
-
-        let old_path = path.with_file_name("memory.jsonl.old");
-        std::fs::rename(&path, &old_path)
-            .with_context(|| format!("rotating {} to {}", path.display(), old_path.display()))?;
-        tracing::info!(
-            bytes = size,
-            old_path = %old_path.display(),
-            "memory file exceeded limit; rotated"
-        );
-
-        // Open the new (fresh) file and re-acquire the lock.
-        let new_file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .mode(0o600)
-            .open(&path)
-            .with_context(|| format!("opening fresh {}", path.display()))?;
-        new_file
-            .lock_exclusive()
-            .with_context(|| format!("locking fresh {}", path.display()))?;
-        new_file
-    } else {
-        file
-    };
-
     // Enforce 0600 even if the file pre-existed with broader permissions.
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
         .with_context(|| format!("setting permissions on {}", path.display()))?;
 
-    file.write_all(line.as_bytes())?;
-    file.unlock()
-        .with_context(|| format!("unlocking {}", path.display()))?;
+    data_file.write_all(line.as_bytes())?;
+
+    // Release the advisory lock.
+    lock_file
+        .unlock()
+        .context("releasing exclusive memory lock")?;
 
     Ok(entry)
 }
@@ -139,127 +158,169 @@ pub fn append(user_prompt: &str, assistant_response: &str) -> Result<MemoryEntry
 /// memory — only the last `n` entries are kept at any point.
 pub fn load_recent(n: usize) -> Result<Vec<MemoryEntry>> {
     let path = memory_path()?;
-    if !path.exists() {
-        return Ok(vec![]);
-    }
 
-    let file = std::fs::File::open(&path).with_context(|| format!("opening {}", path.display()))?;
-    file.lock_shared()
-        .with_context(|| format!("locking {}", path.display()))?;
+    // Acquire a shared lock before opening the data file so readers cannot
+    // observe the file in a partially-rotated state during concurrent writes.
+    let lock_file = open_lock_file()?;
+    lock_file
+        .lock_shared()
+        .context("acquiring shared memory lock")?;
 
-    let mut ring: VecDeque<MemoryEntry> = VecDeque::new();
-    let mut line_no: u64 = 0;
-
-    for line in std::io::BufReader::new(&file).lines() {
-        line_no += 1;
-        let line = line.with_context(|| format!("reading {}", path.display()))?;
-        let l = line.trim();
-        if l.is_empty() {
-            continue;
+    let result = (|| {
+        if !path.exists() {
+            return Ok(vec![]);
         }
-        match serde_json::from_str::<MemoryEntry>(l) {
-            Ok(entry) => {
-                ring.push_back(entry);
-                if ring.len() > n {
-                    ring.pop_front();
+
+        let file =
+            std::fs::File::open(&path).with_context(|| format!("opening {}", path.display()))?;
+
+        let mut ring: VecDeque<MemoryEntry> = VecDeque::new();
+        let mut line_no: u64 = 0;
+
+        for line in std::io::BufReader::new(&file).lines() {
+            line_no += 1;
+            let line = line.with_context(|| format!("reading {}", path.display()))?;
+            let l = line.trim();
+            if l.is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<MemoryEntry>(l) {
+                Ok(entry) => {
+                    ring.push_back(entry);
+                    if ring.len() > n {
+                        ring.pop_front();
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        line_no = line_no,
+                        bytes = l.len(),
+                        "skipping malformed memory entry"
+                    );
                 }
             }
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    line_no = line_no,
-                    bytes = l.len(),
-                    "skipping malformed memory entry"
-                );
-            }
         }
-    }
 
-    file.unlock()
-        .with_context(|| format!("unlocking {}", path.display()))?;
+        Ok(ring.into_iter().collect())
+    })();
 
-    Ok(ring.into_iter().collect())
+    lock_file.unlock().context("releasing shared memory lock")?;
+
+    result
 }
 
 /// Return all entries whose user or assistant text contains `query` (case-insensitive).
 pub fn search(query: &str) -> Result<Vec<MemoryEntry>> {
     let path = memory_path()?;
-    if !path.exists() {
-        return Ok(vec![]);
-    }
 
-    let file = std::fs::File::open(&path).with_context(|| format!("opening {}", path.display()))?;
-    file.lock_shared()
-        .with_context(|| format!("locking {}", path.display()))?;
+    let lock_file = open_lock_file()?;
+    lock_file
+        .lock_shared()
+        .context("acquiring shared memory lock")?;
 
-    let query_lower = query.to_lowercase();
-    let mut results = Vec::new();
-    let mut line_no: u64 = 0;
-
-    for line in std::io::BufReader::new(&file).lines() {
-        line_no += 1;
-        let line = line.with_context(|| format!("reading {}", path.display()))?;
-        let l = line.trim();
-        if l.is_empty() {
-            continue;
+    let result = (|| {
+        if !path.exists() {
+            return Ok(vec![]);
         }
-        match serde_json::from_str::<MemoryEntry>(l) {
-            Ok(entry) => {
-                if entry.user.to_lowercase().contains(&query_lower)
-                    || entry.assistant.to_lowercase().contains(&query_lower)
-                {
-                    results.push(entry);
+
+        let file =
+            std::fs::File::open(&path).with_context(|| format!("opening {}", path.display()))?;
+
+        let query_lower = query.to_lowercase();
+        let mut results = Vec::new();
+        let mut line_no: u64 = 0;
+
+        for line in std::io::BufReader::new(&file).lines() {
+            line_no += 1;
+            let line = line.with_context(|| format!("reading {}", path.display()))?;
+            let l = line.trim();
+            if l.is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<MemoryEntry>(l) {
+                Ok(entry) => {
+                    if entry.user.to_lowercase().contains(&query_lower)
+                        || entry.assistant.to_lowercase().contains(&query_lower)
+                    {
+                        results.push(entry);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        line_no = line_no,
+                        bytes = l.len(),
+                        "skipping malformed memory entry"
+                    );
                 }
             }
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    line_no = line_no,
-                    bytes = l.len(),
-                    "skipping malformed memory entry"
-                );
-            }
         }
-    }
 
-    file.unlock()
-        .with_context(|| format!("unlocking {}", path.display()))?;
+        Ok(results)
+    })();
 
-    Ok(results)
+    lock_file.unlock().context("releasing shared memory lock")?;
+
+    result
 }
 
-/// Delete the memory file.
+/// Delete the memory files (`memory.jsonl` and `memory.jsonl.old` if present).
 pub fn clear() -> Result<()> {
     let path = memory_path()?;
+    let old_path = path.with_file_name("memory.jsonl.old");
+
+    let lock_file = open_lock_file()?;
+    lock_file
+        .lock_exclusive()
+        .context("acquiring exclusive memory lock")?;
+
     if path.exists() {
         std::fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
     }
+    if old_path.exists() {
+        std::fs::remove_file(&old_path)
+            .with_context(|| format!("removing {}", old_path.display()))?;
+    }
+
+    lock_file
+        .unlock()
+        .context("releasing exclusive memory lock")?;
+
     Ok(())
 }
 
 /// Return the total number of entries in the memory file.
 pub fn count() -> Result<usize> {
     let path = memory_path()?;
-    if !path.exists() {
-        return Ok(0);
-    }
 
-    let file = std::fs::File::open(&path).with_context(|| format!("opening {}", path.display()))?;
-    file.lock_shared()
-        .with_context(|| format!("locking {}", path.display()))?;
+    let lock_file = open_lock_file()?;
+    lock_file
+        .lock_shared()
+        .context("acquiring shared memory lock")?;
 
-    let mut count = 0usize;
-    for line in std::io::BufReader::new(&file).lines() {
-        let line = line.with_context(|| format!("reading {}", path.display()))?;
-        if !line.trim().is_empty() {
-            count += 1;
+    let result = (|| {
+        if !path.exists() {
+            return Ok(0usize);
         }
-    }
 
-    file.unlock()
-        .with_context(|| format!("unlocking {}", path.display()))?;
+        let file =
+            std::fs::File::open(&path).with_context(|| format!("opening {}", path.display()))?;
 
-    Ok(count)
+        let mut count = 0usize;
+        for line in std::io::BufReader::new(&file).lines() {
+            let line = line.with_context(|| format!("reading {}", path.display()))?;
+            if !line.trim().is_empty() {
+                count += 1;
+            }
+        }
+
+        Ok(count)
+    })();
+
+    lock_file.unlock().context("releasing shared memory lock")?;
+
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -397,6 +458,28 @@ mod tests {
             assert_eq!(count().unwrap(), 0);
             // clear on non-existent file is a no-op
             clear().unwrap();
+        });
+    }
+
+    #[test]
+    fn test_clear_removes_old_file() {
+        with_temp_home(|| {
+            // Manually create a .old file to simulate a prior rotation.
+            // The amaebi home directory does not exist yet so create it first.
+            let path = memory_path().unwrap();
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let old_path = path.with_file_name("memory.jsonl.old");
+            std::fs::write(&old_path, b"old data\n").unwrap();
+            assert!(old_path.exists());
+
+            append("test", "response").unwrap();
+            clear().unwrap();
+
+            assert!(!memory_path().unwrap().exists());
+            assert!(
+                !old_path.exists(),
+                "clear() must also remove memory.jsonl.old"
+            );
         });
     }
 }

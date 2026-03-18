@@ -26,11 +26,11 @@ const CACHE_SIZE: usize = 20;
 /// # Limitations
 ///
 /// The cache is only updated through the daemon's own `memory::append` calls.
-/// Entries written directly by the CLI (`amaebi memory` subcommands, which call
-/// `memory::append` in the client process) are **not** reflected in a running
+/// Entries written by external processes (e.g. future `amaebi` subcommands
+/// that call `memory::append` directly) are **not** reflected in a running
 /// daemon's cache.  A daemon restart is required to pick up such externally
-/// written entries.  This is an acceptable trade-off for the current single-user,
-/// single-daemon deployment model.
+/// written entries.  This is an acceptable trade-off for the current
+/// single-user, single-daemon deployment model.
 ///
 /// `load_from_disk` acquires a shared file lock (`lock_shared`) on
 /// `memory.jsonl`.  If another process holds an exclusive lock at startup, the
