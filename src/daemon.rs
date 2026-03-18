@@ -142,10 +142,6 @@ where
     W: AsyncWriteExt + Unpin,
 {
     let schemas = tools::tool_schemas();
-    // Guard against runaway tool loops (e.g. a broken tool that always returns
-    // an error the model retries indefinitely).
-    const MAX_TOOL_ROUNDS: usize = 10;
-    let mut tool_rounds = 0;
 
     loop {
         let resp =
@@ -157,12 +153,6 @@ where
             }
 
             FinishReason::ToolCalls => {
-                tool_rounds += 1;
-                if tool_rounds > MAX_TOOL_ROUNDS {
-                    tracing::warn!("exceeded maximum tool rounds ({MAX_TOOL_ROUNDS}), stopping");
-                    break;
-                }
-
                 // Append the assistant's turn (with tool_calls) to history.
                 let api_calls: Vec<ApiToolCall> = resp
                     .tool_calls

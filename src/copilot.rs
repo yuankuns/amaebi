@@ -332,6 +332,7 @@ where
                                         },
                                     )
                                     .await?;
+                                    writer.flush().await?;
                                 }
                             }
                         }
