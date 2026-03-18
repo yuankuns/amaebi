@@ -176,7 +176,7 @@ where
 
                 // Execute each requested tool and append results.
                 for tc in &resp.tool_calls {
-                    tracing::info!(tool = %tc.name, "executing tool");
+                    tracing::debug!(tool = %tc.name, "executing tool");
 
                     // Notify the client so it can show progress.
                     write_frame(

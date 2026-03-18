@@ -58,6 +58,7 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
             }
             Response::ToolUse { name } => {
                 // Tool notifications go to stderr so stdout stays clean for the AI response.
+                eprintln!();
                 eprintln!("[tool] {name}");
             }
         }
