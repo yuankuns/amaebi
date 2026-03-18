@@ -14,25 +14,34 @@ struct HostEntry {
     oauth_token: String,
 }
 
-pub(crate) fn copilot_config_dir() -> Result<PathBuf> {
+/// Returns `~/.amaebi/` — the primary config directory for amaebi.
+pub(crate) fn amaebi_home() -> Result<PathBuf> {
     let home = std::env::var("HOME").context("$HOME is not set")?;
-    Ok(PathBuf::from(home).join(".config/github-copilot"))
+    Ok(PathBuf::from(home).join(".amaebi"))
 }
+
 
 /// Read the long-lived GitHub OAuth token from the Copilot config files.
 ///
-/// Tries `hosts.json` first (VS Code / neovim plugin), then `apps.json`
-/// (GitHub CLI plugin).
+/// Checks `~/.amaebi/hosts.json` first, then falls back to
+/// `~/.config/github-copilot/hosts.json` and `apps.json` for VS Code / neovim
+/// compatibility.
 pub(crate) fn read_oauth_token() -> Result<String> {
-    let dir = copilot_config_dir()?;
-    let candidates = ["hosts.json", "apps.json"];
+    let home = std::env::var("HOME").context("$HOME is not set")?;
+    let home = PathBuf::from(home);
 
-    for name in candidates {
-        let path = dir.join(name);
+    let copilot_dir = home.join(".config/github-copilot");
+    let candidates = [
+        amaebi_home()?.join("hosts.json"),
+        copilot_dir.join("hosts.json"),
+        copilot_dir.join("apps.json"),
+    ];
+
+    for path in &candidates {
         if !path.exists() {
             continue;
         }
-        let raw = std::fs::read_to_string(&path)
+        let raw = std::fs::read_to_string(path)
             .with_context(|| format!("reading {}", path.display()))?;
         let map: HashMap<String, HostEntry> =
             serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
@@ -43,17 +52,17 @@ pub(crate) fn read_oauth_token() -> Result<String> {
 
     anyhow::bail!(
         "GitHub Copilot OAuth token not found. \
-         Expected ~/.config/github-copilot/hosts.json or apps.json with a \
-         \"github.com\" entry."
+         Expected ~/.amaebi/hosts.json or ~/.config/github-copilot/hosts.json / apps.json \
+         with a \"github.com\" entry."
     )
 }
 
-/// Write (or merge) an OAuth token into `~/.config/github-copilot/hosts.json`.
+/// Write (or merge) an OAuth token into `~/.amaebi/hosts.json`.
 ///
 /// If the file already exists its other top-level keys are preserved; only the
 /// `"github.com"` entry is created or replaced.
 pub(crate) fn save_hosts_json(oauth_token: &str, username: &str) -> Result<()> {
-    let dir = copilot_config_dir()?;
+    let dir = amaebi_home()?;
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("creating config dir {}", dir.display()))?;
 

@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
 
+use crate::auth::amaebi_home;
+
 // ---------------------------------------------------------------------------
 // Data model
 // ---------------------------------------------------------------------------
@@ -19,8 +21,7 @@ pub struct MemoryEntry {
 // ---------------------------------------------------------------------------
 
 pub fn memory_path() -> Result<PathBuf> {
-    let home = std::env::var("HOME").context("HOME not set")?;
-    Ok(PathBuf::from(home).join(".config/amaebi/memory.jsonl"))
+    Ok(amaebi_home()?.join("memory.jsonl"))
 }
 
 fn truncate(s: &str) -> String {
