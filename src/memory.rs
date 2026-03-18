@@ -61,23 +61,6 @@ pub fn append(user_prompt: &str, assistant_response: &str) -> Result<MemoryEntry
             .with_context(|| format!("creating {}", parent.display()))?;
     }
 
-    // Rotate if the file exceeds the size limit.
-    if path.exists() {
-        let meta = std::fs::metadata(&path)
-            .with_context(|| format!("checking size of {}", path.display()))?;
-        if meta.len() > MAX_FILE_BYTES {
-            let old_path = path.with_file_name("memory.jsonl.old");
-            std::fs::rename(&path, &old_path).with_context(|| {
-                format!("rotating {} to {}", path.display(), old_path.display())
-            })?;
-            tracing::info!(
-                bytes = meta.len(),
-                old_path = %old_path.display(),
-                "memory file exceeded limit; rotated"
-            );
-        }
-    }
-
     let entry = MemoryEntry {
         timestamp: chrono::Utc::now().to_rfc3339(),
         user: truncate(user_prompt),
@@ -89,20 +72,60 @@ pub fn append(user_prompt: &str, assistant_response: &str) -> Result<MemoryEntry
     let mut line = serde_json::to_string(&entry)?;
     line.push('\n');
 
-    let mut file = std::fs::OpenOptions::new()
+    // Open (or create) the file and acquire the exclusive lock BEFORE any size
+    // check or rename to eliminate the TOCTOU race between checking size and
+    // rotating — without the lock a concurrent writer could append between our
+    // check and the rename, losing that entry.
+    let file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .mode(0o600)
         .open(&path)
         .with_context(|| format!("opening {}", path.display()))?;
 
+    file.lock_exclusive()
+        .with_context(|| format!("locking {}", path.display()))?;
+
+    // Check size under the lock; use the open file handle to avoid a second
+    // path lookup.
+    let size = file
+        .metadata()
+        .with_context(|| format!("checking size of {}", path.display()))?
+        .len();
+
+    let mut file = if size > MAX_FILE_BYTES {
+        // Unlock before rename so the OS can reclaim the old inode cleanly.
+        file.unlock()
+            .with_context(|| format!("unlocking {} before rotation", path.display()))?;
+
+        let old_path = path.with_file_name("memory.jsonl.old");
+        std::fs::rename(&path, &old_path)
+            .with_context(|| format!("rotating {} to {}", path.display(), old_path.display()))?;
+        tracing::info!(
+            bytes = size,
+            old_path = %old_path.display(),
+            "memory file exceeded limit; rotated"
+        );
+
+        // Open the new (fresh) file and re-acquire the lock.
+        let new_file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(&path)
+            .with_context(|| format!("opening fresh {}", path.display()))?;
+        new_file
+            .lock_exclusive()
+            .with_context(|| format!("locking fresh {}", path.display()))?;
+        new_file
+    } else {
+        file
+    };
+
     // Enforce 0600 even if the file pre-existed with broader permissions.
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
         .with_context(|| format!("setting permissions on {}", path.display()))?;
 
-    // Advisory exclusive lock so that concurrent processes cannot interleave writes.
-    file.lock_exclusive()
-        .with_context(|| format!("locking {}", path.display()))?;
     file.write_all(line.as_bytes())?;
     file.unlock()
         .with_context(|| format!("unlocking {}", path.display()))?;
