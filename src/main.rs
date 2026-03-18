@@ -13,11 +13,12 @@ mod tools;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let filter = std::env::var("AMAEBI_LOG")
+        .or_else(|_| std::env::var("RUST_LOG"))
+        .map(|v| tracing_subscriber::EnvFilter::new(v))
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
     tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
+        .with_env_filter(filter)
         .with_target(false)
         .init();
 
