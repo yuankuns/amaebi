@@ -179,10 +179,50 @@ where
                     tracing::debug!(tool = %tc.name, "executing tool");
 
                     // Notify the client so it can show progress.
+                    let tool_detail = {
+                        let args: serde_json::Value =
+                            serde_json::from_str(&tc.arguments).unwrap_or(serde_json::Value::Null);
+                        let s = match tc.name.as_str() {
+                            "shell_command" => args
+                                .get("command")
+                                .and_then(|v| v.as_str())
+                                .map(|s| {
+                                    if s.len() > 80 {
+                                        format!("{}…", &s[..80])
+                                    } else {
+                                        s.to_string()
+                                    }
+                                })
+                                .unwrap_or_default(),
+                            "read_file" => args
+                                .get("path")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default()
+                                .to_string(),
+                            "edit_file" => args
+                                .get("path")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default()
+                                .to_string(),
+                            "tmux_send_keys" => args
+                                .get("keys")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default()
+                                .to_string(),
+                            "tmux_capture_pane" => args
+                                .get("target")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default()
+                                .to_string(),
+                            _ => String::new(),
+                        };
+                        s
+                    };
                     write_frame(
                         writer,
                         &Response::ToolUse {
                             name: tc.name.clone(),
+                            detail: tool_detail,
                         },
                     )
                     .await?;

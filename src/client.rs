@@ -56,10 +56,17 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
             Response::Error { message } => {
                 anyhow::bail!("{message}");
             }
-            Response::ToolUse { name } => {
+            Response::ToolUse { name, detail } => {
                 // Tool notifications go to stderr so stdout stays clean for the AI response.
                 eprintln!();
-                eprintln!("[tool] {name}");
+                match name.as_str() {
+                    "shell_command" => eprintln!("[tool] $ {detail}"),
+                    "read_file" => eprintln!("[tool] read: {detail}"),
+                    "edit_file" => eprintln!("[tool] write: {detail}"),
+                    "tmux_send_keys" => eprintln!("[tool] keys: {detail}"),
+                    "tmux_capture_pane" => eprintln!("[tool] capture: {detail}"),
+                    _ => eprintln!("[tool] {name}: {detail}"),
+                }
             }
         }
     }
