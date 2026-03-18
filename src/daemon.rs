@@ -118,14 +118,17 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
     match run_agentic_loop(&state, &token, &req.model, messages, &mut writer).await {
         Ok(response_text) => {
             let prompt = req.prompt.clone();
-            // Hold the in-process lock for the duration of the blocking write
-            // so that concurrent connections cannot race on the memory file.
-            let _mem_guard = state.memory_lock.lock().await;
-            if let Err(e) =
+            // Serialise memory writes within this process; file-level flock in
+            // memory::append handles cross-process protection.
+            let mem_guard = state.memory_lock.lock().await;
+            let mem_result =
                 tokio::task::spawn_blocking(move || memory::append(&prompt, &response_text))
                     .await
-                    .unwrap_or_else(|e| Err(anyhow::anyhow!("memory::append panicked: {e}")))
-            {
+                    .unwrap_or_else(|e| Err(anyhow::anyhow!("memory::append panicked: {e}")));
+            // Release the lock immediately after the write — before logging —
+            // so other connections are not blocked while we format a warning.
+            drop(mem_guard);
+            if let Err(e) = mem_result {
                 tracing::warn!(error = %e, "failed to save memory");
             }
         }

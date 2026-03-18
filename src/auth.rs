@@ -20,7 +20,6 @@ pub(crate) fn amaebi_home() -> Result<PathBuf> {
     Ok(PathBuf::from(home).join(".amaebi"))
 }
 
-
 /// Read the long-lived GitHub OAuth token from the Copilot config files.
 ///
 /// Checks `~/.amaebi/hosts.json` first, then falls back to
@@ -41,8 +40,8 @@ pub(crate) fn read_oauth_token() -> Result<String> {
         if !path.exists() {
             continue;
         }
-        let raw = std::fs::read_to_string(path)
-            .with_context(|| format!("reading {}", path.display()))?;
+        let raw =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         let map: HashMap<String, HostEntry> =
             serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
         if let Some(entry) = map.get("github.com") {
