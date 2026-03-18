@@ -47,6 +47,9 @@ pub enum Command {
     Memory {
         #[command(subcommand)]
         action: MemoryAction,
+        /// Path to the Unix socket (used to notify a running daemon after clear).
+        #[arg(long, default_value = DEFAULT_SOCKET, global = true)]
+        socket: PathBuf,
     },
 }
 

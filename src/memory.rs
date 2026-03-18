@@ -123,6 +123,10 @@ pub fn append(user_prompt: &str, assistant_response: &str) -> Result<MemoryEntry
         let old_path = path.with_file_name("memory.jsonl.old");
         std::fs::rename(&path, &old_path)
             .with_context(|| format!("rotating {} to {}", path.display(), old_path.display()))?;
+        // Enforce 0600 on the rotated file — the original may have had broader
+        // permissions set before this code path existed.
+        std::fs::set_permissions(&old_path, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("setting permissions on {}", old_path.display()))?;
         tracing::info!(
             bytes = current_size,
             old_path = %old_path.display(),

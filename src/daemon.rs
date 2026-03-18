@@ -73,6 +73,13 @@ impl MemoryCache {
     pub async fn snapshot(&self) -> Vec<MemoryEntry> {
         self.inner.read().await.iter().cloned().collect()
     }
+
+    /// Empty the cache.  Called when the persistent store is wiped by an
+    /// external command (`amaebi memory clear`) so that subsequent requests
+    /// do not replay stale history.
+    pub async fn clear(&self) {
+        self.inner.write().await.clear();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -160,58 +167,73 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
 
     let req: Request = serde_json::from_str(&line).context("parsing request JSON")?;
 
-    tracing::info!(
-        pane = ?req.tmux_pane,
-        model = %req.model,
-        prompt_len = req.prompt.len(),
-        "received request"
-    );
-
-    let token = match state.tokens.get(&state.http).await {
-        Ok(t) => t,
-        Err(e) => {
-            tracing::error!(error = %e, "failed to get Copilot API token");
-            write_frame(
-                &mut writer,
-                &Response::Error {
-                    message: format!("authentication error: {e:#}"),
-                },
-            )
-            .await?;
-            return Ok(());
+    match req {
+        Request::ClearCache => {
+            tracing::info!("received cache clear request");
+            state.memory_cache.clear().await;
+            write_frame(&mut writer, &Response::Done).await?;
         }
-    };
 
-    let messages = build_messages(&req, &state).await;
+        Request::Chat {
+            prompt,
+            tmux_pane,
+            model,
+            session_id: _,
+        } => {
+            tracing::info!(
+                pane = ?tmux_pane,
+                model = %model,
+                prompt_len = prompt.len(),
+                "received chat request"
+            );
 
-    match run_agentic_loop(&state, &token, &req.model, messages, &mut writer).await {
-        Ok(response_text) => {
-            let prompt = req.prompt.clone();
-            // Serialise memory writes within this process; file-level flock in
-            // memory::append handles cross-process protection.
-            let mem_guard = state.memory_lock.lock().await;
-            let mem_result =
-                tokio::task::spawn_blocking(move || memory::append(&prompt, &response_text))
+            let token = match state.tokens.get(&state.http).await {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::error!(error = %e, "failed to get Copilot API token");
+                    write_frame(
+                        &mut writer,
+                        &Response::Error {
+                            message: format!("authentication error: {e:#}"),
+                        },
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            };
+
+            let messages = build_messages(&prompt, tmux_pane.as_deref(), &state).await;
+
+            match run_agentic_loop(&state, &token, &model, messages, &mut writer).await {
+                Ok(response_text) => {
+                    // Serialise memory writes within this process; file-level flock in
+                    // memory::append handles cross-process protection.
+                    let mem_guard = state.memory_lock.lock().await;
+                    let mem_result = tokio::task::spawn_blocking(move || {
+                        memory::append(&prompt, &response_text)
+                    })
                     .await
                     .unwrap_or_else(|e| Err(anyhow::anyhow!("memory::append panicked: {e}")));
-            // Release the lock immediately after the write — before logging —
-            // so other connections are not blocked while we format a warning.
-            drop(mem_guard);
-            match mem_result {
-                Ok(entry) => state.memory_cache.push(entry).await,
-                Err(e) => tracing::warn!(error = %e, "failed to save memory"),
+                    // Release the lock immediately after the write — before logging —
+                    // so other connections are not blocked while we format a warning.
+                    drop(mem_guard);
+                    match mem_result {
+                        Ok(entry) => state.memory_cache.push(entry).await,
+                        Err(e) => tracing::warn!(error = %e, "failed to save memory"),
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "agentic loop error");
+                    // Best-effort: the stream may be partially written already.
+                    let _ = write_frame(
+                        &mut writer,
+                        &Response::Error {
+                            message: format!("agent error: {e:#}"),
+                        },
+                    )
+                    .await;
+                }
             }
-        }
-        Err(e) => {
-            tracing::error!(error = %e, "agentic loop error");
-            // Best-effort: the stream may be partially written already.
-            let _ = write_frame(
-                &mut writer,
-                &Response::Error {
-                    message: format!("agent error: {e:#}"),
-                },
-            )
-            .await;
         }
     }
 
@@ -370,14 +392,18 @@ where
 // Message construction
 // ---------------------------------------------------------------------------
 
-async fn build_messages(req: &Request, state: &DaemonState) -> Vec<Message> {
+async fn build_messages(
+    prompt: &str,
+    tmux_pane: Option<&str>,
+    state: &DaemonState,
+) -> Vec<Message> {
     let mut system = "You are a helpful, concise AI assistant embedded in a tmux terminal. \
                       Answer in plain text; avoid markdown unless the user asks for it. \
                       You have tools available to inspect the terminal, run commands, \
                       and read or edit files — use them when they help you answer accurately."
         .to_owned();
 
-    if let Some(pane) = &req.tmux_pane {
+    if let Some(pane) = tmux_pane {
         system.push_str(&format!(" The user's active tmux pane is {pane}."));
     }
 
@@ -395,7 +421,7 @@ async fn build_messages(req: &Request, state: &DaemonState) -> Vec<Message> {
         messages.push(Message::assistant(Some(entry.assistant), vec![]));
     }
 
-    messages.push(Message::user(req.prompt.clone()));
+    messages.push(Message::user(prompt.to_owned()));
     messages
 }
 
@@ -456,5 +482,26 @@ mod tests {
         assert_eq!(snap[0].user, "first");
         assert_eq!(snap[1].user, "second");
         assert_eq!(snap[2].user, "third");
+    }
+
+    #[tokio::test]
+    async fn cache_clear_empties_all_entries() {
+        let cache = MemoryCache::new();
+        cache.push(make_entry("a", "b")).await;
+        cache.push(make_entry("c", "d")).await;
+        assert_eq!(cache.snapshot().await.len(), 2);
+        cache.clear().await;
+        assert!(cache.snapshot().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cache_clear_then_push_works() {
+        let cache = MemoryCache::new();
+        cache.push(make_entry("old", "data")).await;
+        cache.clear().await;
+        cache.push(make_entry("new", "data")).await;
+        let snap = cache.snapshot().await;
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].user, "new");
     }
 }

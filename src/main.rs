@@ -39,7 +39,7 @@ async fn main() -> Result<()> {
             auth_flow::ensure_authenticated(&http, &client_id, skip_validate).await
         }
         cli::Command::Models => models::run().await,
-        cli::Command::Memory { action } => run_memory(action),
+        cli::Command::Memory { action, socket } => run_memory(action, socket).await,
     }
 }
 
@@ -126,7 +126,7 @@ fn sanitize(s: &str) -> String {
     out
 }
 
-fn run_memory(action: cli::MemoryAction) -> Result<()> {
+async fn run_memory(action: cli::MemoryAction, socket: std::path::PathBuf) -> Result<()> {
     match action {
         cli::MemoryAction::List => {
             let entries = memory::load_recent(20)?;
@@ -162,6 +162,9 @@ fn run_memory(action: cli::MemoryAction) -> Result<()> {
         }
         cli::MemoryAction::Clear => {
             memory::clear()?;
+            // Best-effort: notify a running daemon to clear its in-memory cache.
+            // Silently ignores connection failures (daemon may not be running).
+            notify_daemon_cache_clear(&socket).await;
             println!("Memory cleared.");
             Ok(())
         }
@@ -171,6 +174,32 @@ fn run_memory(action: cli::MemoryAction) -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// Tell a running daemon to flush its in-memory conversation cache.
+///
+/// This is best-effort: if the daemon is not running, or the connection fails
+/// for any reason, the error is silently discarded.
+async fn notify_daemon_cache_clear(socket: &std::path::Path) {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::UnixStream;
+
+    let Ok(stream) = UnixStream::connect(socket).await else {
+        return;
+    };
+    let (reader, mut writer) = tokio::io::split(stream);
+
+    let Ok(mut line) = serde_json::to_string(&ipc::Request::ClearCache) else {
+        return;
+    };
+    line.push('\n');
+
+    if writer.write_all(line.as_bytes()).await.is_err() {
+        return;
+    }
+    // Drain the Done response to confirm the daemon processed the clear.
+    let mut lines = BufReader::new(reader).lines();
+    let _ = lines.next_line().await;
 }
 
 #[cfg(test)]
