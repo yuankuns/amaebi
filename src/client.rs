@@ -60,12 +60,12 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
                 // Tool notifications go to stderr so stdout stays clean for the AI response.
                 eprintln!();
                 match name.as_str() {
-                    "shell_command" => eprintln!("[tool] $ {detail}"),
-                    "read_file" => eprintln!("[tool] read: {detail}"),
-                    "edit_file" => eprintln!("[tool] write: {detail}"),
-                    "tmux_send_keys" => eprintln!("[tool] keys: {detail}"),
-                    "tmux_capture_pane" => eprintln!("[tool] capture: {detail}"),
-                    _ => eprintln!("[tool] {name}: {detail}"),
+                    "shell_command" => eprintln!("```bash\n$ {detail}\n```"),
+                    "read_file" => eprintln!("📄 {detail}"),
+                    "edit_file" => eprintln!("✏️  {detail}"),
+                    "tmux_send_keys" => eprintln!("⌨️  send-keys: {detail}"),
+                    "tmux_capture_pane" => eprintln!("🖥️  capture: {detail}"),
+                    _ => eprintln!("🔧 {name}: {detail}"),
                 }
             }
         }
