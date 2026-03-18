@@ -262,22 +262,6 @@ pub fn count() -> Result<usize> {
     Ok(count)
 }
 
-/// Format entries as a compact string (used in tests; retained for tooling).
-#[allow(dead_code)]
-pub fn format_for_context(entries: &[MemoryEntry]) -> String {
-    if entries.is_empty() {
-        return String::new();
-    }
-    let mut out = String::from("Recent conversation history:\n");
-    for entry in entries {
-        out.push_str(&format!(
-            "- [{}] Q: {} A: {}\n",
-            entry.timestamp, entry.user, entry.assistant
-        ));
-    }
-    out
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -414,24 +398,5 @@ mod tests {
             // clear on non-existent file is a no-op
             clear().unwrap();
         });
-    }
-
-    #[test]
-    fn test_format_for_context() {
-        let entries = vec![MemoryEntry {
-            timestamp: "2024-01-01T00:00:00Z".to_string(),
-            user: "hello".to_string(),
-            assistant: "world".to_string(),
-        }];
-        let ctx = format_for_context(&entries);
-        assert!(ctx.starts_with("Recent conversation history:"));
-        assert!(ctx.contains("Q: hello"));
-        assert!(ctx.contains("A: world"));
-    }
-
-    #[test]
-    fn test_format_for_context_empty() {
-        let ctx = format_for_context(&[]);
-        assert!(ctx.is_empty());
     }
 }

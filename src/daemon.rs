@@ -22,6 +22,20 @@ const CACHE_SIZE: usize = 20;
 ///
 /// The cache is warmed once at daemon startup and updated on every successful
 /// `memory::append`, so `build_messages` never performs disk I/O on the hot path.
+///
+/// # Limitations
+///
+/// The cache is only updated through the daemon's own `memory::append` calls.
+/// Entries written directly by the CLI (`amaebi memory` subcommands, which call
+/// `memory::append` in the client process) are **not** reflected in a running
+/// daemon's cache.  A daemon restart is required to pick up such externally
+/// written entries.  This is an acceptable trade-off for the current single-user,
+/// single-daemon deployment model.
+///
+/// `load_from_disk` acquires a shared file lock (`lock_shared`) on
+/// `memory.jsonl`.  If another process holds an exclusive lock at startup, the
+/// call blocks until the lock is released — this is expected advisory-lock
+/// behaviour and is harmless in practice.
 pub struct MemoryCache {
     inner: tokio::sync::RwLock<VecDeque<MemoryEntry>>,
 }
