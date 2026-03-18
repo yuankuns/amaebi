@@ -147,6 +147,204 @@ async fn edit_file(args: serde_json::Value) -> Result<String> {
 // Tool schemas (OpenAI function-calling format)
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    // ---- tool_schemas ----------------------------------------------------
+
+    #[test]
+    fn tool_schemas_returns_five_entries() {
+        assert_eq!(tool_schemas().len(), 5);
+    }
+
+    #[test]
+    fn tool_schemas_have_expected_names() {
+        let schemas = tool_schemas();
+        let names: Vec<&str> = schemas
+            .iter()
+            .map(|s| s["function"]["name"].as_str().unwrap())
+            .collect();
+        for name in [
+            "shell_command",
+            "tmux_capture_pane",
+            "tmux_send_keys",
+            "read_file",
+            "edit_file",
+        ] {
+            assert!(names.contains(&name), "missing tool: {name}");
+        }
+    }
+
+    #[test]
+    fn tool_schemas_all_have_type_function() {
+        for schema in tool_schemas() {
+            assert_eq!(
+                schema["type"].as_str().unwrap(),
+                "function",
+                "unexpected type for: {}",
+                schema["function"]["name"]
+            );
+        }
+    }
+
+    #[test]
+    fn tool_schemas_all_have_parameters_with_required_array() {
+        for schema in tool_schemas() {
+            let name = schema["function"]["name"].as_str().unwrap();
+            assert!(
+                schema["function"]["parameters"]["required"].is_array(),
+                "missing required array for {name}"
+            );
+        }
+    }
+
+    // ---- shell_command ---------------------------------------------------
+
+    #[tokio::test]
+    async fn shell_command_captures_stdout() {
+        let exec = LocalExecutor;
+        let out = exec
+            .execute(
+                "shell_command",
+                serde_json::json!({"command": "echo hello"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.trim(), "hello");
+    }
+
+    #[tokio::test]
+    async fn shell_command_appends_exit_code_on_failure() {
+        let exec = LocalExecutor;
+        let out = exec
+            .execute(
+                "shell_command",
+                serde_json::json!({"command": "echo bad && exit 2"}),
+            )
+            .await
+            .unwrap();
+        assert!(out.contains("[exit 2]"), "got: {out}");
+        assert!(out.contains("bad"), "stdout should be present: {out}");
+    }
+
+    #[tokio::test]
+    async fn shell_command_empty_output_shows_exit_zero() {
+        let exec = LocalExecutor;
+        let out = exec
+            .execute("shell_command", serde_json::json!({"command": "true"}))
+            .await
+            .unwrap();
+        assert_eq!(out, "[exit 0]");
+    }
+
+    #[tokio::test]
+    async fn shell_command_missing_arg_returns_err() {
+        let exec = LocalExecutor;
+        let result = exec.execute("shell_command", serde_json::json!({})).await;
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("command"),
+            "error should mention 'command': {msg}"
+        );
+    }
+
+    // ---- read_file -------------------------------------------------------
+
+    #[tokio::test]
+    async fn read_file_returns_content() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("test.txt");
+        std::fs::write(&path, "file contents").unwrap();
+
+        let exec = LocalExecutor;
+        let out = exec
+            .execute(
+                "read_file",
+                serde_json::json!({"path": path.to_str().unwrap()}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out, "file contents");
+    }
+
+    #[tokio::test]
+    async fn read_file_nonexistent_returns_err() {
+        let exec = LocalExecutor;
+        let result = exec
+            .execute(
+                "read_file",
+                serde_json::json!({"path": "/no/such/file.txt"}),
+            )
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn read_file_missing_path_arg_returns_err() {
+        let exec = LocalExecutor;
+        let result = exec.execute("read_file", serde_json::json!({})).await;
+        assert!(result.is_err());
+    }
+
+    // ---- edit_file -------------------------------------------------------
+
+    #[tokio::test]
+    async fn edit_file_writes_new_file() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("new.txt");
+
+        let exec = LocalExecutor;
+        let out = exec
+            .execute(
+                "edit_file",
+                serde_json::json!({"path": path.to_str().unwrap(), "content": "written"}),
+            )
+            .await
+            .unwrap();
+        assert!(
+            out.contains("wrote"),
+            "return message should mention 'wrote': {out}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "written");
+    }
+
+    #[tokio::test]
+    async fn edit_file_overwrites_existing() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("existing.txt");
+        std::fs::write(&path, "old").unwrap();
+
+        let exec = LocalExecutor;
+        exec.execute(
+            "edit_file",
+            serde_json::json!({"path": path.to_str().unwrap(), "content": "new"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
+    }
+
+    // ---- unknown tool ---------------------------------------------------
+
+    #[tokio::test]
+    async fn unknown_tool_returns_descriptive_error() {
+        let exec = LocalExecutor;
+        let result = exec
+            .execute("nonexistent_tool", serde_json::json!({}))
+            .await;
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("unknown tool"), "got: {msg}");
+    }
+}
+
 /// Return the JSON schema array to include in every chat request.
 pub fn tool_schemas() -> Vec<serde_json::Value> {
     vec![

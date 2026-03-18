@@ -153,6 +153,224 @@ impl TokenCache {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use tempfile::TempDir;
+
+    // HOME_LOCK serialises all tests that mutate $HOME so they don't race.
+    static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Run `f` with `$HOME` temporarily pointing at `dir`.
+    fn with_home(dir: &std::path::Path, f: impl FnOnce()) {
+        let _guard = HOME_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let old = std::env::var("HOME").ok();
+        // SAFETY: HOME_LOCK ensures only one thread modifies HOME at a time.
+        unsafe { std::env::set_var("HOME", dir) };
+        f();
+        unsafe {
+            match old {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+    }
+
+    /// Path to `~/.amaebi/` inside a temp home.
+    fn amaebi_dir(home: &std::path::Path) -> std::path::PathBuf {
+        home.join(".amaebi")
+    }
+
+    /// Path to the legacy `~/.config/github-copilot/` inside a temp home.
+    fn copilot_dir(home: &std::path::Path) -> std::path::PathBuf {
+        home.join(".config/github-copilot")
+    }
+
+    // ---- amaebi_home ------------------------------------------------------
+
+    #[test]
+    fn amaebi_home_is_home_dot_amaebi() {
+        let tmp = TempDir::new().unwrap();
+        with_home(tmp.path(), || {
+            let dir = amaebi_home().unwrap();
+            assert_eq!(dir, tmp.path().join(".amaebi"));
+        });
+    }
+
+    // ---- read_oauth_token -------------------------------------------------
+
+    #[test]
+    fn read_token_from_amaebi_hosts_json() {
+        // Primary candidate: ~/.amaebi/hosts.json
+        let tmp = TempDir::new().unwrap();
+        let dir = amaebi_dir(tmp.path());
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("hosts.json"),
+            r#"{"github.com": {"oauth_token": "tok123", "user": "alice"}}"#,
+        )
+        .unwrap();
+
+        with_home(tmp.path(), || {
+            assert_eq!(read_oauth_token().unwrap(), "tok123");
+        });
+    }
+
+    #[test]
+    fn read_token_falls_back_to_copilot_hosts_json() {
+        // Second candidate: ~/.config/github-copilot/hosts.json
+        let tmp = TempDir::new().unwrap();
+        let dir = copilot_dir(tmp.path());
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("hosts.json"),
+            r#"{"github.com": {"oauth_token": "copilottok", "user": "bob"}}"#,
+        )
+        .unwrap();
+
+        with_home(tmp.path(), || {
+            assert_eq!(read_oauth_token().unwrap(), "copilottok");
+        });
+    }
+
+    #[test]
+    fn read_token_falls_back_to_apps_json() {
+        // Third candidate: ~/.config/github-copilot/apps.json
+        let tmp = TempDir::new().unwrap();
+        let dir = copilot_dir(tmp.path());
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("apps.json"),
+            r#"{"github.com": {"oauth_token": "appstoken"}}"#,
+        )
+        .unwrap();
+
+        with_home(tmp.path(), || {
+            assert_eq!(read_oauth_token().unwrap(), "appstoken");
+        });
+    }
+
+    #[test]
+    fn read_token_hosts_json_missing_github_com_falls_through() {
+        let tmp = TempDir::new().unwrap();
+        let dir = copilot_dir(tmp.path());
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("hosts.json"),
+            r#"{"gitlab.com": {"oauth_token": "gl"}}"#,
+        )
+        .unwrap();
+
+        with_home(tmp.path(), || {
+            assert!(read_oauth_token().is_err());
+        });
+    }
+
+    #[test]
+    fn read_token_no_files_returns_err() {
+        let tmp = TempDir::new().unwrap();
+        with_home(tmp.path(), || {
+            let err = read_oauth_token().unwrap_err();
+            assert!(format!("{err}").contains("not found"));
+        });
+    }
+
+    // ---- save_hosts_json --------------------------------------------------
+
+    #[test]
+    fn save_creates_new_hosts_json() {
+        let tmp = TempDir::new().unwrap();
+        with_home(tmp.path(), || {
+            save_hosts_json("newtoken", "bob").unwrap();
+
+            // save writes to ~/.amaebi/hosts.json
+            let path = amaebi_dir(tmp.path()).join("hosts.json");
+            let raw = fs::read_to_string(path).unwrap();
+            let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            assert_eq!(v["github.com"]["oauth_token"], "newtoken");
+            assert_eq!(v["github.com"]["user"], "bob");
+            assert_eq!(v["github.com"]["git_protocol"], "https");
+        });
+    }
+
+    #[test]
+    fn save_merges_other_top_level_keys() {
+        let tmp = TempDir::new().unwrap();
+        // Pre-populate ~/.amaebi/hosts.json with an existing key.
+        let dir = amaebi_dir(tmp.path());
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("hosts.json"),
+            r#"{"gitlab.com": {"oauth_token": "gl"}, "github.com": {"oauth_token": "old"}}"#,
+        )
+        .unwrap();
+
+        with_home(tmp.path(), || {
+            save_hosts_json("updated", "carol").unwrap();
+
+            let raw = fs::read_to_string(dir.join("hosts.json")).unwrap();
+            let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            // Pre-existing key must survive.
+            assert_eq!(v["gitlab.com"]["oauth_token"], "gl");
+            // github.com entry is replaced.
+            assert_eq!(v["github.com"]["oauth_token"], "updated");
+            assert_eq!(v["github.com"]["user"], "carol");
+        });
+    }
+
+    #[test]
+    fn save_overwrites_existing_github_com_token() {
+        let tmp = TempDir::new().unwrap();
+        with_home(tmp.path(), || {
+            save_hosts_json("first", "u1").unwrap();
+            save_hosts_json("second", "u2").unwrap();
+
+            let path = amaebi_dir(tmp.path()).join("hosts.json");
+            let raw = fs::read_to_string(path).unwrap();
+            let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            assert_eq!(v["github.com"]["oauth_token"], "second");
+            assert_eq!(v["github.com"]["user"], "u2");
+        });
+    }
+
+    #[test]
+    fn save_sets_dir_permissions_to_0700() {
+        let tmp = TempDir::new().unwrap();
+        with_home(tmp.path(), || {
+            save_hosts_json("tok", "user").unwrap();
+            let mode = amaebi_dir(tmp.path())
+                .metadata()
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o700, "~/.amaebi/ must be mode 0700");
+        });
+    }
+
+    #[test]
+    fn save_sets_file_permissions_to_0600() {
+        let tmp = TempDir::new().unwrap();
+        with_home(tmp.path(), || {
+            save_hosts_json("tok", "user").unwrap();
+            let mode = amaebi_dir(tmp.path())
+                .join("hosts.json")
+                .metadata()
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "hosts.json must be mode 0600");
+        });
+    }
+}
+
 async fn fetch_api_token(http: &reqwest::Client) -> Result<CachedToken> {
     let oauth_token = read_oauth_token()?;
 

@@ -249,6 +249,148 @@ impl SseAccumulator {
 }
 
 // ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---- Message constructors -------------------------------------------
+
+    #[test]
+    fn message_system_fields() {
+        let m = Message::system("be helpful");
+        assert_eq!(m.role, "system");
+        assert_eq!(m.content.as_deref(), Some("be helpful"));
+        assert!(m.tool_calls.is_empty());
+        assert!(m.tool_call_id.is_none());
+    }
+
+    #[test]
+    fn message_user_fields() {
+        let m = Message::user("what is Rust?");
+        assert_eq!(m.role, "user");
+        assert_eq!(m.content.as_deref(), Some("what is Rust?"));
+        assert!(m.tool_calls.is_empty());
+        assert!(m.tool_call_id.is_none());
+    }
+
+    #[test]
+    fn message_assistant_text_only() {
+        let m = Message::assistant(Some("42".into()), vec![]);
+        assert_eq!(m.role, "assistant");
+        assert_eq!(m.content.as_deref(), Some("42"));
+        assert!(m.tool_calls.is_empty());
+        assert!(m.tool_call_id.is_none());
+    }
+
+    #[test]
+    fn message_assistant_with_tool_calls() {
+        let call = ApiToolCall {
+            id: "call_001".into(),
+            kind: "function".into(),
+            function: ApiToolCallFunction {
+                name: "shell_command".into(),
+                arguments: r#"{"command":"ls"}"#.into(),
+            },
+        };
+        let m = Message::assistant(None, vec![call]);
+        assert_eq!(m.role, "assistant");
+        assert!(m.content.is_none());
+        assert_eq!(m.tool_calls.len(), 1);
+        assert_eq!(m.tool_calls[0].id, "call_001");
+        assert_eq!(m.tool_calls[0].function.name, "shell_command");
+    }
+
+    #[test]
+    fn message_tool_result_fields() {
+        let m = Message::tool_result("cid_42", "stdout output");
+        assert_eq!(m.role, "tool");
+        assert_eq!(m.content.as_deref(), Some("stdout output"));
+        assert_eq!(m.tool_call_id.as_deref(), Some("cid_42"));
+        assert!(m.tool_calls.is_empty());
+    }
+
+    // ---- Message serialization ------------------------------------------
+
+    #[test]
+    fn system_message_skips_empty_fields() {
+        let m = Message::system("prompt");
+        let v: serde_json::Value = serde_json::to_value(&m).unwrap();
+        assert_eq!(v["role"], "system");
+        assert_eq!(v["content"], "prompt");
+        // tool_calls and tool_call_id are skipped when empty/absent
+        assert!(
+            v.get("tool_calls").is_none(),
+            "tool_calls should be omitted"
+        );
+        assert!(
+            v.get("tool_call_id").is_none(),
+            "tool_call_id should be omitted"
+        );
+    }
+
+    #[test]
+    fn tool_result_message_serializes_tool_call_id() {
+        let m = Message::tool_result("cid", "result");
+        let v: serde_json::Value = serde_json::to_value(&m).unwrap();
+        assert_eq!(v["role"], "tool");
+        assert_eq!(v["content"], "result");
+        assert_eq!(v["tool_call_id"], "cid");
+    }
+
+    // ---- ToolCall::parse_args -------------------------------------------
+
+    #[test]
+    fn parse_args_valid_object() {
+        let tc = ToolCall {
+            id: "t1".into(),
+            name: "shell_command".into(),
+            arguments: r#"{"command":"echo hi"}"#.into(),
+        };
+        let args = tc.parse_args().unwrap();
+        assert_eq!(args["command"], "echo hi");
+    }
+
+    #[test]
+    fn parse_args_empty_object() {
+        let tc = ToolCall {
+            id: "t2".into(),
+            name: "tmux_capture_pane".into(),
+            arguments: "{}".into(),
+        };
+        assert!(tc.parse_args().unwrap().is_object());
+    }
+
+    #[test]
+    fn parse_args_invalid_json_returns_err_with_name() {
+        let tc = ToolCall {
+            id: "t3".into(),
+            name: "bad_tool".into(),
+            arguments: "{not: valid".into(),
+        };
+        let err = tc.parse_args().unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("bad_tool"),
+            "error should mention tool name: {msg}"
+        );
+    }
+
+    // ---- FinishReason variants ------------------------------------------
+
+    #[test]
+    fn finish_reason_all_variants_constructible() {
+        assert!(matches!(FinishReason::Stop, FinishReason::Stop));
+        assert!(matches!(FinishReason::ToolCalls, FinishReason::ToolCalls));
+        assert!(matches!(FinishReason::Length, FinishReason::Length));
+        let other = FinishReason::Other("content_filter".into());
+        assert!(matches!(other, FinishReason::Other(_)));
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Public streaming function
 // ---------------------------------------------------------------------------
 
