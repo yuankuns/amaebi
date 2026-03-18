@@ -8,6 +8,7 @@ mod client;
 mod copilot;
 mod daemon;
 mod ipc;
+mod memory;
 mod models;
 mod tools;
 
@@ -34,5 +35,43 @@ async fn main() -> Result<()> {
             auth_flow::ensure_authenticated(&http, &client_id, skip_validate).await
         }
         cli::Command::Models => models::run().await,
+        cli::Command::Memory { action } => run_memory(action),
+    }
+}
+
+fn run_memory(action: cli::MemoryAction) -> Result<()> {
+    match action {
+        cli::MemoryAction::List => {
+            let entries = memory::load_recent(20)?;
+            if entries.is_empty() {
+                println!("No memories stored.");
+            } else {
+                for e in &entries {
+                    println!("[{}]\n  Q: {}\n  A: {}\n", e.timestamp, e.user, e.assistant);
+                }
+            }
+            Ok(())
+        }
+        cli::MemoryAction::Search { query } => {
+            let entries = memory::search(&query)?;
+            if entries.is_empty() {
+                println!("No matches for {:?}.", query);
+            } else {
+                for e in &entries {
+                    println!("[{}]\n  Q: {}\n  A: {}\n", e.timestamp, e.user, e.assistant);
+                }
+            }
+            Ok(())
+        }
+        cli::MemoryAction::Clear => {
+            memory::clear()?;
+            println!("Memory cleared.");
+            Ok(())
+        }
+        cli::MemoryAction::Count => {
+            let n = memory::count()?;
+            println!("{n}");
+            Ok(())
+        }
     }
 }

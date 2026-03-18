@@ -43,4 +43,24 @@ pub enum Command {
     },
     /// List available Copilot models.
     Models,
+    /// Manage conversation memory.
+    Memory {
+        #[command(subcommand)]
+        action: MemoryAction,
+    },
+}
+
+#[derive(clap::Subcommand, Debug)]
+pub enum MemoryAction {
+    /// Show the last 20 remembered conversations.
+    List,
+    /// Search memories by substring.
+    Search {
+        /// Query string to search for.
+        query: String,
+    },
+    /// Delete all stored memories.
+    Clear,
+    /// Show total number of stored memories.
+    Count,
 }

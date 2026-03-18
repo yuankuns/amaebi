@@ -7,6 +7,7 @@ use tokio::net::{UnixListener, UnixStream};
 use crate::auth::TokenCache;
 use crate::copilot::{self, ApiToolCall, ApiToolCallFunction, FinishReason, Message};
 use crate::ipc::{write_frame, Request, Response};
+use crate::memory;
 use crate::tools::{self, ToolExecutor};
 
 // ---------------------------------------------------------------------------
@@ -108,18 +109,25 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
         }
     };
 
-    let messages = build_messages(&req);
+    let messages = build_messages(&req).await;
 
-    if let Err(e) = run_agentic_loop(&state, &token, &req.model, messages, &mut writer).await {
-        tracing::error!(error = %e, "agentic loop error");
-        // Best-effort: the stream may be partially written already.
-        let _ = write_frame(
-            &mut writer,
-            &Response::Error {
-                message: format!("agent error: {e:#}"),
-            },
-        )
-        .await;
+    match run_agentic_loop(&state, &token, &req.model, messages, &mut writer).await {
+        Ok(response_text) => {
+            if let Err(e) = memory::append(&req.prompt, &response_text) {
+                tracing::warn!(error = %e, "failed to save memory");
+            }
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "agentic loop error");
+            // Best-effort: the stream may be partially written already.
+            let _ = write_frame(
+                &mut writer,
+                &Response::Error {
+                    message: format!("agent error: {e:#}"),
+                },
+            )
+            .await;
+        }
     }
 
     Ok(())
@@ -137,11 +145,12 @@ async fn run_agentic_loop<W>(
     model: &str,
     mut messages: Vec<Message>,
     writer: &mut W,
-) -> Result<()>
+) -> Result<String>
 where
     W: AsyncWriteExt + Unpin,
 {
     let schemas = tools::tool_schemas();
+    let mut final_text = String::new();
 
     loop {
         let resp =
@@ -149,6 +158,7 @@ where
 
         match resp.finish_reason {
             FinishReason::Stop | FinishReason::Length => {
+                final_text = resp.text;
                 break;
             }
 
@@ -266,14 +276,15 @@ where
         }
     }
 
-    write_frame(writer, &Response::Done).await
+    write_frame(writer, &Response::Done).await?;
+    Ok(final_text)
 }
 
 // ---------------------------------------------------------------------------
 // Message construction
 // ---------------------------------------------------------------------------
 
-fn build_messages(req: &Request) -> Vec<Message> {
+async fn build_messages(req: &Request) -> Vec<Message> {
     let mut system = "You are a helpful, concise AI assistant embedded in a tmux terminal. \
                       Answer in plain text; avoid markdown unless the user asks for it. \
                       You have tools available to inspect the terminal, run commands, \
@@ -282,6 +293,17 @@ fn build_messages(req: &Request) -> Vec<Message> {
 
     if let Some(pane) = &req.tmux_pane {
         system.push_str(&format!(" The user's active tmux pane is {pane}."));
+    }
+
+    // Inject recent conversation history if available.
+    match memory::load_recent(20) {
+        Ok(entries) if !entries.is_empty() => {
+            let ctx = memory::format_for_context(&entries);
+            system.push('\n');
+            system.push_str(&ctx);
+        }
+        Err(e) => tracing::warn!(error = %e, "failed to load memory"),
+        _ => {}
     }
 
     vec![Message::system(system), Message::user(req.prompt.clone())]
