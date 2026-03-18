@@ -286,10 +286,7 @@ where
         .header("Accept", "application/json")
         .header("Copilot-Integration-Id", "vscode-chat")
         .header("Editor-Version", "vscode/1.90.0")
-        .header(
-            "User-Agent",
-            concat!("amaebi/", env!("CARGO_PKG_VERSION")),
-        )
+        .header("User-Agent", concat!("amaebi/", env!("CARGO_PKG_VERSION")))
         .json(&body)
         .send()
         .await

@@ -2,6 +2,7 @@ use anyhow::Result;
 use clap::Parser;
 
 mod auth;
+mod auth_flow;
 mod cli;
 mod client;
 mod copilot;
@@ -23,5 +24,12 @@ async fn main() -> Result<()> {
     match cli.command {
         cli::Command::Daemon { socket } => daemon::run(socket).await,
         cli::Command::Ask { prompt, socket } => client::run(socket, prompt).await,
+        cli::Command::Auth {
+            client_id,
+            skip_validate,
+        } => {
+            let http = reqwest::Client::new();
+            auth_flow::ensure_authenticated(&http, &client_id, skip_validate).await
+        }
     }
 }

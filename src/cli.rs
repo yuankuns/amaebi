@@ -29,4 +29,13 @@ pub enum Command {
         #[arg(long, default_value = DEFAULT_SOCKET)]
         socket: PathBuf,
     },
+    /// Authenticate with GitHub Copilot via the device flow.
+    Auth {
+        /// GitHub OAuth App client ID (defaults to the public neovim copilot.vim ID).
+        #[arg(long, default_value = crate::auth_flow::DEFAULT_CLIENT_ID)]
+        client_id: String,
+        /// Skip Copilot subscription validation after login.
+        #[arg(long)]
+        skip_validate: bool,
+    },
 }

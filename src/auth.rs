@@ -14,7 +14,7 @@ struct HostEntry {
     oauth_token: String,
 }
 
-fn copilot_config_dir() -> Result<PathBuf> {
+pub(crate) fn copilot_config_dir() -> Result<PathBuf> {
     let home = std::env::var("HOME").context("$HOME is not set")?;
     Ok(PathBuf::from(home).join(".config/github-copilot"))
 }
@@ -23,7 +23,7 @@ fn copilot_config_dir() -> Result<PathBuf> {
 ///
 /// Tries `hosts.json` first (VS Code / neovim plugin), then `apps.json`
 /// (GitHub CLI plugin).
-fn read_oauth_token() -> Result<String> {
+pub(crate) fn read_oauth_token() -> Result<String> {
     let dir = copilot_config_dir()?;
     let candidates = ["hosts.json", "apps.json"];
 
@@ -46,6 +46,45 @@ fn read_oauth_token() -> Result<String> {
          Expected ~/.config/github-copilot/hosts.json or apps.json with a \
          \"github.com\" entry."
     )
+}
+
+/// Write (or merge) an OAuth token into `~/.config/github-copilot/hosts.json`.
+///
+/// If the file already exists its other top-level keys are preserved; only the
+/// `"github.com"` entry is created or replaced.
+pub(crate) fn save_hosts_json(oauth_token: &str, username: &str) -> Result<()> {
+    let dir = copilot_config_dir()?;
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("creating config dir {}", dir.display()))?;
+
+    let path = dir.join("hosts.json");
+
+    // Start from the existing file content (if any) so we don't clobber other
+    // providers that may have written their own keys.
+    let mut root: serde_json::Value = if path.exists() {
+        let raw = std::fs::read_to_string(&path)
+            .with_context(|| format!("reading {}", path.display()))?;
+        serde_json::from_str(&raw)
+            .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new()))
+    } else {
+        serde_json::Value::Object(serde_json::Map::new())
+    };
+
+    let obj = root
+        .as_object_mut()
+        .context("hosts.json root is not a JSON object")?;
+
+    obj.insert(
+        "github.com".to_string(),
+        serde_json::json!({
+            "user":        username,
+            "oauth_token": oauth_token,
+            "git_protocol": "https"
+        }),
+    );
+
+    let json = serde_json::to_string_pretty(&root).context("serialising hosts.json")?;
+    std::fs::write(&path, json).with_context(|| format!("writing {}", path.display()))
 }
 
 // ---------------------------------------------------------------------------
@@ -107,10 +146,7 @@ async fn fetch_api_token(http: &reqwest::Client) -> Result<CachedToken> {
         .get("https://api.github.com/copilot_internal/v2/token")
         .header("Authorization", format!("token {oauth_token}"))
         .header("Accept", "application/json")
-        .header(
-            "User-Agent",
-            concat!("amaebi/", env!("CARGO_PKG_VERSION")),
-        )
+        .header("User-Agent", concat!("amaebi/", env!("CARGO_PKG_VERSION")))
         .send()
         .await
         .context("fetching Copilot API token")?
