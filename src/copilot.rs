@@ -154,8 +154,8 @@ struct Choice {
     finish_reason: Option<String>,
 }
 
-/// One SSE data line.  The Copilot API sometimes puts text in choices[0] and
-/// tool_calls in choices[1] — we always collect all choices.
+/// One SSE data line.  The Copilot API sometimes puts text in choices\[0\] and
+/// tool_calls in choices\[1\] — we always collect all choices.
 #[derive(Deserialize, Debug)]
 struct ChatChunk {
     choices: Vec<Choice>,

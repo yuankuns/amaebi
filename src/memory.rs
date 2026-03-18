@@ -92,11 +92,14 @@ pub fn load_recent(n: usize) -> Result<Vec<MemoryEntry>> {
     }
 
     let file = std::fs::File::open(&path).with_context(|| format!("opening {}", path.display()))?;
-    let reader = std::io::BufReader::new(file);
+    file.lock_shared()
+        .with_context(|| format!("locking {}", path.display()))?;
 
     let mut ring: VecDeque<MemoryEntry> = VecDeque::new();
+    let mut line_no: u64 = 0;
 
-    for line in reader.lines() {
+    for line in std::io::BufReader::new(&file).lines() {
+        line_no += 1;
         let line = line.with_context(|| format!("reading {}", path.display()))?;
         let l = line.trim();
         if l.is_empty() {
@@ -110,10 +113,18 @@ pub fn load_recent(n: usize) -> Result<Vec<MemoryEntry>> {
                 }
             }
             Err(e) => {
-                tracing::warn!(error = %e, line = %l, "skipping malformed memory entry");
+                tracing::warn!(
+                    error = %e,
+                    line_no = line_no,
+                    bytes = l.len(),
+                    "skipping malformed memory entry"
+                );
             }
         }
     }
+
+    file.unlock()
+        .with_context(|| format!("unlocking {}", path.display()))?;
 
     Ok(ring.into_iter().collect())
 }
@@ -126,12 +137,15 @@ pub fn search(query: &str) -> Result<Vec<MemoryEntry>> {
     }
 
     let file = std::fs::File::open(&path).with_context(|| format!("opening {}", path.display()))?;
-    let reader = std::io::BufReader::new(file);
+    file.lock_shared()
+        .with_context(|| format!("locking {}", path.display()))?;
+
     let query_lower = query.to_lowercase();
-
     let mut results = Vec::new();
+    let mut line_no: u64 = 0;
 
-    for line in reader.lines() {
+    for line in std::io::BufReader::new(&file).lines() {
+        line_no += 1;
         let line = line.with_context(|| format!("reading {}", path.display()))?;
         let l = line.trim();
         if l.is_empty() {
@@ -146,10 +160,18 @@ pub fn search(query: &str) -> Result<Vec<MemoryEntry>> {
                 }
             }
             Err(e) => {
-                tracing::warn!(error = %e, line = %l, "skipping malformed memory entry");
+                tracing::warn!(
+                    error = %e,
+                    line_no = line_no,
+                    bytes = l.len(),
+                    "skipping malformed memory entry"
+                );
             }
         }
     }
+
+    file.unlock()
+        .with_context(|| format!("unlocking {}", path.display()))?;
 
     Ok(results)
 }
@@ -171,12 +193,18 @@ pub fn count() -> Result<usize> {
     }
 
     let file = std::fs::File::open(&path).with_context(|| format!("opening {}", path.display()))?;
-    let reader = std::io::BufReader::new(file);
+    file.lock_shared()
+        .with_context(|| format!("locking {}", path.display()))?;
 
-    Ok(reader
+    let count = std::io::BufReader::new(&file)
         .lines()
         .filter(|l| l.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false))
-        .count())
+        .count();
+
+    file.unlock()
+        .with_context(|| format!("unlocking {}", path.display()))?;
+
+    Ok(count)
 }
 
 /// Format entries as a compact string (used in tests; retained for tooling).
