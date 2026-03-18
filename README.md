@@ -2,7 +2,7 @@
 
 A tiny, memory-efficient AI assistant for the terminal, powered by GitHub Copilot.
 
-**amaebi** (甘エビ, sweet shrimp) runs as a lightweight daemon that connects to the GitHub Copilot API. It can run shell commands, read and edit files, and interact with tmux panes — all from a single binary under 7MB.
+**amaebi** (甘エビ/小甜虾, sweet shrimp) runs as a lightweight daemon that connects to the GitHub Copilot API. It can run shell commands, read and edit files, and interact with tmux panes — all from a single binary under 7MB.
 
 ## Quick Start
 
