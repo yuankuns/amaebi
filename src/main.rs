@@ -8,6 +8,7 @@ mod client;
 mod copilot;
 mod daemon;
 mod ipc;
+mod models;
 mod tools;
 
 #[tokio::main]
@@ -23,7 +24,7 @@ async fn main() -> Result<()> {
     let cli = cli::Cli::parse();
     match cli.command {
         cli::Command::Daemon { socket } => daemon::run(socket).await,
-        cli::Command::Ask { prompt, socket } => client::run(socket, prompt).await,
+        cli::Command::Ask { prompt, socket, model } => client::run(socket, prompt, model).await,
         cli::Command::Auth {
             client_id,
             skip_validate,
@@ -31,5 +32,6 @@ async fn main() -> Result<()> {
             let http = reqwest::Client::new();
             auth_flow::ensure_authenticated(&http, &client_id, skip_validate).await
         }
+        cli::Command::Models => models::run().await,
     }
 }

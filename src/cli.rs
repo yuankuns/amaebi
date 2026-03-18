@@ -28,6 +28,9 @@ pub enum Command {
         /// Path to the Unix socket.
         #[arg(long, default_value = DEFAULT_SOCKET)]
         socket: PathBuf,
+        /// Model to use (overrides AMAEBI_MODEL env var; default: gpt-4o).
+        #[arg(long)]
+        model: Option<String>,
     },
     /// Authenticate with GitHub Copilot via the device flow.
     Auth {
@@ -38,4 +41,6 @@ pub enum Command {
         #[arg(long)]
         skip_validate: bool,
     },
+    /// List available Copilot models.
+    Models,
 }

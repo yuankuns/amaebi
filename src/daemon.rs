@@ -88,6 +88,7 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
 
     tracing::info!(
         pane = ?req.tmux_pane,
+        model = %req.model,
         prompt_len = req.prompt.len(),
         "received request"
     );
@@ -109,7 +110,7 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
 
     let messages = build_messages(&req);
 
-    if let Err(e) = run_agentic_loop(&state, &token, messages, &mut writer).await {
+    if let Err(e) = run_agentic_loop(&state, &token, &req.model, messages, &mut writer).await {
         tracing::error!(error = %e, "agentic loop error");
         // Best-effort: the stream may be partially written already.
         let _ = write_frame(
@@ -133,6 +134,7 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
 async fn run_agentic_loop<W>(
     state: &DaemonState,
     token: &str,
+    model: &str,
     mut messages: Vec<Message>,
     writer: &mut W,
 ) -> Result<()>
@@ -146,7 +148,8 @@ where
     let mut tool_rounds = 0;
 
     loop {
-        let resp = copilot::stream_chat(&state.http, token, &messages, &schemas, writer).await?;
+        let resp =
+            copilot::stream_chat(&state.http, token, model, &messages, &schemas, writer).await?;
 
         match resp.finish_reason {
             FinishReason::Stop | FinishReason::Length => {

@@ -7,6 +7,8 @@ pub struct Request {
     pub tmux_pane: Option<String>,
     /// Attach to an existing subagent session (Phase 4).
     pub session_id: Option<String>,
+    /// Chat model to use (e.g. "gpt-4o").
+    pub model: String,
 }
 
 /// A single frame streamed from the daemon back to the client.

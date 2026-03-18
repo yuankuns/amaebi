@@ -262,6 +262,7 @@ impl SseAccumulator {
 pub async fn stream_chat<W>(
     http: &reqwest::Client,
     token: &str,
+    model: &str,
     messages: &[Message],
     tools: &[serde_json::Value],
     writer: &mut W,
@@ -270,7 +271,7 @@ where
     W: AsyncWriteExt + Unpin,
 {
     let body = serde_json::json!({
-        "model": "gpt-4o",
+        "model": model,
         "messages": messages,
         "tools": tools,
         "stream": true,
