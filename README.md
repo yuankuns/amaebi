@@ -102,4 +102,4 @@ AMAEBI_LOG=debug amaebi daemon
 
 ## License
 
-MIT
+GPL-3.0
