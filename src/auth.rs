@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
@@ -64,6 +65,9 @@ pub(crate) fn save_hosts_json(oauth_token: &str, username: &str) -> Result<()> {
     let dir = amaebi_home()?;
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("creating config dir {}", dir.display()))?;
+    // Restrict the config directory so other users cannot list its contents.
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("setting permissions on {}", dir.display()))?;
 
     let path = dir.join("hosts.json");
 
@@ -92,7 +96,11 @@ pub(crate) fn save_hosts_json(oauth_token: &str, username: &str) -> Result<()> {
     );
 
     let json = serde_json::to_string_pretty(&root).context("serialising hosts.json")?;
-    std::fs::write(&path, json).with_context(|| format!("writing {}", path.display()))
+    std::fs::write(&path, json).with_context(|| format!("writing {}", path.display()))?;
+    // Restrict the token file so only the owning user can read it.
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("setting permissions on {}", path.display()))?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
