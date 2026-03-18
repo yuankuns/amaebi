@@ -1,6 +1,8 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::io::{BufRead, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 
 use crate::auth::amaebi_home;
@@ -54,6 +56,7 @@ pub fn append(user_prompt: &str, assistant_response: &str) -> Result<()> {
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
+        .mode(0o600)
         .open(&path)
         .with_context(|| format!("opening {}", path.display()))?;
 
@@ -62,32 +65,40 @@ pub fn append(user_prompt: &str, assistant_response: &str) -> Result<()> {
 }
 
 /// Load the last `n` entries from the memory file.
+///
+/// Uses a fixed-capacity ring buffer so the entire file is never held in
+/// memory — only the last `n` entries are kept at any point.
 pub fn load_recent(n: usize) -> Result<Vec<MemoryEntry>> {
     let path = memory_path()?;
     if !path.exists() {
         return Ok(vec![]);
     }
 
-    let file = std::fs::File::open(&path)
-        .with_context(|| format!("opening {}", path.display()))?;
+    let file = std::fs::File::open(&path).with_context(|| format!("opening {}", path.display()))?;
     let reader = std::io::BufReader::new(file);
 
-    let mut entries: Vec<MemoryEntry> = reader
-        .lines()
-        .filter_map(|line| {
-            line.ok().and_then(|l| {
-                let l = l.trim().to_string();
-                if l.is_empty() {
-                    None
-                } else {
-                    serde_json::from_str(&l).ok()
-                }
-            })
-        })
-        .collect();
+    let mut ring: VecDeque<MemoryEntry> = VecDeque::new();
 
-    let start = entries.len().saturating_sub(n);
-    Ok(entries.drain(start..).collect())
+    for line in reader.lines() {
+        let line = line.with_context(|| format!("reading {}", path.display()))?;
+        let l = line.trim();
+        if l.is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<MemoryEntry>(l) {
+            Ok(entry) => {
+                ring.push_back(entry);
+                if ring.len() > n {
+                    ring.pop_front();
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, line = %l, "skipping malformed memory entry");
+            }
+        }
+    }
+
+    Ok(ring.into_iter().collect())
 }
 
 /// Return all entries whose user or assistant text contains `query` (case-insensitive).
@@ -97,36 +108,40 @@ pub fn search(query: &str) -> Result<Vec<MemoryEntry>> {
         return Ok(vec![]);
     }
 
-    let file = std::fs::File::open(&path)
-        .with_context(|| format!("opening {}", path.display()))?;
+    let file = std::fs::File::open(&path).with_context(|| format!("opening {}", path.display()))?;
     let reader = std::io::BufReader::new(file);
     let query_lower = query.to_lowercase();
 
-    Ok(reader
-        .lines()
-        .filter_map(|line| {
-            line.ok().and_then(|l| {
-                let l = l.trim().to_string();
-                if l.is_empty() {
-                    None
-                } else {
-                    serde_json::from_str::<MemoryEntry>(&l).ok()
+    let mut results = Vec::new();
+
+    for line in reader.lines() {
+        let line = line.with_context(|| format!("reading {}", path.display()))?;
+        let l = line.trim();
+        if l.is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<MemoryEntry>(l) {
+            Ok(entry) => {
+                if entry.user.to_lowercase().contains(&query_lower)
+                    || entry.assistant.to_lowercase().contains(&query_lower)
+                {
+                    results.push(entry);
                 }
-            })
-        })
-        .filter(|e| {
-            e.user.to_lowercase().contains(&query_lower)
-                || e.assistant.to_lowercase().contains(&query_lower)
-        })
-        .collect())
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, line = %l, "skipping malformed memory entry");
+            }
+        }
+    }
+
+    Ok(results)
 }
 
 /// Delete the memory file.
 pub fn clear() -> Result<()> {
     let path = memory_path()?;
     if path.exists() {
-        std::fs::remove_file(&path)
-            .with_context(|| format!("removing {}", path.display()))?;
+        std::fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
     }
     Ok(())
 }
@@ -138,17 +153,12 @@ pub fn count() -> Result<usize> {
         return Ok(0);
     }
 
-    let file = std::fs::File::open(&path)
-        .with_context(|| format!("opening {}", path.display()))?;
+    let file = std::fs::File::open(&path).with_context(|| format!("opening {}", path.display()))?;
     let reader = std::io::BufReader::new(file);
 
     Ok(reader
         .lines()
-        .filter(|l| {
-            l.as_ref()
-                .map(|s| !s.trim().is_empty())
-                .unwrap_or(false)
-        })
+        .filter(|l| l.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false))
         .count())
 }
 
@@ -183,8 +193,7 @@ mod tests {
     fn with_temp_home<F: FnOnce() -> R, R>(f: F) -> R {
         let _guard = HOME_LOCK.lock().unwrap();
         let id = COUNTER.fetch_add(1, Ordering::SeqCst);
-        let tmp =
-            std::env::temp_dir().join(format!("amaebi_test_{}_{}", std::process::id(), id));
+        let tmp = std::env::temp_dir().join(format!("amaebi_test_{}_{}", std::process::id(), id));
         std::fs::create_dir_all(&tmp).unwrap();
 
         let old_home = std::env::var("HOME").ok();
@@ -308,13 +317,11 @@ mod tests {
 
     #[test]
     fn test_format_for_context() {
-        let entries = vec![
-            MemoryEntry {
-                timestamp: "2024-01-01T00:00:00Z".to_string(),
-                user: "hello".to_string(),
-                assistant: "world".to_string(),
-            },
-        ];
+        let entries = vec![MemoryEntry {
+            timestamp: "2024-01-01T00:00:00Z".to_string(),
+            user: "hello".to_string(),
+            assistant: "world".to_string(),
+        }];
         let ctx = format_for_context(&entries);
         assert!(ctx.starts_with("Recent conversation history:"));
         assert!(ctx.contains("Q: hello"));

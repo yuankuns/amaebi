@@ -113,7 +113,12 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
 
     match run_agentic_loop(&state, &token, &req.model, messages, &mut writer).await {
         Ok(response_text) => {
-            if let Err(e) = memory::append(&req.prompt, &response_text) {
+            let prompt = req.prompt.clone();
+            if let Err(e) =
+                tokio::task::spawn_blocking(move || memory::append(&prompt, &response_text))
+                    .await
+                    .unwrap_or_else(|e| Err(anyhow::anyhow!("memory::append panicked: {e}")))
+            {
                 tracing::warn!(error = %e, "failed to save memory");
             }
         }
@@ -150,7 +155,7 @@ where
     W: AsyncWriteExt + Unpin,
 {
     let schemas = tools::tool_schemas();
-    let mut final_text = String::new();
+    let final_text;
 
     loop {
         let resp =
@@ -271,6 +276,7 @@ where
 
             FinishReason::Other(ref reason) => {
                 tracing::warn!(finish_reason = %reason, "unexpected finish reason, stopping");
+                final_text = resp.text;
                 break;
             }
         }
@@ -296,13 +302,14 @@ async fn build_messages(req: &Request) -> Vec<Message> {
     }
 
     // Inject recent conversation history if available.
-    match memory::load_recent(20) {
-        Ok(entries) if !entries.is_empty() => {
+    match tokio::task::spawn_blocking(|| memory::load_recent(20)).await {
+        Ok(Ok(entries)) if !entries.is_empty() => {
             let ctx = memory::format_for_context(&entries);
             system.push('\n');
             system.push_str(&ctx);
         }
-        Err(e) => tracing::warn!(error = %e, "failed to load memory"),
+        Ok(Err(e)) => tracing::warn!(error = %e, "failed to load memory"),
+        Err(e) => tracing::warn!(error = %e, "memory::load_recent panicked"),
         _ => {}
     }
 

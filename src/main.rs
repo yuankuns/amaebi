@@ -16,7 +16,7 @@ mod tools;
 async fn main() -> Result<()> {
     let filter = std::env::var("AMAEBI_LOG")
         .or_else(|_| std::env::var("RUST_LOG"))
-        .map(|v| tracing_subscriber::EnvFilter::new(v))
+        .map(tracing_subscriber::EnvFilter::new)
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
     tracing_subscriber::fmt()
         .with_env_filter(filter)
@@ -26,7 +26,11 @@ async fn main() -> Result<()> {
     let cli = cli::Cli::parse();
     match cli.command {
         cli::Command::Daemon { socket } => daemon::run(socket).await,
-        cli::Command::Ask { prompt, socket, model } => client::run(socket, prompt, model).await,
+        cli::Command::Ask {
+            prompt,
+            socket,
+            model,
+        } => client::run(socket, prompt, model).await,
         cli::Command::Auth {
             client_id,
             skip_validate,
