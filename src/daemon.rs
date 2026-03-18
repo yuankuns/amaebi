@@ -22,6 +22,9 @@ pub struct DaemonState {
     pub tokens: TokenCache,
     /// Tool executor — `LocalExecutor` now; swappable with `DockerExecutor` in Phase 4.
     pub executor: Box<dyn ToolExecutor>,
+    /// Serialises concurrent `memory::append` calls within this process so that
+    /// parallel client connections cannot interleave their writes to the memory file.
+    pub memory_lock: tokio::sync::Mutex<()>,
 }
 
 impl DaemonState {
@@ -33,6 +36,7 @@ impl DaemonState {
             http,
             tokens: TokenCache::new(),
             executor: Box::new(tools::LocalExecutor),
+            memory_lock: tokio::sync::Mutex::new(()),
         })
     }
 }
@@ -114,6 +118,9 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
     match run_agentic_loop(&state, &token, &req.model, messages, &mut writer).await {
         Ok(response_text) => {
             let prompt = req.prompt.clone();
+            // Hold the in-process lock for the duration of the blocking write
+            // so that concurrent connections cannot race on the memory file.
+            let _mem_guard = state.memory_lock.lock().await;
             if let Err(e) =
                 tokio::task::spawn_blocking(move || memory::append(&prompt, &response_text))
                     .await
@@ -301,17 +308,24 @@ async fn build_messages(req: &Request) -> Vec<Message> {
         system.push_str(&format!(" The user's active tmux pane is {pane}."));
     }
 
-    // Inject recent conversation history if available.
+    let mut messages = vec![Message::system(system)];
+
+    // Inject recent conversation history as proper user/assistant turn pairs
+    // rather than embedding it in the system prompt.  This preserves role
+    // separation and prevents a malicious assistant response stored in memory
+    // from being able to override system-level instructions.
     match tokio::task::spawn_blocking(|| memory::load_recent(20)).await {
         Ok(Ok(entries)) if !entries.is_empty() => {
-            let ctx = memory::format_for_context(&entries);
-            system.push('\n');
-            system.push_str(&ctx);
+            for entry in entries {
+                messages.push(Message::user(entry.user));
+                messages.push(Message::assistant(Some(entry.assistant), vec![]));
+            }
         }
         Ok(Err(e)) => tracing::warn!(error = %e, "failed to load memory"),
         Err(e) => tracing::warn!(error = %e, "memory::load_recent panicked"),
         _ => {}
     }
 
-    vec![Message::system(system), Message::user(req.prompt.clone())]
+    messages.push(Message::user(req.prompt.clone()));
+    messages
 }

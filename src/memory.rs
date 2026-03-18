@@ -1,8 +1,9 @@
 use anyhow::{Context, Result};
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::io::{BufRead, Write};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::PathBuf;
 
 use crate::auth::amaebi_home;
@@ -53,6 +54,11 @@ pub fn append(user_prompt: &str, assistant_response: &str) -> Result<()> {
         assistant: truncate(assistant_response),
     };
 
+    // Build the complete JSONL line before touching the file so the lock is
+    // held for the minimum time possible.
+    let mut line = serde_json::to_string(&entry)?;
+    line.push('\n');
+
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -60,7 +66,18 @@ pub fn append(user_prompt: &str, assistant_response: &str) -> Result<()> {
         .open(&path)
         .with_context(|| format!("opening {}", path.display()))?;
 
-    writeln!(file, "{}", serde_json::to_string(&entry)?)?;
+    // Enforce 0600 even if the file pre-existed with broader permissions.
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("setting permissions on {}", path.display()))?;
+
+    // Advisory exclusive lock so that concurrent processes (or a future
+    // multi-daemon scenario) cannot interleave partial writes.
+    file.lock_exclusive()
+        .with_context(|| format!("locking {}", path.display()))?;
+    file.write_all(line.as_bytes())?;
+    file.unlock()
+        .with_context(|| format!("unlocking {}", path.display()))?;
+
     Ok(())
 }
 
@@ -162,7 +179,8 @@ pub fn count() -> Result<usize> {
         .count())
 }
 
-/// Format entries as a system-message string for context injection.
+/// Format entries as a compact string (used in tests; retained for tooling).
+#[allow(dead_code)]
 pub fn format_for_context(entries: &[MemoryEntry]) -> String {
     if entries.is_empty() {
         return String::new();
