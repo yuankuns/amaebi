@@ -96,7 +96,7 @@ AMAEBI_LOG=debug amaebi daemon
 
 ## Requirements
 
-- Rust 1.70+
+- Rust 1.85+ (install via [rustup](https://rustup.rs/), not apt — Ubuntu's packaged Rust is too old)
 - A GitHub account with an active [Copilot](https://github.com/features/copilot) subscription
 - (Optional) tmux, for pane capture/send-keys tools
 
