@@ -22,9 +22,15 @@ pub static HOME_LOCK: Mutex<()> = Mutex::new(());
 
 /// RAII guard that restores `$HOME` to its original value when dropped.
 ///
-/// Using a `Drop` guard (rather than restoring in-line) ensures `$HOME` is
-/// reset even if the test body panics, preventing `HOME_LOCK` poisoning and
-/// leaked env state.
+/// Restoring `$HOME` in `Drop` (rather than inline) ensures the environment
+/// variable is reset even if the test body panics.  Without this, a panicking
+/// test would leave `$HOME` pointing at the temp directory for every subsequent
+/// test that runs in the same thread.
+///
+/// Note: this does **not** prevent [`HOME_LOCK`] from being poisoned — a panic
+/// while the mutex is held still marks it poisoned.  [`with_home`] recovers
+/// from a poisoned mutex via `unwrap_or_else(|p| p.into_inner())` so later
+/// tests are not permanently blocked.
 pub struct HomeGuard {
     old: Option<String>,
 }

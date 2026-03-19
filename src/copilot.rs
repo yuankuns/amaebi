@@ -377,17 +377,6 @@ mod tests {
             "error should mention tool name: {msg}"
         );
     }
-
-    // ---- FinishReason variants ------------------------------------------
-
-    #[test]
-    fn finish_reason_all_variants_constructible() {
-        assert!(matches!(FinishReason::Stop, FinishReason::Stop));
-        assert!(matches!(FinishReason::ToolCalls, FinishReason::ToolCalls));
-        assert!(matches!(FinishReason::Length, FinishReason::Length));
-        let other = FinishReason::Other("content_filter".into());
-        assert!(matches!(other, FinishReason::Other(_)));
-    }
 }
 
 // ---------------------------------------------------------------------------
