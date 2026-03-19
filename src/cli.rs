@@ -43,6 +43,18 @@ pub enum Command {
     },
     /// List available Copilot models.
     Models,
+    /// Start amaebi as an ACP (Agent Client Protocol) agent over stdio.
+    ///
+    /// Implements the Zed ACP standard so amaebi can be used as a coding agent
+    /// from any ACP-compatible client (Claude Code, Zed, etc.).
+    /// Communicates via JSON-RPC over stdin/stdout.
+    ///
+    /// Example: amaebi acp
+    Acp {
+        /// Model to use (overrides AMAEBI_MODEL env var; default: gpt-4o).
+        #[arg(long)]
+        model: Option<String>,
+    },
     /// Manage conversation memory.
     Memory {
         #[command(subcommand)]

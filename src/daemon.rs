@@ -245,7 +245,7 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
 
 /// Drive the conversation until Copilot responds with `finish_reason: stop`
 /// (or an error).  Executes tool calls and feeds results back in a loop.
-async fn run_agentic_loop<W>(
+pub(crate) async fn run_agentic_loop<W>(
     state: &DaemonState,
     model: &str,
     mut messages: Vec<Message>,
@@ -384,6 +384,8 @@ where
 
             FinishReason::Other(ref reason) => {
                 tracing::warn!(finish_reason = %reason, "unexpected finish reason, stopping");
+                let warning = format!("\n[stopped: unexpected finish reason '{reason}']");
+                write_frame(writer, &Response::Text { chunk: warning }).await?;
                 final_text = resp.text;
                 break;
             }
@@ -398,7 +400,7 @@ where
 // Message construction
 // ---------------------------------------------------------------------------
 
-async fn build_messages(
+pub(crate) async fn build_messages(
     prompt: &str,
     tmux_pane: Option<&str>,
     state: &DaemonState,
