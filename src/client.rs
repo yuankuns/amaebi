@@ -21,7 +21,7 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
         .unwrap_or_else(|| "gpt-4o".to_string());
 
     // Build and send the request as a single JSON line.
-    let req = Request {
+    let req = Request::Chat {
         prompt,
         tmux_pane: std::env::var("TMUX_PANE").ok(),
         session_id: None,

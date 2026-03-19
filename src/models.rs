@@ -115,10 +115,7 @@ pub async fn run() -> Result<()> {
 
     for m in models {
         let vendor = m.vendor.as_deref().unwrap_or("");
-        let family = m
-            .capabilities
-            .as_ref()
-            .and_then(|c| c.family.as_deref());
+        let family = m.capabilities.as_ref().and_then(|c| c.family.as_deref());
         let cat = category(&m.id, family);
 
         // Check if non-chat (embedding etc.) to mark as such.
@@ -156,14 +153,20 @@ mod tests {
 
     #[test]
     fn category_lightweight() {
-        assert_eq!(category("claude-haiku-3.5", Some("claude-haiku")), "lightweight");
+        assert_eq!(
+            category("claude-haiku-3.5", Some("claude-haiku")),
+            "lightweight"
+        );
         assert_eq!(category("gpt-4o-mini", Some("gpt-4o-mini")), "lightweight");
         assert_eq!(category("gemini-flash", None), "lightweight");
     }
 
     #[test]
     fn category_versatile() {
-        assert_eq!(category("claude-sonnet-4.6", Some("claude-sonnet")), "versatile");
+        assert_eq!(
+            category("claude-sonnet-4.6", Some("claude-sonnet")),
+            "versatile"
+        );
         assert_eq!(category("gpt-4o", Some("gpt-4o")), "versatile");
         assert_eq!(category("o1", None), "versatile");
     }

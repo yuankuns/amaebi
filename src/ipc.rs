@@ -1,14 +1,23 @@
 /// A message sent from the client to the daemon over the Unix socket.
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
-pub struct Request {
-    /// The user's prompt text.
-    pub prompt: String,
-    /// Value of $TMUX_PANE at the time the client was invoked, if set.
-    pub tmux_pane: Option<String>,
-    /// Attach to an existing subagent session (Phase 4).
-    pub session_id: Option<String>,
-    /// Chat model to use (e.g. "gpt-4o").
-    pub model: String,
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Request {
+    /// Send a prompt and stream a reply.
+    Chat {
+        /// The user's prompt text.
+        prompt: String,
+        /// Value of $TMUX_PANE at the time the client was invoked, if set.
+        tmux_pane: Option<String>,
+        /// Attach to an existing subagent session (Phase 4).
+        session_id: Option<String>,
+        /// Chat model to use (e.g. "gpt-4o").
+        model: String,
+    },
+    /// Ask the daemon to clear its in-memory conversation cache.
+    ///
+    /// Sent after `amaebi memory clear` so the running daemon does not serve
+    /// stale entries.  The daemon responds with a single [`Response::Done`] frame.
+    ClearCache,
 }
 
 /// A single frame streamed from the daemon back to the client.

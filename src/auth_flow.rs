@@ -146,7 +146,7 @@ async fn run_and_save(http: &reqwest::Client, client_id: &str, skip_validate: bo
     let (oauth_token, username) = run_device_flow(http, client_id).await?;
 
     save_hosts_json(&oauth_token, &username).context("saving token to hosts.json")?;
-    println!("\n✓ Token saved to ~/.config/github-copilot/hosts.json");
+    println!("\n✓ Token saved to ~/.amaebi/hosts.json");
 
     if !skip_validate {
         print!("Validating Copilot access... ");
