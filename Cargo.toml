@@ -20,7 +20,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 async-trait = "0.1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 fs2 = "0.4"
-agent-client-protocol = { path = "/tmp/acp-rust-sdk/src/agent-client-protocol" }
+agent-client-protocol = "0.10.2"
 tokio-util = { version = "0.7", features = ["compat"] }
 
 [dev-dependencies]

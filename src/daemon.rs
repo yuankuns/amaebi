@@ -384,6 +384,8 @@ where
 
             FinishReason::Other(ref reason) => {
                 tracing::warn!(finish_reason = %reason, "unexpected finish reason, stopping");
+                let warning = format!("\n[stopped: unexpected finish reason '{reason}']");
+                write_frame(writer, &Response::Text { chunk: warning }).await?;
                 final_text = resp.text;
                 break;
             }
