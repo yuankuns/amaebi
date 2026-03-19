@@ -275,7 +275,10 @@ mod tests {
         let path = tmp.path().join("does_not_exist.txt");
         let exec = LocalExecutor;
         let result = exec
-            .execute("read_file", serde_json::json!({"path": path}))
+            .execute(
+                "read_file",
+                serde_json::json!({"path": path.to_str().unwrap()}),
+            )
             .await;
         assert!(result.is_err());
     }

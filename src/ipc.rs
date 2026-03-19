@@ -44,6 +44,7 @@ pub enum Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncReadExt;
 
     // ---- Request serialization -------------------------------------------
 
@@ -164,8 +165,11 @@ mod tests {
 
     #[tokio::test]
     async fn write_frame_emits_newline_terminated_json() {
-        let mut buf: Vec<u8> = Vec::new();
-        write_frame(&mut buf, &Response::Done).await.unwrap();
+        let (mut writer, mut reader) = tokio::io::duplex(1024);
+        write_frame(&mut writer, &Response::Done).await.unwrap();
+        drop(writer);
+        let mut buf = Vec::new();
+        reader.read_to_end(&mut buf).await.unwrap();
         let s = String::from_utf8(buf).unwrap();
         assert!(s.ends_with('\n'), "frame must end with newline");
         let v: serde_json::Value = serde_json::from_str(s.trim_end()).unwrap();
@@ -174,15 +178,18 @@ mod tests {
 
     #[tokio::test]
     async fn write_frame_text_content_survives() {
-        let mut buf: Vec<u8> = Vec::new();
+        let (mut writer, mut reader) = tokio::io::duplex(1024);
         write_frame(
-            &mut buf,
+            &mut writer,
             &Response::Text {
                 chunk: "streamed".into(),
             },
         )
         .await
         .unwrap();
+        drop(writer);
+        let mut buf = Vec::new();
+        reader.read_to_end(&mut buf).await.unwrap();
         let s = String::from_utf8(buf).unwrap();
         let v: serde_json::Value = serde_json::from_str(s.trim_end()).unwrap();
         assert_eq!(v["chunk"], "streamed");
