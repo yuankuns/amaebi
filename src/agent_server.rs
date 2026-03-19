@@ -146,9 +146,7 @@ impl acp::Agent for AmaebiAgent {
                         ack_tx,
                     ))
                     .map_err(|_| acp::Error::internal_error())?;
-                    ack_rx
-                        .await
-                        .map_err(|_| acp::Error::internal_error())?;
+                    ack_rx.await.map_err(|_| acp::Error::internal_error())?;
                 }
                 Response::Done => break,
                 Response::Error { message } => {
