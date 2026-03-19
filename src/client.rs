@@ -10,6 +10,20 @@ use crate::ipc::{Request, Response};
 /// How long the user has to press Ctrl-C a second time to exit.
 const DOUBLE_CTRLC_WINDOW: Duration = Duration::from_secs(2);
 
+/// Returned when the user presses Ctrl-C twice within [`DOUBLE_CTRLC_WINDOW`].
+///
+/// `main` catches this and exits with code 130 (the SIGINT convention).
+#[derive(Debug)]
+pub struct Interrupted;
+
+impl std::fmt::Display for Interrupted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "interrupted by user")
+    }
+}
+
+impl std::error::Error for Interrupted {}
+
 pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Result<()> {
     let stream = UnixStream::connect(&socket).await.with_context(|| {
         format!(
@@ -57,19 +71,23 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
                 // that as a cue to stop rather than spinning the loop forever.
                 let Some(_) = result else { break; };
 
-                if is_within_window(last_ctrl_c, Instant::now(), DOUBLE_CTRLC_WINDOW) {
-                    // Second Ctrl-C within the window — flush buffers then exit.
+                // Capture the time once and reuse for both the window check
+                // and recording the press, so both operations see the same clock.
+                let now = Instant::now();
+
+                if is_within_window(last_ctrl_c, now, DOUBLE_CTRLC_WINDOW) {
+                    // Second Ctrl-C within the window — flush buffers then signal exit.
                     eprintln!();
                     let _ = stdout.flush().await;
-                    let _ = std::io::Write::flush(&mut std::io::stderr());
-                    std::process::exit(130);
+                    let _ = tokio::io::stderr().flush().await;
+                    return Err(anyhow::Error::new(Interrupted));
                 }
                 // First press (or expired window): remind the user and record time.
                 eprintln!(
                     "\nPress Ctrl-C again within {}s to exit",
                     DOUBLE_CTRLC_WINDOW.as_secs()
                 );
-                last_ctrl_c = Some(Instant::now());
+                last_ctrl_c = Some(now);
             }
 
             // Handle the next response frame from the daemon.
@@ -119,12 +137,15 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
 /// Return `true` if `last_press` is `Some` and the duration from `last_press`
 /// to `now` is less than `window`.
 ///
+/// Uses [`Instant::checked_duration_since`] so a clock anomaly where
+/// `now < last_press` returns `false` instead of panicking.
+///
 /// Accepts `now` as a parameter so callers pass `Instant::now()` and tests can
 /// supply controlled values — the function itself has no side effects.
 fn is_within_window(last_press: Option<Instant>, now: Instant, window: Duration) -> bool {
     match last_press {
         None => false,
-        Some(t) => now.duration_since(t) < window,
+        Some(t) => now.checked_duration_since(t).is_some_and(|d| d < window),
     }
 }
 
@@ -157,5 +178,18 @@ mod tests {
         let now = Instant::now();
         let press = now - Duration::from_secs(2);
         assert!(!is_within_window(Some(press), now, Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn is_within_window_clock_skew_returns_false() {
+        // If now < press (impossible in normal operation but guards against
+        // platform clock anomalies), checked_duration_since returns None → false.
+        let now = Instant::now();
+        let future_press = now + Duration::from_secs(1);
+        assert!(!is_within_window(
+            Some(future_press),
+            now,
+            Duration::from_secs(2)
+        ));
     }
 }

@@ -30,7 +30,11 @@ async fn main() -> Result<()> {
             prompt,
             socket,
             model,
-        } => client::run(socket, prompt, model).await,
+        } => match client::run(socket, prompt, model).await {
+            Ok(()) => Ok(()),
+            Err(e) if e.is::<client::Interrupted>() => std::process::exit(130),
+            Err(e) => Err(e),
+        },
         cli::Command::Auth {
             client_id,
             skip_validate,
