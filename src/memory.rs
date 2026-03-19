@@ -334,156 +334,122 @@ pub fn count() -> Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::Mutex;
-
-    static HOME_LOCK: Mutex<()> = Mutex::new(());
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    fn with_temp_home<F: FnOnce() -> R, R>(f: F) -> R {
-        let _guard = HOME_LOCK.lock().unwrap();
-        let id = COUNTER.fetch_add(1, Ordering::SeqCst);
-        let tmp = std::env::temp_dir().join(format!("amaebi_test_{}_{}", std::process::id(), id));
-        std::fs::create_dir_all(&tmp).unwrap();
-
-        let old_home = std::env::var("HOME").ok();
-        // SAFETY: tests are serialized via HOME_LOCK
-        unsafe { std::env::set_var("HOME", &tmp) };
-
-        let result = f();
-
-        match old_home {
-            Some(h) => unsafe { std::env::set_var("HOME", h) },
-            None => unsafe { std::env::remove_var("HOME") },
-        }
-        std::fs::remove_dir_all(&tmp).ok();
-        result
-    }
+    use crate::test_utils::with_temp_home;
 
     #[test]
     fn test_empty_when_no_file() {
-        with_temp_home(|| {
-            assert_eq!(load_recent(20).unwrap().len(), 0);
-            assert_eq!(count().unwrap(), 0);
-            assert_eq!(search("anything").unwrap().len(), 0);
-        });
+        let _guard = with_temp_home();
+        assert_eq!(load_recent(20).unwrap().len(), 0);
+        assert_eq!(count().unwrap(), 0);
+        assert_eq!(search("anything").unwrap().len(), 0);
     }
 
     #[test]
     fn test_append_and_load() {
-        with_temp_home(|| {
-            append("hello world", "I can help with that").unwrap();
-            let entries = load_recent(20).unwrap();
-            assert_eq!(entries.len(), 1);
-            assert_eq!(entries[0].user, "hello world");
-            assert_eq!(entries[0].assistant, "I can help with that");
-        });
+        let _guard = with_temp_home();
+        append("hello world", "I can help with that").unwrap();
+        let entries = load_recent(20).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].user, "hello world");
+        assert_eq!(entries[0].assistant, "I can help with that");
     }
 
     #[test]
     fn test_count() {
-        with_temp_home(|| {
-            assert_eq!(count().unwrap(), 0);
-            append("a", "b").unwrap();
-            assert_eq!(count().unwrap(), 1);
-            append("c", "d").unwrap();
-            assert_eq!(count().unwrap(), 2);
-        });
+        let _guard = with_temp_home();
+        assert_eq!(count().unwrap(), 0);
+        append("a", "b").unwrap();
+        assert_eq!(count().unwrap(), 1);
+        append("c", "d").unwrap();
+        assert_eq!(count().unwrap(), 2);
     }
 
     #[test]
     fn test_load_recent_limits() {
-        with_temp_home(|| {
-            for i in 0..10 {
-                append(&format!("prompt {i}"), &format!("response {i}")).unwrap();
-            }
-            assert_eq!(count().unwrap(), 10);
-            let entries = load_recent(3).unwrap();
-            assert_eq!(entries.len(), 3);
-            assert_eq!(entries[0].user, "prompt 7");
-        });
+        let _guard = with_temp_home();
+        for i in 0..10 {
+            append(&format!("prompt {i}"), &format!("response {i}")).unwrap();
+        }
+        assert_eq!(count().unwrap(), 10);
+        let entries = load_recent(3).unwrap();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].user, "prompt 7");
     }
 
     #[test]
     fn test_search_user_field() {
-        with_temp_home(|| {
-            append("how to install rust", "use rustup").unwrap();
-            append("what is python", "a programming language").unwrap();
+        let _guard = with_temp_home();
+        append("how to install rust", "use rustup").unwrap();
+        append("what is python", "a programming language").unwrap();
 
-            let results = search("rust").unwrap();
-            assert_eq!(results.len(), 1);
-            assert_eq!(results[0].user, "how to install rust");
-        });
+        let results = search("rust").unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].user, "how to install rust");
     }
 
     #[test]
     fn test_search_assistant_field() {
-        with_temp_home(|| {
-            append("how to install rust", "use rustup").unwrap();
-            append("what is python", "a programming language").unwrap();
+        let _guard = with_temp_home();
+        append("how to install rust", "use rustup").unwrap();
+        append("what is python", "a programming language").unwrap();
 
-            // "rustup" is in the assistant field
-            let results = search("rustup").unwrap();
-            assert_eq!(results.len(), 1);
+        // "rustup" is in the assistant field
+        let results = search("rustup").unwrap();
+        assert_eq!(results.len(), 1);
 
-            // No match
-            assert_eq!(search("javascript").unwrap().len(), 0);
-        });
+        // No match
+        assert_eq!(search("javascript").unwrap().len(), 0);
     }
 
     #[test]
     fn test_search_case_insensitive() {
-        with_temp_home(|| {
-            append("How to use Rust", "See the docs").unwrap();
-            assert_eq!(search("rust").unwrap().len(), 1);
-            assert_eq!(search("RUST").unwrap().len(), 1);
-        });
+        let _guard = with_temp_home();
+        append("How to use Rust", "See the docs").unwrap();
+        assert_eq!(search("rust").unwrap().len(), 1);
+        assert_eq!(search("RUST").unwrap().len(), 1);
     }
 
     #[test]
     fn test_truncation() {
-        with_temp_home(|| {
-            let long = "a".repeat(300);
-            append(&long, "short").unwrap();
-            let entries = load_recent(20).unwrap();
-            // 200 bytes of 'a' + "…" (3 UTF-8 bytes) = 203 bytes
-            assert!(entries[0].user.len() <= 203);
-            assert!(entries[0].user.ends_with('…'));
-            assert_eq!(entries[0].assistant, "short");
-        });
+        let _guard = with_temp_home();
+        let long = "a".repeat(300);
+        append(&long, "short").unwrap();
+        let entries = load_recent(20).unwrap();
+        // 200 bytes of 'a' + "…" (3 UTF-8 bytes) = 203 bytes
+        assert!(entries[0].user.len() <= 203);
+        assert!(entries[0].user.ends_with('…'));
+        assert_eq!(entries[0].assistant, "short");
     }
 
     #[test]
     fn test_clear() {
-        with_temp_home(|| {
-            append("test", "response").unwrap();
-            assert_eq!(count().unwrap(), 1);
-            clear().unwrap();
-            assert_eq!(count().unwrap(), 0);
-            // clear on non-existent file is a no-op
-            clear().unwrap();
-        });
+        let _guard = with_temp_home();
+        append("test", "response").unwrap();
+        assert_eq!(count().unwrap(), 1);
+        clear().unwrap();
+        assert_eq!(count().unwrap(), 0);
+        // clear on non-existent file is a no-op
+        clear().unwrap();
     }
 
     #[test]
     fn test_clear_removes_old_file() {
-        with_temp_home(|| {
-            // Manually create a .old file to simulate a prior rotation.
-            // The amaebi home directory does not exist yet so create it first.
-            let path = memory_path().unwrap();
-            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            let old_path = path.with_file_name("memory.jsonl.old");
-            std::fs::write(&old_path, b"old data\n").unwrap();
-            assert!(old_path.exists());
+        let _guard = with_temp_home();
+        // Manually create a .old file to simulate a prior rotation.
+        // The amaebi home directory does not exist yet so create it first.
+        let path = memory_path().unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let old_path = path.with_file_name("memory.jsonl.old");
+        std::fs::write(&old_path, b"old data\n").unwrap();
+        assert!(old_path.exists());
 
-            append("test", "response").unwrap();
-            clear().unwrap();
+        append("test", "response").unwrap();
+        clear().unwrap();
 
-            assert!(!memory_path().unwrap().exists());
-            assert!(
-                !old_path.exists(),
-                "clear() must also remove memory.jsonl.old"
-            );
-        });
+        assert!(!memory_path().unwrap().exists());
+        assert!(
+            !old_path.exists(),
+            "clear() must also remove memory.jsonl.old"
+        );
     }
 }
