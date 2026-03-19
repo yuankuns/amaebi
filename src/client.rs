@@ -25,6 +25,10 @@ impl std::fmt::Display for Interrupted {
 impl std::error::Error for Interrupted {}
 
 pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Result<()> {
+    // Register the SIGINT handler before connecting so double-Ctrl-C applies
+    // for the entire command lifecycle, including the connection attempt.
+    let mut sigint = signal(SignalKind::interrupt()).context("setting up SIGINT handler")?;
+
     let stream = UnixStream::connect(&socket).await.with_context(|| {
         format!(
             "connecting to daemon at {} — is it running? (`amaebi daemon`)",
@@ -57,7 +61,6 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
     // Interleave with SIGINT so we can implement double-Ctrl-C-to-exit.
     let mut lines = BufReader::new(reader).lines();
     let mut stdout = tokio::io::stdout();
-    let mut sigint = signal(SignalKind::interrupt()).context("setting up SIGINT handler")?;
     // Timestamp of the first Ctrl-C press; None means no pending first press.
     let mut last_ctrl_c: Option<Instant> = None;
 
@@ -135,7 +138,7 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
 }
 
 /// Return `true` if `last_press` is `Some` and the duration from `last_press`
-/// to `now` is less than `window`.
+/// to `now` is at most `window` (inclusive boundary).
 ///
 /// Uses [`Instant::checked_duration_since`] so a clock anomaly where
 /// `now < last_press` returns `false` instead of panicking.
@@ -145,7 +148,7 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
 fn is_within_window(last_press: Option<Instant>, now: Instant, window: Duration) -> bool {
     match last_press {
         None => false,
-        Some(t) => now.checked_duration_since(t).is_some_and(|d| d < window),
+        Some(t) => now.checked_duration_since(t).is_some_and(|d| d <= window),
     }
 }
 
@@ -173,11 +176,11 @@ mod tests {
     }
 
     #[test]
-    fn is_within_window_press_at_boundary_is_outside() {
-        // Exactly at the boundary is not strictly less than the window.
+    fn is_within_window_press_at_boundary_is_inside() {
+        // Exactly at the boundary counts as within the window (inclusive).
         let now = Instant::now();
         let press = now - Duration::from_secs(2);
-        assert!(!is_within_window(Some(press), now, Duration::from_secs(2)));
+        assert!(is_within_window(Some(press), now, Duration::from_secs(2)));
     }
 
     #[test]
