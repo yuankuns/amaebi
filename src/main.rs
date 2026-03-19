@@ -10,6 +10,8 @@ mod daemon;
 mod ipc;
 mod memory;
 mod models;
+#[cfg(test)]
+mod test_utils;
 mod tools;
 
 #[tokio::main]

@@ -276,12 +276,11 @@ mod tests {
 
     #[tokio::test]
     async fn read_file_nonexistent_returns_err() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("does_not_exist.txt");
         let exec = LocalExecutor;
         let result = exec
-            .execute(
-                "read_file",
-                serde_json::json!({"path": "/no/such/file.txt"}),
-            )
+            .execute("read_file", serde_json::json!({"path": path}))
             .await;
         assert!(result.is_err());
     }

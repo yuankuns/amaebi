@@ -334,31 +334,7 @@ pub fn count() -> Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::Mutex;
-
-    static HOME_LOCK: Mutex<()> = Mutex::new(());
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    fn with_temp_home<F: FnOnce() -> R, R>(f: F) -> R {
-        let _guard = HOME_LOCK.lock().unwrap();
-        let id = COUNTER.fetch_add(1, Ordering::SeqCst);
-        let tmp = std::env::temp_dir().join(format!("amaebi_test_{}_{}", std::process::id(), id));
-        std::fs::create_dir_all(&tmp).unwrap();
-
-        let old_home = std::env::var("HOME").ok();
-        // SAFETY: tests are serialized via HOME_LOCK
-        unsafe { std::env::set_var("HOME", &tmp) };
-
-        let result = f();
-
-        match old_home {
-            Some(h) => unsafe { std::env::set_var("HOME", h) },
-            None => unsafe { std::env::remove_var("HOME") },
-        }
-        std::fs::remove_dir_all(&tmp).ok();
-        result
-    }
+    use crate::test_utils::with_temp_home;
 
     #[test]
     fn test_empty_when_no_file() {

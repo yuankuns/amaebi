@@ -160,27 +160,10 @@ impl TokenCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::with_home;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use tempfile::TempDir;
-
-    // HOME_LOCK serialises all tests that mutate $HOME so they don't race.
-    static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// Run `f` with `$HOME` temporarily pointing at `dir`.
-    fn with_home(dir: &std::path::Path, f: impl FnOnce()) {
-        let _guard = HOME_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let old = std::env::var("HOME").ok();
-        // SAFETY: HOME_LOCK ensures only one thread modifies HOME at a time.
-        unsafe { std::env::set_var("HOME", dir) };
-        f();
-        unsafe {
-            match old {
-                Some(v) => std::env::set_var("HOME", v),
-                None => std::env::remove_var("HOME"),
-            }
-        }
-    }
 
     /// Path to `~/.amaebi/` inside a temp home.
     fn amaebi_dir(home: &std::path::Path) -> std::path::PathBuf {
