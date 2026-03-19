@@ -187,24 +187,23 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                 "received chat request"
             );
 
-            let token = match state.tokens.get(&state.http).await {
-                Ok(t) => t,
-                Err(e) => {
-                    tracing::error!(error = %e, "failed to get Copilot API token");
-                    write_frame(
-                        &mut writer,
-                        &Response::Error {
-                            message: format!("authentication error: {e:#}"),
-                        },
-                    )
-                    .await?;
-                    return Ok(());
-                }
-            };
+            // Verify authentication before entering the loop so we can return
+            // a clear error to the user instead of failing mid-conversation.
+            if let Err(e) = state.tokens.get(&state.http).await {
+                tracing::error!(error = %e, "failed to get Copilot API token");
+                write_frame(
+                    &mut writer,
+                    &Response::Error {
+                        message: format!("authentication error: {e:#}"),
+                    },
+                )
+                .await?;
+                return Ok(());
+            }
 
             let messages = build_messages(&prompt, tmux_pane.as_deref(), &state).await;
 
-            match run_agentic_loop(&state, &token, &model, messages, &mut writer).await {
+            match run_agentic_loop(&state, &model, messages, &mut writer).await {
                 Ok(response_text) => {
                     // Serialise memory writes within this process; file-level flock in
                     // memory::append handles cross-process protection.
@@ -248,7 +247,6 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
 /// (or an error).  Executes tool calls and feeds results back in a loop.
 async fn run_agentic_loop<W>(
     state: &DaemonState,
-    token: &str,
     model: &str,
     mut messages: Vec<Message>,
     writer: &mut W,
@@ -260,8 +258,16 @@ where
     let final_text;
 
     loop {
+        // Re-fetch the token on every iteration so long-running agentic loops
+        // survive token expiration.  `TokenCache::get` returns the cached value
+        // when it is still valid, so there is no extra network request on cache hit.
+        let token = state
+            .tokens
+            .get(&state.http)
+            .await
+            .context("refreshing Copilot API token inside agentic loop")?;
         let resp =
-            copilot::stream_chat(&state.http, token, model, &messages, &schemas, writer).await?;
+            copilot::stream_chat(&state.http, &token, model, &messages, &schemas, writer).await?;
 
         match resp.finish_reason {
             FinishReason::Stop | FinishReason::Length => {
