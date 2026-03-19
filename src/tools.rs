@@ -103,7 +103,17 @@ async fn tmux_send_keys(args: serde_json::Value) -> Result<String> {
     let target = args["target"].as_str().unwrap_or("%0");
 
     let output = Command::new("tmux")
-        .args(["send-keys", "-t", target, keys])
+        .args(["send-keys", "-t", target])
+        // Pass each whitespace-separated token as its own argument so tmux
+        // recognises special key names such as "Enter", "C-c", "Escape", etc.
+        // When the whole string is a single argument, tmux treats it as one
+        // opaque token and special names are sent as literal text instead of
+        // the corresponding keystroke.
+        //
+        // Note: split_whitespace drops all whitespace, so callers cannot send
+        // a literal space character by typing " ". Use the tmux key name
+        // "Space" instead (e.g. "echo Space hello Enter").
+        .args(split_keys(keys))
         .output()
         .await
         .context("spawning tmux send-keys")?;
@@ -141,6 +151,23 @@ async fn edit_file(args: serde_json::Value) -> Result<String> {
         .with_context(|| format!("edit_file: writing '{path}'"))?;
 
     Ok(format!("wrote {} bytes to {path}", content.len()))
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Split a `tmux_send_keys` `keys` string into individual tokens.
+///
+/// Each whitespace-separated token is passed as a separate argument to
+/// `tmux send-keys`, which lets tmux recognise special key names such as
+/// `Enter`, `C-c`, `Escape`, `Tab`, `Space`, etc.
+///
+/// Because whitespace is the delimiter, callers **must** use the tmux key name
+/// `Space` to send a literal space character — an actual space in the string
+/// acts only as a separator.
+fn split_keys(keys: &str) -> impl Iterator<Item = &str> {
+    keys.split_whitespace()
 }
 
 // ---------------------------------------------------------------------------
@@ -328,6 +355,38 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
     }
 
+    // ---- split_keys -----------------------------------------------------
+
+    #[test]
+    fn split_keys_typical_sequence() {
+        let tokens: Vec<&str> = split_keys("echo hello Enter").collect();
+        assert_eq!(tokens, ["echo", "hello", "Enter"]);
+    }
+
+    #[test]
+    fn split_keys_single_token() {
+        let tokens: Vec<&str> = split_keys("C-c").collect();
+        assert_eq!(tokens, ["C-c"]);
+    }
+
+    #[test]
+    fn split_keys_space_token_preserved() {
+        // "Space" is a tmux key name, not whitespace — it must survive.
+        let tokens: Vec<&str> = split_keys("echo Space hello Enter").collect();
+        assert_eq!(tokens, ["echo", "Space", "hello", "Enter"]);
+    }
+
+    #[test]
+    fn split_keys_empty_string_yields_no_tokens() {
+        assert_eq!(split_keys("").count(), 0);
+    }
+
+    #[test]
+    fn split_keys_extra_whitespace_is_ignored() {
+        let tokens: Vec<&str> = split_keys("  C-c   Enter  ").collect();
+        assert_eq!(tokens, ["C-c", "Enter"]);
+    }
+
     // ---- unknown tool ---------------------------------------------------
 
     #[tokio::test]
@@ -395,7 +454,12 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                     "properties": {
                         "keys": {
                             "type": "string",
-                            "description": "Keys to send, e.g. 'q', 'Enter', 'C-c'."
+                            "description": "Space-separated key tokens. Literal text and special keys \
+                                             (Enter, Escape, C-c, Tab, Up, Down, Left, Right, BSpace) \
+                                             can be mixed freely. To send a literal space character use the \
+                                             tmux key name 'Space' — you cannot use an actual space because \
+                                             it is the token delimiter. \
+                                             Example: 'echo Space hello Enter' types 'echo hello' and presses Return."
                         },
                         "target": {
                             "type": "string",
