@@ -1,6 +1,7 @@
 use anyhow::Result;
 use clap::Parser;
 
+mod agent_server;
 mod auth;
 mod auth_flow;
 mod cli;
@@ -44,6 +45,7 @@ async fn main() -> Result<()> {
             let http = reqwest::Client::new();
             auth_flow::ensure_authenticated(&http, &client_id, skip_validate).await
         }
+        cli::Command::Acp { model } => agent_server::run(model).await,
         cli::Command::Models => models::run().await,
         cli::Command::Memory { action, socket } => run_memory(action, socket).await,
     }
