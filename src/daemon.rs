@@ -421,6 +421,47 @@ where
 }
 
 // ---------------------------------------------------------------------------
+// Skill-file injection
+// ---------------------------------------------------------------------------
+
+/// Files checked in the current working directory, in injection order.
+/// Each tuple is `(filename, section_header)`.
+const SKILL_FILES: &[(&str, &str)] = &[
+    ("SKILL.md", "## Skill Context"),
+    ("AGENTS.md", "## Agent Guidelines"),
+    ("SOUL.md", "## Soul"),
+];
+
+/// Read `SKILL.md`, `AGENTS.md`, and `SOUL.md` from `base_dir` and append each
+/// non-empty file as a `system` message with an appropriate section header.
+///
+/// Injected after the main system prompt and before memory/history so that
+/// per-project instructions take precedence over generic guidance but remain
+/// below the model's core identity.
+///
+/// `base_dir` is passed explicitly (rather than reading `current_dir` inside)
+/// so callers can be tested without modifying the process working directory.
+pub(crate) async fn inject_skill_files(messages: &mut Vec<Message>, base_dir: &std::path::Path) {
+    for (filename, header) in SKILL_FILES {
+        let path = base_dir.join(filename);
+        match tokio::fs::read_to_string(&path).await {
+            Ok(content) => {
+                let trimmed = content.trim();
+                if !trimmed.is_empty() {
+                    messages.push(Message::system(format!("{header}\n\n{trimmed}")));
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // File absent — skip silently.
+            }
+            Err(e) => {
+                tracing::debug!(file = %path.display(), error = %e, "could not read skill file");
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Message construction
 // ---------------------------------------------------------------------------
 
@@ -440,6 +481,10 @@ pub(crate) async fn build_messages(
     }
 
     let mut messages = vec![Message::system(system)];
+
+    // Inject any per-project skill/agent/soul files from the CWD.
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    inject_skill_files(&mut messages, &cwd).await;
 
     // Retrieve context from SQLite: last 4 turns for continuity, plus up to
     // 10 FTS-relevant entries for historical context.  Deduplication and
@@ -547,5 +592,65 @@ mod tests {
         let snap = cache.snapshot().await;
         assert_eq!(snap.len(), 1);
         assert_eq!(snap[0].user, "new");
+    }
+
+    // ------------------------------------------------------------------
+    // inject_skill_files tests
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn skill_files_injected_when_present() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("SKILL.md"), "skill instructions").unwrap();
+        std::fs::write(dir.path().join("AGENTS.md"), "agent guidelines").unwrap();
+        std::fs::write(dir.path().join("SOUL.md"), "soul content").unwrap();
+
+        let mut messages: Vec<Message> = vec![];
+        inject_skill_files(&mut messages, dir.path()).await;
+
+        assert_eq!(messages.len(), 3);
+        // Order matches SKILL_FILES: SKILL.md, AGENTS.md, SOUL.md.
+        let sys = |m: &Message| m.content.as_deref().unwrap_or("").to_owned();
+        assert!(sys(&messages[0]).contains("## Skill Context"));
+        assert!(sys(&messages[0]).contains("skill instructions"));
+        assert!(sys(&messages[1]).contains("## Agent Guidelines"));
+        assert!(sys(&messages[1]).contains("agent guidelines"));
+        assert!(sys(&messages[2]).contains("## Soul"));
+        assert!(sys(&messages[2]).contains("soul content"));
+    }
+
+    #[tokio::test]
+    async fn skill_files_absent_produces_no_messages() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut messages: Vec<Message> = vec![];
+        inject_skill_files(&mut messages, dir.path()).await;
+        assert!(messages.is_empty());
+    }
+
+    #[tokio::test]
+    async fn skill_files_empty_file_skipped() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("SKILL.md"), "   \n  ").unwrap();
+        let mut messages: Vec<Message> = vec![];
+        inject_skill_files(&mut messages, dir.path()).await;
+        assert!(
+            messages.is_empty(),
+            "whitespace-only file must not inject a message"
+        );
+    }
+
+    #[tokio::test]
+    async fn skill_files_partial_presence() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // Only SOUL.md present.
+        std::fs::write(dir.path().join("SOUL.md"), "soul only").unwrap();
+        let mut messages: Vec<Message> = vec![];
+        inject_skill_files(&mut messages, dir.path()).await;
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0]
+            .content
+            .as_deref()
+            .unwrap_or("")
+            .contains("soul only"));
     }
 }

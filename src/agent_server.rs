@@ -16,7 +16,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::compat::{TokioAsyncReadCompatExt as _, TokioAsyncWriteCompatExt as _};
 
 use crate::copilot::Message;
-use crate::daemon::{run_agentic_loop, DaemonState};
+use crate::daemon::{inject_skill_files, run_agentic_loop, DaemonState};
 use crate::ipc::Response;
 use crate::memory;
 use crate::memory_db;
@@ -40,6 +40,10 @@ async fn acp_build_messages(prompt: &str, state: &DaemonState) -> Vec<Message> {
                   — use them when they help you answer accurately.";
 
     let mut messages = vec![Message::system(system.to_owned())];
+
+    // Inject any per-project skill/agent/soul files from the CWD.
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    inject_skill_files(&mut messages, &cwd).await;
 
     // Retrieve context from SQLite: last 4 turns + FTS-relevant history.
     let db_path = state.db_path.clone();
