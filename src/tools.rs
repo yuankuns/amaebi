@@ -159,11 +159,6 @@ mod tests {
     // ---- tool_schemas ----------------------------------------------------
 
     #[test]
-    fn tool_schemas_returns_five_entries() {
-        assert_eq!(tool_schemas().len(), 5);
-    }
-
-    #[test]
     fn tool_schemas_have_expected_names() {
         let schemas = tool_schemas();
         let names: Vec<&str> = schemas

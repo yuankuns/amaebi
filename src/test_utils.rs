@@ -11,7 +11,7 @@
 //! Sharing one process-wide lock eliminates that race.
 
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
 /// Process-wide lock that serialises all tests that mutate `$HOME`.
 ///
@@ -31,23 +31,37 @@ pub static HOME_LOCK: Mutex<()> = Mutex::new(());
 /// from a poisoned mutex via `unwrap_or_else(|p| p.into_inner())` so later
 /// tests are not permanently blocked.
 ///
-/// When `_tmpdir` is `Some`, it is dropped **after** the `Drop` body restores
-/// `$HOME` (Rust drops fields in declaration order after the `drop` fn
-/// returns), so `$HOME` is always restored before the directory is deleted.
+/// Fields are dropped in declaration order *after* the `drop` body runs, so
+/// the sequence is: HOME restored → temp directory deleted → mutex released.
 pub struct HomeGuard {
     old: Option<String>,
     /// Keeps the temporary directory alive until `$HOME` has been restored.
     _tmpdir: Option<tempfile::TempDir>,
+    /// Holds [`HOME_LOCK`] for the lifetime of this guard.
+    ///
+    /// `None` when the guard is created by [`with_home`], which holds the lock
+    /// as a local variable instead (the closure completes before `with_home`
+    /// returns, so the lock scope is identical).
+    _lock: Option<MutexGuard<'static, ()>>,
 }
 
 impl Drop for HomeGuard {
     fn drop(&mut self) {
-        // SAFETY: HOME_LOCK is held for the entire lifetime of this guard.
+        // SAFETY: `set_var` / `remove_var` are unsafe because *any* concurrent
+        // access to the environment — including reads — is undefined behaviour,
+        // not only concurrent mutations.  HOME_LOCK serialises all test code
+        // in this process that *mutates* HOME, but cannot guard against the
+        // operating system, C extensions, or other threads that may read the
+        // environment at any time.  This is a known limitation accepted for
+        // test-only code.  Production code uses `amaebi_home()`, which reads
+        // HOME only at explicit call sites and is never called concurrently
+        // with these tests.
         match &self.old {
             Some(h) => unsafe { std::env::set_var("HOME", h) },
             None => unsafe { std::env::remove_var("HOME") },
         }
-        // _tmpdir drops here (after this fn returns), deleting the directory.
+        // _tmpdir and _lock drop here (after this fn returns), in field order:
+        // temp directory is deleted, then the mutex is released.
     }
 }
 
@@ -60,31 +74,46 @@ impl Drop for HomeGuard {
 /// # Synchronous closures only
 ///
 /// `f` **must** be a synchronous closure.  Passing an `async` block would
-/// return an unawaited `Future` without executing any of its body, meaning the
-/// test logic would never run while the lock is held — a silent no-op.  For
-/// async tests, use [`with_temp_home`] and hold the guard manually.
+/// return an unawaited `Future` without executing any of its body — the lock
+/// would be held and released without any test logic running.  For async
+/// tests, use [`with_temp_home`], which returns a [`HomeGuard`] that the
+/// caller drops at the end of the test.
 pub fn with_home<F: FnOnce() -> R, R>(dir: &Path, f: F) -> R {
     let _lock = HOME_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let old = std::env::var("HOME").ok();
-    // SAFETY: HOME_LOCK is held above; only one thread mutates HOME at a time.
+    // SAFETY: see HomeGuard::drop.
     unsafe { std::env::set_var("HOME", dir) };
-    let _guard = HomeGuard { old, _tmpdir: None };
+    let _guard = HomeGuard {
+        old,
+        _tmpdir: None,
+        _lock: None, // lock held by _lock local above for the duration of f()
+    };
     f()
 }
 
-/// Run `f` with `$HOME` pointing at a fresh temporary directory.
+/// Point `$HOME` at a fresh temporary directory and return a [`HomeGuard`].
 ///
-/// Uses [`tempfile::TempDir`] for RAII cleanup: the directory is deleted when
-/// the [`HomeGuard`] drops (which also restores `$HOME`), even if `f` panics.
-pub fn with_temp_home<F: FnOnce() -> R, R>(f: F) -> R {
+/// The guard restores `$HOME` and deletes the directory when dropped.  Because
+/// this function returns a guard instead of taking a closure it works in both
+/// synchronous and async tests:
+///
+/// ```ignore
+/// let _guard = with_temp_home();
+/// // ... test body (sync or async) ...
+/// // guard dropped here → $HOME restored, temp dir deleted, lock released
+/// ```
+///
+/// Uses [`tempfile::TempDir`] for RAII cleanup so the directory is removed
+/// even if the test panics before the guard is explicitly dropped.
+pub fn with_temp_home() -> HomeGuard {
     let tmp = tempfile::TempDir::new().expect("creating temp home dir");
-    let _lock = HOME_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let lock = HOME_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let old = std::env::var("HOME").ok();
-    // SAFETY: HOME_LOCK is held above; only one thread mutates HOME at a time.
+    // SAFETY: see HomeGuard::drop.
     unsafe { std::env::set_var("HOME", tmp.path()) };
-    let _guard = HomeGuard {
+    HomeGuard {
         old,
         _tmpdir: Some(tmp),
-    };
-    f()
+        _lock: Some(lock),
+    }
 }
