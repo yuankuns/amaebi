@@ -57,13 +57,18 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
                 // that as a cue to stop rather than spinning the loop forever.
                 let Some(_) = result else { break; };
 
-                if is_within_window(last_ctrl_c, DOUBLE_CTRLC_WINDOW) {
-                    // Second Ctrl-C within the window — exit.
+                if is_within_window(last_ctrl_c, Instant::now(), DOUBLE_CTRLC_WINDOW) {
+                    // Second Ctrl-C within the window — flush buffers then exit.
                     eprintln!();
+                    let _ = stdout.flush().await;
+                    let _ = std::io::Write::flush(&mut std::io::stderr());
                     std::process::exit(130);
                 }
                 // First press (or expired window): remind the user and record time.
-                eprintln!("\nPress Ctrl-C again within 2s to exit");
+                eprintln!(
+                    "\nPress Ctrl-C again within {}s to exit",
+                    DOUBLE_CTRLC_WINDOW.as_secs()
+                );
                 last_ctrl_c = Some(Instant::now());
             }
 
@@ -111,12 +116,15 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
     Ok(())
 }
 
-/// Return `true` if `last_press` is `Some` and its elapsed time is less than
-/// `window`.  Pure function — no side effects, deterministically testable.
-fn is_within_window(last_press: Option<Instant>, window: Duration) -> bool {
+/// Return `true` if `last_press` is `Some` and the duration from `last_press`
+/// to `now` is less than `window`.
+///
+/// Accepts `now` as a parameter so callers pass `Instant::now()` and tests can
+/// supply controlled values — the function itself has no side effects.
+fn is_within_window(last_press: Option<Instant>, now: Instant, window: Duration) -> bool {
     match last_press {
         None => false,
-        Some(t) => t.elapsed() < window,
+        Some(t) => now.duration_since(t) < window,
     }
 }
 
@@ -126,21 +134,28 @@ mod tests {
 
     #[test]
     fn is_within_window_none_returns_false() {
-        assert!(!is_within_window(None, DOUBLE_CTRLC_WINDOW));
+        assert!(!is_within_window(None, Instant::now(), DOUBLE_CTRLC_WINDOW));
     }
 
     #[test]
-    fn is_within_window_very_large_window_returns_true() {
-        // A just-captured Instant will always be within a multi-year window.
-        assert!(is_within_window(
-            Some(Instant::now()),
-            Duration::from_secs(u64::MAX / 2)
-        ));
+    fn is_within_window_press_inside_window_returns_true() {
+        let now = Instant::now();
+        let press = now - Duration::from_secs(1);
+        assert!(is_within_window(Some(press), now, Duration::from_secs(2)));
     }
 
     #[test]
-    fn is_within_window_zero_window_returns_false() {
-        // No elapsed time can be less than zero — always outside.
-        assert!(!is_within_window(Some(Instant::now()), Duration::ZERO));
+    fn is_within_window_press_outside_window_returns_false() {
+        let now = Instant::now();
+        let press = now - Duration::from_secs(3);
+        assert!(!is_within_window(Some(press), now, Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn is_within_window_press_at_boundary_is_outside() {
+        // Exactly at the boundary is not strictly less than the window.
+        let now = Instant::now();
+        let press = now - Duration::from_secs(2);
+        assert!(!is_within_window(Some(press), now, Duration::from_secs(2)));
     }
 }
