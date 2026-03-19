@@ -11,7 +11,6 @@
 //! Sharing one process-wide lock eliminates that race.
 
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 /// Process-wide lock that serialises all tests that mutate `$HOME`.
@@ -31,8 +30,14 @@ pub static HOME_LOCK: Mutex<()> = Mutex::new(());
 /// while the mutex is held still marks it poisoned.  [`with_home`] recovers
 /// from a poisoned mutex via `unwrap_or_else(|p| p.into_inner())` so later
 /// tests are not permanently blocked.
+///
+/// When `_tmpdir` is `Some`, it is dropped **after** the `Drop` body restores
+/// `$HOME` (Rust drops fields in declaration order after the `drop` fn
+/// returns), so `$HOME` is always restored before the directory is deleted.
 pub struct HomeGuard {
     old: Option<String>,
+    /// Keeps the temporary directory alive until `$HOME` has been restored.
+    _tmpdir: Option<tempfile::TempDir>,
 }
 
 impl Drop for HomeGuard {
@@ -42,6 +47,7 @@ impl Drop for HomeGuard {
             Some(h) => unsafe { std::env::set_var("HOME", h) },
             None => unsafe { std::env::remove_var("HOME") },
         }
+        // _tmpdir drops here (after this fn returns), deleting the directory.
     }
 }
 
@@ -50,26 +56,35 @@ impl Drop for HomeGuard {
 /// Acquires [`HOME_LOCK`] for the full duration so concurrent tests from
 /// *any* module cannot race on the environment variable.  The original
 /// `$HOME` is restored via [`HomeGuard::drop`] even if `f` panics.
+///
+/// # Synchronous closures only
+///
+/// `f` **must** be a synchronous closure.  Passing an `async` block would
+/// return an unawaited `Future` without executing any of its body, meaning the
+/// test logic would never run while the lock is held — a silent no-op.  For
+/// async tests, use [`with_temp_home`] and hold the guard manually.
 pub fn with_home<F: FnOnce() -> R, R>(dir: &Path, f: F) -> R {
     let _lock = HOME_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let old = std::env::var("HOME").ok();
     // SAFETY: HOME_LOCK is held above; only one thread mutates HOME at a time.
     unsafe { std::env::set_var("HOME", dir) };
-    let _guard = HomeGuard { old };
+    let _guard = HomeGuard { old, _tmpdir: None };
     f()
 }
 
 /// Run `f` with `$HOME` pointing at a fresh temporary directory.
 ///
-/// The directory is removed after `f` returns.  If `f` panics, `$HOME` is
-/// still restored (via [`HomeGuard`]) though the temp directory may be left
-/// on disk — that is acceptable for a test failure scenario.
+/// Uses [`tempfile::TempDir`] for RAII cleanup: the directory is deleted when
+/// the [`HomeGuard`] drops (which also restores `$HOME`), even if `f` panics.
 pub fn with_temp_home<F: FnOnce() -> R, R>(f: F) -> R {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let id = COUNTER.fetch_add(1, Ordering::SeqCst);
-    let tmp = std::env::temp_dir().join(format!("amaebi_test_{}_{}", std::process::id(), id));
-    std::fs::create_dir_all(&tmp).expect("creating temp home dir");
-    let result = with_home(&tmp, f);
-    std::fs::remove_dir_all(&tmp).ok();
-    result
+    let tmp = tempfile::TempDir::new().expect("creating temp home dir");
+    let _lock = HOME_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let old = std::env::var("HOME").ok();
+    // SAFETY: HOME_LOCK is held above; only one thread mutates HOME at a time.
+    unsafe { std::env::set_var("HOME", tmp.path()) };
+    let _guard = HomeGuard {
+        old,
+        _tmpdir: Some(tmp),
+    };
+    f()
 }
