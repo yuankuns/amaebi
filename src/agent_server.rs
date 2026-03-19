@@ -15,9 +15,38 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::compat::{TokioAsyncReadCompatExt as _, TokioAsyncWriteCompatExt as _};
 
-use crate::daemon::{build_messages, run_agentic_loop, DaemonState};
+use crate::copilot::Message;
+use crate::daemon::{run_agentic_loop, DaemonState};
 use crate::ipc::Response;
 use crate::memory;
+
+// ---------------------------------------------------------------------------
+// Message builder for ACP mode
+// ---------------------------------------------------------------------------
+
+/// Build the initial message list for an ACP prompt.
+///
+/// Uses a generic coding-assistant system prompt rather than the daemon's
+/// tmux-specific one: in ACP mode amaebi communicates over stdio and has no
+/// tmux environment available.
+async fn acp_build_messages(prompt: &str, state: &DaemonState) -> Vec<Message> {
+    let system = "You are a helpful, concise AI coding assistant. \
+                  Answer in plain text; avoid markdown unless the user asks for it. \
+                  You have tools available to read and edit files and run shell commands \
+                  — use them when they help you answer accurately.";
+
+    let mut messages = vec![Message::system(system.to_owned())];
+
+    // Inject recent conversation history as proper user/assistant turn pairs.
+    let entries = state.memory_cache.snapshot().await;
+    for entry in entries {
+        messages.push(Message::user(entry.user));
+        messages.push(Message::assistant(Some(entry.assistant), vec![]));
+    }
+
+    messages.push(Message::user(prompt.to_owned()));
+    messages
+}
 
 // ---------------------------------------------------------------------------
 // AmaebiAgent — implements acp::Agent
@@ -99,7 +128,8 @@ impl acp::Agent for AmaebiAgent {
         }
 
         // Build the conversation messages from memory + current prompt.
-        let messages = build_messages(&user_text, None, &self.state).await;
+        // Uses an ACP-specific system prompt (no tmux context).
+        let messages = acp_build_messages(&user_text, &self.state).await;
 
         // Duplex pipe: the agentic loop writes IPC frames → we read them back
         // and forward as ACP session notifications.
@@ -159,19 +189,24 @@ impl acp::Agent for AmaebiAgent {
             }
         }
 
+        // Await the loop outcome; propagate any error to the ACP client.
+        let final_text = match result_rx.await {
+            Ok(Ok(text)) => text,
+            Ok(Err(e)) => return Err(acp::Error::internal_error().data(e)),
+            Err(_) => return Err(acp::Error::internal_error()),
+        };
+
         // Save the conversation to memory (best-effort).
-        if let Ok(Ok(final_text)) = result_rx.await {
-            let mem_guard = self.state.memory_lock.lock().await;
-            let prompt_clone = user_text.clone();
-            let mem_result =
-                tokio::task::spawn_blocking(move || memory::append(&prompt_clone, &final_text))
-                    .await
-                    .unwrap_or_else(|e| Err(anyhow::anyhow!("memory::append panicked: {e}")));
-            drop(mem_guard);
-            match mem_result {
-                Ok(entry) => self.state.memory_cache.push(entry).await,
-                Err(e) => tracing::warn!(error = %e, "failed to save memory after ACP prompt"),
-            }
+        let mem_guard = self.state.memory_lock.lock().await;
+        let prompt_clone = user_text.clone();
+        let mem_result =
+            tokio::task::spawn_blocking(move || memory::append(&prompt_clone, &final_text))
+                .await
+                .unwrap_or_else(|e| Err(anyhow::anyhow!("memory::append panicked: {e}")));
+        drop(mem_guard);
+        match mem_result {
+            Ok(entry) => self.state.memory_cache.push(entry).await,
+            Err(e) => tracing::warn!(error = %e, "failed to save memory after ACP prompt"),
         }
 
         Ok(acp::PromptResponse::new(acp::StopReason::EndTurn))
@@ -247,12 +282,48 @@ pub async fn run(model: Option<String>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Serialises all tests that read or write `AMAEBI_MODEL` so parallel
+    /// test execution cannot race on the environment variable.
+    static MODEL_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// RAII guard that restores `AMAEBI_MODEL` to its prior value on drop,
+    /// even if the test panics.
+    struct ModelEnvGuard {
+        prior: Option<String>,
+    }
+
+    impl ModelEnvGuard {
+        fn unset() -> Self {
+            let prior = std::env::var("AMAEBI_MODEL").ok();
+            // SAFETY: serialised by MODEL_ENV_LOCK; no concurrent mutations.
+            unsafe { std::env::remove_var("AMAEBI_MODEL") };
+            Self { prior }
+        }
+
+        fn set(value: &str) -> Self {
+            let prior = std::env::var("AMAEBI_MODEL").ok();
+            // SAFETY: serialised by MODEL_ENV_LOCK; no concurrent mutations.
+            unsafe { std::env::set_var("AMAEBI_MODEL", value) };
+            Self { prior }
+        }
+    }
+
+    impl Drop for ModelEnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: serialised by MODEL_ENV_LOCK; no concurrent mutations.
+            match &self.prior {
+                Some(v) => unsafe { std::env::set_var("AMAEBI_MODEL", v) },
+                None => unsafe { std::env::remove_var("AMAEBI_MODEL") },
+            }
+        }
+    }
 
     #[test]
     fn model_resolution_uses_default_when_none() {
-        // When no model is specified and AMAEBI_MODEL is unset, we get gpt-4o.
-        // We test the resolution logic directly rather than running the server.
-        std::env::remove_var("AMAEBI_MODEL");
+        let _lock = MODEL_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _env = ModelEnvGuard::unset();
         let model: Arc<str> = None::<String>
             .or_else(|| std::env::var("AMAEBI_MODEL").ok())
             .unwrap_or_else(|| "gpt-4o".to_string())
@@ -262,6 +333,8 @@ mod tests {
 
     #[test]
     fn model_resolution_uses_explicit_flag() {
+        let _lock = MODEL_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // Explicit flag takes priority regardless of env var.
         let model: Arc<str> = Some("gpt-4.1".to_string())
             .or_else(|| std::env::var("AMAEBI_MODEL").ok())
             .unwrap_or_else(|| "gpt-4o".to_string())
@@ -271,12 +344,12 @@ mod tests {
 
     #[test]
     fn model_resolution_uses_env_var() {
-        std::env::set_var("AMAEBI_MODEL", "o4-mini");
+        let _lock = MODEL_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _env = ModelEnvGuard::set("o4-mini");
         let model: Arc<str> = None::<String>
             .or_else(|| std::env::var("AMAEBI_MODEL").ok())
             .unwrap_or_else(|| "gpt-4o".to_string())
             .into();
-        std::env::remove_var("AMAEBI_MODEL");
         assert_eq!(&*model, "o4-mini");
     }
 
