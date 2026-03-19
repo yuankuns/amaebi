@@ -245,7 +245,7 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
 
 /// Drive the conversation until Copilot responds with `finish_reason: stop`
 /// (or an error).  Executes tool calls and feeds results back in a loop.
-async fn run_agentic_loop<W>(
+pub(crate) async fn run_agentic_loop<W>(
     state: &DaemonState,
     model: &str,
     mut messages: Vec<Message>,
@@ -398,7 +398,7 @@ where
 // Message construction
 // ---------------------------------------------------------------------------
 
-async fn build_messages(
+pub(crate) async fn build_messages(
     prompt: &str,
     tmux_pane: Option<&str>,
     state: &DaemonState,
