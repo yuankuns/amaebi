@@ -1,14 +1,14 @@
 use anyhow::{Context, Result};
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::signal::unix::{signal, SignalKind};
 
 use crate::ipc::{Request, Response};
 
-/// How long (seconds) the user has to press Ctrl-C a second time to exit.
-const DOUBLE_CTRLC_WINDOW_SECS: f64 = 2.0;
+/// How long the user has to press Ctrl-C a second time to exit.
+const DOUBLE_CTRLC_WINDOW: Duration = Duration::from_secs(2);
 
 pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Result<()> {
     let stream = UnixStream::connect(&socket).await.with_context(|| {
@@ -52,16 +52,18 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
             biased;
 
             // Handle Ctrl-C (SIGINT).
-            _ = sigint.recv() => {
-                if let Some(t) = last_ctrl_c {
-                    if t.elapsed().as_secs_f64() < DOUBLE_CTRLC_WINDOW_SECS {
-                        // Second Ctrl-C within the window — exit.
-                        eprintln!();
-                        std::process::exit(130);
-                    }
+            result = sigint.recv() => {
+                // recv() returns None when the signal stream is closed; treat
+                // that as a cue to stop rather than spinning the loop forever.
+                let Some(_) = result else { break; };
+
+                if is_within_window(last_ctrl_c, DOUBLE_CTRLC_WINDOW) {
+                    // Second Ctrl-C within the window — exit.
+                    eprintln!();
+                    std::process::exit(130);
                 }
                 // First press (or expired window): remind the user and record time.
-                eprintln!("\nPress Ctrl-C again to exit");
+                eprintln!("\nPress Ctrl-C again within 2s to exit");
                 last_ctrl_c = Some(Instant::now());
             }
 
@@ -109,28 +111,36 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
     Ok(())
 }
 
+/// Return `true` if `last_press` is `Some` and its elapsed time is less than
+/// `window`.  Pure function — no side effects, deterministically testable.
+fn is_within_window(last_press: Option<Instant>, window: Duration) -> bool {
+    match last_press {
+        None => false,
+        Some(t) => t.elapsed() < window,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn double_ctrlc_window_is_positive() {
-        assert!(DOUBLE_CTRLC_WINDOW_SECS > 0.0);
+    fn is_within_window_none_returns_false() {
+        assert!(!is_within_window(None, DOUBLE_CTRLC_WINDOW));
     }
 
     #[test]
-    fn instant_within_window() {
-        let t = Instant::now();
-        // A freshly captured instant should be within the 2-second window.
-        assert!(t.elapsed().as_secs_f64() < DOUBLE_CTRLC_WINDOW_SECS);
+    fn is_within_window_very_large_window_returns_true() {
+        // A just-captured Instant will always be within a multi-year window.
+        assert!(is_within_window(
+            Some(Instant::now()),
+            Duration::from_secs(u64::MAX / 2)
+        ));
     }
 
     #[test]
-    fn instant_outside_window() {
-        // An instant 3 seconds in the past should be outside the window.
-        let t = Instant::now()
-            .checked_sub(std::time::Duration::from_secs(3))
-            .expect("invariant: 3-second subtraction fits in Instant range");
-        assert!(t.elapsed().as_secs_f64() >= DOUBLE_CTRLC_WINDOW_SECS);
+    fn is_within_window_zero_window_returns_false() {
+        // No elapsed time can be less than zero — always outside.
+        assert!(!is_within_window(Some(Instant::now()), Duration::ZERO));
     }
 }
