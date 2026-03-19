@@ -52,15 +52,6 @@ fn open_lock_file() -> Result<std::fs::File> {
         .with_context(|| format!("opening lock file {}", path.display()))
 }
 
-fn truncate(s: &str) -> String {
-    if s.len() <= 200 {
-        s.to_string()
-    } else {
-        let end = s.floor_char_boundary(200);
-        format!("{}…", &s[..end])
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -90,8 +81,8 @@ pub fn append(user_prompt: &str, assistant_response: &str) -> Result<MemoryEntry
 
     let entry = MemoryEntry {
         timestamp: chrono::Utc::now().to_rfc3339(),
-        user: truncate(user_prompt),
-        assistant: truncate(assistant_response),
+        user: user_prompt.to_owned(),
+        assistant: assistant_response.to_owned(),
     };
 
     // Build the complete JSONL line before acquiring any lock so the critical
@@ -215,6 +206,10 @@ pub fn load_recent(n: usize) -> Result<Vec<MemoryEntry>> {
 }
 
 /// Return all entries whose user or assistant text contains `query` (case-insensitive).
+///
+/// The CLI now delegates search to SQLite; this function is kept for JSONL
+/// backward-compatibility and direct callers.
+#[allow(dead_code)]
 pub fn search(query: &str) -> Result<Vec<MemoryEntry>> {
     let path = memory_path()?;
 
@@ -295,6 +290,10 @@ pub fn clear() -> Result<()> {
 }
 
 /// Return the total number of entries in the memory file.
+///
+/// The CLI now reads the count from SQLite; this is kept for JSONL
+/// backward-compatibility and direct callers.
+#[allow(dead_code)]
 pub fn count() -> Result<usize> {
     let path = memory_path()?;
 
@@ -410,14 +409,21 @@ mod tests {
     }
 
     #[test]
-    fn test_truncation() {
+    fn test_full_content_preserved() {
+        // Truncation has been removed; full content must survive a round-trip.
         let _guard = with_temp_home();
         let long = "a".repeat(300);
         append(&long, "short").unwrap();
         let entries = load_recent(20).unwrap();
-        // 200 bytes of 'a' + "…" (3 UTF-8 bytes) = 203 bytes
-        assert!(entries[0].user.len() <= 203);
-        assert!(entries[0].user.ends_with('…'));
+        assert_eq!(
+            entries[0].user.len(),
+            300,
+            "full content must be stored without truncation"
+        );
+        assert!(
+            !entries[0].user.ends_with('…'),
+            "ellipsis must not be appended"
+        );
         assert_eq!(entries[0].assistant, "short");
     }
 

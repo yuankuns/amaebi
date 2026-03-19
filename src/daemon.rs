@@ -9,6 +9,7 @@ use crate::auth::TokenCache;
 use crate::copilot::{self, ApiToolCall, ApiToolCallFunction, FinishReason, Message};
 use crate::ipc::{write_frame, Request, Response};
 use crate::memory::{self, MemoryEntry};
+use crate::memory_db;
 use crate::tools::{self, ToolExecutor};
 
 // ---------------------------------------------------------------------------
@@ -70,6 +71,9 @@ impl MemoryCache {
     }
 
     /// Return a snapshot of all cached entries in chronological order.
+    ///
+    /// Retained for potential future callers; context injection now uses SQLite.
+    #[allow(dead_code)]
     pub async fn snapshot(&self) -> Vec<MemoryEntry> {
         self.inner.read().await.iter().cloned().collect()
     }
@@ -99,6 +103,8 @@ pub struct DaemonState {
     pub memory_lock: tokio::sync::Mutex<()>,
     /// In-memory cache of recent conversation history; avoids disk I/O on the hot path.
     pub memory_cache: MemoryCache,
+    /// Path to the SQLite memory database (`~/.amaebi/memory.db`).
+    pub db_path: PathBuf,
 }
 
 impl DaemonState {
@@ -106,12 +112,14 @@ impl DaemonState {
         let http = reqwest::Client::builder()
             .build()
             .context("building HTTP client")?;
+        let db_path = memory_db::db_path().context("resolving memory DB path")?;
         Ok(Self {
             http,
             tokens: TokenCache::new(),
             executor: Box::new(tools::LocalExecutor),
             memory_lock: tokio::sync::Mutex::new(()),
             memory_cache: MemoryCache::new(),
+            db_path,
         })
     }
 }
@@ -208,11 +216,27 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                     // Serialise memory writes within this process; file-level flock in
                     // memory::append handles cross-process protection.
                     let mem_guard = state.memory_lock.lock().await;
+                    let prompt_clone = prompt.clone();
+                    let response_clone = response_text.clone();
+                    let db_path = state.db_path.clone();
                     let mem_result = tokio::task::spawn_blocking(move || {
-                        memory::append(&prompt, &response_text)
+                        let timestamp = chrono::Utc::now().to_rfc3339();
+                        // Primary: write to SQLite (full content, no truncation).
+                        let conn = memory_db::init_db(&db_path)?;
+                        memory_db::store_memory(&conn, &timestamp, "", "user", &prompt_clone, "")?;
+                        memory_db::store_memory(
+                            &conn,
+                            &timestamp,
+                            "",
+                            "assistant",
+                            &response_clone,
+                            "",
+                        )?;
+                        // Secondary: keep JSONL for backward compatibility.
+                        memory::append(&prompt_clone, &response_clone)
                     })
                     .await
-                    .unwrap_or_else(|e| Err(anyhow::anyhow!("memory::append panicked: {e}")));
+                    .unwrap_or_else(|e| Err(anyhow::anyhow!("memory write panicked: {e}")));
                     // Release the lock immediately after the write — before logging —
                     // so other connections are not blocked while we format a warning.
                     drop(mem_guard);
@@ -417,16 +441,28 @@ pub(crate) async fn build_messages(
 
     let mut messages = vec![Message::system(system)];
 
-    // Inject recent conversation history as proper user/assistant turn pairs
-    // rather than embedding it in the system prompt.  This preserves role
-    // separation and prevents a malicious assistant response stored in memory
-    // from being able to override system-level instructions.
-    //
-    // Reads from the in-memory cache — no disk I/O on the hot path.
-    let entries = state.memory_cache.snapshot().await;
-    for entry in entries {
-        messages.push(Message::user(entry.user));
-        messages.push(Message::assistant(Some(entry.assistant), vec![]));
+    // Retrieve context from SQLite: last 4 turns for continuity, plus up to
+    // 10 FTS-relevant entries for historical context.  Deduplication and
+    // chronological ordering are handled by `retrieve_context`.
+    let db_path = state.db_path.clone();
+    let prompt_owned = prompt.to_owned();
+    match tokio::task::spawn_blocking(move || {
+        let conn = memory_db::init_db(&db_path)?;
+        memory_db::retrieve_context(&conn, &prompt_owned, 4, 10)
+    })
+    .await
+    {
+        Ok(Ok(entries)) => {
+            for entry in entries {
+                if entry.role == "user" {
+                    messages.push(Message::user(entry.content));
+                } else {
+                    messages.push(Message::assistant(Some(entry.content), vec![]));
+                }
+            }
+        }
+        Ok(Err(e)) => tracing::warn!(error = %e, "failed to load memory context from SQLite"),
+        Err(e) => tracing::warn!(error = %e, "memory context load task panicked"),
     }
 
     messages.push(Message::user(prompt.to_owned()));

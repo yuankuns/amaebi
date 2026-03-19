@@ -19,6 +19,7 @@ use crate::copilot::Message;
 use crate::daemon::{run_agentic_loop, DaemonState};
 use crate::ipc::Response;
 use crate::memory;
+use crate::memory_db;
 
 // ---------------------------------------------------------------------------
 // Message builder for ACP mode
@@ -29,6 +30,9 @@ use crate::memory;
 /// Uses a generic coding-assistant system prompt rather than the daemon's
 /// tmux-specific one: in ACP mode amaebi communicates over stdio and has no
 /// tmux environment available.
+///
+/// Retrieves context from SQLite: last 4 turns for continuity plus up to 10
+/// FTS-relevant entries for historical context.
 async fn acp_build_messages(prompt: &str, state: &DaemonState) -> Vec<Message> {
     let system = "You are a helpful, concise AI coding assistant. \
                   Answer in plain text; avoid markdown unless the user asks for it. \
@@ -37,11 +41,26 @@ async fn acp_build_messages(prompt: &str, state: &DaemonState) -> Vec<Message> {
 
     let mut messages = vec![Message::system(system.to_owned())];
 
-    // Inject recent conversation history as proper user/assistant turn pairs.
-    let entries = state.memory_cache.snapshot().await;
-    for entry in entries {
-        messages.push(Message::user(entry.user));
-        messages.push(Message::assistant(Some(entry.assistant), vec![]));
+    // Retrieve context from SQLite: last 4 turns + FTS-relevant history.
+    let db_path = state.db_path.clone();
+    let prompt_owned = prompt.to_owned();
+    match tokio::task::spawn_blocking(move || {
+        let conn = memory_db::init_db(&db_path)?;
+        memory_db::retrieve_context(&conn, &prompt_owned, 4, 10)
+    })
+    .await
+    {
+        Ok(Ok(entries)) => {
+            for entry in entries {
+                if entry.role == "user" {
+                    messages.push(Message::user(entry.content));
+                } else {
+                    messages.push(Message::assistant(Some(entry.content), vec![]));
+                }
+            }
+        }
+        Ok(Err(e)) => tracing::warn!(error = %e, "failed to load ACP memory context from SQLite"),
+        Err(e) => tracing::warn!(error = %e, "ACP memory context load task panicked"),
     }
 
     messages.push(Message::user(prompt.to_owned()));
@@ -199,10 +218,19 @@ impl acp::Agent for AmaebiAgent {
         // Save the conversation to memory (best-effort).
         let mem_guard = self.state.memory_lock.lock().await;
         let prompt_clone = user_text.clone();
-        let mem_result =
-            tokio::task::spawn_blocking(move || memory::append(&prompt_clone, &final_text))
-                .await
-                .unwrap_or_else(|e| Err(anyhow::anyhow!("memory::append panicked: {e}")));
+        let final_text_clone = final_text.clone();
+        let db_path = self.state.db_path.clone();
+        let mem_result = tokio::task::spawn_blocking(move || {
+            let timestamp = chrono::Utc::now().to_rfc3339();
+            // Primary: SQLite (full content, no truncation).
+            let conn = memory_db::init_db(&db_path)?;
+            memory_db::store_memory(&conn, &timestamp, "", "user", &prompt_clone, "")?;
+            memory_db::store_memory(&conn, &timestamp, "", "assistant", &final_text_clone, "")?;
+            // Secondary: JSONL for backward compatibility.
+            memory::append(&prompt_clone, &final_text_clone)
+        })
+        .await
+        .unwrap_or_else(|e| Err(anyhow::anyhow!("memory write panicked: {e}")));
         drop(mem_guard);
         match mem_result {
             Ok(entry) => self.state.memory_cache.push(entry).await,

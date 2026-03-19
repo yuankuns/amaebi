@@ -10,6 +10,7 @@ mod copilot;
 mod daemon;
 mod ipc;
 mod memory;
+mod memory_db;
 mod models;
 #[cfg(test)]
 mod test_utils;
@@ -137,38 +138,57 @@ fn sanitize(s: &str) -> String {
 async fn run_memory(action: cli::MemoryAction, socket: std::path::PathBuf) -> Result<()> {
     match action {
         cli::MemoryAction::List => {
-            let entries = memory::load_recent(20)?;
+            let db_path = memory_db::db_path()?;
+            let entries = if db_path.exists() {
+                let conn = memory_db::init_db(&db_path)?;
+                memory_db::get_recent(&conn, 40)?
+            } else {
+                vec![]
+            };
             if entries.is_empty() {
                 println!("No memories stored.");
             } else {
                 for e in &entries {
                     println!(
-                        "[{}]\n  Q: {}\n  A: {}\n",
+                        "[{}] ({})\n  {}\n",
                         sanitize(&e.timestamp),
-                        sanitize(&e.user),
-                        sanitize(&e.assistant)
+                        sanitize(&e.role),
+                        sanitize(&e.content)
                     );
                 }
             }
             Ok(())
         }
         cli::MemoryAction::Search { query } => {
-            let entries = memory::search(&query)?;
+            let db_path = memory_db::db_path()?;
+            let entries = if db_path.exists() {
+                let conn = memory_db::init_db(&db_path)?;
+                memory_db::search_relevant(&conn, &query, 20)?
+            } else {
+                vec![]
+            };
             if entries.is_empty() {
                 println!("No matches for {:?}.", query);
             } else {
                 for e in &entries {
                     println!(
-                        "[{}]\n  Q: {}\n  A: {}\n",
+                        "[{}] ({})\n  {}\n",
                         sanitize(&e.timestamp),
-                        sanitize(&e.user),
-                        sanitize(&e.assistant)
+                        sanitize(&e.role),
+                        sanitize(&e.content)
                     );
                 }
             }
             Ok(())
         }
         cli::MemoryAction::Clear => {
+            // Clear SQLite.
+            let db_path = memory_db::db_path()?;
+            if db_path.exists() {
+                let conn = memory_db::init_db(&db_path)?;
+                memory_db::clear(&conn)?;
+            }
+            // Also clear legacy JSONL.
             memory::clear()?;
             // Best-effort: notify a running daemon to clear its in-memory cache.
             // Silently ignores connection failures (daemon may not be running).
@@ -177,7 +197,13 @@ async fn run_memory(action: cli::MemoryAction, socket: std::path::PathBuf) -> Re
             Ok(())
         }
         cli::MemoryAction::Count => {
-            let n = memory::count()?;
+            let db_path = memory_db::db_path()?;
+            let n = if db_path.exists() {
+                let conn = memory_db::init_db(&db_path)?;
+                memory_db::count(&conn)?
+            } else {
+                0
+            };
             println!("{n}");
             Ok(())
         }
