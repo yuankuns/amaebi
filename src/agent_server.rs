@@ -5,20 +5,138 @@
 //! communicate with it via JSON-RPC without going through the Unix-socket
 //! daemon.
 //!
+//! **Memory architecture**: all SQLite reads and writes for this ACP agent
+//! are routed through a running daemon process via the Unix socket (see
+//! [`Request::StoreMemory`] and [`Request::RetrieveContext`]).  The ACP agent
+//! never opens its own SQLite connection.  If no daemon is reachable, memory
+//! operations are skipped (writes logged at warn level, reads at debug) so
+//! the ACP session continues uninterrupted.  Note that other CLI subcommands
+//! (e.g. `amaebi memory clear`) write to SQLite directly; the daemon is the
+//! primary — not exclusive — writer.
+//!
 //! Entry point: [`run`].
 
-use std::{cell::Cell, sync::Arc};
+use std::{cell::Cell, path::PathBuf, sync::Arc};
 
 use agent_client_protocol::{self as acp, Client as _};
 use anyhow::{Context, Result};
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::UnixStream;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::compat::{TokioAsyncReadCompatExt as _, TokioAsyncWriteCompatExt as _};
 
 use crate::copilot::Message;
-use crate::daemon::{run_agentic_loop, DaemonState};
-use crate::ipc::Response;
-use crate::memory;
+use crate::daemon::{inject_skill_files, run_agentic_loop, DaemonState};
+use crate::ipc::{Request, Response};
+
+// ---------------------------------------------------------------------------
+// Daemon IPC helpers
+// ---------------------------------------------------------------------------
+
+/// Send a [`Request::StoreMemory`] to the daemon and wait for `Done`.
+///
+/// Best-effort: if the daemon is not reachable the warning is logged and the
+/// call returns without error so the ACP session is not disrupted.
+async fn ipc_store_memory(socket: &std::path::Path, user: &str, assistant: &str) {
+    let stream = match UnixStream::connect(socket).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(
+                socket = %socket.display(),
+                error = %e,
+                "could not connect to daemon to store memory; write skipped"
+            );
+            return;
+        }
+    };
+    let (reader, mut writer) = tokio::io::split(stream);
+
+    let req = Request::StoreMemory {
+        user: user.to_owned(),
+        assistant: assistant.to_owned(),
+    };
+    let mut line = match serde_json::to_string(&req) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to serialise StoreMemory request");
+            return;
+        }
+    };
+    line.push('\n');
+
+    if writer.write_all(line.as_bytes()).await.is_err() {
+        return;
+    }
+    // Drain the Done response.
+    let mut lines = BufReader::new(reader).lines();
+    let _ = lines.next_line().await;
+}
+
+/// Send a [`Request::RetrieveContext`] to the daemon and collect the returned
+/// [`Response::MemoryEntry`] frames as `Message` values.
+///
+/// Returns an empty list if the daemon is not reachable, so the ACP agent
+/// continues without historical context rather than failing.
+async fn ipc_retrieve_context(socket: &std::path::Path, prompt: &str) -> Vec<Message> {
+    let stream = match UnixStream::connect(socket).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::debug!(
+                socket = %socket.display(),
+                error = %e,
+                "daemon not reachable; proceeding without memory context"
+            );
+            return vec![];
+        }
+    };
+    let (reader, mut writer) = tokio::io::split(stream);
+
+    let req = Request::RetrieveContext {
+        prompt: prompt.to_owned(),
+    };
+    let mut line = match serde_json::to_string(&req) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to serialise RetrieveContext request");
+            return vec![];
+        }
+    };
+    line.push('\n');
+
+    if writer.write_all(line.as_bytes()).await.is_err() {
+        return vec![];
+    }
+
+    let mut messages = Vec::new();
+    let mut lines = BufReader::new(reader).lines();
+    loop {
+        match lines.next_line().await {
+            Ok(Some(raw)) => match serde_json::from_str::<Response>(&raw) {
+                Ok(Response::MemoryEntry { role, content }) => {
+                    if role == "user" {
+                        messages.push(Message::user(content));
+                    } else if role == "assistant" {
+                        messages.push(Message::assistant(Some(content), vec![]));
+                    } else {
+                        tracing::warn!(role = %role, "unexpected role in MemoryEntry; skipping");
+                    }
+                }
+                Ok(Response::Done) => break,
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(error = %e, "unexpected frame from daemon during RetrieveContext");
+                    break;
+                }
+            },
+            Ok(None) => break, // daemon closed connection
+            Err(e) => {
+                tracing::warn!(error = %e, "I/O error reading daemon response");
+                break;
+            }
+        }
+    }
+    messages
+}
 
 // ---------------------------------------------------------------------------
 // Message builder for ACP mode
@@ -27,9 +145,8 @@ use crate::memory;
 /// Build the initial message list for an ACP prompt.
 ///
 /// Uses a generic coding-assistant system prompt rather than the daemon's
-/// tmux-specific one: in ACP mode amaebi communicates over stdio and has no
-/// tmux environment available.
-fn acp_build_messages(prompt: &str, history: &[memory::MemoryEntry]) -> Vec<Message> {
+/// tmux-specific one.  Memory context is fetched from the daemon via IPC.
+async fn acp_build_messages(prompt: &str, socket: &std::path::Path) -> Vec<Message> {
     let system = "You are a helpful, concise AI coding assistant. \
                   Answer in plain text; avoid markdown unless the user asks for it. \
                   You have tools available to read and edit files and run shell commands \
@@ -37,10 +154,12 @@ fn acp_build_messages(prompt: &str, history: &[memory::MemoryEntry]) -> Vec<Mess
 
     let mut messages = vec![Message::system(system.to_owned())];
 
-    // Inject recent conversation history as proper user/assistant turn pairs.
-    for entry in history {
-        messages.push(Message::user(entry.user.clone()));
-        messages.push(Message::assistant(Some(entry.assistant.clone()), vec![]));
+    // Inject global config files (AGENTS.md, SOUL.md) from ~/.amaebi/.
+    inject_skill_files(&mut messages).await;
+
+    // Retrieve context from the daemon via IPC (no direct SQLite access).
+    for msg in ipc_retrieve_context(socket, prompt).await {
+        messages.push(msg);
     }
 
     messages.push(Message::user(prompt.to_owned()));
@@ -59,6 +178,8 @@ struct AmaebiAgent {
     session_update_tx: mpsc::UnboundedSender<(acp::SessionNotification, oneshot::Sender<()>)>,
     /// Monotonically increasing session counter (Cell: !Sync, fine for !Send).
     next_session_id: Cell<u64>,
+    /// Path to the daemon's Unix socket for memory IPC.
+    daemon_socket: PathBuf,
 }
 
 #[async_trait::async_trait(?Send)]
@@ -126,16 +247,8 @@ impl acp::Agent for AmaebiAgent {
             return Err(acp::Error::auth_required().data(e.to_string()));
         }
 
-        // Load per-session history (keyed by the ACP session_id string).
-        let session_arc = self.state.sessions.get_or_create(&args.session_id.0).await;
-        let history_snapshot = {
-            let session = session_arc.lock().await;
-            session.history.clone()
-        };
-
-        // Build the conversation messages from session history + current prompt.
-        // Uses an ACP-specific system prompt (no tmux context).
-        let messages = acp_build_messages(&user_text, &history_snapshot);
+        // Build conversation messages; memory context fetched from daemon via IPC.
+        let messages = acp_build_messages(&user_text, &self.daemon_socket).await;
 
         // Duplex pipe: the agentic loop writes IPC frames → we read them back
         // and forward as ACP session notifications.
@@ -144,7 +257,7 @@ impl acp::Agent for AmaebiAgent {
         let state = Arc::clone(&self.state);
         let model = Arc::clone(&self.model);
 
-        // Oneshot to receive the loop's final text for memory saving.
+        // Oneshot to receive the loop's final text.
         let (result_tx, result_rx) = oneshot::channel::<Result<String, String>>();
 
         // Run the agentic loop in a background local task.
@@ -192,9 +305,8 @@ impl acp::Agent for AmaebiAgent {
                 Response::Error { message } => {
                     return Err(acp::Error::internal_error().data(message));
                 }
-                Response::ToolUse { .. } => {
-                    // Tool-use notifications are relevant in daemon/CLI mode
-                    // but not exposed over ACP (the agent handles tools itself).
+                Response::ToolUse { .. } | Response::MemoryEntry { .. } => {
+                    // Not relevant on the ACP forwarding path.
                 }
                 Response::SteerAck => {
                     // ACP mode never sends Steer requests, so SteerAck should
@@ -215,28 +327,8 @@ impl acp::Agent for AmaebiAgent {
             Err(_) => return Err(acp::Error::internal_error()),
         };
 
-        // Persist the exchange to per-session history and the global JSONL store.
-        {
-            let entry = memory::MemoryEntry {
-                timestamp: chrono::Utc::now().to_rfc3339(),
-                user: user_text.clone(),
-                assistant: final_text.clone(),
-            };
-            let mut session = session_arc.lock().await;
-            session.history.push(entry);
-            session.last_active = std::time::Instant::now();
-        }
-        let mem_guard = self.state.memory_lock.lock().await;
-        let prompt_clone = user_text.clone();
-        let final_clone = final_text.clone();
-        let mem_result =
-            tokio::task::spawn_blocking(move || memory::append(&prompt_clone, &final_clone))
-                .await
-                .unwrap_or_else(|e| Err(anyhow::anyhow!("memory::append panicked: {e}")));
-        drop(mem_guard);
-        if let Err(e) = mem_result {
-            tracing::warn!(error = %e, "failed to save memory after ACP prompt");
-        }
+        // Store the exchange via daemon IPC — never writes SQLite directly.
+        ipc_store_memory(&self.daemon_socket, &user_text, &final_text).await;
 
         Ok(acp::PromptResponse::new(acp::StopReason::EndTurn))
     }
@@ -255,13 +347,20 @@ impl acp::Agent for AmaebiAgent {
 // ---------------------------------------------------------------------------
 
 /// Start amaebi as an ACP agent, communicating via JSON-RPC over stdio.
-pub async fn run(model: Option<String>) -> Result<()> {
+///
+/// `socket` is the path to a running daemon's Unix socket.  Memory operations
+/// are routed through it so the daemon remains the sole SQLite writer.
+pub async fn run(model: Option<String>, socket: PathBuf) -> Result<()> {
     let model: Arc<str> = model
         .or_else(|| std::env::var("AMAEBI_MODEL").ok())
         .unwrap_or_else(|| "gpt-4o".to_string())
         .into();
 
-    let state = Arc::new(DaemonState::new().context("initialising daemon state")?);
+    let state = Arc::new(
+        DaemonState::new()
+            .await
+            .context("initialising daemon state")?,
+    );
 
     let outgoing = tokio::io::stdout().compat_write();
     let incoming = tokio::io::stdin().compat();
@@ -277,6 +376,7 @@ pub async fn run(model: Option<String>) -> Result<()> {
                     model,
                     session_update_tx: tx,
                     next_session_id: Cell::new(0),
+                    daemon_socket: socket,
                 },
                 outgoing,
                 incoming,
@@ -411,5 +511,23 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert_eq!(text, "keep");
+    }
+
+    /// Verify that ipc_store_memory degrades gracefully when no daemon is running.
+    #[tokio::test]
+    async fn ipc_store_memory_no_daemon_is_silent() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let socket = dir.path().join("nonexistent.sock");
+        // Must not panic or return an error — just logs a warning.
+        ipc_store_memory(&socket, "hello", "world").await;
+    }
+
+    /// Verify that ipc_retrieve_context returns empty when no daemon is running.
+    #[tokio::test]
+    async fn ipc_retrieve_context_no_daemon_returns_empty() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let socket = dir.path().join("nonexistent.sock");
+        let msgs = ipc_retrieve_context(&socket, "rust async").await;
+        assert!(msgs.is_empty());
     }
 }

@@ -157,6 +157,9 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
                         // Should never arrive in a normal foreground Chat loop.
                         tracing::debug!("unexpected DetachAccepted in foreground loop");
                     }
+                    Response::MemoryEntry { .. } => {
+                        // Not sent to the CLI client — daemon-internal only.
+                    }
                 }
             }
 
@@ -355,6 +358,9 @@ pub async fn run_resume(
                     }
                     Response::DetachAccepted { .. } => {
                         tracing::debug!("unexpected DetachAccepted in resume loop");
+                    }
+                    Response::MemoryEntry { .. } => {
+                        // Not sent to the CLI client — daemon-internal only.
                     }
                 }
             }

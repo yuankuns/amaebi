@@ -11,7 +11,7 @@ mod copilot;
 mod daemon;
 mod inbox;
 mod ipc;
-mod memory;
+mod memory_db;
 mod models;
 mod session;
 #[cfg(test)]
@@ -76,7 +76,7 @@ async fn main() -> Result<()> {
             let http = reqwest::Client::new();
             auth_flow::ensure_authenticated(&http, &client_id, skip_validate).await
         }
-        cli::Command::Acp { model } => agent_server::run(model).await,
+        cli::Command::Acp { model, socket } => agent_server::run(model, socket).await,
         cli::Command::Models => models::run().await,
         cli::Command::Memory { action, socket } => run_memory(action, socket).await,
         cli::Command::Session { action } => run_session(action),
@@ -171,47 +171,58 @@ fn sanitize(s: &str) -> String {
 async fn run_memory(action: cli::MemoryAction, socket: std::path::PathBuf) -> Result<()> {
     match action {
         cli::MemoryAction::List => {
-            let entries = memory::load_recent(20)?;
+            let db_path = memory_db::db_path()?;
+            let conn = memory_db::init_db(&db_path)?;
+            let entries = memory_db::get_recent(&conn, 40)?;
             if entries.is_empty() {
                 println!("No memories stored.");
             } else {
                 for e in &entries {
                     println!(
-                        "[{}]\n  Q: {}\n  A: {}\n",
+                        "[{}] ({})\n  {}\n",
                         sanitize(&e.timestamp),
-                        sanitize(&e.user),
-                        sanitize(&e.assistant)
+                        sanitize(&e.role),
+                        sanitize(&e.content)
                     );
                 }
             }
             Ok(())
         }
         cli::MemoryAction::Search { query } => {
-            let entries = memory::search(&query)?;
+            let db_path = memory_db::db_path()?;
+            let conn = memory_db::init_db(&db_path)?;
+            let entries = memory_db::search_relevant(&conn, &query, 20)?;
             if entries.is_empty() {
                 println!("No matches for {:?}.", query);
             } else {
                 for e in &entries {
                     println!(
-                        "[{}]\n  Q: {}\n  A: {}\n",
+                        "[{}] ({})\n  {}\n",
                         sanitize(&e.timestamp),
-                        sanitize(&e.user),
-                        sanitize(&e.assistant)
+                        sanitize(&e.role),
+                        sanitize(&e.content)
                     );
                 }
             }
             Ok(())
         }
         cli::MemoryAction::Clear => {
-            memory::clear()?;
-            // Best-effort: notify a running daemon to clear its in-memory cache.
+            // Clear SQLite.
+            let db_path = memory_db::db_path()?;
+            if db_path.exists() {
+                let conn = memory_db::init_db(&db_path)?;
+                memory_db::clear(&conn)?;
+            }
+            // Best-effort: notify a running daemon to also clear its SQLite DB.
             // Silently ignores connection failures (daemon may not be running).
             notify_daemon_cache_clear(&socket).await;
             println!("Memory cleared.");
             Ok(())
         }
         cli::MemoryAction::Count => {
-            let n = memory::count()?;
+            let db_path = memory_db::db_path()?;
+            let conn = memory_db::init_db(&db_path)?;
+            let n = memory_db::count(&conn)?;
             println!("{n}");
             Ok(())
         }
@@ -397,18 +408,19 @@ fn run_cache(action: cli::CacheAction) -> Result<()> {
             };
             println!("{verb} {session_count} session(s).");
 
-            // 2. Prune memory entries.
-            if let Some(max) = max_memory {
-                let removed = memory::prune(max, dry_run)?;
-                println!("{verb} {removed} memory entry/entries (keeping {max}).");
+            // 2. Prune memory entries (max_memory not supported with SQLite backend).
+            if let Some(_max) = max_memory {
+                tracing::warn!("--max-memory is not supported in the SQLite memory backend; ignoring");
             }
 
             Ok(())
         }
         cli::CacheAction::Stats => {
             let sessions = session::list_all()?;
-            let mem_count = memory::count()?;
-            let mem_bytes = memory::disk_usage()?;
+            let db_path = memory_db::db_path()?;
+            let conn = memory_db::init_db(&db_path)?;
+            let mem_count = memory_db::count(&conn)?;
+            let mem_bytes = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
 
             println!("Sessions: {}", sessions.len());
             for (dir, rec) in &sessions {
@@ -445,7 +457,7 @@ async fn notify_daemon_cache_clear(socket: &std::path::Path) {
     };
     let (reader, mut writer) = tokio::io::split(stream);
 
-    let Ok(mut line) = serde_json::to_string(&ipc::Request::ClearCache) else {
+    let Ok(mut line) = serde_json::to_string(&ipc::Request::ClearMemory) else {
         return;
     };
     line.push('\n');

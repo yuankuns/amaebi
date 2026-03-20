@@ -55,11 +55,28 @@ pub enum Request {
         /// Chat model to use (e.g. "gpt-4o").
         model: String,
     },
-    /// Ask the daemon to clear its in-memory conversation cache.
+    /// Ask the daemon to clear its persisted SQLite memory database.
     ///
-    /// Sent after `amaebi memory clear` so the running daemon does not serve
-    /// stale entries.  The daemon responds with a single [`Response::Done`] frame.
-    ClearCache,
+    /// Sent after `amaebi memory clear` so the running daemon also clears its
+    /// copy of the SQLite database.  The daemon responds with a single
+    /// [`Response::Done`] frame.
+    ClearMemory,
+    /// Ask the daemon to persist a user/assistant exchange.
+    ///
+    /// Used by the ACP agent so all SQLite writes go through the single daemon
+    /// process.  The daemon responds with a single [`Response::Done`] frame.
+    StoreMemory {
+        /// The user's prompt text.
+        user: String,
+        /// The assistant's response text.
+        assistant: String,
+    },
+    /// Ask the daemon for conversation context relevant to `prompt`.
+    ///
+    /// Used by the ACP agent so all SQLite reads go through the daemon.
+    /// The daemon responds with zero or more [`Response::MemoryEntry`] frames
+    /// followed by a single [`Response::Done`] frame.
+    RetrieveContext { prompt: String },
 }
 
 /// A single frame streamed from the daemon back to the client.
@@ -86,6 +103,13 @@ pub enum Response {
     DetachAccepted {
         /// The session UUID under which the task will run.
         session_id: String,
+    },
+    /// A single memory entry returned in response to [`Request::RetrieveContext`].
+    MemoryEntry {
+        /// `"user"` or `"assistant"`.
+        role: String,
+        /// The message content.
+        content: String,
     },
 }
 
@@ -221,13 +245,13 @@ mod tests {
     }
 
     #[test]
-    fn request_clear_cache_round_trip() {
-        let req = Request::ClearCache;
+    fn request_clear_memory_round_trip() {
+        let req = Request::ClearMemory;
         let json = serde_json::to_string(&req).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(v["type"], "clear_cache");
+        assert_eq!(v["type"], "clear_memory");
         let back: Request = serde_json::from_str(&json).unwrap();
-        assert!(matches!(back, Request::ClearCache));
+        assert!(matches!(back, Request::ClearMemory));
     }
 
     // ---- Response tag encoding ------------------------------------------
@@ -282,6 +306,46 @@ mod tests {
     }
 
     #[test]
+    fn request_store_memory_round_trip() {
+        let req = Request::StoreMemory {
+            user: "hello".into(),
+            assistant: "world".into(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["type"], "store_memory");
+        assert_eq!(v["user"], "hello");
+        assert_eq!(v["assistant"], "world");
+        let back: Request = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, Request::StoreMemory { .. }));
+    }
+
+    #[test]
+    fn request_retrieve_context_round_trip() {
+        let req = Request::RetrieveContext {
+            prompt: "rust async".into(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["type"], "retrieve_context");
+        assert_eq!(v["prompt"], "rust async");
+        let back: Request = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, Request::RetrieveContext { .. }));
+    }
+
+    #[test]
+    fn response_memory_entry_has_snake_case_type() {
+        let r = Response::MemoryEntry {
+            role: "user".into(),
+            content: "hello".into(),
+        };
+        let v: serde_json::Value = serde_json::to_value(&r).unwrap();
+        assert_eq!(v["type"], "memory_entry");
+        assert_eq!(v["role"], "user");
+        assert_eq!(v["content"], "hello");
+    }
+
+    #[test]
     fn response_all_variants_round_trip() {
         let frames = [
             r#"{"type":"text","chunk":"hello"}"#,
@@ -290,6 +354,7 @@ mod tests {
             r#"{"type":"tool_use","name":"read_file","detail":"/tmp/x"}"#,
             r#"{"type":"steer_ack"}"#,
             r#"{"type":"detach_accepted","session_id":"uuid-1"}"#,
+            r#"{"type":"memory_entry","role":"user","content":"hi"}"#,
         ];
         for frame in frames {
             let r: Response = serde_json::from_str(frame).unwrap();
@@ -301,6 +366,7 @@ mod tests {
                     | Response::ToolUse { .. }
                     | Response::SteerAck
                     | Response::DetachAccepted { .. }
+                    | Response::MemoryEntry { .. }
             ));
         }
     }

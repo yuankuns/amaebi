@@ -105,6 +105,7 @@ pub fn with_home<F: FnOnce() -> R, R>(dir: &Path, f: F) -> R {
 ///
 /// Uses [`tempfile::TempDir`] for RAII cleanup so the directory is removed
 /// even if the test panics before the guard is explicitly dropped.
+#[allow(dead_code)]
 pub fn with_temp_home() -> HomeGuard {
     let tmp = tempfile::TempDir::new().expect("creating temp home dir");
     let lock = HOME_LOCK.lock().unwrap_or_else(|p| p.into_inner());
