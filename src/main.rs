@@ -450,7 +450,10 @@ fn format_bytes(bytes: u64) -> String {
 
 fn run_cron(action: cli::CronAction) -> Result<()> {
     match action {
-        cli::CronAction::Add { description, schedule } => {
+        cli::CronAction::Add {
+            description,
+            schedule,
+        } => {
             // Validate the expression before writing to disk.
             cron::parse_schedule(&schedule)
                 .with_context(|| format!("invalid cron expression: {schedule:?}"))?;
@@ -465,10 +468,7 @@ fn run_cron(action: cli::CronAction) -> Result<()> {
                 println!("No cron jobs scheduled.");
             } else {
                 for job in &jobs {
-                    let last = job
-                        .last_run
-                        .as_deref()
-                        .unwrap_or("never");
+                    let last = job.last_run.as_deref().unwrap_or("never");
                     println!(
                         "[{}] {}\n  schedule:   {}\n  created:    {}\n  last_run:   {}\n",
                         job.id, job.description, job.schedule, job.created_at, last

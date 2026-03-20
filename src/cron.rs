@@ -153,8 +153,7 @@ impl CronStore {
     /// The schedule is validated before writing so an unparseable expression
     /// is never persisted.
     pub fn add(&self, description: &str, schedule: &str) -> Result<String> {
-        parse_schedule(schedule)
-            .with_context(|| format!("invalid cron schedule: {schedule:?}"))?;
+        parse_schedule(schedule).with_context(|| format!("invalid cron schedule: {schedule:?}"))?;
 
         let id = uuid::Uuid::new_v4().to_string();
         let created_at = chrono::Utc::now().to_rfc3339();
@@ -362,8 +361,7 @@ pub fn due_jobs(jobs: &[CronJob], now: &chrono::DateTime<chrono::Utc>) -> Vec<Cr
         // Guard: don't re-fire within the same minute.
         if let Some(last) = &job.last_run {
             if let Ok(last_dt) = chrono::DateTime::parse_from_rfc3339(last) {
-                let elapsed =
-                    now.signed_duration_since(last_dt.with_timezone(&chrono::Utc));
+                let elapsed = now.signed_duration_since(last_dt.with_timezone(&chrono::Utc));
                 if elapsed < chrono::Duration::seconds(30) {
                     continue;
                 }
@@ -630,10 +628,7 @@ mod tests {
         let id = store.add("task", "* * * * *").unwrap();
         store.update_last_run(&id, "2026-03-20T09:00:00Z").unwrap();
         let jobs = store.list().unwrap();
-        assert_eq!(
-            jobs[0].last_run.as_deref(),
-            Some("2026-03-20T09:00:00Z")
-        );
+        assert_eq!(jobs[0].last_run.as_deref(), Some("2026-03-20T09:00:00Z"));
     }
 
     #[test]
