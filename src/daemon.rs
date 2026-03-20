@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
@@ -22,11 +22,12 @@ pub struct DaemonState {
     pub tokens: TokenCache,
     /// Tool executor — `LocalExecutor` now; swappable with `DockerExecutor` in Phase 4.
     pub executor: Box<dyn ToolExecutor>,
-    /// Serialises concurrent SQLite writes within this process so that
-    /// parallel client connections cannot race on memory storage.
-    pub memory_lock: tokio::sync::Mutex<()>,
-    /// Path to the SQLite memory database (`~/.amaebi/memory.db`).
-    pub db_path: PathBuf,
+    /// Persistent SQLite connection opened once at startup.
+    ///
+    /// Wrapped in `Mutex` so that concurrent `spawn_blocking` tasks serialise
+    /// all reads and writes through a single connection without re-running the
+    /// schema setup (`PRAGMA`s, `CREATE TABLE`, triggers) on every request.
+    pub db: Arc<Mutex<rusqlite::Connection>>,
 }
 
 impl DaemonState {
@@ -35,12 +36,12 @@ impl DaemonState {
             .build()
             .context("building HTTP client")?;
         let db_path = memory_db::db_path().context("resolving memory DB path")?;
+        let conn = memory_db::init_db(&db_path).context("opening memory DB")?;
         Ok(Self {
             http,
             tokens: TokenCache::new(),
             executor: Box::new(tools::LocalExecutor),
-            memory_lock: tokio::sync::Mutex::new(()),
-            db_path,
+            db: Arc::new(Mutex::new(conn)),
         })
     }
 }
@@ -98,16 +99,13 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
     match req {
         Request::ClearMemory => {
             tracing::info!("received memory clear request");
-            // Acquire the write lock so we don't race with store_conversation.
-            let _guard = state.memory_lock.lock().await;
-            let db_path = state.db_path.clone();
+            let db = Arc::clone(&state.db);
             let result = tokio::task::spawn_blocking(move || {
-                let conn = memory_db::init_db(&db_path)?;
+                let conn = db.lock().unwrap_or_else(|p| p.into_inner());
                 memory_db::clear(&conn)
             })
             .await
             .unwrap_or_else(|e| Err(anyhow::anyhow!("DB clear panicked: {e}")));
-            drop(_guard);
             if let Err(e) = result {
                 tracing::warn!(error = %e, "failed to clear memory DB");
             }
@@ -120,9 +118,9 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
         }
 
         Request::RetrieveContext { prompt } => {
-            let db_path = state.db_path.clone();
+            let db = Arc::clone(&state.db);
             let entries = tokio::task::spawn_blocking(move || {
-                let conn = memory_db::init_db(&db_path)?;
+                let conn = db.lock().unwrap_or_else(|p| p.into_inner());
                 memory_db::retrieve_context(&conn, &prompt, 4, 10)
             })
             .await
@@ -205,10 +203,10 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
 /// deduplicated and sorted chronologically, as `Message` values ready for
 /// injection into a Copilot API request.
 pub(crate) async fn retrieve_memory_context(state: &DaemonState, prompt: &str) -> Vec<Message> {
-    let db_path = state.db_path.clone();
+    let db = Arc::clone(&state.db);
     let prompt_owned = prompt.to_owned();
     match tokio::task::spawn_blocking(move || {
-        let conn = memory_db::init_db(&db_path)?;
+        let conn = db.lock().unwrap_or_else(|p| p.into_inner());
         memory_db::retrieve_context(&conn, &prompt_owned, 4, 10)
     })
     .await
@@ -239,13 +237,12 @@ pub(crate) async fn retrieve_memory_context(state: &DaemonState, prompt: &str) -
 /// Acquires `memory_lock` to serialise concurrent writes within this process.
 /// Best-effort: errors are logged but not propagated.
 pub(crate) async fn store_conversation(state: &DaemonState, user: &str, assistant: &str) {
-    let _guard = state.memory_lock.lock().await;
-    let db_path = state.db_path.clone();
+    let db = Arc::clone(&state.db);
     let user_owned = user.to_owned();
     let assistant_owned = assistant.to_owned();
     let result = tokio::task::spawn_blocking(move || {
         let timestamp = chrono::Utc::now().to_rfc3339();
-        let mut conn = memory_db::init_db(&db_path)?;
+        let mut conn = db.lock().unwrap_or_else(|p| p.into_inner());
         // Write the user/assistant pair atomically so they are never split.
         let tx = conn.transaction().context("beginning memory transaction")?;
         memory_db::store_memory(&tx, &timestamp, "", "user", &user_owned, "")?;
