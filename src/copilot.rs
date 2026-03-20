@@ -441,8 +441,9 @@ mod tests {
 
 /// Exponential back-off delay for `attempt` (0-indexed).
 ///
-/// Returns 1 s, 2 s, 4 s for attempts 0, 1, 2.  Saturates at u64::MAX ms
-/// but in practice MAX_RETRIES is 3 so the maximum is 4 s.
+/// Returns 1 s, 2 s, 4 s for attempts 0, 1, 2.  The exponent is capped at
+/// 10, so the delay saturates at `BACKOFF_BASE_MS << 10` (about 17 minutes),
+/// but in practice `MAX_RETRIES` is 3 so the maximum used delay is 4 s.
 pub(crate) fn backoff_delay(attempt: u32) -> Duration {
     Duration::from_millis(BACKOFF_BASE_MS << attempt.min(10))
 }

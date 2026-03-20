@@ -139,7 +139,7 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                     &mut writer,
                     &Response::MemoryEntry {
                         role: entry.role,
-                        content: entry.content,
+                        content: truncate_chars(entry.content, MAX_HISTORY_CHARS),
                     },
                 )
                 .await?;
@@ -544,16 +544,27 @@ pub(crate) async fn build_messages(
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Truncate `s` to at most `max` Unicode scalar values.
+/// Truncate `s` to at most `max` Unicode scalar values (including the marker).
 ///
 /// If truncation occurs, appends `"…[truncated]"` so the model knows the
-/// content was cut.  Operates on char boundaries, never slicing multi-byte
-/// sequences.
+/// content was cut.  The returned string always contains at most `max` chars.
+/// Operates on char boundaries, never slicing multi-byte sequences.
+///
+/// Edge case: if `max` is smaller than or equal to the marker length, the
+/// marker itself is truncated to `max` chars.
 fn truncate_chars(s: String, max: usize) -> String {
-    match s.char_indices().nth(max) {
-        None => s, // already within limit — no allocation
-        Some((byte_idx, _)) => format!("{}…[truncated]", &s[..byte_idx]),
+    if s.chars().count() <= max {
+        return s; // already within limit — no allocation
     }
+    const MARKER: &str = "…[truncated]";
+    const MARKER_LEN: usize = 12; // "…[truncated]" is 12 chars (… = 1 char)
+    if max <= MARKER_LEN {
+        return MARKER.chars().take(max).collect();
+    }
+    let content_len = max - MARKER_LEN;
+    let mut out: String = s.chars().take(content_len).collect();
+    out.push_str(MARKER);
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -582,22 +593,45 @@ mod tests {
 
     #[test]
     fn truncate_chars_over_limit_appends_marker() {
-        let s = "hello world".to_owned();
-        let result = truncate_chars(s, 5);
-        assert!(result.starts_with("hello"), "should keep first 5 chars");
-        assert!(
-            result.contains("[truncated]"),
-            "should append truncation marker"
-        );
+        // max=20: 12 chars for marker + 8 chars of content = 20 total
+        let s = "hello world extra text here".to_owned(); // 27 chars > 20
+        let result = truncate_chars(s, 20);
+        assert!(result.ends_with("…[truncated]"), "should end with marker");
+        assert_eq!(result.chars().count(), 20);
+    }
+
+    #[test]
+    fn truncate_chars_total_length_never_exceeds_max() {
+        // Verify the hard cap for various max values.
+        let s = "a".repeat(100);
+        for max in [14, 20, 50, 99] {
+            let result = truncate_chars(s.clone(), max);
+            assert!(
+                result.chars().count() <= max,
+                "max={max}: got {} chars",
+                result.chars().count()
+            );
+        }
+    }
+
+    #[test]
+    fn truncate_chars_max_smaller_than_marker_returns_partial_marker() {
+        let result = truncate_chars("hello world".to_owned(), 3);
+        assert_eq!(result.chars().count(), 3);
+        assert!(result.starts_with('…'));
     }
 
     #[test]
     fn truncate_chars_respects_unicode_boundaries() {
-        // "日本語" is 3 chars, each 3 bytes; slicing bytes would panic on boundaries
-        let s = "日本語テスト".to_owned(); // 6 chars
-        let result = truncate_chars(s, 3);
-        assert!(result.starts_with("日本語"), "should preserve 3 full chars");
-        assert!(result.contains("[truncated]"));
+        // "日本語テスト" is 6 chars, each 3 bytes; slicing bytes would panic.
+        // max=20 gives room for content + marker (total ≤ 20).
+        let s = "日本語テスト".repeat(5); // 30 chars
+        let result = truncate_chars(s, 20);
+        assert!(
+            result.chars().count() <= 20,
+            "total length must not exceed max"
+        );
+        assert!(result.ends_with("…[truncated]"));
     }
 
     #[test]
