@@ -495,7 +495,15 @@ mod tests {
     fn test_get_session_history() {
         let (conn, _dir) = open_test_db();
         store_memory(&conn, "2026-01-01T00:00:00Z", "sess-1", "user", "hello", "").unwrap();
-        store_memory(&conn, "2026-01-01T00:00:01Z", "sess-1", "assistant", "hi", "").unwrap();
+        store_memory(
+            &conn,
+            "2026-01-01T00:00:01Z",
+            "sess-1",
+            "assistant",
+            "hi",
+            "",
+        )
+        .unwrap();
         store_memory(&conn, "2026-01-01T00:00:02Z", "sess-2", "user", "other", "").unwrap();
 
         let history = get_session_history(&conn, "sess-1").unwrap();

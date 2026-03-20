@@ -316,8 +316,7 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                 vec![]
             });
 
-            let mut messages =
-                build_messages_resume(&prompt, tmux_pane.as_deref(), &history);
+            let mut messages = build_messages_resume(&prompt, tmux_pane.as_deref(), &history);
             inject_skill_files(&mut messages).await;
 
             match run_agentic_loop(&state, &model, messages, &mut writer, &mut steer_rx).await {
@@ -485,7 +484,12 @@ fn truncate_chars(s: String, max: usize) -> String {
 /// Runs inside `spawn_blocking`; locks `state.db` to serialise concurrent
 /// writes within this process.  Best-effort: errors are logged but not
 /// propagated.
-pub(crate) async fn store_conversation(state: &DaemonState, session_id: &str, user: &str, assistant: &str) {
+pub(crate) async fn store_conversation(
+    state: &DaemonState,
+    session_id: &str,
+    user: &str,
+    assistant: &str,
+) {
     let db = Arc::clone(&state.db);
     let sid = session_id.to_owned();
     let user_owned = user.to_owned();
@@ -852,7 +856,11 @@ mod tests {
         let mut entries = Vec::with_capacity(n * 2);
         for i in 0..n {
             entries.push(make_db_entry((i * 2) as i64, "user", &format!("u{i}")));
-            entries.push(make_db_entry((i * 2 + 1) as i64, "assistant", &format!("a{i}")));
+            entries.push(make_db_entry(
+                (i * 2 + 1) as i64,
+                "assistant",
+                &format!("a{i}"),
+            ));
         }
         entries
     }
@@ -951,7 +959,10 @@ mod tests {
     fn build_messages_tmux_pane_in_system() {
         let msgs = build_messages("prompt", Some("%3"), &[]);
         let content = msgs[0].content.as_deref().unwrap_or("");
-        assert!(content.contains("%3"), "system prompt should mention the pane");
+        assert!(
+            content.contains("%3"),
+            "system prompt should mention the pane"
+        );
     }
 
     // ---- build_messages_resume tests -----
@@ -961,8 +972,11 @@ mod tests {
         let history = make_history(MAX_HISTORY + 1);
         let msgs = build_messages_resume("new", None, &history);
         let expected = 1 + (MAX_HISTORY + 1) * 2 + 1;
-        assert_eq!(msgs.len(), expected,
-            "resume should load full history, not just last {MAX_HISTORY}");
+        assert_eq!(
+            msgs.len(),
+            expected,
+            "resume should load full history, not just last {MAX_HISTORY}"
+        );
     }
 
     #[test]
@@ -1012,7 +1026,10 @@ mod tests {
         std::fs::write(dir.path().join("AGENTS.md"), "   \n  ").unwrap();
         let mut messages: Vec<Message> = vec![];
         inject_skill_files_from(&mut messages, dir.path()).await;
-        assert!(messages.is_empty(), "whitespace-only file must not inject a message");
+        assert!(
+            messages.is_empty(),
+            "whitespace-only file must not inject a message"
+        );
     }
 
     #[tokio::test]
@@ -1022,6 +1039,10 @@ mod tests {
         let mut messages: Vec<Message> = vec![];
         inject_skill_files_from(&mut messages, dir.path()).await;
         assert_eq!(messages.len(), 1);
-        assert!(messages[0].content.as_deref().unwrap_or("").contains("soul only"));
+        assert!(messages[0]
+            .content
+            .as_deref()
+            .unwrap_or("")
+            .contains("soul only"));
     }
 }
