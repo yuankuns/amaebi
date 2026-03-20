@@ -100,10 +100,10 @@ END;
 /// Open (or create) the SQLite memory database at `path`.
 ///
 /// Applies WAL mode and creates the schema on first run.
-/// Sets a 5-second busy timeout so concurrent processes do not fail
-/// immediately on lock contention.
-/// Enforces `0600` permissions on the database file to protect
-/// conversation history from other local users.
+/// Sets a 5-second busy timeout so concurrent processes retry instead of
+/// failing immediately on lock contention.
+/// On Unix, attempts to set `0600` permissions on the database file
+/// (best-effort: failures are logged at debug level and not propagated).
 pub fn init_db(path: &Path) -> Result<Connection> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)

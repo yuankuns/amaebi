@@ -51,7 +51,8 @@ pub enum Command {
     ///
     /// Memory reads and writes are routed through a running daemon process via
     /// the Unix socket so that only the daemon ever writes to SQLite.
-    /// If no daemon is reachable, memory operations are silently skipped.
+    /// If no daemon is reachable, memory operations are skipped; connection
+    /// failures are logged (writes at warning level, reads at debug level).
     ///
     /// Example: amaebi acp
     Acp {

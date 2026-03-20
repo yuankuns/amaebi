@@ -138,12 +138,8 @@ async fn run_memory(action: cli::MemoryAction, socket: std::path::PathBuf) -> Re
     match action {
         cli::MemoryAction::List => {
             let db_path = memory_db::db_path()?;
-            let entries = if db_path.exists() {
-                let conn = memory_db::init_db(&db_path)?;
-                memory_db::get_recent(&conn, 40)?
-            } else {
-                vec![]
-            };
+            let conn = memory_db::init_db(&db_path)?;
+            let entries = memory_db::get_recent(&conn, 40)?;
             if entries.is_empty() {
                 println!("No memories stored.");
             } else {
@@ -160,12 +156,8 @@ async fn run_memory(action: cli::MemoryAction, socket: std::path::PathBuf) -> Re
         }
         cli::MemoryAction::Search { query } => {
             let db_path = memory_db::db_path()?;
-            let entries = if db_path.exists() {
-                let conn = memory_db::init_db(&db_path)?;
-                memory_db::search_relevant(&conn, &query, 20)?
-            } else {
-                vec![]
-            };
+            let conn = memory_db::init_db(&db_path)?;
+            let entries = memory_db::search_relevant(&conn, &query, 20)?;
             if entries.is_empty() {
                 println!("No matches for {:?}.", query);
             } else {
@@ -195,12 +187,8 @@ async fn run_memory(action: cli::MemoryAction, socket: std::path::PathBuf) -> Re
         }
         cli::MemoryAction::Count => {
             let db_path = memory_db::db_path()?;
-            let n = if db_path.exists() {
-                let conn = memory_db::init_db(&db_path)?;
-                memory_db::count(&conn)?
-            } else {
-                0
-            };
+            let conn = memory_db::init_db(&db_path)?;
+            let n = memory_db::count(&conn)?;
             println!("{n}");
             Ok(())
         }

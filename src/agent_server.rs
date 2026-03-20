@@ -5,12 +5,14 @@
 //! communicate with it via JSON-RPC without going through the Unix-socket
 //! daemon.
 //!
-//! **Memory architecture**: all SQLite reads and writes are routed through
-//! a running daemon process via the Unix socket (see [`Request::StoreMemory`]
-//! and [`Request::RetrieveContext`]).  If no daemon is reachable, memory
-//! operations are skipped with a warning so the ACP agent never opens its
-//! own SQLite connection.  This ensures only one process ever writes to
-//! `~/.amaebi/memory.db` at a time.
+//! **Memory architecture**: all SQLite reads and writes for this ACP agent
+//! are routed through a running daemon process via the Unix socket (see
+//! [`Request::StoreMemory`] and [`Request::RetrieveContext`]).  The ACP agent
+//! never opens its own SQLite connection.  If no daemon is reachable, memory
+//! operations are skipped (writes logged at warn level, reads at debug) so
+//! the ACP session continues uninterrupted.  Note that other CLI subcommands
+//! (e.g. `amaebi memory clear`) write to SQLite directly; the daemon is the
+//! primary — not exclusive — writer.
 //!
 //! Entry point: [`run`].
 
@@ -150,7 +152,7 @@ async fn acp_build_messages(prompt: &str, socket: &std::path::Path) -> Vec<Messa
 
     let mut messages = vec![Message::system(system.to_owned())];
 
-    // Inject config files from ~/.amaebi/.
+    // Inject global config files (AGENTS.md, SOUL.md) from ~/.amaebi/.
     inject_skill_files(&mut messages).await;
 
     // Retrieve context from the daemon via IPC (no direct SQLite access).

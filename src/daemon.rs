@@ -420,10 +420,11 @@ where
 // Skill-file injection
 // ---------------------------------------------------------------------------
 
-/// Read config files from `~/.amaebi/` and inject them as system messages.
+/// Read global config files from `~/.amaebi/` and inject them as system messages.
 ///
-/// `AGENTS.md` and `SOUL.md` are loaded directly from `~/.amaebi/`.
-/// Files that do not exist or are whitespace-only are silently skipped.
+/// Loads `AGENTS.md` and `SOUL.md` from the user's amaebi home directory
+/// (`~/.amaebi/`).  Files that do not exist or are whitespace-only are
+/// silently skipped.  No per-project or CWD-relative files are read.
 pub(crate) async fn inject_skill_files(messages: &mut Vec<Message>) {
     let home = match amaebi_home() {
         Ok(p) => p,
