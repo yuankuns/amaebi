@@ -12,7 +12,6 @@
 //! SQLite's WAL mode allows concurrent readers without blocking.
 
 use std::collections::HashSet;
-use std::io::BufRead;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -114,14 +113,6 @@ pub fn init_db(path: &Path) -> Result<Connection> {
     conn.execute_batch(SCHEMA)
         .context("applying memory DB schema")?;
 
-    // One-time migration from legacy JSONL file.
-    if let Some(parent) = path.parent() {
-        let jsonl = parent.join("memory.jsonl");
-        if let Err(e) = migrate_jsonl(&jsonl, &conn) {
-            tracing::warn!(error = %e, "memory.jsonl migration failed (non-fatal)");
-        }
-    }
-
     Ok(conn)
 }
 
@@ -209,102 +200,6 @@ pub fn clear(conn: &Connection) -> Result<()> {
     .context("clearing memories")
 }
 
-/// Import all entries from a legacy `memory.jsonl` file into the open DB.
-///
-/// Only runs when the DB is empty to avoid re-importing on subsequent starts.
-/// Renames the JSONL file to `memory.jsonl.migrated` on success.
-pub fn migrate_jsonl(jsonl_path: &Path, conn: &Connection) -> Result<()> {
-    if !jsonl_path.exists() {
-        return Ok(());
-    }
-
-    // Only migrate into an empty database to avoid duplicates.
-    let existing: i64 = conn
-        .query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0))
-        .context("checking memory count for migration")?;
-    if existing > 0 {
-        return Ok(());
-    }
-
-    tracing::info!(path = %jsonl_path.display(), "migrating memory.jsonl to SQLite");
-
-    let file = std::fs::File::open(jsonl_path)
-        .with_context(|| format!("opening {}", jsonl_path.display()))?;
-
-    #[derive(serde::Deserialize)]
-    struct JsonlEntry {
-        timestamp: String,
-        user: String,
-        assistant: String,
-    }
-
-    // A transaction makes bulk inserts orders of magnitude faster.
-    conn.execute_batch("BEGIN")
-        .context("beginning migration transaction")?;
-
-    let mut line_no: u64 = 0;
-    let mut imported: u64 = 0;
-
-    for raw in std::io::BufReader::new(file).lines() {
-        line_no += 1;
-        let raw = match raw {
-            Ok(l) => l,
-            Err(e) => {
-                tracing::warn!(line_no, error = %e, "skipping unreadable migration line");
-                continue;
-            }
-        };
-        let l = raw.trim();
-        if l.is_empty() {
-            continue;
-        }
-        match serde_json::from_str::<JsonlEntry>(l) {
-            Ok(entry) => {
-                let ts = &entry.timestamp;
-                if let Err(e) = conn.execute(
-                    "INSERT INTO memories (timestamp, session_id, role, content, summary)
-                     VALUES (?1, '', 'user', ?2, '')",
-                    params![ts, entry.user],
-                ) {
-                    tracing::warn!(line_no, error = %e, "failed to migrate user row");
-                } else {
-                    imported += 1;
-                }
-                if let Err(e) = conn.execute(
-                    "INSERT INTO memories (timestamp, session_id, role, content, summary)
-                     VALUES (?1, '', 'assistant', ?2, '')",
-                    params![ts, entry.assistant],
-                ) {
-                    tracing::warn!(line_no, error = %e, "failed to migrate assistant row");
-                } else {
-                    imported += 1;
-                }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    line_no,
-                    error = %e,
-                    bytes = l.len(),
-                    "skipping malformed migration entry"
-                );
-            }
-        }
-    }
-
-    conn.execute_batch("COMMIT")
-        .context("committing migration transaction")?;
-
-    tracing::info!(imported, "memory.jsonl migration complete");
-
-    // Rename rather than delete — keeps a recoverable backup.
-    let migrated = jsonl_path.with_extension("jsonl.migrated");
-    if let Err(e) = std::fs::rename(jsonl_path, &migrated) {
-        tracing::warn!(error = %e, "could not rename memory.jsonl after migration");
-    }
-
-    Ok(())
-}
-
 // ---------------------------------------------------------------------------
 // Retrieval helper used by build_messages
 // ---------------------------------------------------------------------------
@@ -365,7 +260,6 @@ fn escape_fts5_query(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::with_temp_home;
 
     fn open_test_db() -> (Connection, tempfile::TempDir) {
         let dir = tempfile::TempDir::new().unwrap();
@@ -523,31 +417,6 @@ mod tests {
             ctx.len(),
             "context must not contain duplicate entries"
         );
-    }
-
-    #[test]
-    fn test_migrate_jsonl() {
-        let _guard = with_temp_home();
-        // Create a mock memory.jsonl in the temp home.
-        let home = std::env::var("HOME").unwrap();
-        let amaebi_dir = std::path::PathBuf::from(&home).join(".amaebi");
-        std::fs::create_dir_all(&amaebi_dir).unwrap();
-        let jsonl_path = amaebi_dir.join("memory.jsonl");
-        std::fs::write(
-            &jsonl_path,
-            "{\"timestamp\":\"2026-01-01T00:00:00Z\",\"user\":\"hi\",\"assistant\":\"hello\"}\n",
-        )
-        .unwrap();
-
-        let db_path = amaebi_dir.join("memory.db");
-        let conn = init_db(&db_path).unwrap();
-        // init_db triggers migration automatically.
-        assert_eq!(count(&conn).unwrap(), 2); // user + assistant rows
-        assert!(
-            !jsonl_path.exists(),
-            "jsonl should be renamed after migration"
-        );
-        assert!(jsonl_path.with_extension("jsonl.migrated").exists());
     }
 
     #[test]

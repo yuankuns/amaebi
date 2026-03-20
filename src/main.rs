@@ -9,7 +9,6 @@ mod client;
 mod copilot;
 mod daemon;
 mod ipc;
-mod memory;
 mod memory_db;
 mod models;
 #[cfg(test)]
@@ -188,9 +187,7 @@ async fn run_memory(action: cli::MemoryAction, socket: std::path::PathBuf) -> Re
                 let conn = memory_db::init_db(&db_path)?;
                 memory_db::clear(&conn)?;
             }
-            // Also clear legacy JSONL.
-            memory::clear()?;
-            // Best-effort: notify a running daemon to clear its in-memory cache.
+            // Best-effort: notify a running daemon to also clear its SQLite DB.
             // Silently ignores connection failures (daemon may not be running).
             notify_daemon_cache_clear(&socket).await;
             println!("Memory cleared.");
