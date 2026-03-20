@@ -81,8 +81,6 @@ const EVICTION_INTERVAL: Duration = Duration::from_secs(5 * 60);
 /// A single user/assistant exchange stored in per-session in-memory history.
 #[derive(Clone, Debug)]
 pub struct MemoryEntry {
-    /// RFC 3339 timestamp of the exchange.
-    pub timestamp: String,
     /// The user's prompt (possibly truncated).
     pub user: String,
     /// The assistant's response (possibly truncated).
@@ -185,15 +183,16 @@ impl SessionStore {
         }
     }
 
-    /// Remove all sessions from the store.
-    pub async fn clear(&self) {
-        self.inner.lock().await.clear();
-    }
-
     /// Return the number of tracked sessions.
     #[allow(dead_code)]
     pub async fn len(&self) -> usize {
         self.inner.lock().await.len()
+    }
+
+    /// Remove all sessions from the store.
+    #[cfg(test)]
+    pub async fn clear(&self) {
+        self.inner.lock().await.clear();
     }
 
     /// Evict sessions that have been inactive longer than their tier's TTL.
@@ -420,8 +419,7 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                 let session_arc = state.sessions.get_or_create(&sid).await;
                 let mut session = session_arc.lock().await;
                 session.last_active = Instant::now();
-                let mut messages =
-                    build_messages(&prompt, tmux_pane.as_deref(), &session.history);
+                let mut messages = build_messages(&prompt, tmux_pane.as_deref(), &session.history);
                 inject_skill_files(&mut messages).await;
 
                 // Use a sink writer — output frames are discarded; we only
@@ -432,7 +430,6 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                 match run_agentic_loop(&state, &model, messages, &mut sink, &mut steer_rx).await {
                     Ok(final_text) => {
                         let entry = MemoryEntry {
-                            timestamp: chrono::Utc::now().to_rfc3339(),
                             user: truncate_chars(prompt.clone(), MAX_PROMPT_CHARS),
                             assistant: truncate_chars(final_text.clone(), MAX_RESPONSE_CHARS),
                         };
@@ -527,7 +524,6 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
             match run_agentic_loop(&state, &model, messages, &mut writer, &mut steer_rx).await {
                 Ok(response_text) => {
                     let entry = MemoryEntry {
-                        timestamp: chrono::Utc::now().to_rfc3339(),
                         user: truncate_chars(prompt.clone(), MAX_PROMPT_CHARS),
                         assistant: truncate_chars(response_text.clone(), MAX_RESPONSE_CHARS),
                     };
@@ -620,7 +616,6 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
             match run_agentic_loop(&state, &model, messages, &mut writer, &mut steer_rx).await {
                 Ok(response_text) => {
                     let entry = MemoryEntry {
-                        timestamp: chrono::Utc::now().to_rfc3339(),
                         user: truncate_chars(prompt.clone(), MAX_PROMPT_CHARS),
                         assistant: truncate_chars(response_text.clone(), MAX_RESPONSE_CHARS),
                     };
@@ -689,42 +684,6 @@ fn truncate_chars(s: String, max: usize) -> String {
 // ---------------------------------------------------------------------------
 // Memory helpers — canonical DB access for daemon and ACP agent
 // ---------------------------------------------------------------------------
-
-/// Retrieve conversation context for `prompt` from SQLite.
-///
-/// Returns the last 4 turns (recency) plus up to 10 FTS-relevant entries,
-/// deduplicated and sorted chronologically, as `Message` values ready for
-/// injection into a Copilot API request.
-pub(crate) async fn retrieve_memory_context(state: &DaemonState, prompt: &str) -> Vec<Message> {
-    let db = Arc::clone(&state.db);
-    let prompt_owned = prompt.to_owned();
-    match tokio::task::spawn_blocking(move || {
-        let conn = db.lock().unwrap_or_else(|p| p.into_inner());
-        memory_db::retrieve_context(&conn, &prompt_owned, 4, 10)
-    })
-    .await
-    {
-        Ok(Ok(entries)) => entries
-            .into_iter()
-            .map(|e| {
-                let content = truncate_chars(e.content, MAX_HISTORY_CHARS);
-                if e.role == "user" {
-                    Message::user(content)
-                } else {
-                    Message::assistant(Some(content), vec![])
-                }
-            })
-            .collect(),
-        Ok(Err(e)) => {
-            tracing::warn!(error = %e, "failed to load memory context from SQLite");
-            vec![]
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "memory context load task panicked");
-            vec![]
-        }
-    }
-}
 
 /// Persist a user/assistant exchange to SQLite.
 ///
@@ -1078,7 +1037,6 @@ mod tests {
 
     fn make_entry(user: &str, assistant: &str) -> MemoryEntry {
         MemoryEntry {
-            timestamp: "2024-01-01T00:00:00Z".to_string(),
             user: user.to_string(),
             assistant: assistant.to_string(),
         }

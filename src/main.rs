@@ -410,7 +410,9 @@ fn run_cache(action: cli::CacheAction) -> Result<()> {
 
             // 2. Prune memory entries (max_memory not supported with SQLite backend).
             if let Some(_max) = max_memory {
-                tracing::warn!("--max-memory is not supported in the SQLite memory backend; ignoring");
+                tracing::warn!(
+                    "--max-memory is not supported in the SQLite memory backend; ignoring"
+                );
             }
 
             Ok(())
