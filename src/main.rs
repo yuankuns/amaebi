@@ -6,6 +6,7 @@ mod auth;
 mod auth_flow;
 mod cli;
 mod client;
+mod config;
 mod copilot;
 mod daemon;
 mod ipc;
@@ -50,6 +51,7 @@ async fn main() -> Result<()> {
         cli::Command::Models => models::run().await,
         cli::Command::Memory { action, socket } => run_memory(action, socket).await,
         cli::Command::Session { action } => run_session(action),
+        cli::Command::Cache { action } => run_cache(action),
     }
 }
 
@@ -197,8 +199,130 @@ fn run_session(action: cli::SessionAction) -> Result<()> {
             let id = session::reset(&cwd)?;
             println!("{id}");
         }
+        cli::SessionAction::Status => {
+            let entries = session::list_all()?;
+            if entries.is_empty() {
+                println!("No sessions.");
+            } else {
+                let mut entries: Vec<_> = entries.into_iter().collect();
+                entries.sort_by(|a, b| b.1.last_accessed.cmp(&a.1.last_accessed));
+                for (dir, rec) in &entries {
+                    println!(
+                        "{}\n  uuid:     {}\n  created:  {}\n  accessed: {}\n  tier:     {}\n",
+                        dir, rec.uuid, rec.created_at, rec.last_accessed, rec.ttl_tier
+                    );
+                }
+                println!("{} session(s) total.", entries.len());
+            }
+        }
+        cli::SessionAction::Clear {
+            dry_run,
+            default_ttl,
+            ephemeral_ttl,
+            persistent_ttl,
+        } => {
+            let mut ttls = std::collections::HashMap::new();
+            ttls.insert("default".to_string(), default_ttl);
+            ttls.insert("ephemeral".to_string(), ephemeral_ttl);
+            ttls.insert("persistent".to_string(), persistent_ttl);
+
+            let removed = session::clear_expired(&ttls, dry_run)?;
+            if removed.is_empty() {
+                println!("No expired sessions.");
+            } else {
+                let verb = if dry_run { "Would remove" } else { "Removed" };
+                for (dir, rec) in &removed {
+                    println!(
+                        "{verb}: {} (uuid: {}, last: {}, tier: {})",
+                        dir, rec.uuid, rec.last_accessed, rec.ttl_tier
+                    );
+                }
+                println!("\n{} {} session(s).", verb, removed.len());
+            }
+        }
+        cli::SessionAction::SetTier { tier } => {
+            let uuid = session::get_or_create_with_tier(&cwd, &tier)?;
+            println!("Session {uuid} set to tier \"{tier}\"");
+        }
     }
     Ok(())
+}
+
+fn run_cache(action: cli::CacheAction) -> Result<()> {
+    match action {
+        cli::CacheAction::Prune {
+            max_memory,
+            dry_run,
+            aggressive,
+        } => {
+            let verb = if dry_run { "Would prune" } else { "Pruned" };
+
+            // 1. Prune expired sessions.
+            let cfg = config::Config::load();
+            let session_count = if aggressive {
+                // Aggressive mode: remove ALL sessions from sessions.json.
+                let all = session::list_all()?;
+                let count = all.len();
+                if !dry_run && count > 0 {
+                    // Use clear_expired with TTL of 0 to expire everything.
+                    let mut ttls = std::collections::HashMap::new();
+                    ttls.insert("default".to_string(), 0u64);
+                    ttls.insert("ephemeral".to_string(), 0u64);
+                    ttls.insert("persistent".to_string(), 0u64);
+                    let _ = session::clear_expired(&ttls, false)?;
+                }
+                count
+            } else {
+                // Use config-based TTLs for tier-aware expiry.
+                let mut ttls = std::collections::HashMap::new();
+                let default_secs = cfg.default_ttl().as_secs();
+                ttls.insert("default".to_string(), default_secs);
+                ttls.insert("ephemeral".to_string(), 300u64);
+                ttls.insert("persistent".to_string(), 86400u64);
+                // Merge any per-tier overrides from config ttl_minutes.
+                for (key, &minutes) in &cfg.ttl_minutes {
+                    if key != "default" && !key.starts_with('/') {
+                        ttls.insert(key.clone(), minutes * 60);
+                    }
+                }
+                let removed = session::clear_expired(&ttls, dry_run)?;
+                removed.len()
+            };
+            println!("{verb} {session_count} session(s).");
+
+            // 2. Prune memory entries.
+            if let Some(max) = max_memory {
+                let removed = memory::prune(max, dry_run)?;
+                println!("{verb} {removed} memory entry/entries (keeping {max}).");
+            }
+
+            Ok(())
+        }
+        cli::CacheAction::Stats => {
+            let sessions = session::list_all()?;
+            let mem_count = memory::count()?;
+            let mem_bytes = memory::disk_usage()?;
+
+            println!("Sessions: {}", sessions.len());
+            for (dir, rec) in &sessions {
+                println!("  {} ({}, tier: {})", dir, rec.uuid, rec.ttl_tier);
+            }
+            println!("\nMemory entries: {mem_count}");
+            println!("Memory disk usage: {}", format_bytes(mem_bytes));
+
+            Ok(())
+        }
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    }
 }
 
 /// Tell a running daemon to flush its in-memory conversation cache.

@@ -13,11 +13,62 @@ use crate::memory::{self, MemoryEntry};
 use crate::tools::{self, ToolExecutor};
 
 // ---------------------------------------------------------------------------
-// Session TTL
+// Session TTL tiers
 // ---------------------------------------------------------------------------
 
-/// Sessions inactive longer than this are evicted from the in-memory store.
-const SESSION_TTL: Duration = Duration::from_secs(30 * 60);
+/// Default TTL tiers for in-memory session eviction.
+///
+/// These can be overridden via `AMAEBI_SESSION_TTL_<TIER>` env vars (seconds).
+pub struct TtlConfig {
+    pub tiers: HashMap<String, Duration>,
+}
+
+impl TtlConfig {
+    pub fn from_env() -> Self {
+        let mut tiers = HashMap::new();
+        tiers.insert("default".to_string(), Duration::from_secs(30 * 60));
+        tiers.insert("ephemeral".to_string(), Duration::from_secs(5 * 60));
+        tiers.insert("persistent".to_string(), Duration::from_secs(24 * 60 * 60));
+
+        // Load from ~/.amaebi/config.json if present.
+        let cfg = crate::config::Config::load();
+        if let Some(&minutes) = cfg.ttl_minutes.get("default") {
+            tiers.insert("default".to_string(), Duration::from_secs(minutes * 60));
+        }
+        // Non-path keys in ttl_minutes that aren't "default" are tier names.
+        for (key, &minutes) in &cfg.ttl_minutes {
+            if key != "default" && !key.starts_with('/') {
+                tiers.insert(key.clone(), Duration::from_secs(minutes * 60));
+            }
+        }
+
+        // Allow env overrides: AMAEBI_SESSION_TTL_DEFAULT=3600, etc.
+        for (key, val) in std::env::vars() {
+            if let Some(tier) = key
+                .strip_prefix("AMAEBI_SESSION_TTL_")
+                .map(|s| s.to_lowercase())
+            {
+                if let Ok(secs) = val.parse::<u64>() {
+                    tiers.insert(tier, Duration::from_secs(secs));
+                }
+            }
+        }
+
+        Self { tiers }
+    }
+
+    pub fn ttl_for(&self, tier: &str) -> Duration {
+        self.tiers
+            .get(tier)
+            .copied()
+            .unwrap_or_else(|| {
+                self.tiers
+                    .get("default")
+                    .copied()
+                    .unwrap_or(Duration::from_secs(30 * 60))
+            })
+    }
+}
 
 /// How many history entries to inject as context when building messages.
 const MAX_HISTORY: usize = 20;
@@ -40,6 +91,8 @@ pub struct Session {
     pub history: Vec<MemoryEntry>,
     /// Updated at the start of each request; used for TTL eviction.
     pub last_active: Instant,
+    /// TTL tier label — determines eviction timing.
+    pub ttl_tier: String,
 }
 
 impl Session {
@@ -47,6 +100,15 @@ impl Session {
         Self {
             history: Vec::new(),
             last_active: Instant::now(),
+            ttl_tier: "default".to_string(),
+        }
+    }
+
+    fn with_tier(tier: &str) -> Self {
+        Self {
+            history: Vec::new(),
+            last_active: Instant::now(),
+            ttl_tier: tier.to_string(),
         }
     }
 }
@@ -63,21 +125,25 @@ impl Session {
 /// serialising same-session requests.
 pub struct SessionStore {
     inner: tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<Session>>>>,
+    pub ttl_config: TtlConfig,
 }
 
 impl SessionStore {
     pub fn new() -> Self {
         Self {
             inner: tokio::sync::Mutex::new(HashMap::new()),
+            ttl_config: TtlConfig::from_env(),
         }
     }
 
     /// Retrieve (or create) the `Arc<Mutex<Session>>` for `session_id`.
     ///
-    /// The top-level lock is released before returning, so callers can hold
-    /// the per-session lock for an arbitrarily long time without blocking
+    /// Uses a two-phase approach: first check if the key exists (read-only),
+    /// then insert only if missing.  The top-level lock is released before
+    /// returning so callers can hold the per-session lock without blocking
     /// other sessions.
     pub async fn get_or_create(&self, session_id: &str) -> Arc<tokio::sync::Mutex<Session>> {
+        // Single lock acquisition — the map lock is held only briefly.
         let mut map = self.inner.lock().await;
         if let Some(arc) = map.get(session_id) {
             Arc::clone(arc)
@@ -88,22 +154,43 @@ impl SessionStore {
         }
     }
 
-    /// Remove all sessions from the store.  Called when the user runs
-    /// `amaebi memory clear` so stale context is not served after a wipe.
+    /// Retrieve (or create) with a specific TTL tier.
+    pub async fn get_or_create_with_tier(
+        &self,
+        session_id: &str,
+        tier: &str,
+    ) -> Arc<tokio::sync::Mutex<Session>> {
+        let mut map = self.inner.lock().await;
+        if let Some(arc) = map.get(session_id) {
+            Arc::clone(arc)
+        } else {
+            let arc = Arc::new(tokio::sync::Mutex::new(Session::with_tier(tier)));
+            map.insert(session_id.to_string(), Arc::clone(&arc));
+            arc
+        }
+    }
+
+    /// Remove all sessions from the store.
     pub async fn clear(&self) {
         self.inner.lock().await.clear();
     }
 
-    /// Evict sessions that have been inactive longer than [`SESSION_TTL`].
+    /// Return the number of tracked sessions.
+    pub async fn len(&self) -> usize {
+        self.inner.lock().await.len()
+    }
+
+    /// Evict sessions that have been inactive longer than their tier's TTL.
     ///
     /// Sessions that are currently locked (actively running an agentic loop)
     /// are never evicted — `try_lock` returns `Err` in that case.
     pub async fn evict_expired(&self) {
         let mut map = self.inner.lock().await;
         let before = map.len();
+        let config = &self.ttl_config;
         map.retain(|_, arc| {
             if let Ok(session) = arc.try_lock() {
-                session.last_active.elapsed() < SESSION_TTL
+                session.last_active.elapsed() < config.ttl_for(&session.ttl_tier)
             } else {
                 true // actively in use — keep it
             }
@@ -585,17 +672,15 @@ mod tests {
     #[tokio::test]
     async fn session_store_evict_expired_removes_stale() {
         let store = SessionStore::new();
-        // Insert a session and manually backdate last_active beyond TTL.
+        let default_ttl = store.ttl_config.ttl_for("default");
         {
             let arc = store.get_or_create("stale").await;
             let mut s = arc.lock().await;
-            // Subtract more than SESSION_TTL so it appears expired.
             s.last_active = Instant::now()
-                .checked_sub(SESSION_TTL + Duration::from_secs(1))
+                .checked_sub(default_ttl + Duration::from_secs(1))
                 .expect("test clock arithmetic");
         }
         store.evict_expired().await;
-        // The map should now be empty.
         let map = store.inner.lock().await;
         assert!(map.is_empty());
     }
@@ -607,6 +692,47 @@ mod tests {
         store.evict_expired().await;
         let map = store.inner.lock().await;
         assert!(map.contains_key("active"));
+    }
+
+    #[tokio::test]
+    async fn session_store_multi_tier_eviction() {
+        let store = SessionStore::new();
+        let ephemeral_ttl = store.ttl_config.ttl_for("ephemeral");
+        let persistent_ttl = store.ttl_config.ttl_for("persistent");
+
+        // Create an ephemeral session backdated past ephemeral TTL but within persistent TTL.
+        {
+            let arc = store.get_or_create_with_tier("eph", "ephemeral").await;
+            let mut s = arc.lock().await;
+            s.last_active = Instant::now()
+                .checked_sub(ephemeral_ttl + Duration::from_secs(1))
+                .expect("clock");
+        }
+        // Create a persistent session backdated the same amount.
+        {
+            let arc = store.get_or_create_with_tier("persist", "persistent").await;
+            let mut s = arc.lock().await;
+            s.last_active = Instant::now()
+                .checked_sub(ephemeral_ttl + Duration::from_secs(1))
+                .expect("clock");
+        }
+
+        store.evict_expired().await;
+        let map = store.inner.lock().await;
+        // Ephemeral should be evicted, persistent should survive.
+        assert!(!map.contains_key("eph"), "ephemeral session should be evicted");
+        assert!(map.contains_key("persist"), "persistent session should survive");
+    }
+
+    #[tokio::test]
+    async fn session_store_len() {
+        let store = SessionStore::new();
+        assert_eq!(store.len().await, 0);
+        store.get_or_create("a").await;
+        store.get_or_create("b").await;
+        assert_eq!(store.len().await, 2);
+        store.clear().await;
+        assert_eq!(store.len().await, 0);
     }
 
     // ---- truncate_chars tests ----------------------------------------------

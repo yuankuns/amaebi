@@ -71,6 +71,11 @@ pub enum Command {
         #[command(subcommand)]
         action: SessionAction,
     },
+    /// Manage cache state (sessions, memory, disk usage).
+    Cache {
+        #[command(subcommand)]
+        action: CacheAction,
+    },
 }
 
 #[derive(clap::Subcommand, Debug)]
@@ -100,4 +105,48 @@ pub enum SessionAction {
     /// The old conversation context is abandoned; the next `amaebi ask` will
     /// start with a blank slate.
     New,
+    /// List all session mappings with their last-access timestamps.
+    Status,
+    /// Clear expired session entries from `~/.amaebi/sessions.json`.
+    Clear {
+        /// Show which entries would be evicted without actually removing them.
+        #[arg(long)]
+        dry_run: bool,
+        /// TTL in seconds for the "default" tier (default: 1800).
+        #[arg(long, default_value = "1800")]
+        default_ttl: u64,
+        /// TTL in seconds for the "ephemeral" tier (default: 300).
+        #[arg(long, default_value = "300")]
+        ephemeral_ttl: u64,
+        /// TTL in seconds for the "persistent" tier (default: 86400).
+        #[arg(long, default_value = "86400")]
+        persistent_ttl: u64,
+    },
+    /// Set the TTL tier for the current directory's session.
+    SetTier {
+        /// Tier name (e.g. "default", "ephemeral", "persistent").
+        tier: String,
+    },
+}
+
+#[derive(clap::Subcommand, Debug)]
+pub enum CacheAction {
+    /// Prune stale history and session allocation state.
+    ///
+    /// Removes expired sessions from `sessions.json` and optionally trims
+    /// the memory JSONL file to a maximum number of entries.
+    Prune {
+        /// Maximum memory entries to keep (oldest are removed first).
+        /// Defaults to keeping all entries.
+        #[arg(long)]
+        max_memory: Option<usize>,
+        /// Show what would be pruned without actually doing it.
+        #[arg(long)]
+        dry_run: bool,
+        /// Force prune ALL sessions (ignores TTL; keeps only active ones).
+        #[arg(long)]
+        aggressive: bool,
+    },
+    /// Show cache statistics (session count, memory entry count, disk usage).
+    Stats,
 }

@@ -328,6 +328,85 @@ pub fn count() -> Result<usize> {
 }
 
 // ---------------------------------------------------------------------------
+// Pruning
+// ---------------------------------------------------------------------------
+
+/// Prune memory entries, keeping only the most recent `max_keep` entries.
+///
+/// Returns the number of entries removed.  If `dry_run` is true, no changes
+/// are made to the file.
+pub fn prune(max_keep: usize, dry_run: bool) -> Result<usize> {
+    let path = memory_path()?;
+
+    let lock_file = open_lock_file()?;
+    lock_file
+        .lock_exclusive()
+        .context("acquiring exclusive memory lock for prune")?;
+
+    let result = (|| {
+        if !path.exists() {
+            return Ok(0usize);
+        }
+
+        let file =
+            std::fs::File::open(&path).with_context(|| format!("opening {}", path.display()))?;
+
+        let mut lines: Vec<String> = Vec::new();
+        for line in std::io::BufReader::new(&file).lines() {
+            let line = line.with_context(|| format!("reading {}", path.display()))?;
+            if !line.trim().is_empty() {
+                lines.push(line);
+            }
+        }
+
+        if lines.len() <= max_keep {
+            return Ok(0);
+        }
+
+        let to_remove = lines.len() - max_keep;
+
+        if !dry_run {
+            // Keep only the tail (most recent entries).
+            let kept = &lines[to_remove..];
+            let tmp = path.with_extension("jsonl.prune.tmp");
+            {
+                let mut out = std::fs::OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .truncate(true)
+                    .mode(0o600)
+                    .open(&tmp)
+                    .with_context(|| format!("creating {}", tmp.display()))?;
+                for line in kept {
+                    use std::io::Write;
+                    writeln!(out, "{}", line)?;
+                }
+            }
+            std::fs::rename(&tmp, &path)
+                .with_context(|| format!("renaming {} to {}", tmp.display(), path.display()))?;
+        }
+
+        Ok(to_remove)
+    })();
+
+    lock_file
+        .unlock()
+        .context("releasing exclusive memory lock")?;
+
+    result
+}
+
+/// Return the disk size of the memory file in bytes.
+pub fn disk_usage() -> Result<u64> {
+    let path = memory_path()?;
+    if !path.exists() {
+        return Ok(0);
+    }
+    let meta = std::fs::metadata(&path)?;
+    Ok(meta.len())
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
