@@ -2,11 +2,27 @@ use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 
 use crate::ipc::{write_frame, Response};
 
 const CHAT_ENDPOINT: &str = "https://api.githubcopilot.com/chat/completions";
+
+// ---------------------------------------------------------------------------
+// Retry policy constants
+// ---------------------------------------------------------------------------
+
+/// How many times to retry transient failures (5xx, 429, network errors)
+/// before surfacing the error to the caller.
+const MAX_RETRIES: u32 = 3;
+
+/// Base delay for exponential backoff: attempt 0 → 1 s, 1 → 2 s, 2 → 4 s.
+const BACKOFF_BASE_MS: u64 = 1_000;
+
+/// Hard ceiling on a Retry-After value.  Prevents hanging for unreasonably
+/// long server-imposed back-off windows.
+const MAX_RETRY_AFTER_SECS: u64 = 30;
 
 // ---------------------------------------------------------------------------
 // Typed HTTP error — lets callers inspect the status and body
@@ -364,6 +380,22 @@ mod tests {
         assert_eq!(v["tool_call_id"], "cid");
     }
 
+    // ---- Retry helpers --------------------------------------------------
+
+    #[test]
+    fn backoff_delay_increases_exponentially() {
+        assert_eq!(backoff_delay(0), Duration::from_millis(1_000));
+        assert_eq!(backoff_delay(1), Duration::from_millis(2_000));
+        assert_eq!(backoff_delay(2), Duration::from_millis(4_000));
+    }
+
+    #[test]
+    fn backoff_delay_saturates_at_high_attempt() {
+        // Must not panic on large attempt numbers.
+        let _ = backoff_delay(30);
+        let _ = backoff_delay(u32::MAX);
+    }
+
     // ---- ToolCall::parse_args -------------------------------------------
 
     #[test]
@@ -404,16 +436,172 @@ mod tests {
 }
 
 // ---------------------------------------------------------------------------
+// Retry helpers
+// ---------------------------------------------------------------------------
+
+/// Exponential back-off delay for `attempt` (0-indexed).
+///
+/// Returns 1 s, 2 s, 4 s for attempts 0, 1, 2.  Saturates at u64::MAX ms
+/// but in practice MAX_RETRIES is 3 so the maximum is 4 s.
+pub(crate) fn backoff_delay(attempt: u32) -> Duration {
+    Duration::from_millis(BACKOFF_BASE_MS << attempt.min(10))
+}
+
+/// Parse the `Retry-After` response header into a `Duration`.
+///
+/// Accepts an integer number of seconds only (date-form is not handled).
+/// Caps the returned delay at [`MAX_RETRY_AFTER_SECS`] to prevent the daemon
+/// from sleeping for unreasonably long periods.
+pub(crate) fn parse_retry_after(resp: &reqwest::Response) -> Option<Duration> {
+    resp.headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(|secs| Duration::from_secs(secs.min(MAX_RETRY_AFTER_SECS)))
+}
+
+/// Send a single chat-completions POST to Copilot with a transparent retry
+/// policy for transient failures.
+///
+/// **Retry policy:**
+/// - **Transport / network errors** (connection reset, timeout, DNS failure):
+///   retry up to `MAX_RETRIES` times with exponential back-off.
+/// - **429 Too Many Requests**: retry up to `MAX_RETRIES` times; delay is
+///   taken from the `Retry-After` header when present, otherwise exponential
+///   back-off, capped at `MAX_RETRY_AFTER_SECS`.
+/// - **5xx Server Error**: retry up to `MAX_RETRIES` times with exponential
+///   back-off.
+/// - **4xx Client Error** (other than 429): returned immediately as
+///   [`CopilotHttpError`] without retrying; the caller is responsible for
+///   deciding whether to refresh the token and retry.
+///
+/// On success returns the raw `reqwest::Response` (status 2xx).
+async fn send_with_retry(
+    http: &reqwest::Client,
+    token: &str,
+    model: &str,
+    messages: &[Message],
+    tools: &[serde_json::Value],
+) -> Result<reqwest::Response> {
+    let body = serde_json::json!({
+        "model": model,
+        "messages": messages,
+        "tools": tools,
+        "stream": true,
+        "max_tokens": 4096,
+    });
+
+    let mut attempt = 0u32;
+    loop {
+        let result = http
+            .post(CHAT_ENDPOINT)
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json")
+            .header("Copilot-Integration-Id", "vscode-chat")
+            .header("Editor-Version", "vscode/1.90.0")
+            .header("User-Agent", concat!("amaebi/", env!("CARGO_PKG_VERSION")))
+            .json(&body)
+            .send()
+            .await;
+
+        match result {
+            // ── Success ────────────────────────────────────────────────────
+            Ok(resp) if resp.status().is_success() => return Ok(resp),
+
+            // ── 429 Too Many Requests ──────────────────────────────────────
+            Ok(resp) if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS => {
+                if attempt >= MAX_RETRIES {
+                    let status = resp.status();
+                    let body_text = resp
+                        .text()
+                        .await
+                        .unwrap_or_else(|_| "<unreadable body>".into());
+                    return Err(anyhow::Error::new(CopilotHttpError {
+                        status,
+                        body: body_text,
+                    }));
+                }
+                let delay = parse_retry_after(&resp).unwrap_or_else(|| backoff_delay(attempt));
+                tracing::warn!(
+                    attempt,
+                    delay_ms = delay.as_millis(),
+                    "Copilot rate-limited (429); backing off before retry"
+                );
+                tokio::time::sleep(delay).await;
+                attempt += 1;
+            }
+
+            // ── 5xx Server Error ───────────────────────────────────────────
+            Ok(resp) if resp.status().is_server_error() => {
+                if attempt >= MAX_RETRIES {
+                    let status = resp.status();
+                    let body_text = resp
+                        .text()
+                        .await
+                        .unwrap_or_else(|_| "<unreadable body>".into());
+                    return Err(anyhow::Error::new(CopilotHttpError {
+                        status,
+                        body: body_text,
+                    }));
+                }
+                let delay = backoff_delay(attempt);
+                tracing::warn!(
+                    attempt,
+                    status = %resp.status(),
+                    delay_ms = delay.as_millis(),
+                    "Copilot server error; retrying with exponential backoff"
+                );
+                tokio::time::sleep(delay).await;
+                attempt += 1;
+            }
+
+            // ── Other 4xx Client Error ─────────────────────────────────────
+            // Returned immediately — token refresh and higher-level retry are
+            // the caller's responsibility (see run_agentic_loop in daemon.rs).
+            Ok(resp) => {
+                let status = resp.status();
+                let body_text = resp
+                    .text()
+                    .await
+                    .unwrap_or_else(|_| "<unreadable body>".into());
+                return Err(anyhow::Error::new(CopilotHttpError {
+                    status,
+                    body: body_text,
+                }));
+            }
+
+            // ── Transport / network error ──────────────────────────────────
+            Err(e) => {
+                if attempt >= MAX_RETRIES {
+                    return Err(anyhow::Error::from(e).context("sending chat request to Copilot"));
+                }
+                let delay = backoff_delay(attempt);
+                tracing::warn!(
+                    attempt,
+                    error = %e,
+                    delay_ms = delay.as_millis(),
+                    "Copilot request failed (transport error); retrying"
+                );
+                tokio::time::sleep(delay).await;
+                attempt += 1;
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Public streaming function
 // ---------------------------------------------------------------------------
 
-/// Send a streaming chat-completions request to Copilot.
+/// Send a streaming chat-completions request to Copilot with built-in retry.
+///
+/// Delegates to [`send_with_retry`] for the HTTP layer (handles 5xx, 429,
+/// and transport errors transparently).  Auth errors (4xx other than 429) are
+/// surfaced as [`CopilotHttpError`] so the caller can refresh the token.
 ///
 /// Text chunks are forwarded to `writer` as `Response::Text` frames as they
-/// arrive.  The caller is responsible for writing `Response::Done` (so the
-/// agentic loop can decide whether to loop or finish).
-///
-/// Returns a `CopilotResponse` describing the full turn result.
+/// arrive.  Returns a [`CopilotResponse`] describing the full turn result.
 pub async fn stream_chat<W>(
     http: &reqwest::Client,
     token: &str,
@@ -425,41 +613,8 @@ pub async fn stream_chat<W>(
 where
     W: AsyncWriteExt + Unpin,
 {
-    let body = serde_json::json!({
-        "model": model,
-        "messages": messages,
-        "tools": tools,
-        "stream": true,
-        "max_tokens": 4096,
-    });
-
     tracing::debug!(messages = messages.len(), "sending chat request to Copilot");
-
-    let resp = http
-        .post(CHAT_ENDPOINT)
-        .header("Authorization", format!("Bearer {token}"))
-        .header("Content-Type", "application/json")
-        .header("Accept", "application/json")
-        .header("Copilot-Integration-Id", "vscode-chat")
-        .header("Editor-Version", "vscode/1.90.0")
-        .header("User-Agent", concat!("amaebi/", env!("CARGO_PKG_VERSION")))
-        .json(&body)
-        .send()
-        .await
-        .context("sending chat request to Copilot")?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body_text = resp
-            .text()
-            .await
-            .unwrap_or_else(|_| "<unreadable body>".into());
-        return Err(anyhow::Error::new(CopilotHttpError {
-            status,
-            body: body_text,
-        }));
-    }
-
+    let resp = send_with_retry(http, token, model, messages, tools).await?;
     parse_sse_stream(resp, writer).await
 }
 

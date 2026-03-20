@@ -301,30 +301,31 @@ where
             .await
             .context("refreshing Copilot API token inside agentic loop")?;
 
-        // On a 4xx response, the cached token may have been invalidated server-
-        // side before its nominal expiry (Copilot sometimes returns 400 instead
-        // of 401 for a silently-expired session).  Evict the cache and retry
-        // exactly once with a fresh token so the loop can self-heal.
+        // stream_chat already retries 5xx, 429, and transport errors internally.
+        // The only errors it surfaces here are auth-adjacent ones (400/401/403)
+        // where the cached token may have been silently invalidated server-side.
+        // On those, evict the cache and retry exactly once with a fresh token.
+        // Any other error (exhausted retries, context overflow, etc.) propagates.
         let resp =
             match copilot::stream_chat(&state.http, &token, model, &messages, &schemas, writer)
                 .await
             {
                 Ok(r) => r,
                 Err(e) => {
-                    let is_client_err = e
+                    let is_auth_err = e
                         .downcast_ref::<copilot::CopilotHttpError>()
-                        .is_some_and(|he| he.status.is_client_error());
-                    if is_client_err {
+                        .is_some_and(|he| matches!(he.status.as_u16(), 400 | 401 | 403));
+                    if is_auth_err {
                         tracing::warn!(
                             error = %e,
-                            "Copilot returned a 4xx; evicting token cache and retrying once"
+                            "Copilot auth error; evicting token cache and retrying once"
                         );
                         state.tokens.invalidate().await;
                         let fresh_token = state
                             .tokens
                             .get(&state.http)
                             .await
-                            .context("fetching fresh token after 4xx")?;
+                            .context("fetching fresh token after auth error")?;
                         copilot::stream_chat(
                             &state.http,
                             &fresh_token,
