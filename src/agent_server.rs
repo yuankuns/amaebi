@@ -343,7 +343,11 @@ pub async fn run(model: Option<String>, socket: PathBuf) -> Result<()> {
         .unwrap_or_else(|| "gpt-4o".to_string())
         .into();
 
-    let state = Arc::new(DaemonState::new().context("initialising daemon state")?);
+    let state = Arc::new(
+        DaemonState::new()
+            .await
+            .context("initialising daemon state")?,
+    );
 
     let outgoing = tokio::io::stdout().compat_write();
     let incoming = tokio::io::stdin().compat();

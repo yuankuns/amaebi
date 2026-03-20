@@ -31,12 +31,17 @@ pub struct DaemonState {
 }
 
 impl DaemonState {
-    pub fn new() -> Result<Self> {
+    /// Create a new `DaemonState`, opening the SQLite DB inside
+    /// `spawn_blocking` so the file I/O never blocks the async reactor.
+    pub async fn new() -> Result<Self> {
         let http = reqwest::Client::builder()
             .build()
             .context("building HTTP client")?;
         let db_path = memory_db::db_path().context("resolving memory DB path")?;
-        let conn = memory_db::init_db(&db_path).context("opening memory DB")?;
+        let conn = tokio::task::spawn_blocking(move || memory_db::init_db(&db_path))
+            .await
+            .unwrap_or_else(|e| Err(anyhow::anyhow!("DB init panicked: {e}")))
+            .context("opening memory DB")?;
         Ok(Self {
             http,
             tokens: TokenCache::new(),
@@ -61,7 +66,7 @@ pub async fn run(socket: PathBuf) -> Result<()> {
 
     tracing::info!(path = %socket.display(), "daemon listening");
 
-    let state = Arc::new(DaemonState::new()?);
+    let state = Arc::new(DaemonState::new().await?);
 
     loop {
         match listener.accept().await {
@@ -234,8 +239,9 @@ pub(crate) async fn retrieve_memory_context(state: &DaemonState, prompt: &str) -
 
 /// Persist a user/assistant exchange to SQLite.
 ///
-/// Acquires `memory_lock` to serialise concurrent writes within this process.
-/// Best-effort: errors are logged but not propagated.
+/// Runs inside `spawn_blocking`; locks `state.db` to serialise concurrent
+/// writes within this process.  Best-effort: errors are logged but not
+/// propagated.
 pub(crate) async fn store_conversation(state: &DaemonState, user: &str, assistant: &str) {
     let db = Arc::clone(&state.db);
     let user_owned = user.to_owned();
