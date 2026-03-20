@@ -148,10 +148,14 @@ impl acp::Agent for AmaebiAgent {
         let (result_tx, result_rx) = oneshot::channel::<Result<String, String>>();
 
         // Run the agentic loop in a background local task.
+        // ACP mode has no steering channel — create a channel and immediately
+        // drop the sender so the receiver is always empty.
+        let (_steer_tx, mut steer_rx) = tokio::sync::mpsc::channel::<String>(1);
         tokio::task::spawn_local(async move {
-            let outcome = run_agentic_loop(&state, &model, messages, &mut write_half)
-                .await
-                .map_err(|e| format!("{e:#}"));
+            let outcome =
+                run_agentic_loop(&state, &model, messages, &mut write_half, &mut steer_rx)
+                    .await
+                    .map_err(|e| format!("{e:#}"));
             let _ = result_tx.send(outcome);
             // Dropping write_half closes the pipe, signalling EOF to the reader.
         });
@@ -191,6 +195,11 @@ impl acp::Agent for AmaebiAgent {
                 Response::ToolUse { .. } => {
                     // Tool-use notifications are relevant in daemon/CLI mode
                     // but not exposed over ACP (the agent handles tools itself).
+                }
+                Response::SteerAck => {
+                    // ACP mode never sends Steer requests, so SteerAck should
+                    // never arrive here — log and continue.
+                    tracing::debug!("unexpected SteerAck in ACP mode");
                 }
             }
         }

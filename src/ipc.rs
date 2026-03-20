@@ -13,6 +13,17 @@ pub enum Request {
         /// Chat model to use (e.g. "gpt-4o").
         model: String,
     },
+    /// Inject a user correction into a running agentic loop on the same connection.
+    ///
+    /// The daemon drains these between model turns and injects each message as a
+    /// `user` turn, then responds with [`Response::SteerAck`].  If no agentic loop
+    /// is currently running for `session_id` this returns [`Response::Error`].
+    Steer {
+        /// Session UUID to steer (matches the `session_id` of the active `Chat`).
+        session_id: String,
+        /// The correction text to inject as a user message.
+        message: String,
+    },
     /// Ask the daemon to clear its in-memory conversation cache.
     ///
     /// Sent after `amaebi memory clear` so the running daemon does not serve
@@ -35,6 +46,8 @@ pub enum Response {
     Error { message: String },
     /// The agent is about to invoke a tool — the client may display this.
     ToolUse { name: String, detail: String },
+    /// Acknowledgement that a [`Request::Steer`] correction was injected.
+    SteerAck,
 }
 
 // ---------------------------------------------------------------------------
@@ -94,6 +107,29 @@ mod tests {
     }
 
     #[test]
+    fn request_steer_round_trip() {
+        let req = Request::Steer {
+            session_id: "abc-123".into(),
+            message: "no, keep the old signature".into(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["type"], "steer");
+        assert_eq!(v["session_id"], "abc-123");
+        assert_eq!(v["message"], "no, keep the old signature");
+        let back: Request = serde_json::from_str(&json).unwrap();
+        let Request::Steer {
+            session_id,
+            message,
+        } = back
+        else {
+            panic!("expected Steer variant");
+        };
+        assert_eq!(session_id, "abc-123");
+        assert_eq!(message, "no, keep the old signature");
+    }
+
+    #[test]
     fn request_clear_cache_round_trip() {
         let req = Request::ClearCache;
         let json = serde_json::to_string(&req).unwrap();
@@ -142,12 +178,26 @@ mod tests {
     }
 
     #[test]
+    fn response_steer_ack_has_snake_case_type() {
+        let v: serde_json::Value = serde_json::to_value(Response::SteerAck).unwrap();
+        assert_eq!(v["type"], "steer_ack");
+    }
+
+    #[test]
+    fn response_steer_ack_round_trip() {
+        let json = r#"{"type":"steer_ack"}"#;
+        let r: Response = serde_json::from_str(json).unwrap();
+        assert!(matches!(r, Response::SteerAck));
+    }
+
+    #[test]
     fn response_all_variants_round_trip() {
         let frames = [
             r#"{"type":"text","chunk":"hello"}"#,
             r#"{"type":"done"}"#,
             r#"{"type":"error","message":"fail"}"#,
             r#"{"type":"tool_use","name":"read_file","detail":"/tmp/x"}"#,
+            r#"{"type":"steer_ack"}"#,
         ];
         for frame in frames {
             let r: Response = serde_json::from_str(frame).unwrap();
@@ -157,6 +207,7 @@ mod tests {
                     | Response::Done
                     | Response::Error { .. }
                     | Response::ToolUse { .. }
+                    | Response::SteerAck
             ));
         }
     }

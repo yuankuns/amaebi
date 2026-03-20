@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use std::io::IsTerminal as _;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -50,6 +51,9 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
             "global".to_string()
         });
 
+    // Keep a copy for the steering requests and the exit footer.
+    let session_id_copy = session_id.clone();
+
     // Build and send the request as a single JSON line.
     let req = Request::Chat {
         prompt,
@@ -66,10 +70,21 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
 
     // Stream responses to stdout until Done or Error.
     // Interleave with SIGINT so we can implement double-Ctrl-C-to-exit.
+    // When stdout is a terminal, also read stdin so the user can steer the
+    // agent mid-flight by typing a line and pressing Enter.
     let mut lines = BufReader::new(reader).lines();
     let mut stdout = tokio::io::stdout();
     // Timestamp of the first Ctrl-C press; None means no pending first press.
     let mut last_ctrl_c: Option<Instant> = None;
+
+    // Stdin reader — only created when stdout is a TTY so that piped
+    // invocations (`amaebi ask "..." | grep foo`) never block on stdin.
+    let use_stdin = std::io::stdout().is_terminal();
+    let mut stdin_lines: Option<BufReader<tokio::io::Stdin>> = if use_stdin {
+        Some(BufReader::new(tokio::io::stdin()))
+    } else {
+        None
+    };
 
     loop {
         tokio::select! {
@@ -133,6 +148,37 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
                             _ => eprintln!("🔧 {name}: {detail}"),
                         }
                     }
+                    Response::SteerAck => {
+                        // The daemon has acknowledged our steering message.
+                        // No visible output — the next model turn will incorporate it.
+                        tracing::debug!("steer acknowledged by daemon");
+                    }
+                }
+            }
+
+            // Read a line from stdin and send it as a steering correction.
+            // This arm is disabled (pending forever) when stdout is not a TTY.
+            steer_line = next_stdin_line(&mut stdin_lines) => {
+                match steer_line {
+                    Some(text) => {
+                        let steer_req = Request::Steer {
+                            session_id: session_id_copy.clone(),
+                            message: text,
+                        };
+                        let mut frame =
+                            serde_json::to_string(&steer_req).context("serializing Steer")?;
+                        frame.push('\n');
+                        // If the daemon has already finished and closed the
+                        // connection, the write will fail — swallow the error
+                        // so the response loop can drain normally.
+                        let _ = writer.write_all(frame.as_bytes()).await;
+                        let _ = writer.flush().await;
+                    }
+                    None => {
+                        // Ctrl+D on stdin — detach gracefully (task continues
+                        // on the daemon side; we stop reading stdin).
+                        stdin_lines = None;
+                    }
                 }
             }
         }
@@ -141,7 +187,49 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
     // Ensure the cursor ends up on a fresh line.
     stdout.write_all(b"\n").await.context("writing newline")?;
 
+    // Print a dim session footer so the UUID is visible in scrollback for
+    // use with `amaebi ask --resume <uuid>`.  Suppressed when stderr is not
+    // a terminal (e.g., piped invocations).
+    if std::io::stderr().is_terminal() {
+        eprintln!("\x1b[2m[Session: {}]\x1b[0m", session_id_copy);
+    }
+
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Stdin helper
+// ---------------------------------------------------------------------------
+
+/// Read the next line from an optional stdin `Lines` reader.
+///
+/// Returns `Some(line)` when the user types a line, `None` on EOF (Ctrl+D),
+/// and **never resolves** (`std::future::pending`) when `lines` is `None`.
+/// This allows the caller to include this as an always-present arm in
+/// `tokio::select!` without special-casing the TTY check in the macro body.
+async fn next_stdin_line(lines: &mut Option<BufReader<tokio::io::Stdin>>) -> Option<String>
+where
+{
+    match lines {
+        Some(buf) => {
+            let mut line = String::new();
+            match tokio::io::AsyncBufReadExt::read_line(buf, &mut line).await {
+                Ok(0) => None, // EOF
+                Ok(_) => {
+                    // Strip trailing newline.
+                    if line.ends_with('\n') {
+                        line.pop();
+                        if line.ends_with('\r') {
+                            line.pop();
+                        }
+                    }
+                    Some(line)
+                }
+                Err(_) => None,
+            }
+        }
+        None => std::future::pending().await,
+    }
 }
 
 // ---------------------------------------------------------------------------

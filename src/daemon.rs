@@ -302,6 +302,18 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
             write_frame(&mut writer, &Response::Done).await?;
         }
 
+        Request::Steer { .. } => {
+            // A Steer frame arriving on a fresh connection (not mid-Chat) is
+            // an error — there is no running agentic loop to steer.
+            write_frame(
+                &mut writer,
+                &Response::Error {
+                    message: "no active agentic loop to steer on this connection".into(),
+                },
+            )
+            .await?;
+        }
+
         Request::Chat {
             prompt,
             tmux_pane,
@@ -329,6 +341,31 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                 return Ok(());
             }
 
+            // Steering channel: the spawned reader task sends user corrections
+            // here; the agentic loop drains them between model turns.
+            let (steer_tx, mut steer_rx) = tokio::sync::mpsc::channel::<String>(16);
+
+            // Spawn a task that reads subsequent frames from the client on
+            // this connection.  Any Steer frames are forwarded to steer_tx so
+            // the running agentic loop can inject them between tool turns.
+            // The task exits when the client closes the connection (EOF) or
+            // when steer_tx is dropped (agentic loop finished).
+            tokio::spawn(async move {
+                while let Ok(Some(frame)) = lines.next_line().await {
+                    match serde_json::from_str::<Request>(&frame) {
+                        Ok(Request::Steer { message, .. }) => {
+                            if steer_tx.send(message).await.is_err() {
+                                break; // agentic loop has finished; channel closed
+                            }
+                        }
+                        Ok(_) | Err(_) => {
+                            // Unexpected frame type mid-stream; ignore.
+                            tracing::debug!("unexpected frame type on established chat connection");
+                        }
+                    }
+                }
+            });
+
             // Resolve session — fall back to "global" when the client does not
             // provide one (e.g., old clients or non-directory contexts).
             let sid = session_id.unwrap_or_else(|| "global".to_string());
@@ -343,7 +380,7 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
 
             let messages = build_messages(&prompt, tmux_pane.as_deref(), &session.history);
 
-            match run_agentic_loop(&state, &model, messages, &mut writer).await {
+            match run_agentic_loop(&state, &model, messages, &mut writer, &mut steer_rx).await {
                 Ok(response_text) => {
                     let entry = MemoryEntry {
                         timestamp: chrono::Utc::now().to_rfc3339(),
@@ -431,6 +468,12 @@ pub(crate) fn truncate_chars(s: &str, max: usize) -> String {
 /// Drive the conversation until Copilot responds with `finish_reason: stop`
 /// (or an error).  Executes tool calls and feeds results back in a loop.
 ///
+/// `steer_rx` receives user corrections injected mid-flight from the CLI's
+/// stdin.  Any messages in the channel are drained **between tool turns**
+/// (after all tool results are appended but before the next model call) and
+/// pushed as `user` messages.  A [`Response::SteerAck`] frame is sent for
+/// each message consumed.
+///
 /// `stream_chat` retries 5xx, 429, and transport errors internally up to its
 /// `MAX_RETRIES`, but those errors can still surface here if retries are
 /// exhausted or if a non-retryable error occurs.
@@ -439,6 +482,7 @@ pub(crate) async fn run_agentic_loop<W>(
     model: &str,
     mut messages: Vec<Message>,
     writer: &mut W,
+    steer_rx: &mut tokio::sync::mpsc::Receiver<String>,
 ) -> Result<String>
 where
     W: AsyncWriteExt + Unpin,
@@ -562,6 +606,14 @@ where
                     };
 
                     messages.push(Message::tool_result(&tc.id, result));
+                }
+
+                // Drain any steering corrections that arrived while tools were
+                // running.  Each is injected as a fresh `user` turn so the
+                // model sees it before its next response.
+                while let Ok(steer_msg) = steer_rx.try_recv() {
+                    messages.push(Message::user(steer_msg));
+                    write_frame(writer, &Response::SteerAck).await?;
                 }
             }
 
