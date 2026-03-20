@@ -8,6 +8,7 @@ mod cli;
 mod client;
 mod config;
 mod copilot;
+mod cron;
 mod daemon;
 mod inbox;
 mod ipc;
@@ -82,6 +83,7 @@ async fn main() -> Result<()> {
         cli::Command::Session { action } => run_session(action),
         cli::Command::Cache { action } => run_cache(action),
         cli::Command::Inbox { action } => run_inbox(action),
+        cli::Command::Cron { action } => run_cron(action),
     }
 }
 
@@ -444,6 +446,46 @@ fn format_bytes(bytes: u64) -> String {
     } else {
         format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
     }
+}
+
+fn run_cron(action: cli::CronAction) -> Result<()> {
+    match action {
+        cli::CronAction::Add { description, schedule } => {
+            // Validate the expression before writing to disk.
+            cron::parse_schedule(&schedule)
+                .with_context(|| format!("invalid cron expression: {schedule:?}"))?;
+            let id = cron::add_job(&description, &schedule)?;
+            println!("Cron job added: {id}");
+            println!("  Description: {description}");
+            println!("  Schedule:    {schedule}");
+        }
+        cli::CronAction::List => {
+            let jobs = cron::load_jobs()?;
+            if jobs.is_empty() {
+                println!("No cron jobs scheduled.");
+            } else {
+                for job in &jobs {
+                    let last = job
+                        .last_run
+                        .as_deref()
+                        .unwrap_or("never");
+                    println!(
+                        "[{}] {}\n  schedule: {}\n  last_run: {}\n",
+                        job.id, job.description, job.schedule, last
+                    );
+                }
+                println!("{} job(s) total.", jobs.len());
+            }
+        }
+        cli::CronAction::Delete { id } => {
+            if cron::delete_job(&id)? {
+                println!("Cron job {id} deleted.");
+            } else {
+                anyhow::bail!("no cron job with id {id:?}");
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Tell a running daemon to flush its in-memory conversation cache.

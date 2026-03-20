@@ -6,6 +6,7 @@ use tokio::net::{UnixListener, UnixStream};
 
 use crate::auth::{amaebi_home, TokenCache};
 use crate::copilot::{self, ApiToolCall, ApiToolCallFunction, FinishReason, Message};
+use crate::cron;
 use crate::inbox::InboxStore;
 use crate::ipc::{write_frame, Request, Response};
 use crate::memory_db;
@@ -65,6 +66,14 @@ pub async fn run(socket: PathBuf) -> Result<()> {
     tracing::info!(path = %socket.display(), "daemon listening");
 
     let state = Arc::new(DaemonState::new().await?);
+
+    // Spawn the 1-minute cron scheduler in the background.
+    {
+        let state = Arc::clone(&state);
+        tokio::spawn(async move {
+            run_cron_scheduler(state).await;
+        });
+    }
 
     loop {
         match listener.accept().await {
@@ -830,6 +839,91 @@ fn build_messages_inner(
 
     messages.push(Message::user(prompt.to_owned()));
     messages
+}
+
+// ---------------------------------------------------------------------------
+// Cron scheduler
+// ---------------------------------------------------------------------------
+
+/// Background task: ticks every 60 seconds, fires any due cron jobs.
+///
+/// Never returns (runs for the lifetime of the daemon).  Each due job is
+/// spawned as an independent `tokio::task` so that slow LLM calls do not
+/// block subsequent ticks.
+async fn run_cron_scheduler(state: Arc<DaemonState>) {
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+    // Skip missed ticks — don't fire a backlog of jobs if the daemon was paused.
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        interval.tick().await;
+
+        let now = chrono::Utc::now();
+        let jobs = match cron::load_jobs() {
+            Ok(j) => j,
+            Err(e) => {
+                tracing::warn!(error = %e, "cron: failed to load cron.json");
+                continue;
+            }
+        };
+
+        for job in cron::due_jobs(&jobs, &now) {
+            let state = Arc::clone(&state);
+            tokio::spawn(async move {
+                run_cron_job(state, job).await;
+            });
+        }
+    }
+}
+
+/// Execute a single cron job: runs the agentic loop, saves output to inbox.
+async fn run_cron_job(state: Arc<DaemonState>, job: cron::CronJob) {
+    tracing::info!(id = %job.id, description = %job.description, "cron: firing job");
+
+    // Generate a fresh session UUID for this run.
+    let session_id = uuid::Uuid::new_v4().to_string();
+
+    // Resolve model from env var (same default as CLI client).
+    let model = std::env::var("AMAEBI_MODEL").unwrap_or_else(|_| "gpt-4o".to_string());
+
+    let messages = build_messages(&job.description, None, &[]);
+    let mut sink = tokio::io::sink();
+    let (_steer_tx, mut steer_rx) = tokio::sync::mpsc::channel::<String>(1);
+
+    let result = run_agentic_loop(&state, &model, messages, &mut sink, &mut steer_rx).await;
+
+    let (output, run_ok) = match result {
+        Ok(final_text) => {
+            store_conversation(&state, &session_id, &job.description, &final_text).await;
+            (final_text, true)
+        }
+        Err(e) => {
+            tracing::error!(error = %e, id = %job.id, "cron: job failed");
+            (format!("[error] {e:#}"), false)
+        }
+    };
+
+    let task_desc = truncate_chars(job.description.clone(), 200);
+
+    // Persist to inbox.
+    match InboxStore::open() {
+        Ok(inbox) => {
+            if let Err(e) = inbox.save_report(&session_id, &task_desc, &output) {
+                tracing::error!(error = %e, "cron: failed to save inbox report");
+            }
+        }
+        Err(e) => tracing::error!(error = %e, "cron: failed to open inbox"),
+    }
+
+    // Update last_run timestamp so due_jobs won't fire this job again this minute.
+    if run_ok {
+        let now_str = chrono::Utc::now().to_rfc3339();
+        if let Err(e) = cron::update_last_run(&job.id, &now_str) {
+            tracing::warn!(error = %e, id = %job.id, "cron: failed to update last_run");
+        }
+    }
+
+    tracing::info!(id = %job.id, "cron: job complete");
 }
 
 // ---------------------------------------------------------------------------

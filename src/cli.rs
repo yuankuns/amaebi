@@ -92,6 +92,16 @@ pub enum Command {
         #[command(subcommand)]
         action: CacheAction,
     },
+    /// Manage scheduled cron jobs.
+    ///
+    /// Jobs are stored in `~/.amaebi/cron.json` and executed autonomously by
+    /// a running daemon process.  Results are deposited into `amaebi inbox`.
+    ///
+    /// Example: amaebi cron add "check disk usage" --cron "0 9 * * *"
+    Cron {
+        #[command(subcommand)]
+        action: CronAction,
+    },
     /// Read reports from completed cron tasks.
     ///
     /// Cron tasks run autonomously in the background; their output is stored
@@ -173,6 +183,28 @@ pub enum InboxAction {
     MarkRead,
     /// Delete all inbox reports.
     Clear,
+}
+
+#[derive(clap::Subcommand, Debug)]
+pub enum CronAction {
+    /// Add a new cron job.
+    Add {
+        /// Task description used as the LLM prompt when the job fires.
+        description: String,
+        /// 5-field cron expression (min hour dom mon dow).
+        ///
+        /// Supports: `*`, `n`, `n-m`, `*/n`, and comma-separated lists.
+        /// Example: "0 9 * * *" runs every day at 09:00 UTC.
+        #[arg(long = "cron")]
+        schedule: String,
+    },
+    /// List all scheduled cron jobs.
+    List,
+    /// Delete a cron job by its UUID.
+    Delete {
+        /// UUID of the job to remove (shown in `cron list`).
+        id: String,
+    },
 }
 
 #[derive(clap::Subcommand, Debug)]
