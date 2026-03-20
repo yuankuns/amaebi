@@ -94,7 +94,7 @@ pub enum Command {
     },
     /// Manage scheduled cron jobs.
     ///
-    /// Jobs are stored in `~/.amaebi/cron.json` and executed autonomously by
+    /// Jobs are stored in `~/.amaebi/cron.db` and executed autonomously by
     /// a running daemon process.  Results are deposited into `amaebi inbox`.
     ///
     /// Example: amaebi cron add "check disk usage" --cron "0 9 * * *"

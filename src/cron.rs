@@ -1,11 +1,30 @@
 //! Cron job store and scheduler.
 //!
-//! Jobs are persisted in `~/.amaebi/cron.json` (plain JSON, human-readable).
-//! The daemon ticks every minute and fires any jobs whose schedule matches the
-//! current UTC wall-clock time.  Results land in the inbox via [`InboxStore`].
+//! Jobs are persisted in `~/.amaebi/cron.db` (SQLite).  The daemon ticks
+//! every minute and fires any jobs whose schedule matches the current UTC
+//! wall-clock time.  Results land in the inbox via [`crate::inbox::InboxStore`].
+//!
+//! # Schema
+//!
+//! ```sql
+//! CREATE TABLE IF NOT EXISTS cron_jobs (
+//!     id         TEXT PRIMARY KEY,
+//!     description TEXT NOT NULL,
+//!     schedule   TEXT NOT NULL,
+//!     created_at TEXT NOT NULL,
+//!     last_run   TEXT
+//! );
+//! ```
+//!
+//! # Concurrency
+//!
+//! WAL mode is enabled so CLI reads do not block daemon writes.
+//! A 5-second busy timeout prevents immediate failure when the daemon and
+//! CLI collide on the same row.
 
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
+use rusqlite::{params, Connection};
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
 use crate::auth::amaebi_home;
@@ -15,7 +34,7 @@ use crate::auth::amaebi_home;
 // ---------------------------------------------------------------------------
 
 /// A registered cron job.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct CronJob {
     /// UUID v4 identifier.
     pub id: String,
@@ -25,93 +44,176 @@ pub struct CronJob {
     pub schedule: String,
     /// RFC 3339 creation timestamp.
     pub created_at: String,
-    /// RFC 3339 timestamp of the last successful run, or `null`.
+    /// RFC 3339 timestamp of the last successful run, or `None`.
     pub last_run: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
-// Path helper
+// Store
 // ---------------------------------------------------------------------------
 
-/// Path to the cron job store (`~/.amaebi/cron.json`).
-pub fn cron_path() -> Result<PathBuf> {
-    Ok(amaebi_home()?.join("cron.json"))
-}
-
-// ---------------------------------------------------------------------------
-// CRUD operations
-// ---------------------------------------------------------------------------
-
-/// Load all cron jobs from disk.  Returns an empty list if the file does not
-/// exist yet (first run before any jobs are added).
-pub fn load_jobs() -> Result<Vec<CronJob>> {
-    let path = cron_path()?;
-    if !path.exists() {
-        return Ok(vec![]);
-    }
-    let raw = std::fs::read_to_string(&path)
-        .with_context(|| format!("reading {}", path.display()))?;
-    serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))
-}
-
-/// Persist the job list to disk using an atomic write (temp file → rename).
-pub fn save_jobs(jobs: &[CronJob]) -> Result<()> {
-    let path = cron_path()?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
-    }
-    let json = serde_json::to_string_pretty(jobs).context("serialising cron jobs")?;
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, &json).with_context(|| format!("writing {}", tmp.display()))?;
-    std::fs::rename(&tmp, &path)
-        .with_context(|| format!("renaming cron tmp to {}", path.display()))?;
-    Ok(())
-}
-
-/// Register a new cron job after validating the schedule expression.
+/// SQLite-backed store for cron jobs.
 ///
-/// Returns the new job's UUID.
-pub fn add_job(description: &str, schedule: &str) -> Result<String> {
-    // Validate first — never write an unparseable expression to disk.
-    parse_schedule(schedule)
-        .with_context(|| format!("invalid cron schedule: {schedule:?}"))?;
-
-    let mut jobs = load_jobs()?;
-    let id = uuid::Uuid::new_v4().to_string();
-    jobs.push(CronJob {
-        id: id.clone(),
-        description: description.to_owned(),
-        schedule: schedule.to_owned(),
-        created_at: chrono::Utc::now().to_rfc3339(),
-        last_run: None,
-    });
-    save_jobs(&jobs)?;
-    Ok(id)
+/// The connection is opened fresh on each operation so the store is cheap to
+/// construct and holds no file descriptor when idle.
+pub struct CronStore {
+    db_path: PathBuf,
 }
 
-/// Remove a job by ID.  Returns `true` if removed, `false` if not found.
-pub fn delete_job(id: &str) -> Result<bool> {
-    let mut jobs = load_jobs()?;
-    let before = jobs.len();
-    jobs.retain(|j| j.id != id);
-    if jobs.len() == before {
-        return Ok(false);
+impl CronStore {
+    /// Open (or create) the cron database at `~/.amaebi/cron.db`.
+    pub fn open() -> Result<Self> {
+        let db_path = amaebi_home()?.join("cron.db");
+        let store = Self { db_path };
+        store.init()?;
+        Ok(store)
     }
-    save_jobs(&jobs)?;
-    Ok(true)
-}
 
-/// Record that a job ran at `timestamp` (RFC 3339).
-pub fn update_last_run(id: &str, timestamp: &str) -> Result<()> {
-    let mut jobs = load_jobs()?;
-    for job in &mut jobs {
-        if job.id == id {
-            job.last_run = Some(timestamp.to_owned());
+    /// Open the cron database at an explicit path (used in tests).
+    #[cfg(test)]
+    pub fn open_at(db_path: PathBuf) -> Result<Self> {
+        let store = Self { db_path };
+        store.init()?;
+        Ok(store)
+    }
+
+    fn connect(&self) -> Result<Connection> {
+        if let Some(parent) = self.db_path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
         }
+
+        let conn = Connection::open(&self.db_path)
+            .with_context(|| format!("opening cron.db at {}", self.db_path.display()))?;
+
+        // Enforce 0600 permissions (may contain sensitive task descriptions).
+        std::fs::set_permissions(&self.db_path, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("setting permissions on {}", self.db_path.display()))?;
+
+        conn.execute_batch("PRAGMA journal_mode=WAL;")
+            .context("enabling WAL mode")?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .context("setting busy timeout")?;
+
+        Ok(conn)
     }
-    save_jobs(&jobs)?;
-    Ok(())
+
+    fn init(&self) -> Result<()> {
+        let conn = self.connect()?;
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS cron_jobs (
+                id          TEXT PRIMARY KEY,
+                description TEXT NOT NULL,
+                schedule    TEXT NOT NULL,
+                created_at  TEXT NOT NULL,
+                last_run    TEXT
+            );",
+        )
+        .context("creating cron_jobs table")?;
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Read operations
+    // -----------------------------------------------------------------------
+
+    /// Return all registered cron jobs, ordered by creation time.
+    pub fn list(&self) -> Result<Vec<CronJob>> {
+        let conn = self.connect()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, description, schedule, created_at, last_run
+                 FROM cron_jobs
+                 ORDER BY created_at ASC",
+            )
+            .context("preparing cron list query")?;
+
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(CronJob {
+                    id: row.get(0)?,
+                    description: row.get(1)?,
+                    schedule: row.get(2)?,
+                    created_at: row.get(3)?,
+                    last_run: row.get(4)?,
+                })
+            })
+            .context("executing cron list query")?;
+
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("collecting cron job rows")
+    }
+
+    // -----------------------------------------------------------------------
+    // Write operations
+    // -----------------------------------------------------------------------
+
+    /// Register a new cron job.  Returns the new job's UUID.
+    ///
+    /// The schedule is validated before writing so an unparseable expression
+    /// is never persisted.
+    pub fn add(&self, description: &str, schedule: &str) -> Result<String> {
+        parse_schedule(schedule)
+            .with_context(|| format!("invalid cron schedule: {schedule:?}"))?;
+
+        let id = uuid::Uuid::new_v4().to_string();
+        let created_at = chrono::Utc::now().to_rfc3339();
+        let conn = self.connect()?;
+        conn.execute(
+            "INSERT INTO cron_jobs (id, description, schedule, created_at, last_run)
+             VALUES (?1, ?2, ?3, ?4, NULL)",
+            params![id, description, schedule, created_at],
+        )
+        .context("inserting cron job")?;
+        Ok(id)
+    }
+
+    /// Remove a job by ID.  Returns `true` if a row was deleted.
+    pub fn delete(&self, id: &str) -> Result<bool> {
+        let conn = self.connect()?;
+        let n = conn
+            .execute("DELETE FROM cron_jobs WHERE id = ?1", params![id])
+            .context("deleting cron job")?;
+        Ok(n > 0)
+    }
+
+    /// Record that job `id` ran at `timestamp` (RFC 3339).
+    pub fn update_last_run(&self, id: &str, timestamp: &str) -> Result<()> {
+        let conn = self.connect()?;
+        conn.execute(
+            "UPDATE cron_jobs SET last_run = ?1 WHERE id = ?2",
+            params![timestamp, id],
+        )
+        .context("updating cron job last_run")?;
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Free-function shims used by daemon.rs and main.rs
+// ---------------------------------------------------------------------------
+//
+// These thin wrappers keep daemon.rs and main.rs callers unchanged while the
+// storage backend is fully SQLite.
+
+/// Load all cron jobs from the store.
+pub fn load_jobs() -> Result<Vec<CronJob>> {
+    CronStore::open()?.list()
+}
+
+/// Register a new cron job; returns the UUID.
+pub fn add_job(description: &str, schedule: &str) -> Result<String> {
+    CronStore::open()?.add(description, schedule)
+}
+
+/// Remove a job by ID; returns `true` if found and deleted.
+pub fn delete_job(id: &str) -> Result<bool> {
+    CronStore::open()?.delete(id)
+}
+
+/// Update the `last_run` timestamp for a job.
+pub fn update_last_run(id: &str, timestamp: &str) -> Result<()> {
+    CronStore::open()?.update_last_run(id, timestamp)
 }
 
 // ---------------------------------------------------------------------------
@@ -239,10 +341,7 @@ pub fn is_due(schedule: &Schedule, dt: &chrono::DateTime<chrono::Utc>) -> bool {
 /// A job is skipped (even if the schedule matches) when its `last_run`
 /// timestamp is within the last 30 seconds — this prevents double-firing
 /// if the daemon tick runs slightly within the same wall-clock minute.
-pub fn due_jobs(
-    jobs: &[CronJob],
-    now: &chrono::DateTime<chrono::Utc>,
-) -> Vec<CronJob> {
+pub fn due_jobs(jobs: &[CronJob], now: &chrono::DateTime<chrono::Utc>) -> Vec<CronJob> {
     let mut due = Vec::new();
     for job in jobs {
         let sched = match parse_schedule(&job.schedule) {
@@ -477,30 +576,76 @@ mod tests {
         assert!(due_jobs(&jobs, &now).is_empty());
     }
 
-    // ---- save/load roundtrip ---------------------------------------------
+    // ---- CronStore SQLite roundtrip ---------------------------------------
+
+    fn open_temp() -> (CronStore, tempfile::TempDir) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("cron.db");
+        let store = CronStore::open_at(path).unwrap();
+        // Return dir alongside the store so the caller keeps it alive.
+        (store, dir)
+    }
 
     #[test]
-    fn save_and_load_roundtrip() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("cron.json");
+    fn store_add_and_list_roundtrip() {
+        let (store, _dir) = open_temp();
+        let id = store.add("daily report", "0 9 * * *").unwrap();
+        let jobs = store.list().unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].id, id);
+        assert_eq!(jobs[0].description, "daily report");
+        assert_eq!(jobs[0].schedule, "0 9 * * *");
+        assert!(jobs[0].last_run.is_none());
+    }
 
-        let jobs = vec![CronJob {
-            id: "test-id-1".into(),
-            description: "daily report".into(),
-            schedule: "0 9 * * *".into(),
-            created_at: "2026-01-01T00:00:00Z".into(),
-            last_run: Some("2026-03-20T09:00:00Z".into()),
-        }];
+    #[test]
+    fn store_multiple_jobs_ordered_by_created_at() {
+        let (store, _dir) = open_temp();
+        let id1 = store.add("first", "0 1 * * *").unwrap();
+        let id2 = store.add("second", "0 2 * * *").unwrap();
+        let jobs = store.list().unwrap();
+        assert_eq!(jobs.len(), 2);
+        // Insertion order preserved via created_at ASC.
+        assert_eq!(jobs[0].id, id1);
+        assert_eq!(jobs[1].id, id2);
+    }
 
-        let json = serde_json::to_string_pretty(&jobs).unwrap();
-        std::fs::write(&path, json).unwrap();
+    #[test]
+    fn store_delete_removes_job() {
+        let (store, _dir) = open_temp();
+        let id = store.add("task", "* * * * *").unwrap();
+        assert!(store.delete(&id).unwrap());
+        assert!(store.list().unwrap().is_empty());
+    }
 
-        let loaded: Vec<CronJob> =
-            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    #[test]
+    fn store_delete_nonexistent_returns_false() {
+        let (store, _dir) = open_temp();
+        assert!(!store.delete("no-such-id").unwrap());
+    }
 
-        assert_eq!(loaded.len(), 1);
-        assert_eq!(loaded[0].id, "test-id-1");
-        assert_eq!(loaded[0].schedule, "0 9 * * *");
-        assert_eq!(loaded[0].last_run.as_deref(), Some("2026-03-20T09:00:00Z"));
+    #[test]
+    fn store_update_last_run() {
+        let (store, _dir) = open_temp();
+        let id = store.add("task", "* * * * *").unwrap();
+        store.update_last_run(&id, "2026-03-20T09:00:00Z").unwrap();
+        let jobs = store.list().unwrap();
+        assert_eq!(
+            jobs[0].last_run.as_deref(),
+            Some("2026-03-20T09:00:00Z")
+        );
+    }
+
+    #[test]
+    fn store_rejects_invalid_schedule() {
+        let (store, _dir) = open_temp();
+        assert!(store.add("bad", "60 * * * *").is_err());
+        assert!(store.list().unwrap().is_empty(), "nothing written on error");
+    }
+
+    #[test]
+    fn store_empty_list_when_no_jobs() {
+        let (store, _dir) = open_temp();
+        assert!(store.list().unwrap().is_empty());
     }
 }

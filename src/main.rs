@@ -470,8 +470,8 @@ fn run_cron(action: cli::CronAction) -> Result<()> {
                         .as_deref()
                         .unwrap_or("never");
                     println!(
-                        "[{}] {}\n  schedule: {}\n  last_run: {}\n",
-                        job.id, job.description, job.schedule, last
+                        "[{}] {}\n  schedule:   {}\n  created:    {}\n  last_run:   {}\n",
+                        job.id, job.description, job.schedule, job.created_at, last
                     );
                 }
                 println!("{} job(s) total.", jobs.len());

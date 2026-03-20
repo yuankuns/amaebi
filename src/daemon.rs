@@ -862,7 +862,7 @@ async fn run_cron_scheduler(state: Arc<DaemonState>) {
         let jobs = match cron::load_jobs() {
             Ok(j) => j,
             Err(e) => {
-                tracing::warn!(error = %e, "cron: failed to load cron.json");
+                tracing::warn!(error = %e, "cron: failed to load jobs from cron.db");
                 continue;
             }
         };
