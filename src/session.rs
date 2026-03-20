@@ -60,7 +60,20 @@ fn load_map(path: &Path) -> Result<HashMap<String, String>> {
     }
     let content =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    serde_json::from_str(&content).with_context(|| format!("parsing {}", path.display()))
+    if content.trim().is_empty() {
+        return Ok(HashMap::new());
+    }
+    match serde_json::from_str(&content) {
+        Ok(map) => Ok(map),
+        Err(e) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "sessions.json is corrupted; resetting to empty"
+            );
+            Ok(HashMap::new())
+        }
+    }
 }
 
 /// Write the map atomically: write to a `.tmp` file, then rename.
@@ -318,6 +331,66 @@ mod tests {
             let id = h.join().unwrap();
             assert!(!id.is_empty());
         }
+    }
+
+    #[test]
+    fn corrupted_sessions_json_recovers_gracefully() {
+        let _guard = with_temp_home();
+        let dir = tempdir().unwrap();
+        // Seed a valid entry first so the file exists.
+        let _ = get_or_create(dir.path()).unwrap();
+        // Corrupt the file.
+        let path = sessions_path().unwrap();
+        std::fs::write(&path, "not valid json {{{").unwrap();
+        // Should recover by treating as empty and creating a new UUID.
+        let id = get_or_create(dir.path()).unwrap();
+        assert!(!id.is_empty());
+    }
+
+    #[test]
+    fn empty_sessions_json_treated_as_fresh() {
+        let _guard = with_temp_home();
+        let dir = tempdir().unwrap();
+        // Create an empty file (valid edge case — file exists but is empty).
+        let path = sessions_path().unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "").unwrap();
+        // Empty file should be treated as no sessions — creates fresh UUID.
+        let id = get_or_create(dir.path()).unwrap();
+        assert!(!id.is_empty());
+    }
+
+    #[test]
+    fn reset_on_nonexistent_session_creates_new() {
+        let _guard = with_temp_home();
+        let dir = tempdir().unwrap();
+        // Reset without prior get_or_create should succeed.
+        let id = reset(dir.path()).unwrap();
+        assert!(!id.is_empty());
+        assert_eq!(current(dir.path()).unwrap(), Some(id));
+    }
+
+    #[test]
+    fn sessions_json_file_permissions_are_0600() {
+        let _guard = with_temp_home();
+        let dir = tempdir().unwrap();
+        let _ = get_or_create(dir.path()).unwrap();
+        let path = sessions_path().unwrap();
+        let meta = std::fs::metadata(&path).unwrap();
+        let mode = meta.permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "sessions.json should be mode 0600, got {mode:o}");
+    }
+
+    #[test]
+    fn symlinked_dirs_resolve_to_same_session() {
+        let _guard = with_temp_home();
+        let dir = tempdir().unwrap();
+        let link = dir.path().parent().unwrap().join("symlink-test");
+        std::os::unix::fs::symlink(dir.path(), &link).unwrap();
+        let id1 = get_or_create(dir.path()).unwrap();
+        let id2 = get_or_create(&link).unwrap();
+        assert_eq!(id1, id2, "symlink and target should share the same session");
+        std::fs::remove_file(&link).ok();
     }
 
     #[test]
