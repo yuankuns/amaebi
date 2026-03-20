@@ -31,6 +31,14 @@ pub enum Command {
         /// Model to use (overrides AMAEBI_MODEL env var; default: gpt-4o).
         #[arg(long)]
         model: Option<String>,
+        /// Submit the task in the background; print a task ID to stderr and exit
+        /// immediately.  The result is deposited into `amaebi inbox` when done.
+        #[arg(long)]
+        detach: bool,
+        /// Resume a prior session by UUID, loading its full chronological history
+        /// instead of the normal FTS5-filtered context window.
+        #[arg(long)]
+        resume: Option<String>,
     },
     /// Authenticate with GitHub Copilot via the device flow.
     Auth {

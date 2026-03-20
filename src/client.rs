@@ -153,6 +153,10 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
                         // No visible output — the next model turn will incorporate it.
                         tracing::debug!("steer acknowledged by daemon");
                     }
+                    Response::DetachAccepted { .. } => {
+                        // Should never arrive in a normal foreground Chat loop.
+                        tracing::debug!("unexpected DetachAccepted in foreground loop");
+                    }
                 }
             }
 
@@ -192,6 +196,194 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
     // a terminal (e.g., piped invocations).
     if std::io::stderr().is_terminal() {
         eprintln!("\x1b[2m[Session: {}]\x1b[0m", session_id_copy);
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Detach mode
+// ---------------------------------------------------------------------------
+
+/// Submit a task to the daemon in detached (background) mode.
+///
+/// Sends [`Request::SubmitDetach`], waits for [`Response::DetachAccepted`],
+/// prints the session ID to stderr, and exits `0`.  The daemon continues
+/// running the agentic loop in the background; results appear in the inbox.
+pub async fn run_detach(socket: PathBuf, prompt: String, model: Option<String>) -> Result<()> {
+    let stream = connect_or_start_daemon(&socket).await?;
+    let (reader, mut writer) = tokio::io::split(stream);
+
+    let model = model
+        .or_else(|| std::env::var("AMAEBI_MODEL").ok())
+        .unwrap_or_else(|| "gpt-4o".to_string());
+
+    let cwd = std::env::current_dir().context("getting current directory")?;
+    let session_id = tokio::task::spawn_blocking(move || session::get_or_create(&cwd))
+        .await
+        .context("session::get_or_create panicked")?
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "failed to resolve session id; using \"global\"");
+            "global".to_string()
+        });
+
+    let req = Request::SubmitDetach {
+        prompt,
+        tmux_pane: std::env::var("TMUX_PANE").ok(),
+        session_id: Some(session_id),
+        model,
+    };
+    let mut req_line = serde_json::to_string(&req).context("serializing detach request")?;
+    req_line.push('\n');
+    writer
+        .write_all(req_line.as_bytes())
+        .await
+        .context("sending detach request to daemon")?;
+
+    // Wait for the single DetachAccepted (or Error) frame.
+    let mut lines = BufReader::new(reader).lines();
+    let line = lines
+        .next_line()
+        .await
+        .context("reading detach response")?
+        .context("daemon closed connection without responding")?;
+    let resp: Response = serde_json::from_str(&line).context("parsing detach response")?;
+    match resp {
+        Response::DetachAccepted { session_id } => {
+            eprintln!("Task accepted. Running in background under session {session_id}.");
+            eprintln!("Check `amaebi inbox list` for the result when done.");
+            Ok(())
+        }
+        Response::Error { message } => anyhow::bail!("{message}"),
+        other => anyhow::bail!("unexpected response from daemon: {other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Resume mode
+// ---------------------------------------------------------------------------
+
+/// Resume a prior session, loading its full history, then stream the reply.
+///
+/// Sends [`Request::Resume`] to the daemon, which bypasses the normal
+/// `MAX_HISTORY` sliding-window and re-hydrates the complete chronological
+/// conversation.  The streaming display loop is identical to [`run`].
+pub async fn run_resume(
+    socket: PathBuf,
+    prompt: String,
+    model: Option<String>,
+    session_uuid: String,
+) -> Result<()> {
+    let mut sigint = signal(SignalKind::interrupt()).context("setting up SIGINT handler")?;
+
+    let stream = connect_or_start_daemon(&socket).await?;
+    let (reader, mut writer) = tokio::io::split(stream);
+
+    let model = model
+        .or_else(|| std::env::var("AMAEBI_MODEL").ok())
+        .unwrap_or_else(|| "gpt-4o".to_string());
+
+    let req = Request::Resume {
+        prompt,
+        tmux_pane: std::env::var("TMUX_PANE").ok(),
+        session_id: session_uuid.clone(),
+        model,
+    };
+    let mut req_line = serde_json::to_string(&req).context("serializing resume request")?;
+    req_line.push('\n');
+    writer
+        .write_all(req_line.as_bytes())
+        .await
+        .context("sending resume request to daemon")?;
+
+    // Streaming display loop — identical to run().
+    let mut lines = BufReader::new(reader).lines();
+    let mut stdout = tokio::io::stdout();
+    let mut last_ctrl_c: Option<Instant> = None;
+
+    let use_stdin = std::io::stdout().is_terminal();
+    let mut stdin_lines: Option<BufReader<tokio::io::Stdin>> = if use_stdin {
+        Some(BufReader::new(tokio::io::stdin()))
+    } else {
+        None
+    };
+
+    loop {
+        tokio::select! {
+            biased;
+
+            result = sigint.recv() => {
+                let Some(_) = result else { break; };
+                let now = Instant::now();
+                if is_within_window(last_ctrl_c, now, DOUBLE_CTRLC_WINDOW) {
+                    eprintln!();
+                    let _ = stdout.flush().await;
+                    let _ = tokio::io::stderr().flush().await;
+                    return Err(anyhow::Error::new(Interrupted));
+                }
+                eprintln!(
+                    "\nPress Ctrl-C again within {}s to exit",
+                    DOUBLE_CTRLC_WINDOW.as_secs()
+                );
+                last_ctrl_c = Some(now);
+            }
+
+            result = lines.next_line() => {
+                let line = result.context("reading response from daemon")?;
+                let Some(line) = line else { break; };
+                let resp: Response = serde_json::from_str(&line).context("parsing response")?;
+                match resp {
+                    Response::Text { chunk } => {
+                        stdout.write_all(chunk.as_bytes()).await.context("writing to stdout")?;
+                        stdout.flush().await.context("flushing stdout")?;
+                    }
+                    Response::Done => break,
+                    Response::Error { message } => anyhow::bail!("{message}"),
+                    Response::ToolUse { name, detail } => {
+                        eprintln!();
+                        match name.as_str() {
+                            "shell_command" => eprintln!("```bash\n$ {detail}\n```"),
+                            "read_file" => eprintln!("📄 {detail}"),
+                            "edit_file" => eprintln!("✏️  {detail}"),
+                            "tmux_send_keys" => eprintln!("⌨️  send-keys: {detail}"),
+                            "tmux_capture_pane" => eprintln!("🖥️  capture: {detail}"),
+                            _ => eprintln!("🔧 {name}: {detail}"),
+                        }
+                    }
+                    Response::SteerAck => {
+                        tracing::debug!("steer acknowledged by daemon");
+                    }
+                    Response::DetachAccepted { .. } => {
+                        tracing::debug!("unexpected DetachAccepted in resume loop");
+                    }
+                }
+            }
+
+            steer_line = next_stdin_line(&mut stdin_lines) => {
+                match steer_line {
+                    Some(text) => {
+                        let steer_req = Request::Steer {
+                            session_id: session_uuid.clone(),
+                            message: text,
+                        };
+                        let mut frame = serde_json::to_string(&steer_req)
+                            .context("serializing Steer")?;
+                        frame.push('\n');
+                        let _ = writer.write_all(frame.as_bytes()).await;
+                        let _ = writer.flush().await;
+                    }
+                    None => {
+                        stdin_lines = None;
+                    }
+                }
+            }
+        }
+    }
+
+    stdout.write_all(b"\n").await.context("writing newline")?;
+
+    if std::io::stderr().is_terminal() {
+        eprintln!("\x1b[2m[Session: {}]\x1b[0m", session_uuid);
     }
 
     Ok(())

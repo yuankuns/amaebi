@@ -201,6 +201,10 @@ impl acp::Agent for AmaebiAgent {
                     // never arrive here — log and continue.
                     tracing::debug!("unexpected SteerAck in ACP mode");
                 }
+                Response::DetachAccepted { .. } => {
+                    // ACP mode never submits detach requests.
+                    tracing::debug!("unexpected DetachAccepted in ACP mode");
+                }
             }
         }
 

@@ -24,6 +24,37 @@ pub enum Request {
         /// The correction text to inject as a user message.
         message: String,
     },
+    /// Submit a task to run entirely in the background.
+    ///
+    /// The daemon spawns the agentic loop in a background `tokio::spawn`, responds
+    /// immediately with [`Response::DetachAccepted`], and saves the final output to
+    /// `~/.amaebi/inbox.db` when the loop completes.
+    SubmitDetach {
+        /// The user's prompt text.
+        prompt: String,
+        /// Value of `$TMUX_PANE` at the time the client was invoked, if set.
+        tmux_pane: Option<String>,
+        /// Session UUID to associate with this task.
+        session_id: Option<String>,
+        /// Chat model to use (e.g. "gpt-4o").
+        model: String,
+    },
+    /// Resume a prior session by UUID, loading its **full** chronological history.
+    ///
+    /// Unlike [`Request::Chat`], which applies a sliding-window cap, this variant
+    /// bypasses the `MAX_HISTORY` limit so the LLM receives the entire conversation
+    /// from disk.  Useful for multi-day projects where full context matters.
+    Resume {
+        /// The prompt to send in this turn.
+        prompt: String,
+        /// Value of `$TMUX_PANE` at the time the client was invoked, if set.
+        tmux_pane: Option<String>,
+        /// Session UUID to re-hydrate.  Required — this variant always targets a
+        /// specific historical session.
+        session_id: String,
+        /// Chat model to use (e.g. "gpt-4o").
+        model: String,
+    },
     /// Ask the daemon to clear its in-memory conversation cache.
     ///
     /// Sent after `amaebi memory clear` so the running daemon does not serve
@@ -48,6 +79,14 @@ pub enum Response {
     ToolUse { name: String, detail: String },
     /// Acknowledgement that a [`Request::Steer`] correction was injected.
     SteerAck,
+    /// Confirms that a [`Request::SubmitDetach`] was accepted.
+    ///
+    /// Sent immediately before the daemon starts the background task.  The client
+    /// should print the session ID and exit cleanly.
+    DetachAccepted {
+        /// The session UUID under which the task will run.
+        session_id: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -130,6 +169,58 @@ mod tests {
     }
 
     #[test]
+    fn request_submit_detach_round_trip() {
+        let req = Request::SubmitDetach {
+            prompt: "run tests".into(),
+            tmux_pane: None,
+            session_id: Some("uuid-abc".into()),
+            model: "gpt-4o".into(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["type"], "submit_detach");
+        assert_eq!(v["prompt"], "run tests");
+        let back: Request = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, Request::SubmitDetach { .. }));
+    }
+
+    #[test]
+    fn request_resume_round_trip() {
+        let req = Request::Resume {
+            prompt: "continue".into(),
+            tmux_pane: Some("%3".into()),
+            session_id: "old-uuid".into(),
+            model: "gpt-4o".into(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["type"], "resume");
+        assert_eq!(v["session_id"], "old-uuid");
+        let back: Request = serde_json::from_str(&json).unwrap();
+        let Request::Resume {
+            session_id, prompt, ..
+        } = back
+        else {
+            panic!("expected Resume variant");
+        };
+        assert_eq!(session_id, "old-uuid");
+        assert_eq!(prompt, "continue");
+    }
+
+    #[test]
+    fn response_detach_accepted_round_trip() {
+        let r = Response::DetachAccepted {
+            session_id: "task-uuid".into(),
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["type"], "detach_accepted");
+        assert_eq!(v["session_id"], "task-uuid");
+        let back: Response = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, Response::DetachAccepted { .. }));
+    }
+
+    #[test]
     fn request_clear_cache_round_trip() {
         let req = Request::ClearCache;
         let json = serde_json::to_string(&req).unwrap();
@@ -198,6 +289,7 @@ mod tests {
             r#"{"type":"error","message":"fail"}"#,
             r#"{"type":"tool_use","name":"read_file","detail":"/tmp/x"}"#,
             r#"{"type":"steer_ack"}"#,
+            r#"{"type":"detach_accepted","session_id":"uuid-1"}"#,
         ];
         for frame in frames {
             let r: Response = serde_json::from_str(frame).unwrap();
@@ -208,6 +300,7 @@ mod tests {
                     | Response::Error { .. }
                     | Response::ToolUse { .. }
                     | Response::SteerAck
+                    | Response::DetachAccepted { .. }
             ));
         }
     }

@@ -8,6 +8,7 @@ use tokio::net::{UnixListener, UnixStream};
 
 use crate::auth::TokenCache;
 use crate::copilot::{self, ApiToolCall, ApiToolCallFunction, FinishReason, Message};
+use crate::inbox::InboxStore;
 use crate::ipc::{write_frame, Request, Response};
 use crate::memory::{self, MemoryEntry};
 use crate::tools::{self, ToolExecutor};
@@ -312,6 +313,193 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                 },
             )
             .await?;
+        }
+
+        Request::SubmitDetach {
+            prompt,
+            tmux_pane,
+            model,
+            session_id,
+        } => {
+            tracing::info!(
+                model = %model,
+                prompt_len = prompt.len(),
+                "received detach request"
+            );
+
+            // Verify auth eagerly so we can return an error before detaching.
+            if let Err(e) = state.tokens.get(&state.http).await {
+                write_frame(
+                    &mut writer,
+                    &Response::Error {
+                        message: format!("authentication error: {e:#}"),
+                    },
+                )
+                .await?;
+                return Ok(());
+            }
+
+            let sid = session_id.unwrap_or_else(|| "global".to_string());
+
+            // Acknowledge immediately — client can exit after this.
+            write_frame(
+                &mut writer,
+                &Response::DetachAccepted {
+                    session_id: sid.clone(),
+                },
+            )
+            .await?;
+
+            // Spawn the agentic loop as a fully detached background task.
+            let state = Arc::clone(&state);
+            tokio::spawn(async move {
+                let session_arc = state.sessions.get_or_create(&sid).await;
+                let mut session = session_arc.lock().await;
+                session.last_active = Instant::now();
+                let messages = build_messages(&prompt, tmux_pane.as_deref(), &session.history);
+
+                // Use a sink writer — output frames are discarded; we only
+                // need the return value (final_text) for the inbox.
+                let mut sink = tokio::io::sink();
+                let (_steer_tx, mut steer_rx) = tokio::sync::mpsc::channel::<String>(1);
+
+                match run_agentic_loop(&state, &model, messages, &mut sink, &mut steer_rx).await {
+                    Ok(final_text) => {
+                        let entry = MemoryEntry {
+                            timestamp: chrono::Utc::now().to_rfc3339(),
+                            user: truncate_chars(&prompt, MAX_PROMPT_CHARS),
+                            assistant: truncate_chars(&final_text, MAX_RESPONSE_CHARS),
+                        };
+                        session.history.push(entry.clone());
+                        session.last_active = Instant::now();
+                        drop(session);
+
+                        // Persist to global memory store.
+                        let mem_guard = state.memory_lock.lock().await;
+                        let p = entry.user.clone();
+                        let r = entry.assistant.clone();
+                        let mem_res = tokio::task::spawn_blocking(move || memory::append(&p, &r))
+                            .await
+                            .unwrap_or_else(|e| {
+                                Err(anyhow::anyhow!("memory::append panicked: {e}"))
+                            });
+                        drop(mem_guard);
+                        if let Err(e) = mem_res {
+                            tracing::warn!(error = %e, "detach: failed to persist memory");
+                        }
+
+                        // Save result to inbox so the user gets a notification.
+                        let task_desc = truncate_chars(&prompt, 200);
+                        match InboxStore::open() {
+                            Ok(inbox) => {
+                                if let Err(e) = inbox.save_report(&sid, &task_desc, &final_text) {
+                                    tracing::warn!(
+                                        error = %e,
+                                        "detach: failed to save inbox report"
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    error = %e,
+                                    "detach: failed to open inbox"
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "detach agentic loop error");
+                        drop(session);
+                        // Save the error itself to inbox so user is informed.
+                        let task_desc = truncate_chars(&prompt, 200);
+                        if let Ok(inbox) = InboxStore::open() {
+                            let _ = inbox.save_report(&sid, &task_desc, &format!("[error] {e:#}"));
+                        }
+                    }
+                }
+            });
+        }
+
+        Request::Resume {
+            prompt,
+            tmux_pane,
+            model,
+            session_id,
+        } => {
+            tracing::info!(
+                model = %model,
+                session_id = %session_id,
+                prompt_len = prompt.len(),
+                "received resume request"
+            );
+
+            if let Err(e) = state.tokens.get(&state.http).await {
+                write_frame(
+                    &mut writer,
+                    &Response::Error {
+                        message: format!("authentication error: {e:#}"),
+                    },
+                )
+                .await?;
+                return Ok(());
+            }
+
+            let (steer_tx, mut steer_rx) = tokio::sync::mpsc::channel::<String>(16);
+            tokio::spawn(async move {
+                while let Ok(Some(frame)) = lines.next_line().await {
+                    match serde_json::from_str::<Request>(&frame) {
+                        Ok(Request::Steer { message, .. }) => {
+                            if steer_tx.send(message).await.is_err() {
+                                break;
+                            }
+                        }
+                        Ok(_) | Err(_) => {
+                            tracing::debug!("unexpected frame on established resume connection");
+                        }
+                    }
+                }
+            });
+
+            let session_arc = state.sessions.get_or_create(&session_id).await;
+            let mut session = session_arc.lock().await;
+            session.last_active = Instant::now();
+
+            // Resume: load the FULL history without the MAX_HISTORY cap.
+            let messages = build_messages_resume(&prompt, tmux_pane.as_deref(), &session.history);
+
+            match run_agentic_loop(&state, &model, messages, &mut writer, &mut steer_rx).await {
+                Ok(response_text) => {
+                    let entry = MemoryEntry {
+                        timestamp: chrono::Utc::now().to_rfc3339(),
+                        user: truncate_chars(&prompt, MAX_PROMPT_CHARS),
+                        assistant: truncate_chars(&response_text, MAX_RESPONSE_CHARS),
+                    };
+                    session.history.push(entry.clone());
+                    session.last_active = Instant::now();
+                    drop(session);
+
+                    let mem_guard = state.memory_lock.lock().await;
+                    let p = entry.user.clone();
+                    let r = entry.assistant.clone();
+                    let mem_result = tokio::task::spawn_blocking(move || memory::append(&p, &r))
+                        .await
+                        .unwrap_or_else(|e| Err(anyhow::anyhow!("memory::append panicked: {e}")));
+                    drop(mem_guard);
+                    if let Err(e) = mem_result {
+                        tracing::warn!(error = %e, "resume: failed to persist memory");
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "resume agentic loop error");
+                    let _ = write_frame(
+                        &mut writer,
+                        &Response::Error {
+                            message: format!("agent error: {e:#}"),
+                        },
+                    )
+                    .await;
+                }
+            }
         }
 
         Request::Chat {
@@ -640,6 +828,26 @@ pub(crate) fn build_messages(
     tmux_pane: Option<&str>,
     history: &[MemoryEntry],
 ) -> Vec<Message> {
+    build_messages_inner(prompt, tmux_pane, history, false)
+}
+
+/// Like [`build_messages`] but loads the **full** chronological history without
+/// the `MAX_HISTORY` sliding-window cap.  Used by the `--resume` path to
+/// re-hydrate a complete prior session.
+pub(crate) fn build_messages_resume(
+    prompt: &str,
+    tmux_pane: Option<&str>,
+    history: &[MemoryEntry],
+) -> Vec<Message> {
+    build_messages_inner(prompt, tmux_pane, history, true)
+}
+
+fn build_messages_inner(
+    prompt: &str,
+    tmux_pane: Option<&str>,
+    history: &[MemoryEntry],
+    full_history: bool,
+) -> Vec<Message> {
     let mut system = "You are a helpful, concise AI assistant embedded in a tmux terminal. \
                       Answer in plain text; avoid markdown unless the user asks for it. \
                       You have tools available to inspect the terminal, run commands, \
@@ -652,13 +860,11 @@ pub(crate) fn build_messages(
 
     let mut messages = vec![Message::system(system)];
 
-    // Inject the most recent session history as proper user/assistant turn
-    // pairs.  Using a sliding window of MAX_HISTORY entries keeps the context
-    // window bounded; taking from the tail ensures recency.
-    let window = if history.len() > MAX_HISTORY {
-        &history[history.len() - MAX_HISTORY..]
-    } else {
+    // In normal mode apply a sliding-window cap; in resume mode load everything.
+    let window = if full_history || history.len() <= MAX_HISTORY {
         history
+    } else {
+        &history[history.len() - MAX_HISTORY..]
     };
     for entry in window {
         messages.push(Message::user(entry.user.clone()));
@@ -860,5 +1066,48 @@ mod tests {
             content.contains("%3"),
             "system prompt should mention the pane"
         );
+    }
+
+    // ---- build_messages_resume tests (full history, no sliding window) -----
+
+    #[test]
+    fn build_messages_resume_loads_all_history_beyond_max() {
+        // Create history larger than MAX_HISTORY so we can verify it's all loaded.
+        let history: Vec<MemoryEntry> = (0..=MAX_HISTORY)
+            .map(|i| make_entry(&format!("u{i}"), &format!("a{i}")))
+            .collect();
+        let msgs = build_messages_resume("new", None, &history);
+        // system + ALL history entries as pairs + new user prompt
+        let expected = 1 + (MAX_HISTORY + 1) * 2 + 1;
+        assert_eq!(
+            msgs.len(),
+            expected,
+            "resume should load full history, not just last {MAX_HISTORY}"
+        );
+    }
+
+    #[test]
+    fn build_messages_resume_small_history_unchanged() {
+        let history = vec![make_entry("q1", "a1"), make_entry("q2", "a2")];
+        // When history fits within MAX_HISTORY, both variants produce identical output.
+        let normal = build_messages("q3", None, &history);
+        let resume = build_messages_resume("q3", None, &history);
+        assert_eq!(
+            normal.len(),
+            resume.len(),
+            "small history should produce same message count"
+        );
+    }
+
+    #[test]
+    fn build_messages_caps_at_max_history_normal() {
+        // Verify normal path still applies the cap after refactor.
+        let history: Vec<MemoryEntry> = (0..=MAX_HISTORY)
+            .map(|i| make_entry(&format!("u{i}"), &format!("a{i}")))
+            .collect();
+        let msgs = build_messages("new", None, &history);
+        // system + MAX_HISTORY*(user+assistant) + user
+        let expected = 1 + MAX_HISTORY * 2 + 1;
+        assert_eq!(msgs.len(), expected);
     }
 }
