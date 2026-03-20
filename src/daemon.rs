@@ -1,8 +1,6 @@
 use anyhow::{Context, Result};
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
@@ -13,213 +11,8 @@ use crate::ipc::{write_frame, Request, Response};
 use crate::memory_db;
 use crate::tools::{self, ToolExecutor};
 
-// ---------------------------------------------------------------------------
-// Session TTL tiers
-// ---------------------------------------------------------------------------
-
-/// Default TTL tiers for in-memory session eviction.
-///
-/// These can be overridden via `AMAEBI_SESSION_TTL_<TIER>` env vars (seconds).
-pub struct TtlConfig {
-    pub tiers: HashMap<String, Duration>,
-}
-
-impl TtlConfig {
-    pub fn from_env() -> Self {
-        let mut tiers = HashMap::new();
-        tiers.insert("default".to_string(), Duration::from_secs(30 * 60));
-        tiers.insert("ephemeral".to_string(), Duration::from_secs(5 * 60));
-        tiers.insert("persistent".to_string(), Duration::from_secs(24 * 60 * 60));
-
-        // Load from ~/.amaebi/config.json if present.
-        let cfg = crate::config::Config::load();
-        if let Some(&minutes) = cfg.ttl_minutes.get("default") {
-            tiers.insert("default".to_string(), Duration::from_secs(minutes * 60));
-        }
-        // Non-path keys in ttl_minutes that aren't "default" are tier names.
-        for (key, &minutes) in &cfg.ttl_minutes {
-            if key != "default" && !key.starts_with('/') {
-                tiers.insert(key.clone(), Duration::from_secs(minutes * 60));
-            }
-        }
-
-        // Allow env overrides: AMAEBI_SESSION_TTL_DEFAULT=3600, etc.
-        for (key, val) in std::env::vars() {
-            if let Some(tier) = key
-                .strip_prefix("AMAEBI_SESSION_TTL_")
-                .map(|s| s.to_lowercase())
-            {
-                if let Ok(secs) = val.parse::<u64>() {
-                    tiers.insert(tier, Duration::from_secs(secs));
-                }
-            }
-        }
-
-        Self { tiers }
-    }
-
-    pub fn ttl_for(&self, tier: &str) -> Duration {
-        self.tiers.get(tier).copied().unwrap_or_else(|| {
-            self.tiers
-                .get("default")
-                .copied()
-                .unwrap_or(Duration::from_secs(30 * 60))
-        })
-    }
-}
-
-/// How many history entries to inject as context when building messages.
+/// How many history entries (user+assistant pairs) to inject as context.
 const MAX_HISTORY: usize = 20;
-
-/// Background eviction check interval.
-const EVICTION_INTERVAL: Duration = Duration::from_secs(5 * 60);
-
-// ---------------------------------------------------------------------------
-// Per-session memory entry
-// ---------------------------------------------------------------------------
-
-/// A single user/assistant exchange stored in per-session in-memory history.
-#[derive(Clone, Debug)]
-pub struct MemoryEntry {
-    /// The user's prompt (possibly truncated).
-    pub user: String,
-    /// The assistant's response (possibly truncated).
-    pub assistant: String,
-}
-
-// ---------------------------------------------------------------------------
-// Per-session conversation state
-// ---------------------------------------------------------------------------
-
-/// In-memory state for a single session (one directory's conversation thread).
-///
-/// Protected by its own `Mutex` so that concurrent requests for the *same*
-/// session block until the previous agentic loop completes, ensuring causal
-/// ordering of history writes.  Requests for *different* sessions run freely
-/// in parallel.
-pub struct Session {
-    /// Chronological exchange history, newest last.
-    pub history: Vec<MemoryEntry>,
-    /// Updated at the start of each request; used for TTL eviction.
-    pub last_active: Instant,
-    /// TTL tier label — determines eviction timing.
-    pub ttl_tier: String,
-}
-
-impl Session {
-    fn new() -> Self {
-        Self {
-            history: Vec::new(),
-            last_active: Instant::now(),
-            ttl_tier: "default".to_string(),
-        }
-    }
-
-    #[allow(dead_code)]
-    fn with_tier(tier: &str) -> Self {
-        Self {
-            history: Vec::new(),
-            last_active: Instant::now(),
-            ttl_tier: tier.to_string(),
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Session store
-// ---------------------------------------------------------------------------
-
-/// Thread-safe map of session UUID → `Arc<Mutex<Session>>`.
-///
-/// The top-level `Mutex` is held only while doing the HashMap lookup/insert;
-/// callers then hold the per-session `Mutex` for the duration of the agentic
-/// loop.  This design allows different sessions to run concurrently while
-/// serialising same-session requests.
-pub struct SessionStore {
-    inner: tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<Session>>>>,
-    pub ttl_config: TtlConfig,
-}
-
-impl SessionStore {
-    pub fn new() -> Self {
-        Self {
-            inner: tokio::sync::Mutex::new(HashMap::new()),
-            ttl_config: TtlConfig::from_env(),
-        }
-    }
-
-    /// Retrieve (or create) the `Arc<Mutex<Session>>` for `session_id`.
-    ///
-    /// Uses a two-phase approach: first check if the key exists (read-only),
-    /// then insert only if missing.  The top-level lock is released before
-    /// returning so callers can hold the per-session lock without blocking
-    /// other sessions.
-    pub async fn get_or_create(&self, session_id: &str) -> Arc<tokio::sync::Mutex<Session>> {
-        // Single lock acquisition — the map lock is held only briefly.
-        let mut map = self.inner.lock().await;
-        if let Some(arc) = map.get(session_id) {
-            Arc::clone(arc)
-        } else {
-            let arc = Arc::new(tokio::sync::Mutex::new(Session::new()));
-            map.insert(session_id.to_string(), Arc::clone(&arc));
-            arc
-        }
-    }
-
-    /// Retrieve (or create) with a specific TTL tier.
-    #[allow(dead_code)]
-    pub async fn get_or_create_with_tier(
-        &self,
-        session_id: &str,
-        tier: &str,
-    ) -> Arc<tokio::sync::Mutex<Session>> {
-        let mut map = self.inner.lock().await;
-        if let Some(arc) = map.get(session_id) {
-            Arc::clone(arc)
-        } else {
-            let arc = Arc::new(tokio::sync::Mutex::new(Session::with_tier(tier)));
-            map.insert(session_id.to_string(), Arc::clone(&arc));
-            arc
-        }
-    }
-
-    /// Return the number of tracked sessions.
-    #[allow(dead_code)]
-    pub async fn len(&self) -> usize {
-        self.inner.lock().await.len()
-    }
-
-    /// Remove all sessions from the store.
-    #[cfg(test)]
-    pub async fn clear(&self) {
-        self.inner.lock().await.clear();
-    }
-
-    /// Evict sessions that have been inactive longer than their tier's TTL.
-    ///
-    /// Sessions that are currently locked (actively running an agentic loop)
-    /// are never evicted — `try_lock` returns `Err` in that case.
-    pub async fn evict_expired(&self) {
-        let mut map = self.inner.lock().await;
-        let before = map.len();
-        let config = &self.ttl_config;
-        map.retain(|_, arc| {
-            if let Ok(session) = arc.try_lock() {
-                session.last_active.elapsed() < config.ttl_for(&session.ttl_tier)
-            } else {
-                true // actively in use — keep it
-            }
-        });
-        let evicted = before - map.len();
-        if evicted > 0 {
-            tracing::info!(evicted, "evicted expired sessions");
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Shared daemon state
-// ---------------------------------------------------------------------------
 
 /// State shared across all concurrent client connections via `Arc`.
 pub struct DaemonState {
@@ -233,8 +26,6 @@ pub struct DaemonState {
     /// all reads and writes through a single connection without re-running the
     /// schema setup (`PRAGMA`s, `CREATE TABLE`, triggers) on every request.
     pub db: Arc<Mutex<rusqlite::Connection>>,
-    /// Per-session conversation history, keyed by session UUID.
-    pub sessions: SessionStore,
 }
 
 impl DaemonState {
@@ -254,7 +45,6 @@ impl DaemonState {
             tokens: TokenCache::new(),
             executor: Box::new(tools::LocalExecutor),
             db: Arc::new(Mutex::new(conn)),
-            sessions: SessionStore::new(),
         })
     }
 }
@@ -275,17 +65,6 @@ pub async fn run(socket: PathBuf) -> Result<()> {
     tracing::info!(path = %socket.display(), "daemon listening");
 
     let state = Arc::new(DaemonState::new().await?);
-
-    // Background task: periodically evict expired sessions.
-    let state_evict = Arc::clone(&state);
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(EVICTION_INTERVAL);
-        interval.tick().await; // skip the immediate first tick
-        loop {
-            interval.tick().await;
-            state_evict.sessions.evict_expired().await;
-        }
-    });
 
     loop {
         match listener.accept().await {
@@ -337,7 +116,7 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
         }
 
         Request::StoreMemory { user, assistant } => {
-            store_conversation(&state, &user, &assistant).await;
+            store_conversation(&state, "", &user, &assistant).await;
             write_frame(&mut writer, &Response::Done).await?;
         }
 
@@ -416,10 +195,24 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
             // Spawn the agentic loop as a fully detached background task.
             let state = Arc::clone(&state);
             tokio::spawn(async move {
-                let session_arc = state.sessions.get_or_create(&sid).await;
-                let mut session = session_arc.lock().await;
-                session.last_active = Instant::now();
-                let mut messages = build_messages(&prompt, tmux_pane.as_deref(), &session.history);
+                // Load recent history from SQLite.
+                let db = Arc::clone(&state.db);
+                let sid_clone = sid.clone();
+                let history = tokio::task::spawn_blocking(move || {
+                    let conn = db.lock().unwrap_or_else(|p| p.into_inner());
+                    memory_db::get_session_recent(&conn, &sid_clone, MAX_HISTORY * 2)
+                })
+                .await
+                .unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "detach history load panicked");
+                    Ok(vec![])
+                })
+                .unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "failed to load detach history");
+                    vec![]
+                });
+
+                let mut messages = build_messages(&prompt, tmux_pane.as_deref(), &history);
                 inject_skill_files(&mut messages).await;
 
                 // Use a sink writer — output frames are discarded; we only
@@ -429,16 +222,11 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
 
                 match run_agentic_loop(&state, &model, messages, &mut sink, &mut steer_rx).await {
                     Ok(final_text) => {
-                        let entry = MemoryEntry {
-                            user: truncate_chars(prompt.clone(), MAX_PROMPT_CHARS),
-                            assistant: truncate_chars(final_text.clone(), MAX_RESPONSE_CHARS),
-                        };
-                        session.history.push(entry.clone());
-                        session.last_active = Instant::now();
-                        drop(session);
+                        let user_text = truncate_chars(prompt.clone(), MAX_PROMPT_CHARS);
+                        let assistant_text = truncate_chars(final_text.clone(), MAX_RESPONSE_CHARS);
 
                         // Persist to SQLite memory store.
-                        store_conversation(&state, &entry.user, &entry.assistant).await;
+                        store_conversation(&state, &sid, &user_text, &assistant_text).await;
 
                         // Save result to inbox so the user gets a notification.
                         let task_desc = truncate_chars(prompt, 200);
@@ -461,7 +249,6 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                     }
                     Err(e) => {
                         tracing::error!(error = %e, "detach agentic loop error");
-                        drop(session);
                         // Save the error itself to inbox so user is informed.
                         let task_desc = truncate_chars(prompt, 200);
                         if let Ok(inbox) = InboxStore::open() {
@@ -512,26 +299,33 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                 }
             });
 
-            let session_arc = state.sessions.get_or_create(&session_id).await;
-            let mut session = session_arc.lock().await;
-            session.last_active = Instant::now();
+            // Resume: load the FULL history from SQLite without a sliding-window cap.
+            let db = Arc::clone(&state.db);
+            let sid_clone = session_id.clone();
+            let history = tokio::task::spawn_blocking(move || {
+                let conn = db.lock().unwrap_or_else(|p| p.into_inner());
+                memory_db::get_session_history(&conn, &sid_clone)
+            })
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "resume history load panicked");
+                Ok(vec![])
+            })
+            .unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "failed to load resume history");
+                vec![]
+            });
 
-            // Resume: load the FULL history without the MAX_HISTORY cap.
             let mut messages =
-                build_messages_resume(&prompt, tmux_pane.as_deref(), &session.history);
+                build_messages_resume(&prompt, tmux_pane.as_deref(), &history);
             inject_skill_files(&mut messages).await;
 
             match run_agentic_loop(&state, &model, messages, &mut writer, &mut steer_rx).await {
                 Ok(response_text) => {
-                    let entry = MemoryEntry {
-                        user: truncate_chars(prompt.clone(), MAX_PROMPT_CHARS),
-                        assistant: truncate_chars(response_text.clone(), MAX_RESPONSE_CHARS),
-                    };
-                    session.history.push(entry.clone());
-                    session.last_active = Instant::now();
-                    drop(session);
+                    let user_text = truncate_chars(prompt.clone(), MAX_PROMPT_CHARS);
+                    let assistant_text = truncate_chars(response_text.clone(), MAX_RESPONSE_CHARS);
 
-                    store_conversation(&state, &entry.user, &entry.assistant).await;
+                    store_conversation(&state, &session_id, &user_text, &assistant_text).await;
                 }
                 Err(e) => {
                     tracing::error!(error = %e, "resume agentic loop error");
@@ -601,34 +395,35 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
             // Resolve session — fall back to "global" when the client does not
             // provide one (e.g., old clients or non-directory contexts).
             let sid = session_id.unwrap_or_else(|| "global".to_string());
-            let session_arc = state.sessions.get_or_create(&sid).await;
 
-            // Acquire the per-session lock for the full duration of the
-            // agentic loop.  This ensures causal ordering: a second request
-            // for the same session blocks here until the first completes and
-            // writes its exchange into `session.history`.
-            let mut session = session_arc.lock().await;
-            session.last_active = Instant::now();
+            // Load recent history from SQLite (sliding window).
+            let db = Arc::clone(&state.db);
+            let sid_clone = sid.clone();
+            let history = tokio::task::spawn_blocking(move || {
+                let conn = db.lock().unwrap_or_else(|p| p.into_inner());
+                // MAX_HISTORY entries × 2 rows (user+assistant) per entry
+                memory_db::get_session_recent(&conn, &sid_clone, MAX_HISTORY * 2)
+            })
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "session history load panicked");
+                Ok(vec![])
+            })
+            .unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "failed to load session history");
+                vec![]
+            });
 
-            let mut messages = build_messages(&prompt, tmux_pane.as_deref(), &session.history);
+            let mut messages = build_messages(&prompt, tmux_pane.as_deref(), &history);
             inject_skill_files(&mut messages).await;
 
             match run_agentic_loop(&state, &model, messages, &mut writer, &mut steer_rx).await {
                 Ok(response_text) => {
-                    let entry = MemoryEntry {
-                        user: truncate_chars(prompt.clone(), MAX_PROMPT_CHARS),
-                        assistant: truncate_chars(response_text.clone(), MAX_RESPONSE_CHARS),
-                    };
-
-                    // Append to per-session in-memory history.
-                    session.history.push(entry.clone());
-                    session.last_active = Instant::now();
-
-                    // Release the per-session lock before doing any I/O.
-                    drop(session);
+                    let user_text = truncate_chars(prompt.clone(), MAX_PROMPT_CHARS);
+                    let assistant_text = truncate_chars(response_text.clone(), MAX_RESPONSE_CHARS);
 
                     // Persist to SQLite memory store.
-                    store_conversation(&state, &entry.user, &entry.assistant).await;
+                    store_conversation(&state, &sid, &user_text, &assistant_text).await;
                 }
                 Err(e) => {
                     tracing::error!(error = %e, "agentic loop error");
@@ -690,8 +485,9 @@ fn truncate_chars(s: String, max: usize) -> String {
 /// Runs inside `spawn_blocking`; locks `state.db` to serialise concurrent
 /// writes within this process.  Best-effort: errors are logged but not
 /// propagated.
-pub(crate) async fn store_conversation(state: &DaemonState, user: &str, assistant: &str) {
+pub(crate) async fn store_conversation(state: &DaemonState, session_id: &str, user: &str, assistant: &str) {
     let db = Arc::clone(&state.db);
+    let sid = session_id.to_owned();
     let user_owned = user.to_owned();
     let assistant_owned = assistant.to_owned();
     let result = tokio::task::spawn_blocking(move || {
@@ -699,8 +495,8 @@ pub(crate) async fn store_conversation(state: &DaemonState, user: &str, assistan
         let mut conn = db.lock().unwrap_or_else(|p| p.into_inner());
         // Write the user/assistant pair atomically so they are never split.
         let tx = conn.transaction().context("beginning memory transaction")?;
-        memory_db::store_memory(&tx, &timestamp, "", "user", &user_owned, "")?;
-        memory_db::store_memory(&tx, &timestamp, "", "assistant", &assistant_owned, "")?;
+        memory_db::store_memory(&tx, &timestamp, &sid, "user", &user_owned, "")?;
+        memory_db::store_memory(&tx, &timestamp, &sid, "assistant", &assistant_owned, "")?;
         tx.commit().context("committing memory transaction")
     })
     .await
@@ -978,7 +774,7 @@ async fn inject_skill_files_from(messages: &mut Vec<Message>, amaebi_home: &std:
 pub(crate) fn build_messages(
     prompt: &str,
     tmux_pane: Option<&str>,
-    history: &[MemoryEntry],
+    history: &[memory_db::DbMemoryEntry],
 ) -> Vec<Message> {
     build_messages_inner(prompt, tmux_pane, history, false)
 }
@@ -989,7 +785,7 @@ pub(crate) fn build_messages(
 pub(crate) fn build_messages_resume(
     prompt: &str,
     tmux_pane: Option<&str>,
-    history: &[MemoryEntry],
+    history: &[memory_db::DbMemoryEntry],
 ) -> Vec<Message> {
     build_messages_inner(prompt, tmux_pane, history, true)
 }
@@ -997,7 +793,7 @@ pub(crate) fn build_messages_resume(
 fn build_messages_inner(
     prompt: &str,
     tmux_pane: Option<&str>,
-    history: &[MemoryEntry],
+    history: &[memory_db::DbMemoryEntry],
     full_history: bool,
 ) -> Vec<Message> {
     let mut system = "You are a helpful, concise AI assistant embedded in a tmux terminal. \
@@ -1013,14 +809,19 @@ fn build_messages_inner(
     let mut messages = vec![Message::system(system)];
 
     // In normal mode apply a sliding-window cap; in resume mode load everything.
-    let window = if full_history || history.len() <= MAX_HISTORY {
+    let max_rows = MAX_HISTORY * 2; // each exchange = 2 rows (user + assistant)
+    let window = if full_history || history.len() <= max_rows {
         history
     } else {
-        &history[history.len() - MAX_HISTORY..]
+        &history[history.len() - max_rows..]
     };
     for entry in window {
-        messages.push(Message::user(entry.user.clone()));
-        messages.push(Message::assistant(Some(entry.assistant.clone()), vec![]));
+        let content = truncate_chars(entry.content.clone(), MAX_HISTORY_CHARS);
+        match entry.role.as_str() {
+            "user" => messages.push(Message::user(content)),
+            "assistant" => messages.push(Message::assistant(Some(content), vec![])),
+            _ => {} // skip unknown roles
+        }
     }
 
     messages.push(Message::user(prompt.to_owned()));
@@ -1035,11 +836,25 @@ fn build_messages_inner(
 mod tests {
     use super::*;
 
-    fn make_entry(user: &str, assistant: &str) -> MemoryEntry {
-        MemoryEntry {
-            user: user.to_string(),
-            assistant: assistant.to_string(),
+    fn make_db_entry(id: i64, role: &str, content: &str) -> memory_db::DbMemoryEntry {
+        memory_db::DbMemoryEntry {
+            id,
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            session_id: "test".to_string(),
+            role: role.to_string(),
+            content: content.to_string(),
+            summary: String::new(),
         }
+    }
+
+    /// Create a history of `n` user/assistant pairs as DbMemoryEntry rows.
+    fn make_history(n: usize) -> Vec<memory_db::DbMemoryEntry> {
+        let mut entries = Vec::with_capacity(n * 2);
+        for i in 0..n {
+            entries.push(make_db_entry((i * 2) as i64, "user", &format!("u{i}")));
+            entries.push(make_db_entry((i * 2 + 1) as i64, "assistant", &format!("a{i}")));
+        }
+        entries
     }
 
     // ------------------------------------------------------------------
@@ -1060,8 +875,7 @@ mod tests {
 
     #[test]
     fn truncate_chars_over_limit_appends_marker() {
-        // max=20: 12 chars for marker + 8 chars of content = 20 total
-        let s = "hello world extra text here".to_owned(); // 27 chars > 20
+        let s = "hello world extra text here".to_owned();
         let result = truncate_chars(s, 20);
         assert!(result.ends_with("…[truncated]"), "should end with marker");
         assert_eq!(result.chars().count(), 20);
@@ -1069,7 +883,6 @@ mod tests {
 
     #[test]
     fn truncate_chars_total_length_never_exceeds_max() {
-        // Verify the hard cap for various max values.
         let s = "a".repeat(100);
         for max in [14, 20, 50, 99] {
             let result = truncate_chars(s.clone(), max);
@@ -1090,14 +903,9 @@ mod tests {
 
     #[test]
     fn truncate_chars_respects_unicode_boundaries() {
-        // "日本語テスト" is 6 chars, each 3 bytes; slicing bytes would panic.
-        // max=20 gives room for content + marker (total ≤ 20).
-        let s = "日本語テスト".repeat(5); // 30 chars
+        let s = "日本語テスト".repeat(5);
         let result = truncate_chars(s, 20);
-        assert!(
-            result.chars().count() <= 20,
-            "total length must not exceed max"
-        );
+        assert!(result.chars().count() <= 20);
         assert!(result.ends_with("…[truncated]"));
     }
 
@@ -1108,118 +916,10 @@ mod tests {
 
     #[test]
     fn truncate_chars_multibyte_safe() {
-        // Each '日' is 3 bytes but 1 char; make sure we don't split bytes.
         let s = "日".repeat(25);
         let result = truncate_chars(s, 20);
         assert!(result.chars().count() <= 20);
         assert!(result.ends_with("…[truncated]"));
-    }
-
-    // ---- SessionStore tests ------------------------------------------------
-
-    #[tokio::test]
-    async fn session_store_get_or_create_returns_same_arc() {
-        let store = SessionStore::new();
-        let a1 = store.get_or_create("abc").await;
-        let a2 = store.get_or_create("abc").await;
-        assert!(Arc::ptr_eq(&a1, &a2));
-    }
-
-    #[tokio::test]
-    async fn session_store_different_ids_get_different_arcs() {
-        let store = SessionStore::new();
-        let a = store.get_or_create("session-a").await;
-        let b = store.get_or_create("session-b").await;
-        assert!(!Arc::ptr_eq(&a, &b));
-    }
-
-    #[tokio::test]
-    async fn session_store_clear_removes_all() {
-        let store = SessionStore::new();
-        store.get_or_create("x").await;
-        store.get_or_create("y").await;
-        store.clear().await;
-        // After clear, getting "x" should return a *new* Arc (different pointer).
-        let pre = {
-            let mut map = store.inner.lock().await;
-            let arc = Arc::new(tokio::sync::Mutex::new(Session::new()));
-            map.insert("x".to_string(), Arc::clone(&arc));
-            arc
-        };
-        store.clear().await;
-        let post = store.get_or_create("x").await;
-        assert!(!Arc::ptr_eq(&pre, &post));
-    }
-
-    #[tokio::test]
-    async fn session_store_evict_expired_removes_stale() {
-        let store = SessionStore::new();
-        let default_ttl = store.ttl_config.ttl_for("default");
-        {
-            let arc = store.get_or_create("stale").await;
-            let mut s = arc.lock().await;
-            s.last_active = Instant::now()
-                .checked_sub(default_ttl + Duration::from_secs(1))
-                .expect("test clock arithmetic");
-        }
-        store.evict_expired().await;
-        let map = store.inner.lock().await;
-        assert!(map.is_empty());
-    }
-
-    #[tokio::test]
-    async fn session_store_evict_keeps_active() {
-        let store = SessionStore::new();
-        store.get_or_create("active").await;
-        store.evict_expired().await;
-        let map = store.inner.lock().await;
-        assert!(map.contains_key("active"));
-    }
-
-    #[tokio::test]
-    async fn session_store_multi_tier_eviction() {
-        let store = SessionStore::new();
-        let ephemeral_ttl = store.ttl_config.ttl_for("ephemeral");
-
-        // Create an ephemeral session backdated past ephemeral TTL but within persistent TTL.
-        {
-            let arc = store.get_or_create_with_tier("eph", "ephemeral").await;
-            let mut s = arc.lock().await;
-            s.last_active = Instant::now()
-                .checked_sub(ephemeral_ttl + Duration::from_secs(1))
-                .expect("clock");
-        }
-        // Create a persistent session backdated the same amount.
-        {
-            let arc = store.get_or_create_with_tier("persist", "persistent").await;
-            let mut s = arc.lock().await;
-            s.last_active = Instant::now()
-                .checked_sub(ephemeral_ttl + Duration::from_secs(1))
-                .expect("clock");
-        }
-
-        store.evict_expired().await;
-        let map = store.inner.lock().await;
-        // Ephemeral should be evicted, persistent should survive.
-        assert!(
-            !map.contains_key("eph"),
-            "ephemeral session should be evicted"
-        );
-        assert!(
-            map.contains_key("persist"),
-            "persistent session should survive"
-        );
-    }
-
-    #[tokio::test]
-    async fn session_store_len() {
-        let store = SessionStore::new();
-        assert_eq!(store.len().await, 0);
-        store.get_or_create("a").await;
-        store.get_or_create("b").await;
-        assert_eq!(store.len().await, 2);
-        store.clear().await;
-        assert_eq!(store.len().await, 0);
     }
 
     // ---- build_messages tests ----------------------------------------------
@@ -1227,25 +927,22 @@ mod tests {
     #[test]
     fn build_messages_empty_history() {
         let msgs = build_messages("hello", None, &[]);
-        // system + user
         assert_eq!(msgs.len(), 2);
     }
 
     #[test]
-    fn build_messages_injects_history_as_pairs() {
-        let history = vec![make_entry("q1", "a1"), make_entry("q2", "a2")];
+    fn build_messages_injects_history_rows() {
+        let history = make_history(2); // 4 rows: u0, a0, u1, a1
         let msgs = build_messages("q3", None, &history);
-        // system + 2*(user+assistant) + user
+        // system + 4 history rows + user
         assert_eq!(msgs.len(), 6);
     }
 
     #[test]
     fn build_messages_caps_history_at_max() {
-        let history: Vec<MemoryEntry> = (0..=MAX_HISTORY)
-            .map(|i| make_entry(&format!("u{i}"), &format!("a{i}")))
-            .collect();
+        let history = make_history(MAX_HISTORY + 1);
         let msgs = build_messages("new", None, &history);
-        // system + MAX_HISTORY*(user+assistant) + user
+        // system + MAX_HISTORY*2 rows (sliding window) + user
         let expected = 1 + MAX_HISTORY * 2 + 1;
         assert_eq!(msgs.len(), expected);
     }
@@ -1253,70 +950,46 @@ mod tests {
     #[test]
     fn build_messages_tmux_pane_in_system() {
         let msgs = build_messages("prompt", Some("%3"), &[]);
-        // The first message is the system message; its content contains the pane id.
         let content = msgs[0].content.as_deref().unwrap_or("");
-        assert!(
-            content.contains("%3"),
-            "system prompt should mention the pane"
-        );
+        assert!(content.contains("%3"), "system prompt should mention the pane");
     }
 
-    // ---- build_messages_resume tests (full history, no sliding window) -----
+    // ---- build_messages_resume tests -----
 
     #[test]
     fn build_messages_resume_loads_all_history_beyond_max() {
-        // Create history larger than MAX_HISTORY so we can verify it's all loaded.
-        let history: Vec<MemoryEntry> = (0..=MAX_HISTORY)
-            .map(|i| make_entry(&format!("u{i}"), &format!("a{i}")))
-            .collect();
+        let history = make_history(MAX_HISTORY + 1);
         let msgs = build_messages_resume("new", None, &history);
-        // system + ALL history entries as pairs + new user prompt
         let expected = 1 + (MAX_HISTORY + 1) * 2 + 1;
-        assert_eq!(
-            msgs.len(),
-            expected,
-            "resume should load full history, not just last {MAX_HISTORY}"
-        );
+        assert_eq!(msgs.len(), expected,
+            "resume should load full history, not just last {MAX_HISTORY}");
     }
 
     #[test]
     fn build_messages_resume_small_history_unchanged() {
-        let history = vec![make_entry("q1", "a1"), make_entry("q2", "a2")];
-        // When history fits within MAX_HISTORY, both variants produce identical output.
+        let history = make_history(2);
         let normal = build_messages("q3", None, &history);
         let resume = build_messages_resume("q3", None, &history);
-        assert_eq!(
-            normal.len(),
-            resume.len(),
-            "small history should produce same message count"
-        );
+        assert_eq!(normal.len(), resume.len());
     }
 
     #[test]
     fn build_messages_caps_at_max_history_normal() {
-        // Verify normal path still applies the cap after refactor.
-        let history: Vec<MemoryEntry> = (0..=MAX_HISTORY)
-            .map(|i| make_entry(&format!("u{i}"), &format!("a{i}")))
-            .collect();
+        let history = make_history(MAX_HISTORY + 1);
         let msgs = build_messages("new", None, &history);
-        // system + MAX_HISTORY*(user+assistant) + user
         let expected = 1 + MAX_HISTORY * 2 + 1;
         assert_eq!(msgs.len(), expected);
     }
 
-    // ------------------------------------------------------------------
-    // inject_skill_files tests
-    // ------------------------------------------------------------------
+    // ---- inject_skill_files tests -----
 
     #[tokio::test]
     async fn skill_files_agents_and_soul_injected_from_home() {
         let dir = tempfile::TempDir::new().unwrap();
         std::fs::write(dir.path().join("AGENTS.md"), "agent guidelines").unwrap();
         std::fs::write(dir.path().join("SOUL.md"), "soul content").unwrap();
-
         let mut messages: Vec<Message> = vec![];
         inject_skill_files_from(&mut messages, dir.path()).await;
-
         assert_eq!(messages.len(), 2);
         let body = |m: &Message| m.content.as_deref().unwrap_or("").to_owned();
         assert!(body(&messages[0]).contains("## Agent Guidelines"));
@@ -1339,24 +1012,16 @@ mod tests {
         std::fs::write(dir.path().join("AGENTS.md"), "   \n  ").unwrap();
         let mut messages: Vec<Message> = vec![];
         inject_skill_files_from(&mut messages, dir.path()).await;
-        assert!(
-            messages.is_empty(),
-            "whitespace-only file must not inject a message"
-        );
+        assert!(messages.is_empty(), "whitespace-only file must not inject a message");
     }
 
     #[tokio::test]
     async fn skill_files_partial_presence() {
         let dir = tempfile::TempDir::new().unwrap();
-        // Only SOUL.md present.
         std::fs::write(dir.path().join("SOUL.md"), "soul only").unwrap();
         let mut messages: Vec<Message> = vec![];
         inject_skill_files_from(&mut messages, dir.path()).await;
         assert_eq!(messages.len(), 1);
-        assert!(messages[0]
-            .content
-            .as_deref()
-            .unwrap_or("")
-            .contains("soul only"));
+        assert!(messages[0].content.as_deref().unwrap_or("").contains("soul only"));
     }
 }
