@@ -99,8 +99,11 @@ END;
 
 /// Open (or create) the SQLite memory database at `path`.
 ///
-/// Applies WAL mode, creates the schema, and imports any existing
-/// `memory.jsonl` in the same directory on first run.
+/// Applies WAL mode and creates the schema on first run.
+/// Sets a 5-second busy timeout so concurrent processes do not fail
+/// immediately on lock contention.
+/// Enforces `0600` permissions on the database file to protect
+/// conversation history from other local users.
 pub fn init_db(path: &Path) -> Result<Connection> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -109,6 +112,19 @@ pub fn init_db(path: &Path) -> Result<Connection> {
 
     let conn = Connection::open(path)
         .with_context(|| format!("opening memory DB at {}", path.display()))?;
+
+    // Enforce 0600 so conversation history is readable only by the owner.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
+            tracing::debug!(error = %e, "could not set permissions on memory DB");
+        }
+    }
+
+    // Retry for up to 5 s when the DB is locked by another process.
+    conn.busy_timeout(std::time::Duration::from_millis(5000))
+        .context("setting SQLite busy timeout")?;
 
     conn.execute_batch(SCHEMA)
         .context("applying memory DB schema")?;
@@ -137,8 +153,8 @@ pub fn store_memory(
 /// Full-text search over `content` and `summary` fields using FTS5.
 ///
 /// Returns up to `limit` entries ordered by FTS5 relevance rank.
-/// Returns an empty list (not an error) when the query yields no results or
-/// when FTS5 syntax is invalid.
+/// Returns an empty list when the query is blank or yields no results.
+/// Propagates SQLite errors (e.g. schema issues) as `Err`.
 pub fn search_relevant(conn: &Connection, query: &str, limit: usize) -> Result<Vec<DbMemoryEntry>> {
     if query.trim().is_empty() {
         return Ok(vec![]);
@@ -150,7 +166,7 @@ pub fn search_relevant(conn: &Connection, query: &str, limit: usize) -> Result<V
              FROM memories m
              JOIN memories_fts ON memories_fts.rowid = m.id
              WHERE memories_fts MATCH ?1
-             ORDER BY rank
+             ORDER BY memories_fts.rank
              LIMIT ?2",
         )
         .context("preparing FTS5 search query")?;

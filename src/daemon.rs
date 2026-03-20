@@ -98,6 +98,8 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
     match req {
         Request::ClearCache => {
             tracing::info!("received cache clear request");
+            // Acquire the write lock so we don't race with store_conversation.
+            let _guard = state.memory_lock.lock().await;
             let db_path = state.db_path.clone();
             let result = tokio::task::spawn_blocking(move || {
                 let conn = memory_db::init_db(&db_path)?;
@@ -105,6 +107,7 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
             })
             .await
             .unwrap_or_else(|e| Err(anyhow::anyhow!("DB clear panicked: {e}")));
+            drop(_guard);
             if let Err(e) = result {
                 tracing::warn!(error = %e, "failed to clear memory DB");
             }
@@ -212,9 +215,12 @@ pub(crate) async fn store_conversation(state: &DaemonState, user: &str, assistan
     let assistant_owned = assistant.to_owned();
     let result = tokio::task::spawn_blocking(move || {
         let timestamp = chrono::Utc::now().to_rfc3339();
-        let conn = memory_db::init_db(&db_path)?;
-        memory_db::store_memory(&conn, &timestamp, "", "user", &user_owned, "")?;
-        memory_db::store_memory(&conn, &timestamp, "", "assistant", &assistant_owned, "")
+        let mut conn = memory_db::init_db(&db_path)?;
+        // Write the user/assistant pair atomically so they are never split.
+        let tx = conn.transaction().context("beginning memory transaction")?;
+        memory_db::store_memory(&tx, &timestamp, "", "user", &user_owned, "")?;
+        memory_db::store_memory(&tx, &timestamp, "", "assistant", &assistant_owned, "")?;
+        tx.commit().context("committing memory transaction")
     })
     .await
     .unwrap_or_else(|e| Err(anyhow::anyhow!("memory write panicked: {e}")));
