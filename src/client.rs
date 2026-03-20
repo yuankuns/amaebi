@@ -6,6 +6,7 @@ use tokio::net::UnixStream;
 use tokio::signal::unix::{signal, SignalKind};
 
 use crate::ipc::{Request, Response};
+use crate::session;
 
 /// How long the user has to press Ctrl-C a second time to exit.
 const DOUBLE_CTRLC_WINDOW: Duration = Duration::from_secs(2);
@@ -29,12 +30,7 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
     // for the entire command lifecycle, including the connection attempt.
     let mut sigint = signal(SignalKind::interrupt()).context("setting up SIGINT handler")?;
 
-    let stream = UnixStream::connect(&socket).await.with_context(|| {
-        format!(
-            "connecting to daemon at {} — is it running? (`amaebi daemon`)",
-            socket.display()
-        )
-    })?;
+    let stream = connect_or_start_daemon(&socket).await?;
 
     let (reader, mut writer) = tokio::io::split(stream);
 
@@ -43,11 +39,22 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
         .or_else(|| std::env::var("AMAEBI_MODEL").ok())
         .unwrap_or_else(|| "gpt-4o".to_string());
 
+    // Resolve the session UUID for the current working directory.
+    // Wrapped in spawn_blocking because session::get_or_create does file I/O.
+    let cwd = std::env::current_dir().context("getting current directory")?;
+    let session_id = tokio::task::spawn_blocking(move || session::get_or_create(&cwd))
+        .await
+        .context("session::get_or_create panicked")?
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "failed to resolve session id; using \"global\"");
+            "global".to_string()
+        });
+
     // Build and send the request as a single JSON line.
     let req = Request::Chat {
         prompt,
         tmux_pane: std::env::var("TMUX_PANE").ok(),
-        session_id: None,
+        session_id: Some(session_id),
         model,
     };
     let mut req_line = serde_json::to_string(&req).context("serializing request")?;
@@ -134,6 +141,56 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
     // Ensure the cursor ends up on a fresh line.
     stdout.write_all(b"\n").await.context("writing newline")?;
 
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Daemon auto-start
+// ---------------------------------------------------------------------------
+
+/// Connect to the daemon socket, starting the daemon in the background if it
+/// is not already running.
+///
+/// On the first failed connection attempt the daemon binary is spawned with
+/// `stdin`/`stdout`/`stderr` all redirected to `/dev/null`.  Connection is
+/// then retried with exponential back-off up to ~5 seconds before giving up.
+async fn connect_or_start_daemon(socket: &std::path::Path) -> Result<UnixStream> {
+    // Happy path: daemon is already running.
+    if let Ok(stream) = UnixStream::connect(socket).await {
+        return Ok(stream);
+    }
+
+    // Spawn the daemon in the background.
+    tracing::info!(path = %socket.display(), "daemon not reachable; auto-starting");
+    start_daemon(socket).await?;
+
+    // Retry with exponential back-off (100 ms, 200 ms, 400 ms … capped at 1 s).
+    for attempt in 0u32..10 {
+        let wait_ms = 100u64 << attempt.min(3); // 100, 200, 400, 800, 800, …
+        tokio::time::sleep(Duration::from_millis(wait_ms)).await;
+        if let Ok(stream) = UnixStream::connect(socket).await {
+            return Ok(stream);
+        }
+    }
+
+    anyhow::bail!(
+        "daemon did not become ready in time — socket: {}",
+        socket.display()
+    )
+}
+
+/// Spawn the amaebi daemon as a detached background process.
+async fn start_daemon(socket: &std::path::Path) -> Result<()> {
+    let exe = std::env::current_exe().context("finding current executable path")?;
+    tokio::process::Command::new(&exe)
+        .arg("daemon")
+        .arg("--socket")
+        .arg(socket)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .with_context(|| format!("spawning daemon from {}", exe.display()))?;
     Ok(())
 }
 

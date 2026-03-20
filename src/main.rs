@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 
 mod agent_server;
@@ -11,6 +11,7 @@ mod daemon;
 mod ipc;
 mod memory;
 mod models;
+mod session;
 #[cfg(test)]
 mod test_utils;
 mod tools;
@@ -48,6 +49,7 @@ async fn main() -> Result<()> {
         cli::Command::Acp { model } => agent_server::run(model).await,
         cli::Command::Models => models::run().await,
         cli::Command::Memory { action, socket } => run_memory(action, socket).await,
+        cli::Command::Session { action } => run_session(action),
     }
 }
 
@@ -182,6 +184,21 @@ async fn run_memory(action: cli::MemoryAction, socket: std::path::PathBuf) -> Re
             Ok(())
         }
     }
+}
+
+fn run_session(action: cli::SessionAction) -> Result<()> {
+    let cwd = std::env::current_dir().context("getting current directory")?;
+    match action {
+        cli::SessionAction::Show => match session::current(&cwd)? {
+            Some(id) => println!("{id}"),
+            None => println!("(none)"),
+        },
+        cli::SessionAction::New => {
+            let id = session::reset(&cwd)?;
+            println!("{id}");
+        }
+    }
+    Ok(())
 }
 
 /// Tell a running daemon to flush its in-memory conversation cache.

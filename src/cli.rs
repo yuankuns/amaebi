@@ -63,6 +63,14 @@ pub enum Command {
         #[arg(long, default_value = DEFAULT_SOCKET, global = true)]
         socket: PathBuf,
     },
+    /// Manage the session identity for the current directory.
+    ///
+    /// Each directory has a stable UUID stored in `~/.amaebi/sessions.json`.
+    /// The daemon uses this UUID to isolate per-project conversation history.
+    Session {
+        #[command(subcommand)]
+        action: SessionAction,
+    },
 }
 
 #[derive(clap::Subcommand, Debug)]
@@ -78,4 +86,18 @@ pub enum MemoryAction {
     Clear,
     /// Show total number of stored memories.
     Count,
+}
+
+#[derive(clap::Subcommand, Debug)]
+pub enum SessionAction {
+    /// Show the session UUID for the current directory.
+    ///
+    /// Prints the UUID if one has been assigned, or "(none)" if the current
+    /// directory has not started a session yet.
+    Show,
+    /// Reset the session for the current directory by generating a new UUID.
+    ///
+    /// The old conversation context is abandoned; the next `amaebi ask` will
+    /// start with a blank slate.
+    New,
 }

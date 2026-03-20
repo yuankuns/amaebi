@@ -29,7 +29,7 @@ use crate::memory;
 /// Uses a generic coding-assistant system prompt rather than the daemon's
 /// tmux-specific one: in ACP mode amaebi communicates over stdio and has no
 /// tmux environment available.
-async fn acp_build_messages(prompt: &str, state: &DaemonState) -> Vec<Message> {
+fn acp_build_messages(prompt: &str, history: &[memory::MemoryEntry]) -> Vec<Message> {
     let system = "You are a helpful, concise AI coding assistant. \
                   Answer in plain text; avoid markdown unless the user asks for it. \
                   You have tools available to read and edit files and run shell commands \
@@ -38,10 +38,9 @@ async fn acp_build_messages(prompt: &str, state: &DaemonState) -> Vec<Message> {
     let mut messages = vec![Message::system(system.to_owned())];
 
     // Inject recent conversation history as proper user/assistant turn pairs.
-    let entries = state.memory_cache.snapshot().await;
-    for entry in entries {
-        messages.push(Message::user(entry.user));
-        messages.push(Message::assistant(Some(entry.assistant), vec![]));
+    for entry in history {
+        messages.push(Message::user(entry.user.clone()));
+        messages.push(Message::assistant(Some(entry.assistant.clone()), vec![]));
     }
 
     messages.push(Message::user(prompt.to_owned()));
@@ -127,9 +126,16 @@ impl acp::Agent for AmaebiAgent {
             return Err(acp::Error::auth_required().data(e.to_string()));
         }
 
-        // Build the conversation messages from memory + current prompt.
+        // Load per-session history (keyed by the ACP session_id string).
+        let session_arc = self.state.sessions.get_or_create(&args.session_id.0).await;
+        let history_snapshot = {
+            let session = session_arc.lock().await;
+            session.history.clone()
+        };
+
+        // Build the conversation messages from session history + current prompt.
         // Uses an ACP-specific system prompt (no tmux context).
-        let messages = acp_build_messages(&user_text, &self.state).await;
+        let messages = acp_build_messages(&user_text, &history_snapshot);
 
         // Duplex pipe: the agentic loop writes IPC frames → we read them back
         // and forward as ACP session notifications.
@@ -196,17 +202,27 @@ impl acp::Agent for AmaebiAgent {
             Err(_) => return Err(acp::Error::internal_error()),
         };
 
-        // Save the conversation to memory (best-effort).
+        // Persist the exchange to per-session history and the global JSONL store.
+        {
+            let entry = memory::MemoryEntry {
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                user: user_text.clone(),
+                assistant: final_text.clone(),
+            };
+            let mut session = session_arc.lock().await;
+            session.history.push(entry);
+            session.last_active = std::time::Instant::now();
+        }
         let mem_guard = self.state.memory_lock.lock().await;
         let prompt_clone = user_text.clone();
+        let final_clone = final_text.clone();
         let mem_result =
-            tokio::task::spawn_blocking(move || memory::append(&prompt_clone, &final_text))
+            tokio::task::spawn_blocking(move || memory::append(&prompt_clone, &final_clone))
                 .await
                 .unwrap_or_else(|e| Err(anyhow::anyhow!("memory::append panicked: {e}")));
         drop(mem_guard);
-        match mem_result {
-            Ok(entry) => self.state.memory_cache.push(entry).await,
-            Err(e) => tracing::warn!(error = %e, "failed to save memory after ACP prompt"),
+        if let Err(e) = mem_result {
+            tracing::warn!(error = %e, "failed to save memory after ACP prompt");
         }
 
         Ok(acp::PromptResponse::new(acp::StopReason::EndTurn))
@@ -233,7 +249,6 @@ pub async fn run(model: Option<String>) -> Result<()> {
         .into();
 
     let state = Arc::new(DaemonState::new().context("initialising daemon state")?);
-    state.memory_cache.load_from_disk().await;
 
     let outgoing = tokio::io::stdout().compat_write();
     let incoming = tokio::io::stdin().compat();

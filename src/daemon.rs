@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
-use std::collections::VecDeque;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
@@ -12,73 +13,105 @@ use crate::memory::{self, MemoryEntry};
 use crate::tools::{self, ToolExecutor};
 
 // ---------------------------------------------------------------------------
-// In-memory cache for recent conversation history
+// Session TTL
 // ---------------------------------------------------------------------------
 
-/// Maximum number of entries kept in the in-memory cache (matches `load_recent` default).
-const CACHE_SIZE: usize = 20;
+/// Sessions inactive longer than this are evicted from the in-memory store.
+const SESSION_TTL: Duration = Duration::from_secs(30 * 60);
 
-/// Thread-safe in-memory ring buffer of the most recent memory entries.
+/// How many history entries to inject as context when building messages.
+const MAX_HISTORY: usize = 20;
+
+/// Background eviction check interval.
+const EVICTION_INTERVAL: Duration = Duration::from_secs(5 * 60);
+
+// ---------------------------------------------------------------------------
+// Per-session conversation state
+// ---------------------------------------------------------------------------
+
+/// In-memory state for a single session (one directory's conversation thread).
 ///
-/// The cache is warmed once at daemon startup and updated on every successful
-/// `memory::append`, so `build_messages` never performs disk I/O on the hot path.
-///
-/// # Limitations
-///
-/// The cache is only updated through the daemon's own `memory::append` calls.
-/// Entries written by external processes (e.g. future `amaebi` subcommands
-/// that call `memory::append` directly) are **not** reflected in a running
-/// daemon's cache.  A daemon restart is required to pick up such externally
-/// written entries.  This is an acceptable trade-off for the current
-/// single-user, single-daemon deployment model.
-///
-/// `load_from_disk` acquires a shared file lock (`lock_shared`) on
-/// `memory.jsonl`.  If another process holds an exclusive lock at startup, the
-/// call blocks until the lock is released — this is expected advisory-lock
-/// behaviour and is harmless in practice.
-pub struct MemoryCache {
-    inner: tokio::sync::RwLock<VecDeque<MemoryEntry>>,
+/// Protected by its own `Mutex` so that concurrent requests for the *same*
+/// session block until the previous agentic loop completes, ensuring causal
+/// ordering of history writes.  Requests for *different* sessions run freely
+/// in parallel.
+pub struct Session {
+    /// Chronological exchange history, newest last.
+    pub history: Vec<MemoryEntry>,
+    /// Updated at the start of each request; used for TTL eviction.
+    pub last_active: Instant,
 }
 
-impl MemoryCache {
+impl Session {
+    fn new() -> Self {
+        Self {
+            history: Vec::new(),
+            last_active: Instant::now(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Session store
+// ---------------------------------------------------------------------------
+
+/// Thread-safe map of session UUID → `Arc<Mutex<Session>>`.
+///
+/// The top-level `Mutex` is held only while doing the HashMap lookup/insert;
+/// callers then hold the per-session `Mutex` for the duration of the agentic
+/// loop.  This design allows different sessions to run concurrently while
+/// serialising same-session requests.
+pub struct SessionStore {
+    inner: tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<Session>>>>,
+}
+
+impl SessionStore {
     pub fn new() -> Self {
         Self {
-            inner: tokio::sync::RwLock::new(VecDeque::with_capacity(CACHE_SIZE)),
+            inner: tokio::sync::Mutex::new(HashMap::new()),
         }
     }
 
-    /// Populate the cache from disk.  Called once at startup.
-    pub async fn load_from_disk(&self) {
-        match tokio::task::spawn_blocking(|| memory::load_recent(CACHE_SIZE)).await {
-            Ok(Ok(entries)) => {
-                let mut guard = self.inner.write().await;
-                guard.clear();
-                guard.extend(entries);
-            }
-            Ok(Err(e)) => tracing::warn!(error = %e, "failed to warm memory cache from disk"),
-            Err(e) => tracing::warn!(error = %e, "memory::load_recent panicked during cache warm"),
+    /// Retrieve (or create) the `Arc<Mutex<Session>>` for `session_id`.
+    ///
+    /// The top-level lock is released before returning, so callers can hold
+    /// the per-session lock for an arbitrarily long time without blocking
+    /// other sessions.
+    pub async fn get_or_create(&self, session_id: &str) -> Arc<tokio::sync::Mutex<Session>> {
+        let mut map = self.inner.lock().await;
+        if let Some(arc) = map.get(session_id) {
+            Arc::clone(arc)
+        } else {
+            let arc = Arc::new(tokio::sync::Mutex::new(Session::new()));
+            map.insert(session_id.to_string(), Arc::clone(&arc));
+            arc
         }
     }
 
-    /// Push a new entry into the cache, evicting the oldest if necessary.
-    pub async fn push(&self, entry: MemoryEntry) {
-        let mut guard = self.inner.write().await;
-        if guard.len() >= CACHE_SIZE {
-            guard.pop_front();
-        }
-        guard.push_back(entry);
-    }
-
-    /// Return a snapshot of all cached entries in chronological order.
-    pub async fn snapshot(&self) -> Vec<MemoryEntry> {
-        self.inner.read().await.iter().cloned().collect()
-    }
-
-    /// Empty the cache.  Called when the persistent store is wiped by an
-    /// external command (`amaebi memory clear`) so that subsequent requests
-    /// do not replay stale history.
+    /// Remove all sessions from the store.  Called when the user runs
+    /// `amaebi memory clear` so stale context is not served after a wipe.
     pub async fn clear(&self) {
-        self.inner.write().await.clear();
+        self.inner.lock().await.clear();
+    }
+
+    /// Evict sessions that have been inactive longer than [`SESSION_TTL`].
+    ///
+    /// Sessions that are currently locked (actively running an agentic loop)
+    /// are never evicted — `try_lock` returns `Err` in that case.
+    pub async fn evict_expired(&self) {
+        let mut map = self.inner.lock().await;
+        let before = map.len();
+        map.retain(|_, arc| {
+            if let Ok(session) = arc.try_lock() {
+                session.last_active.elapsed() < SESSION_TTL
+            } else {
+                true // actively in use — keep it
+            }
+        });
+        let evicted = before - map.len();
+        if evicted > 0 {
+            tracing::info!(evicted, "evicted expired sessions");
+        }
     }
 }
 
@@ -87,8 +120,6 @@ impl MemoryCache {
 // ---------------------------------------------------------------------------
 
 /// State shared across all concurrent client connections via `Arc`.
-///
-/// Phase 4 will extend this with a `SessionMap` for subagent tracking.
 pub struct DaemonState {
     pub http: reqwest::Client,
     pub tokens: TokenCache,
@@ -97,8 +128,8 @@ pub struct DaemonState {
     /// Serialises concurrent `memory::append` calls within this process so that
     /// parallel client connections cannot interleave their writes to the memory file.
     pub memory_lock: tokio::sync::Mutex<()>,
-    /// In-memory cache of recent conversation history; avoids disk I/O on the hot path.
-    pub memory_cache: MemoryCache,
+    /// Per-session conversation history, keyed by session UUID.
+    pub sessions: SessionStore,
 }
 
 impl DaemonState {
@@ -111,7 +142,7 @@ impl DaemonState {
             tokens: TokenCache::new(),
             executor: Box::new(tools::LocalExecutor),
             memory_lock: tokio::sync::Mutex::new(()),
-            memory_cache: MemoryCache::new(),
+            sessions: SessionStore::new(),
         })
     }
 }
@@ -132,7 +163,17 @@ pub async fn run(socket: PathBuf) -> Result<()> {
     tracing::info!(path = %socket.display(), "daemon listening");
 
     let state = Arc::new(DaemonState::new()?);
-    state.memory_cache.load_from_disk().await;
+
+    // Background task: periodically evict expired sessions.
+    let state_evict = Arc::clone(&state);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(EVICTION_INTERVAL);
+        interval.tick().await; // skip the immediate first tick
+        loop {
+            interval.tick().await;
+            state_evict.sessions.evict_expired().await;
+        }
+    });
 
     loop {
         match listener.accept().await {
@@ -170,7 +211,7 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
     match req {
         Request::ClearCache => {
             tracing::info!("received cache clear request");
-            state.memory_cache.clear().await;
+            state.sessions.clear().await;
             write_frame(&mut writer, &Response::Done).await?;
         }
 
@@ -178,7 +219,7 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
             prompt,
             tmux_pane,
             model,
-            session_id: _,
+            session_id,
         } => {
             tracing::info!(
                 pane = ?tmux_pane,
@@ -201,29 +242,55 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                 return Ok(());
             }
 
-            let messages = build_messages(&prompt, tmux_pane.as_deref(), &state).await;
+            // Resolve session — fall back to "global" when the client does not
+            // provide one (e.g., old clients or non-directory contexts).
+            let sid = session_id.unwrap_or_else(|| "global".to_string());
+            let session_arc = state.sessions.get_or_create(&sid).await;
+
+            // Acquire the per-session lock for the full duration of the
+            // agentic loop.  This ensures causal ordering: a second request
+            // for the same session blocks here until the first completes and
+            // writes its exchange into `session.history`.
+            let mut session = session_arc.lock().await;
+            session.last_active = Instant::now();
+
+            let messages = build_messages(&prompt, tmux_pane.as_deref(), &session.history);
 
             match run_agentic_loop(&state, &model, messages, &mut writer).await {
                 Ok(response_text) => {
-                    // Serialise memory writes within this process; file-level flock in
-                    // memory::append handles cross-process protection.
+                    let entry = MemoryEntry {
+                        timestamp: chrono::Utc::now().to_rfc3339(),
+                        user: truncate_chars(&prompt, MAX_PROMPT_CHARS),
+                        assistant: truncate_chars(&response_text, MAX_RESPONSE_CHARS),
+                    };
+
+                    // Append to per-session in-memory history.
+                    session.history.push(entry.clone());
+                    session.last_active = Instant::now();
+
+                    // Release the per-session lock before doing any I/O.
+                    drop(session);
+
+                    // Persist to the global JSONL backing store (for
+                    // `amaebi memory list/search`).  The memory_lock
+                    // serialises concurrent writes within this process;
+                    // memory::append holds an flock for cross-process safety.
                     let mem_guard = state.memory_lock.lock().await;
+                    let prompt_copy = entry.user.clone();
+                    let response_copy = entry.assistant.clone();
                     let mem_result = tokio::task::spawn_blocking(move || {
-                        memory::append(&prompt, &response_text)
+                        memory::append(&prompt_copy, &response_copy)
                     })
                     .await
                     .unwrap_or_else(|e| Err(anyhow::anyhow!("memory::append panicked: {e}")));
-                    // Release the lock immediately after the write — before logging —
-                    // so other connections are not blocked while we format a warning.
                     drop(mem_guard);
-                    match mem_result {
-                        Ok(entry) => state.memory_cache.push(entry).await,
-                        Err(e) => tracing::warn!(error = %e, "failed to save memory"),
+
+                    if let Err(e) = mem_result {
+                        tracing::warn!(error = %e, "failed to persist memory to disk");
                     }
                 }
                 Err(e) => {
                     tracing::error!(error = %e, "agentic loop error");
-                    // Best-effort: the stream may be partially written already.
                     let _ = write_frame(
                         &mut writer,
                         &Response::Error {
@@ -240,11 +307,46 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
 }
 
 // ---------------------------------------------------------------------------
+// Character-level truncation
+// ---------------------------------------------------------------------------
+
+/// Maximum chars stored for a user prompt in session history.
+const MAX_PROMPT_CHARS: usize = 4_000;
+/// Maximum chars stored for an assistant response in session history.
+const MAX_RESPONSE_CHARS: usize = 8_000;
+
+/// Truncate `s` to at most `max` Unicode scalar values.
+///
+/// If truncation occurs, appends `MARKER` so the recipient can see the text
+/// was cut.  The total output is guaranteed to be ≤ `max` chars.
+pub(crate) fn truncate_chars(s: &str, max: usize) -> String {
+    const MARKER: &str = "…[truncated]";
+    let marker_len = MARKER.chars().count();
+
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+
+    // We want `body_max` chars of content + marker ≤ max chars total.
+    let body_max = max.saturating_sub(marker_len);
+    let end = s
+        .char_indices()
+        .nth(body_max)
+        .map(|(i, _)| i)
+        .unwrap_or(s.len());
+    format!("{}{}", &s[..end], MARKER)
+}
+
+// ---------------------------------------------------------------------------
 // Agentic loop
 // ---------------------------------------------------------------------------
 
 /// Drive the conversation until Copilot responds with `finish_reason: stop`
 /// (or an error).  Executes tool calls and feeds results back in a loop.
+///
+/// `stream_chat` retries 5xx, 429, and transport errors internally up to its
+/// `MAX_RETRIES`, but those errors can still surface here if retries are
+/// exhausted or if a non-retryable error occurs.
 pub(crate) async fn run_agentic_loop<W>(
     state: &DaemonState,
     model: &str,
@@ -259,8 +361,7 @@ where
 
     loop {
         // Re-fetch the token on every iteration so long-running agentic loops
-        // survive token expiration.  `TokenCache::get` returns the cached value
-        // when it is still valid, so there is no extra network request on cache hit.
+        // survive token expiration.
         let token = state
             .tokens
             .get(&state.http)
@@ -276,7 +377,6 @@ where
             }
 
             FinishReason::ToolCalls => {
-                // Append the assistant's turn (with tool_calls) to history.
                 let api_calls: Vec<ApiToolCall> = resp
                     .tool_calls
                     .iter()
@@ -297,15 +397,13 @@ where
                 };
                 messages.push(Message::assistant(assistant_text, api_calls));
 
-                // Execute each requested tool and append results.
                 for tc in &resp.tool_calls {
                     tracing::debug!(tool = %tc.name, "executing tool");
 
-                    // Notify the client so it can show progress.
                     let tool_detail = {
                         let args: serde_json::Value =
                             serde_json::from_str(&tc.arguments).unwrap_or(serde_json::Value::Null);
-                        let s = match tc.name.as_str() {
+                        match tc.name.as_str() {
                             "shell_command" => args
                                 .get("command")
                                 .and_then(|v| v.as_str())
@@ -338,8 +436,7 @@ where
                                 .unwrap_or_default()
                                 .to_string(),
                             _ => String::new(),
-                        };
-                        s
+                        }
                     };
                     write_frame(
                         writer,
@@ -379,7 +476,6 @@ where
 
                     messages.push(Message::tool_result(&tc.id, result));
                 }
-                // Continue the loop with the updated message history.
             }
 
             FinishReason::Other(ref reason) => {
@@ -400,10 +496,10 @@ where
 // Message construction
 // ---------------------------------------------------------------------------
 
-pub(crate) async fn build_messages(
+pub(crate) fn build_messages(
     prompt: &str,
     tmux_pane: Option<&str>,
-    state: &DaemonState,
+    history: &[MemoryEntry],
 ) -> Vec<Message> {
     let mut system = "You are a helpful, concise AI assistant embedded in a tmux terminal. \
                       Answer in plain text; avoid markdown unless the user asks for it. \
@@ -417,16 +513,17 @@ pub(crate) async fn build_messages(
 
     let mut messages = vec![Message::system(system)];
 
-    // Inject recent conversation history as proper user/assistant turn pairs
-    // rather than embedding it in the system prompt.  This preserves role
-    // separation and prevents a malicious assistant response stored in memory
-    // from being able to override system-level instructions.
-    //
-    // Reads from the in-memory cache — no disk I/O on the hot path.
-    let entries = state.memory_cache.snapshot().await;
-    for entry in entries {
-        messages.push(Message::user(entry.user));
-        messages.push(Message::assistant(Some(entry.assistant), vec![]));
+    // Inject the most recent session history as proper user/assistant turn
+    // pairs.  Using a sliding window of MAX_HISTORY entries keeps the context
+    // window bounded; taking from the tail ensures recency.
+    let window = if history.len() > MAX_HISTORY {
+        &history[history.len() - MAX_HISTORY..]
+    } else {
+        history
+    };
+    for entry in window {
+        messages.push(Message::user(entry.user.clone()));
+        messages.push(Message::assistant(Some(entry.assistant.clone()), vec![]));
     }
 
     messages.push(Message::user(prompt.to_owned()));
@@ -449,67 +546,135 @@ mod tests {
         }
     }
 
+    // ---- SessionStore tests ------------------------------------------------
+
     #[tokio::test]
-    async fn cache_starts_empty() {
-        let cache = MemoryCache::new();
-        assert!(cache.snapshot().await.is_empty());
+    async fn session_store_get_or_create_returns_same_arc() {
+        let store = SessionStore::new();
+        let a1 = store.get_or_create("abc").await;
+        let a2 = store.get_or_create("abc").await;
+        assert!(Arc::ptr_eq(&a1, &a2));
     }
 
     #[tokio::test]
-    async fn cache_push_and_snapshot() {
-        let cache = MemoryCache::new();
-        cache.push(make_entry("hello", "world")).await;
-        let snap = cache.snapshot().await;
-        assert_eq!(snap.len(), 1);
-        assert_eq!(snap[0].user, "hello");
-        assert_eq!(snap[0].assistant, "world");
+    async fn session_store_different_ids_get_different_arcs() {
+        let store = SessionStore::new();
+        let a = store.get_or_create("session-a").await;
+        let b = store.get_or_create("session-b").await;
+        assert!(!Arc::ptr_eq(&a, &b));
     }
 
     #[tokio::test]
-    async fn cache_evicts_oldest_at_capacity() {
-        let cache = MemoryCache::new();
-        for i in 0..=CACHE_SIZE {
-            cache
-                .push(make_entry(&format!("u{i}"), &format!("a{i}")))
-                .await;
+    async fn session_store_clear_removes_all() {
+        let store = SessionStore::new();
+        store.get_or_create("x").await;
+        store.get_or_create("y").await;
+        store.clear().await;
+        // After clear, getting "x" should return a *new* Arc (different pointer).
+        let pre = {
+            let mut map = store.inner.lock().await;
+            let arc = Arc::new(tokio::sync::Mutex::new(Session::new()));
+            map.insert("x".to_string(), Arc::clone(&arc));
+            arc
+        };
+        store.clear().await;
+        let post = store.get_or_create("x").await;
+        assert!(!Arc::ptr_eq(&pre, &post));
+    }
+
+    #[tokio::test]
+    async fn session_store_evict_expired_removes_stale() {
+        let store = SessionStore::new();
+        // Insert a session and manually backdate last_active beyond TTL.
+        {
+            let arc = store.get_or_create("stale").await;
+            let mut s = arc.lock().await;
+            // Subtract more than SESSION_TTL so it appears expired.
+            s.last_active = Instant::now()
+                .checked_sub(SESSION_TTL + Duration::from_secs(1))
+                .expect("test clock arithmetic");
         }
-        let snap = cache.snapshot().await;
-        assert_eq!(snap.len(), CACHE_SIZE);
-        // Oldest entry (u0) should have been evicted.
-        assert_eq!(snap[0].user, "u1");
-        assert_eq!(snap[CACHE_SIZE - 1].user, format!("u{CACHE_SIZE}"));
+        store.evict_expired().await;
+        // The map should now be empty.
+        let map = store.inner.lock().await;
+        assert!(map.is_empty());
     }
 
     #[tokio::test]
-    async fn cache_preserves_order() {
-        let cache = MemoryCache::new();
-        cache.push(make_entry("first", "a")).await;
-        cache.push(make_entry("second", "b")).await;
-        cache.push(make_entry("third", "c")).await;
-        let snap = cache.snapshot().await;
-        assert_eq!(snap[0].user, "first");
-        assert_eq!(snap[1].user, "second");
-        assert_eq!(snap[2].user, "third");
+    async fn session_store_evict_keeps_active() {
+        let store = SessionStore::new();
+        store.get_or_create("active").await;
+        store.evict_expired().await;
+        let map = store.inner.lock().await;
+        assert!(map.contains_key("active"));
     }
 
-    #[tokio::test]
-    async fn cache_clear_empties_all_entries() {
-        let cache = MemoryCache::new();
-        cache.push(make_entry("a", "b")).await;
-        cache.push(make_entry("c", "d")).await;
-        assert_eq!(cache.snapshot().await.len(), 2);
-        cache.clear().await;
-        assert!(cache.snapshot().await.is_empty());
+    // ---- truncate_chars tests ----------------------------------------------
+
+    #[test]
+    fn truncate_chars_short_string_unchanged() {
+        assert_eq!(truncate_chars("hello", 20), "hello");
     }
 
-    #[tokio::test]
-    async fn cache_clear_then_push_works() {
-        let cache = MemoryCache::new();
-        cache.push(make_entry("old", "data")).await;
-        cache.clear().await;
-        cache.push(make_entry("new", "data")).await;
-        let snap = cache.snapshot().await;
-        assert_eq!(snap.len(), 1);
-        assert_eq!(snap[0].user, "new");
+    #[test]
+    fn truncate_chars_exact_limit_unchanged() {
+        let s = "a".repeat(20);
+        assert_eq!(truncate_chars(&s, 20), s);
+    }
+
+    #[test]
+    fn truncate_chars_over_limit_appends_marker() {
+        let s = "a".repeat(27);
+        let result = truncate_chars(&s, 20);
+        assert!(result.ends_with("…[truncated]"));
+        assert!(result.chars().count() <= 20);
+    }
+
+    #[test]
+    fn truncate_chars_multibyte_safe() {
+        // Each '日' is 3 bytes but 1 char; make sure we don't split bytes.
+        let s = "日".repeat(25);
+        let result = truncate_chars(&s, 20);
+        assert!(result.chars().count() <= 20);
+        assert!(result.ends_with("…[truncated]"));
+    }
+
+    // ---- build_messages tests ----------------------------------------------
+
+    #[test]
+    fn build_messages_empty_history() {
+        let msgs = build_messages("hello", None, &[]);
+        // system + user
+        assert_eq!(msgs.len(), 2);
+    }
+
+    #[test]
+    fn build_messages_injects_history_as_pairs() {
+        let history = vec![make_entry("q1", "a1"), make_entry("q2", "a2")];
+        let msgs = build_messages("q3", None, &history);
+        // system + 2*(user+assistant) + user
+        assert_eq!(msgs.len(), 6);
+    }
+
+    #[test]
+    fn build_messages_caps_history_at_max() {
+        let history: Vec<MemoryEntry> = (0..=MAX_HISTORY)
+            .map(|i| make_entry(&format!("u{i}"), &format!("a{i}")))
+            .collect();
+        let msgs = build_messages("new", None, &history);
+        // system + MAX_HISTORY*(user+assistant) + user
+        let expected = 1 + MAX_HISTORY * 2 + 1;
+        assert_eq!(msgs.len(), expected);
+    }
+
+    #[test]
+    fn build_messages_tmux_pane_in_system() {
+        let msgs = build_messages("prompt", Some("%3"), &[]);
+        // The first message is the system message; its content contains the pane id.
+        let content = msgs[0].content.as_deref().unwrap_or("");
+        assert!(
+            content.contains("%3"),
+            "system prompt should mention the pane"
+        );
     }
 }
