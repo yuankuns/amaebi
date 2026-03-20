@@ -9,6 +9,30 @@ use crate::ipc::{write_frame, Response};
 const CHAT_ENDPOINT: &str = "https://api.githubcopilot.com/chat/completions";
 
 // ---------------------------------------------------------------------------
+// Typed HTTP error — lets callers inspect the status and body
+// ---------------------------------------------------------------------------
+
+/// An HTTP error response from the Copilot API.
+///
+/// Returned (via `anyhow::Error::new`) when the chat endpoint responds with a
+/// non-2xx status.  Callers can use `anyhow::Error::downcast_ref::<CopilotHttpError>()`
+/// to inspect the status code and decide how to recover (e.g. retry on 4xx).
+#[derive(Debug)]
+pub struct CopilotHttpError {
+    pub status: reqwest::StatusCode,
+    /// Raw response body — may contain a JSON error description.
+    pub body: String,
+}
+
+impl std::fmt::Display for CopilotHttpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Copilot API returned {}: {}", self.status, self.body)
+    }
+}
+
+impl std::error::Error for CopilotHttpError {}
+
+// ---------------------------------------------------------------------------
 // Public API message types
 // ---------------------------------------------------------------------------
 
@@ -422,9 +446,19 @@ where
         .json(&body)
         .send()
         .await
-        .context("sending chat request to Copilot")?
-        .error_for_status()
-        .context("Copilot chat endpoint returned an error")?;
+        .context("sending chat request to Copilot")?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body_text = resp
+            .text()
+            .await
+            .unwrap_or_else(|_| "<unreadable body>".into());
+        return Err(anyhow::Error::new(CopilotHttpError {
+            status,
+            body: body_text,
+        }));
+    }
 
     parse_sse_stream(resp, writer).await
 }

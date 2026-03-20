@@ -133,6 +133,15 @@ impl TokenCache {
         }
     }
 
+    /// Evict the cached token, forcing the next [`get`] call to fetch a fresh one.
+    ///
+    /// Call this when the API returns a 4xx response that suggests the token
+    /// was invalidated server-side before its nominal `valid_until` time.
+    pub async fn invalidate(&self) {
+        let mut guard = self.inner.lock().await;
+        *guard = None;
+    }
+
     /// Return a valid API token, fetching a fresh one if the cache is empty
     /// or the cached token is about to expire.
     pub async fn get(&self, http: &reqwest::Client) -> Result<String> {
@@ -163,7 +172,27 @@ mod tests {
     use crate::test_utils::with_home;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
+    use std::time::Duration;
     use tempfile::TempDir;
+
+    // ---- TokenCache::invalidate -------------------------------------------
+
+    #[tokio::test]
+    async fn token_cache_invalidate_clears_cached_value() {
+        let cache = TokenCache::new();
+        // Manually populate the cache with a far-future token.
+        {
+            let mut guard = cache.inner.lock().await;
+            *guard = Some(CachedToken {
+                value: "test-token".into(),
+                valid_until: Instant::now() + Duration::from_secs(3600),
+            });
+        }
+        // Invalidate should clear it.
+        cache.invalidate().await;
+        let guard = cache.inner.lock().await;
+        assert!(guard.is_none(), "cache should be empty after invalidate");
+    }
 
     /// Path to `~/.amaebi/` inside a temp home.
     fn amaebi_dir(home: &std::path::Path) -> std::path::PathBuf {
