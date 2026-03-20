@@ -405,9 +405,7 @@ pub async fn run_resume(
 /// and **never resolves** (`std::future::pending`) when `lines` is `None`.
 /// This allows the caller to include this as an always-present arm in
 /// `tokio::select!` without special-casing the TTY check in the macro body.
-async fn next_stdin_line(lines: &mut Option<BufReader<tokio::io::Stdin>>) -> Option<String>
-where
-{
+async fn next_stdin_line(lines: &mut Option<BufReader<tokio::io::Stdin>>) -> Option<String> {
     match lines {
         Some(buf) => {
             let mut line = String::new();

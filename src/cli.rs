@@ -36,7 +36,7 @@ pub enum Command {
         #[arg(long)]
         detach: bool,
         /// Resume a prior session by UUID, loading its full chronological history
-        /// instead of the normal FTS5-filtered context window.
+        /// instead of the normal sliding-window context (last N turns).
         #[arg(long)]
         resume: Option<String>,
     },

@@ -39,11 +39,14 @@ pub enum Request {
         /// Chat model to use (e.g. "gpt-4o").
         model: String,
     },
-    /// Resume a prior session by UUID, loading its **full** chronological history.
+    /// Resume a prior session by UUID, loading its **full** chronological history
+    /// from the SQLite memory store.
     ///
-    /// Unlike [`Request::Chat`], which applies a sliding-window cap, this variant
-    /// bypasses the `MAX_HISTORY` limit so the LLM receives the entire conversation
-    /// from disk.  Useful for multi-day projects where full context matters.
+    /// Unlike [`Request::Chat`], which applies a sliding-window cap over recent
+    /// turns, this variant bypasses the `MAX_HISTORY` limit so the LLM receives the
+    /// entire persisted conversation for `session_id`.  History is read from the
+    /// SQLite DB on every call, so it survives daemon restarts.
+    /// Useful for multi-day projects where full context matters.
     Resume {
         /// The prompt to send in this turn.
         prompt: String,

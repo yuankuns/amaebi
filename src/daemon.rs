@@ -190,7 +190,9 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                 return Ok(());
             }
 
-            let sid = session_id.unwrap_or_else(|| "global".to_string());
+            // Fall back to "" to stay compatible with history rows written by
+            // older clients that did not send a session_id.
+            let sid = session_id.unwrap_or_default();
 
             // Acknowledge immediately — client can exit after this.
             write_frame(
@@ -400,9 +402,9 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                 }
             });
 
-            // Resolve session — fall back to "global" when the client does not
-            // provide one (e.g., old clients or non-directory contexts).
-            let sid = session_id.unwrap_or_else(|| "global".to_string());
+            // Resolve session — fall back to "" to stay compatible with history
+            // rows written by older clients that did not send a session_id.
+            let sid = session_id.unwrap_or_default();
 
             // Load recent history from SQLite (sliding window).
             let db = Arc::clone(&state.db);

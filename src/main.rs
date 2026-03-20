@@ -234,8 +234,19 @@ async fn run_memory(action: cli::MemoryAction, socket: std::path::PathBuf) -> Re
 /// Print a bell notification to stderr if there are unread inbox reports.
 ///
 /// Silently no-ops if the inbox database does not yet exist or cannot be read,
-/// so a cold-start installation never produces a confusing error.
+/// so a cold-start installation never creates dotfiles just from running `amaebi ask`.
 fn print_inbox_notification() {
+    // Only open the DB if it already exists — avoids creating inbox.db on cold start.
+    let db_path = match inbox::db_path() {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::debug!(error = %e, "could not resolve inbox db path for notification");
+            return;
+        }
+    };
+    if !db_path.exists() {
+        return;
+    }
     match inbox::InboxStore::open() {
         Ok(store) => match store.unread_count() {
             Ok(0) => {}

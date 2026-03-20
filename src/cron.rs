@@ -95,7 +95,35 @@ impl CronStore {
         conn.busy_timeout(std::time::Duration::from_secs(5))
             .context("setting busy timeout")?;
 
+        // Restrict WAL/SHM sidecar files to 0600 — they can contain sensitive
+        // job descriptions and may otherwise inherit a broader umask.
+        self.restrict_sidecar_permissions()
+            .context("setting permissions on WAL sidecar files")?;
+
         Ok(conn)
+    }
+
+    /// Set 0600 on `cron.db-wal` and `cron.db-shm` when they exist.
+    fn restrict_sidecar_permissions(&self) -> Result<()> {
+        for suffix in ["-wal", "-shm"] {
+            let sidecar = self.db_path.with_file_name(format!(
+                "{}{}",
+                self.db_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("cron.db"),
+                suffix
+            ));
+            match std::fs::set_permissions(&sidecar, std::fs::Permissions::from_mode(0o600)) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(e)
+                        .with_context(|| format!("setting permissions on {}", sidecar.display()));
+                }
+            }
+        }
+        Ok(())
     }
 
     fn init(&self) -> Result<()> {

@@ -223,7 +223,12 @@ pub fn get_or_create(dir: &Path) -> Result<String> {
     // shared read and the exclusive lock acquisition.
     let uuid = if let Some(rec) = map.get_mut(&key) {
         rec.touch();
-        rec.uuid.clone()
+        // Clone UUID before releasing the mutable borrow so we can pass `map`
+        // to save_map.  Persisting here ensures TTL eviction sees the correct
+        // last_accessed even when two processes race on the same entry.
+        let id = rec.uuid.clone();
+        save_map(&path, &map)?;
+        id
     } else {
         let rec = SessionRecord::new();
         let id = rec.uuid.clone();
@@ -375,7 +380,7 @@ pub fn clear_expired(
 
         if let Ok(accessed) = chrono::DateTime::parse_from_rfc3339(&rec.last_accessed) {
             let age = now.signed_duration_since(accessed).num_seconds().max(0) as u64;
-            if age > tier_ttl {
+            if age >= tier_ttl {
                 expired.push((key.clone(), rec.clone()));
             }
         }
