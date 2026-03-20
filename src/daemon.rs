@@ -301,11 +301,13 @@ where
             .await
             .context("refreshing Copilot API token inside agentic loop")?;
 
-        // stream_chat already retries 5xx, 429, and transport errors internally.
-        // The only errors it surfaces here are auth-adjacent ones (400/401/403)
-        // where the cached token may have been silently invalidated server-side.
-        // On those, evict the cache and retry exactly once with a fresh token.
-        // Any other error (exhausted retries, context overflow, etc.) propagates.
+        // stream_chat retries 5xx, 429, and transport errors internally up to
+        // its MAX_RETRIES, but those errors can still surface here if retries
+        // are exhausted, or if parsing/IO errors occur while streaming.
+        // 4xx responses (except 429) are surfaced immediately as CopilotHttpError;
+        // for auth-adjacent ones (400/401/403) we evict the cache and retry once
+        // with a fresh token. Any other error (exhausted retries, context overflow,
+        // etc.) propagates.
         let resp =
             match copilot::stream_chat(&state.http, &token, model, &messages, &schemas, writer)
                 .await
@@ -553,8 +555,10 @@ pub(crate) async fn build_messages(
 /// Edge case: if `max` is smaller than or equal to the marker length, the
 /// marker itself is truncated to `max` chars.
 fn truncate_chars(s: String, max: usize) -> String {
-    if s.chars().count() <= max {
-        return s; // already within limit — no allocation
+    // Fast path: if there is no (max+1)-th character the string is within limit.
+    // char_indices().nth(max) is O(max), unlike chars().count() which is O(n).
+    if s.char_indices().nth(max).is_none() {
+        return s; // already within limit — no additional allocation
     }
     const MARKER: &str = "…[truncated]";
     const MARKER_LEN: usize = 12; // "…[truncated]" is 12 chars (… = 1 char)

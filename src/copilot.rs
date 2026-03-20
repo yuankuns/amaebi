@@ -295,6 +295,42 @@ impl SseAccumulator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
+
+    // ---- parse_retry_after_header ---------------------------------------
+
+    #[test]
+    fn parse_retry_after_header_missing() {
+        let headers = HeaderMap::new();
+        assert_eq!(parse_retry_after_header(&headers), None);
+    }
+
+    #[test]
+    fn parse_retry_after_header_invalid_value() {
+        let mut headers = HeaderMap::new();
+        headers.insert(RETRY_AFTER, HeaderValue::from_static("not-a-number"));
+        assert_eq!(parse_retry_after_header(&headers), None);
+    }
+
+    #[test]
+    fn parse_retry_after_header_valid_value() {
+        let mut headers = HeaderMap::new();
+        headers.insert(RETRY_AFTER, HeaderValue::from_static("10"));
+        let dur = parse_retry_after_header(&headers).expect("expected Some(Duration)");
+        assert_eq!(dur, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn parse_retry_after_header_caps_large_values() {
+        let mut headers = HeaderMap::new();
+        let large = (MAX_RETRY_AFTER_SECS.saturating_add(10)).to_string();
+        headers.insert(
+            RETRY_AFTER,
+            HeaderValue::from_str(&large).expect("valid header value"),
+        );
+        let dur = parse_retry_after_header(&headers).expect("expected Some(Duration)");
+        assert_eq!(dur, Duration::from_secs(MAX_RETRY_AFTER_SECS));
+    }
 
     // ---- Message constructors -------------------------------------------
 
@@ -454,7 +490,15 @@ pub(crate) fn backoff_delay(attempt: u32) -> Duration {
 /// Caps the returned delay at [`MAX_RETRY_AFTER_SECS`] to prevent the daemon
 /// from sleeping for unreasonably long periods.
 pub(crate) fn parse_retry_after(resp: &reqwest::Response) -> Option<Duration> {
-    resp.headers()
+    parse_retry_after_header(resp.headers())
+}
+
+/// Parse the `Retry-After` header from a [`HeaderMap`] into a [`Duration`].
+///
+/// Factored out of [`parse_retry_after`] so it can be tested without
+/// constructing a full `reqwest::Response`.
+pub(crate) fn parse_retry_after_header(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    headers
         .get(reqwest::header::RETRY_AFTER)
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<u64>().ok())
@@ -529,6 +573,7 @@ async fn send_with_retry(
                     delay_ms = delay.as_millis(),
                     "Copilot rate-limited (429); backing off before retry"
                 );
+                drop(resp); // release connection before sleeping so the pool can reuse it
                 tokio::time::sleep(delay).await;
                 attempt += 1;
             }
@@ -546,13 +591,15 @@ async fn send_with_retry(
                         body: body_text,
                     }));
                 }
+                let status = resp.status();
                 let delay = backoff_delay(attempt);
                 tracing::warn!(
                     attempt,
-                    status = %resp.status(),
+                    status = %status,
                     delay_ms = delay.as_millis(),
                     "Copilot server error; retrying with exponential backoff"
                 );
+                drop(resp); // release connection before sleeping so the pool can reuse it
                 tokio::time::sleep(delay).await;
                 attempt += 1;
             }
