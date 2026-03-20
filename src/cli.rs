@@ -76,6 +76,15 @@ pub enum Command {
         #[command(subcommand)]
         action: CacheAction,
     },
+    /// Read reports from completed cron tasks.
+    ///
+    /// Cron tasks run autonomously in the background; their output is stored
+    /// in `~/.amaebi/inbox.db`.  A bell notification is printed at the start
+    /// of every `amaebi ask` invocation when unread reports are present.
+    Inbox {
+        #[command(subcommand)]
+        action: InboxAction,
+    },
 }
 
 #[derive(clap::Subcommand, Debug)]
@@ -127,6 +136,27 @@ pub enum SessionAction {
         /// Tier name (e.g. "default", "ephemeral", "persistent").
         tier: String,
     },
+}
+
+#[derive(clap::Subcommand, Debug)]
+pub enum InboxAction {
+    /// List all unread cron reports (default view).
+    ///
+    /// Pass `--all` to include already-read reports.
+    List {
+        /// Include reports that have already been read.
+        #[arg(long)]
+        all: bool,
+    },
+    /// Display a specific report and mark it as read.
+    Read {
+        /// The numeric ID of the report (shown in `inbox list`).
+        id: i64,
+    },
+    /// Mark all unread reports as read without displaying them.
+    MarkRead,
+    /// Delete all inbox reports.
+    Clear,
 }
 
 #[derive(clap::Subcommand, Debug)]

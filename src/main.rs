@@ -9,6 +9,7 @@ mod client;
 mod config;
 mod copilot;
 mod daemon;
+mod inbox;
 mod ipc;
 mod memory;
 mod models;
@@ -29,6 +30,20 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = cli::Cli::parse();
+
+    // Print a bell notification if there are unread cron reports.
+    // Shown only for user-facing commands; silently skipped if the inbox db
+    // does not exist yet (no cron tasks have ever run).
+    if matches!(
+        &cli.command,
+        cli::Command::Ask { .. }
+            | cli::Command::Session { .. }
+            | cli::Command::Memory { .. }
+            | cli::Command::Cache { .. }
+    ) {
+        print_inbox_notification();
+    }
+
     match cli.command {
         cli::Command::Daemon { socket } => daemon::run(socket).await,
         cli::Command::Ask {
@@ -52,6 +67,7 @@ async fn main() -> Result<()> {
         cli::Command::Memory { action, socket } => run_memory(action, socket).await,
         cli::Command::Session { action } => run_session(action),
         cli::Command::Cache { action } => run_cache(action),
+        cli::Command::Inbox { action } => run_inbox(action),
     }
 }
 
@@ -183,6 +199,83 @@ async fn run_memory(action: cli::MemoryAction, socket: std::path::PathBuf) -> Re
         cli::MemoryAction::Count => {
             let n = memory::count()?;
             println!("{n}");
+            Ok(())
+        }
+    }
+}
+
+/// Print a bell notification to stderr if there are unread inbox reports.
+///
+/// Silently no-ops if the inbox database does not yet exist or cannot be read,
+/// so a cold-start installation never produces a confusing error.
+fn print_inbox_notification() {
+    match inbox::InboxStore::open() {
+        Ok(store) => match store.unread_count() {
+            Ok(0) => {}
+            Ok(n) => {
+                let noun = if n == 1 { "report" } else { "reports" };
+                eprintln!("[🔔 You have {n} unread cron {noun}. Run `amaebi inbox list` to read.]");
+            }
+            Err(e) => tracing::debug!(error = %e, "could not check inbox unread count"),
+        },
+        Err(e) => tracing::debug!(error = %e, "could not open inbox store for notification"),
+    }
+}
+
+fn run_inbox(action: cli::InboxAction) -> Result<()> {
+    let store = inbox::InboxStore::open().context("opening inbox database")?;
+    match action {
+        cli::InboxAction::List { all } => {
+            let reports = if all {
+                store.get_all()?
+            } else {
+                store.get_unread()?
+            };
+            if reports.is_empty() {
+                if all {
+                    println!("Inbox is empty.");
+                } else {
+                    println!("No unread cron reports.");
+                }
+            } else {
+                for r in &reports {
+                    let status = if r.read { "read" } else { "UNREAD" };
+                    println!(
+                        "[{}] #{} — {} ({})\n  Task: {}\n",
+                        status,
+                        r.id,
+                        r.created_at,
+                        r.session_id,
+                        sanitize(&r.task_description),
+                    );
+                }
+                let unread = reports.iter().filter(|r| !r.read).count();
+                if unread > 0 {
+                    println!("{unread} unread. Use `amaebi inbox read <id>` to view a report.");
+                }
+            }
+            Ok(())
+        }
+        cli::InboxAction::Read { id } => match store.get_by_id(id)? {
+            None => anyhow::bail!("no report with id {id}"),
+            Some(report) => {
+                println!("Task: {}", sanitize(&report.task_description));
+                println!("Session: {}", report.session_id);
+                println!("Created: {}", report.created_at);
+                println!();
+                println!("{}", sanitize(&report.output));
+                store.mark_read(id)?;
+                Ok(())
+            }
+        },
+        cli::InboxAction::MarkRead => {
+            store.mark_all_read()?;
+            println!("All reports marked as read.");
+            Ok(())
+        }
+        cli::InboxAction::Clear => {
+            store.clear()?;
+            println!("Inbox cleared.");
             Ok(())
         }
     }

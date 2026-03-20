@@ -56,6 +56,7 @@ impl Config {
     ///
     /// Checks for an exact canonical-path match first, then falls back to
     /// the `"default"` key, and finally to `DEFAULT_TTL_MINUTES`.
+    #[allow(dead_code)]
     pub fn ttl_for(&self, dir: &str) -> Duration {
         // Exact match on canonical directory path.
         if let Some(&minutes) = self.ttl_minutes.get(dir) {

@@ -58,15 +58,12 @@ impl TtlConfig {
     }
 
     pub fn ttl_for(&self, tier: &str) -> Duration {
-        self.tiers
-            .get(tier)
-            .copied()
-            .unwrap_or_else(|| {
-                self.tiers
-                    .get("default")
-                    .copied()
-                    .unwrap_or(Duration::from_secs(30 * 60))
-            })
+        self.tiers.get(tier).copied().unwrap_or_else(|| {
+            self.tiers
+                .get("default")
+                .copied()
+                .unwrap_or(Duration::from_secs(30 * 60))
+        })
     }
 }
 
@@ -104,6 +101,7 @@ impl Session {
         }
     }
 
+    #[allow(dead_code)]
     fn with_tier(tier: &str) -> Self {
         Self {
             history: Vec::new(),
@@ -155,6 +153,7 @@ impl SessionStore {
     }
 
     /// Retrieve (or create) with a specific TTL tier.
+    #[allow(dead_code)]
     pub async fn get_or_create_with_tier(
         &self,
         session_id: &str,
@@ -176,6 +175,7 @@ impl SessionStore {
     }
 
     /// Return the number of tracked sessions.
+    #[allow(dead_code)]
     pub async fn len(&self) -> usize {
         self.inner.lock().await.len()
     }
@@ -720,8 +720,14 @@ mod tests {
         store.evict_expired().await;
         let map = store.inner.lock().await;
         // Ephemeral should be evicted, persistent should survive.
-        assert!(!map.contains_key("eph"), "ephemeral session should be evicted");
-        assert!(map.contains_key("persist"), "persistent session should survive");
+        assert!(
+            !map.contains_key("eph"),
+            "ephemeral session should be evicted"
+        );
+        assert!(
+            map.contains_key("persist"),
+            "persistent session should survive"
+        );
     }
 
     #[tokio::test]

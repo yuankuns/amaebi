@@ -21,6 +21,7 @@ async-trait = "0.1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 fs2 = "0.4"
 uuid = { version = "1", features = ["v4"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
 agent-client-protocol = "0.10.2"
 tokio-util = { version = "0.7", features = ["compat"] }
 

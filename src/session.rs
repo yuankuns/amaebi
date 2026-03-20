@@ -181,12 +181,16 @@ pub fn get_or_create(dir: &Path) -> Result<String> {
     // --- Fast path: shared-lock read ---
     {
         let lock_file = open_lock_file()?;
-        lock_file.lock_shared().context("acquiring shared sessions lock")?;
+        lock_file
+            .lock_shared()
+            .context("acquiring shared sessions lock")?;
 
         if let Ok(map) = load_map(&path) {
             if let Some(rec) = map.get(&key) {
                 let uuid = rec.uuid.clone();
-                lock_file.unlock().context("releasing shared sessions lock")?;
+                lock_file
+                    .unlock()
+                    .context("releasing shared sessions lock")?;
 
                 // Touch last_accessed under exclusive lock (best-effort).
                 if let Ok(lf2) = open_lock_file() {
@@ -301,6 +305,7 @@ pub fn current(dir: &Path) -> Result<Option<String>> {
 }
 
 /// Return the full session record for `dir`, if one exists.
+#[allow(dead_code)]
 pub fn current_record(dir: &Path) -> Result<Option<SessionRecord>> {
     let path = sessions_path()?;
     if !path.exists() {
@@ -369,10 +374,7 @@ pub fn clear_expired(
         );
 
         if let Ok(accessed) = chrono::DateTime::parse_from_rfc3339(&rec.last_accessed) {
-            let age = now
-                .signed_duration_since(accessed)
-                .num_seconds()
-                .max(0) as u64;
+            let age = now.signed_duration_since(accessed).num_seconds().max(0) as u64;
             if age > tier_ttl {
                 expired.push((key.clone(), rec.clone()));
             }
@@ -566,7 +568,10 @@ mod tests {
         let path = sessions_path().unwrap();
         let meta = std::fs::metadata(&path).unwrap();
         let mode = meta.permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600, "sessions.json should be mode 0600, got {mode:o}");
+        assert_eq!(
+            mode, 0o600,
+            "sessions.json should be mode 0600, got {mode:o}"
+        );
     }
 
     #[test]
@@ -694,8 +699,8 @@ mod tests {
         save_map(&path, &map).unwrap();
 
         let mut ttls = HashMap::new();
-        ttls.insert("ephemeral".to_string(), 300u64);    // 5 min — expired
-        ttls.insert("default".to_string(), 1800u64);     // 30 min — expired
+        ttls.insert("ephemeral".to_string(), 300u64); // 5 min — expired
+        ttls.insert("default".to_string(), 1800u64); // 30 min — expired
         ttls.insert("persistent".to_string(), 86400u64); // 24 hr — NOT expired
 
         let expired = clear_expired(&ttls, false).unwrap();
