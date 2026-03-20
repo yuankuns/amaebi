@@ -13,11 +13,12 @@ pub enum Request {
         /// Chat model to use (e.g. "gpt-4o").
         model: String,
     },
-    /// Ask the daemon to clear its in-memory conversation cache.
+    /// Ask the daemon to clear its persisted SQLite memory database.
     ///
-    /// Sent after `amaebi memory clear` so the running daemon does not serve
-    /// stale entries.  The daemon responds with a single [`Response::Done`] frame.
-    ClearCache,
+    /// Sent after `amaebi memory clear` so the running daemon also clears its
+    /// copy of the SQLite database.  The daemon responds with a single
+    /// [`Response::Done`] frame.
+    ClearMemory,
     /// Ask the daemon to persist a user/assistant exchange.
     ///
     /// Used by the ACP agent so all SQLite writes go through the single daemon
@@ -117,13 +118,13 @@ mod tests {
     }
 
     #[test]
-    fn request_clear_cache_round_trip() {
-        let req = Request::ClearCache;
+    fn request_clear_memory_round_trip() {
+        let req = Request::ClearMemory;
         let json = serde_json::to_string(&req).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(v["type"], "clear_cache");
+        assert_eq!(v["type"], "clear_memory");
         let back: Request = serde_json::from_str(&json).unwrap();
-        assert!(matches!(back, Request::ClearCache));
+        assert!(matches!(back, Request::ClearMemory));
     }
 
     // ---- Response tag encoding ------------------------------------------

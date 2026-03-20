@@ -208,7 +208,7 @@ async fn notify_daemon_cache_clear(socket: &std::path::Path) {
     };
     let (reader, mut writer) = tokio::io::split(stream);
 
-    let Ok(mut line) = serde_json::to_string(&ipc::Request::ClearCache) else {
+    let Ok(mut line) = serde_json::to_string(&ipc::Request::ClearMemory) else {
         return;
     };
     line.push('\n');

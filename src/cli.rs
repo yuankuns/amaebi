@@ -75,11 +75,11 @@ pub enum Command {
 
 #[derive(clap::Subcommand, Debug)]
 pub enum MemoryAction {
-    /// Show the last 20 remembered conversations.
+    /// Show the last 40 remembered messages.
     List,
-    /// Search memories by substring.
+    /// Search memories using full-text search (FTS5).
     Search {
-        /// Query string to search for.
+        /// Query string (phrase search; special FTS5 operators are escaped).
         query: String,
     },
     /// Delete all stored memories.

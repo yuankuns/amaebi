@@ -115,8 +115,10 @@ async fn ipc_retrieve_context(socket: &std::path::Path, prompt: &str) -> Vec<Mes
                 Ok(Response::MemoryEntry { role, content }) => {
                     if role == "user" {
                         messages.push(Message::user(content));
-                    } else {
+                    } else if role == "assistant" {
                         messages.push(Message::assistant(Some(content), vec![]));
+                    } else {
+                        tracing::warn!(role = %role, "unexpected role in MemoryEntry; skipping");
                     }
                 }
                 Ok(Response::Done) => break,

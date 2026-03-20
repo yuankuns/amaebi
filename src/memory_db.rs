@@ -62,7 +62,7 @@ CREATE TABLE IF NOT EXISTS memories (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     timestamp  TEXT    NOT NULL,
     session_id TEXT    NOT NULL DEFAULT '',
-    role       TEXT    NOT NULL,
+    role       TEXT    NOT NULL CHECK (role IN ('user', 'assistant')),
     content    TEXT    NOT NULL,
     summary    TEXT    NOT NULL DEFAULT ''
 );

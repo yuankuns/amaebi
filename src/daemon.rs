@@ -96,8 +96,8 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
     let req: Request = serde_json::from_str(&line).context("parsing request JSON")?;
 
     match req {
-        Request::ClearCache => {
-            tracing::info!("received cache clear request");
+        Request::ClearMemory => {
+            tracing::info!("received memory clear request");
             // Acquire the write lock so we don't race with store_conversation.
             let _guard = state.memory_lock.lock().await;
             let db_path = state.db_path.clone();
