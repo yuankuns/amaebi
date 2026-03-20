@@ -114,6 +114,36 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
             write_frame(&mut writer, &Response::Done).await?;
         }
 
+        Request::StoreMemory { user, assistant } => {
+            store_conversation(&state, &user, &assistant).await;
+            write_frame(&mut writer, &Response::Done).await?;
+        }
+
+        Request::RetrieveContext { prompt } => {
+            let db_path = state.db_path.clone();
+            let entries = tokio::task::spawn_blocking(move || {
+                let conn = memory_db::init_db(&db_path)?;
+                memory_db::retrieve_context(&conn, &prompt, 4, 10)
+            })
+            .await
+            .unwrap_or_else(|e| Err(anyhow::anyhow!("memory read panicked: {e}")))
+            .unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "failed to retrieve memory context via IPC");
+                vec![]
+            });
+            for entry in entries {
+                write_frame(
+                    &mut writer,
+                    &Response::MemoryEntry {
+                        role: entry.role,
+                        content: entry.content,
+                    },
+                )
+                .await?;
+            }
+            write_frame(&mut writer, &Response::Done).await?;
+        }
+
         Request::Chat {
             prompt,
             tmux_pane,

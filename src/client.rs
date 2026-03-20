@@ -126,6 +126,9 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
                             _ => eprintln!("🔧 {name}: {detail}"),
                         }
                     }
+                    Response::MemoryEntry { .. } => {
+                        // Not sent to the CLI client — daemon-internal only.
+                    }
                 }
             }
         }

@@ -49,11 +49,18 @@ pub enum Command {
     /// from any ACP-compatible client (Claude Code, Zed, etc.).
     /// Communicates via JSON-RPC over stdin/stdout.
     ///
+    /// Memory reads and writes are routed through a running daemon process via
+    /// the Unix socket so that only the daemon ever writes to SQLite.
+    /// If no daemon is reachable, memory operations are silently skipped.
+    ///
     /// Example: amaebi acp
     Acp {
         /// Model to use (overrides AMAEBI_MODEL env var; default: gpt-4o).
         #[arg(long)]
         model: Option<String>,
+        /// Path to the daemon's Unix socket (used for memory IPC).
+        #[arg(long, default_value = DEFAULT_SOCKET)]
+        socket: PathBuf,
     },
     /// Manage conversation memory.
     Memory {
