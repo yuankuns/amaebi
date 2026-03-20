@@ -139,7 +139,7 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                     &mut writer,
                     &Response::MemoryEntry {
                         role: entry.role,
-                        content: entry.content,
+                        content: truncate_chars(entry.content, MAX_HISTORY_CHARS),
                     },
                 )
                 .await?;
@@ -219,10 +219,11 @@ pub(crate) async fn retrieve_memory_context(state: &DaemonState, prompt: &str) -
         Ok(Ok(entries)) => entries
             .into_iter()
             .map(|e| {
+                let content = truncate_chars(e.content, MAX_HISTORY_CHARS);
                 if e.role == "user" {
-                    Message::user(e.content)
+                    Message::user(content)
                 } else {
-                    Message::assistant(Some(e.content), vec![])
+                    Message::assistant(Some(content), vec![])
                 }
             })
             .collect(),
@@ -266,6 +267,16 @@ pub(crate) async fn store_conversation(state: &DaemonState, user: &str, assistan
 // Agentic loop
 // ---------------------------------------------------------------------------
 
+/// Maximum number of Unicode scalar values kept from a single historical
+/// memory message injected into a request.  Prevents accumulated long tool
+/// outputs from blowing the model's context window after extended use.
+const MAX_HISTORY_CHARS: usize = 4_000;
+
+/// Maximum number of Unicode scalar values kept from a single tool-call
+/// output within the current agentic loop iteration.  Large file reads and
+/// shell command outputs are truncated before being fed back to the model.
+const MAX_TOOL_OUTPUT_CHARS: usize = 8_000;
+
 /// Drive the conversation until Copilot responds with `finish_reason: stop`
 /// (or an error).  Executes tool calls and feeds results back in a loop.
 pub(crate) async fn run_agentic_loop<W>(
@@ -289,8 +300,48 @@ where
             .get(&state.http)
             .await
             .context("refreshing Copilot API token inside agentic loop")?;
+
+        // stream_chat retries 5xx, 429, and transport errors internally up to
+        // its MAX_RETRIES, but those errors can still surface here if retries
+        // are exhausted, or if parsing/IO errors occur while streaming.
+        // 4xx responses (except 429) are surfaced immediately as CopilotHttpError;
+        // for auth-adjacent ones (400/401/403) we evict the cache and retry once
+        // with a fresh token. Any other error (exhausted retries, context overflow,
+        // etc.) propagates.
         let resp =
-            copilot::stream_chat(&state.http, &token, model, &messages, &schemas, writer).await?;
+            match copilot::stream_chat(&state.http, &token, model, &messages, &schemas, writer)
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    let is_auth_err = e
+                        .downcast_ref::<copilot::CopilotHttpError>()
+                        .is_some_and(|he| matches!(he.status.as_u16(), 400 | 401 | 403));
+                    if is_auth_err {
+                        tracing::warn!(
+                            error = %e,
+                            "Copilot auth error; evicting token cache and retrying once"
+                        );
+                        state.tokens.invalidate().await;
+                        let fresh_token = state
+                            .tokens
+                            .get(&state.http)
+                            .await
+                            .context("fetching fresh token after auth error")?;
+                        copilot::stream_chat(
+                            &state.http,
+                            &fresh_token,
+                            model,
+                            &messages,
+                            &schemas,
+                            writer,
+                        )
+                        .await?
+                    } else {
+                        return Err(e);
+                    }
+                }
+            };
 
         match resp.finish_reason {
             FinishReason::Stop | FinishReason::Length => {
@@ -392,7 +443,7 @@ where
                                 output_len = output.len(),
                                 "tool succeeded"
                             );
-                            output
+                            truncate_chars(output, MAX_TOOL_OUTPUT_CHARS)
                         }
                         Err(e) => {
                             tracing::warn!(tool = %tc.name, error = %e, "tool failed");
@@ -492,12 +543,105 @@ pub(crate) async fn build_messages(
 }
 
 // ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Truncate `s` to at most `max` Unicode scalar values (including the marker).
+///
+/// If truncation occurs, appends `"…[truncated]"` so the model knows the
+/// content was cut.  The returned string always contains at most `max` chars.
+/// Operates on char boundaries, never slicing multi-byte sequences.
+///
+/// Edge case: if `max` is smaller than or equal to the marker length, the
+/// marker itself is truncated to `max` chars.
+fn truncate_chars(s: String, max: usize) -> String {
+    // Fast path: if there is no (max+1)-th character the string is within limit.
+    // char_indices().nth(max) is O(max), unlike chars().count() which is O(n).
+    if s.char_indices().nth(max).is_none() {
+        return s; // already within limit — no additional allocation
+    }
+    const MARKER: &str = "…[truncated]";
+    let marker_len = MARKER.chars().count(); // derived, never drifts from MARKER
+    if max <= marker_len {
+        return MARKER.chars().take(max).collect();
+    }
+    let content_len = max - marker_len;
+    let mut out: String = s.chars().take(content_len).collect();
+    out.push_str(MARKER);
+    out
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ------------------------------------------------------------------
+    // truncate_chars tests
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn truncate_chars_short_string_unchanged() {
+        let s = "hello".to_owned();
+        assert_eq!(truncate_chars(s, 10), "hello");
+    }
+
+    #[test]
+    fn truncate_chars_at_limit_unchanged() {
+        let s = "hello".to_owned();
+        assert_eq!(truncate_chars(s, 5), "hello");
+    }
+
+    #[test]
+    fn truncate_chars_over_limit_appends_marker() {
+        // max=20: 12 chars for marker + 8 chars of content = 20 total
+        let s = "hello world extra text here".to_owned(); // 27 chars > 20
+        let result = truncate_chars(s, 20);
+        assert!(result.ends_with("…[truncated]"), "should end with marker");
+        assert_eq!(result.chars().count(), 20);
+    }
+
+    #[test]
+    fn truncate_chars_total_length_never_exceeds_max() {
+        // Verify the hard cap for various max values.
+        let s = "a".repeat(100);
+        for max in [14, 20, 50, 99] {
+            let result = truncate_chars(s.clone(), max);
+            assert!(
+                result.chars().count() <= max,
+                "max={max}: got {} chars",
+                result.chars().count()
+            );
+        }
+    }
+
+    #[test]
+    fn truncate_chars_max_smaller_than_marker_returns_partial_marker() {
+        let result = truncate_chars("hello world".to_owned(), 3);
+        assert_eq!(result.chars().count(), 3);
+        assert!(result.starts_with('…'));
+    }
+
+    #[test]
+    fn truncate_chars_respects_unicode_boundaries() {
+        // "日本語テスト" is 6 chars, each 3 bytes; slicing bytes would panic.
+        // max=20 gives room for content + marker (total ≤ 20).
+        let s = "日本語テスト".repeat(5); // 30 chars
+        let result = truncate_chars(s, 20);
+        assert!(
+            result.chars().count() <= 20,
+            "total length must not exceed max"
+        );
+        assert!(result.ends_with("…[truncated]"));
+    }
+
+    #[test]
+    fn truncate_chars_empty_string_unchanged() {
+        assert_eq!(truncate_chars(String::new(), 10), "");
+    }
 
     // ------------------------------------------------------------------
     // inject_skill_files tests
