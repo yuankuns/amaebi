@@ -561,11 +561,11 @@ fn truncate_chars(s: String, max: usize) -> String {
         return s; // already within limit — no additional allocation
     }
     const MARKER: &str = "…[truncated]";
-    const MARKER_LEN: usize = 12; // "…[truncated]" is 12 chars (… = 1 char)
-    if max <= MARKER_LEN {
+    let marker_len = MARKER.chars().count(); // derived, never drifts from MARKER
+    if max <= marker_len {
         return MARKER.chars().take(max).collect();
     }
-    let content_len = max - MARKER_LEN;
+    let content_len = max - marker_len;
     let mut out: String = s.chars().take(content_len).collect();
     out.push_str(MARKER);
     out

@@ -42,7 +42,18 @@ pub struct CopilotHttpError {
 
 impl std::fmt::Display for CopilotHttpError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Copilot API returned {}: {}", self.status, self.body)
+        // Truncate the body to 200 chars to prevent flooding logs when this
+        // error is formatted via tracing::warn!(error = %e, ...).
+        let body = &self.body;
+        match body.char_indices().nth(200) {
+            None => write!(f, "Copilot API returned {}: {}", self.status, body),
+            Some((byte_idx, _)) => write!(
+                f,
+                "Copilot API returned {}: {}…",
+                self.status,
+                &body[..byte_idx]
+            ),
+        }
     }
 }
 
@@ -573,7 +584,9 @@ async fn send_with_retry(
                     delay_ms = delay.as_millis(),
                     "Copilot rate-limited (429); backing off before retry"
                 );
-                drop(resp); // release connection before sleeping so the pool can reuse it
+                // Drain the body so the underlying connection can be returned
+                // to the pool for reuse, then sleep before retrying.
+                let _ = resp.bytes().await;
                 tokio::time::sleep(delay).await;
                 attempt += 1;
             }
@@ -599,7 +612,9 @@ async fn send_with_retry(
                     delay_ms = delay.as_millis(),
                     "Copilot server error; retrying with exponential backoff"
                 );
-                drop(resp); // release connection before sleeping so the pool can reuse it
+                // Drain the body so the underlying connection can be returned
+                // to the pool for reuse, then sleep before retrying.
+                let _ = resp.bytes().await;
                 tokio::time::sleep(delay).await;
                 attempt += 1;
             }
