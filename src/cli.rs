@@ -49,11 +49,19 @@ pub enum Command {
     /// from any ACP-compatible client (Claude Code, Zed, etc.).
     /// Communicates via JSON-RPC over stdin/stdout.
     ///
+    /// Memory reads and writes are routed through a running daemon process via
+    /// the Unix socket so that only the daemon ever writes to SQLite.
+    /// If no daemon is reachable, memory operations are skipped; connection
+    /// failures are logged (writes at warning level, reads at debug level).
+    ///
     /// Example: amaebi acp
     Acp {
         /// Model to use (overrides AMAEBI_MODEL env var; default: gpt-4o).
         #[arg(long)]
         model: Option<String>,
+        /// Path to the daemon's Unix socket (used for memory IPC).
+        #[arg(long, default_value = DEFAULT_SOCKET)]
+        socket: PathBuf,
     },
     /// Manage conversation memory.
     Memory {
@@ -67,11 +75,11 @@ pub enum Command {
 
 #[derive(clap::Subcommand, Debug)]
 pub enum MemoryAction {
-    /// Show the last 20 remembered conversations.
+    /// Show the last 40 remembered messages.
     List,
-    /// Search memories by substring.
+    /// Search memories using full-text search (FTS5).
     Search {
-        /// Query string to search for.
+        /// Query string (phrase search; special FTS5 operators are escaped).
         query: String,
     },
     /// Delete all stored memories.

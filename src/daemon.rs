@@ -1,86 +1,14 @@
 use anyhow::{Context, Result};
-use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
-use crate::auth::TokenCache;
+use crate::auth::{amaebi_home, TokenCache};
 use crate::copilot::{self, ApiToolCall, ApiToolCallFunction, FinishReason, Message};
 use crate::ipc::{write_frame, Request, Response};
-use crate::memory::{self, MemoryEntry};
+use crate::memory_db;
 use crate::tools::{self, ToolExecutor};
-
-// ---------------------------------------------------------------------------
-// In-memory cache for recent conversation history
-// ---------------------------------------------------------------------------
-
-/// Maximum number of entries kept in the in-memory cache (matches `load_recent` default).
-const CACHE_SIZE: usize = 20;
-
-/// Thread-safe in-memory ring buffer of the most recent memory entries.
-///
-/// The cache is warmed once at daemon startup and updated on every successful
-/// `memory::append`, so `build_messages` never performs disk I/O on the hot path.
-///
-/// # Limitations
-///
-/// The cache is only updated through the daemon's own `memory::append` calls.
-/// Entries written by external processes (e.g. future `amaebi` subcommands
-/// that call `memory::append` directly) are **not** reflected in a running
-/// daemon's cache.  A daemon restart is required to pick up such externally
-/// written entries.  This is an acceptable trade-off for the current
-/// single-user, single-daemon deployment model.
-///
-/// `load_from_disk` acquires a shared file lock (`lock_shared`) on
-/// `memory.jsonl`.  If another process holds an exclusive lock at startup, the
-/// call blocks until the lock is released — this is expected advisory-lock
-/// behaviour and is harmless in practice.
-pub struct MemoryCache {
-    inner: tokio::sync::RwLock<VecDeque<MemoryEntry>>,
-}
-
-impl MemoryCache {
-    pub fn new() -> Self {
-        Self {
-            inner: tokio::sync::RwLock::new(VecDeque::with_capacity(CACHE_SIZE)),
-        }
-    }
-
-    /// Populate the cache from disk.  Called once at startup.
-    pub async fn load_from_disk(&self) {
-        match tokio::task::spawn_blocking(|| memory::load_recent(CACHE_SIZE)).await {
-            Ok(Ok(entries)) => {
-                let mut guard = self.inner.write().await;
-                guard.clear();
-                guard.extend(entries);
-            }
-            Ok(Err(e)) => tracing::warn!(error = %e, "failed to warm memory cache from disk"),
-            Err(e) => tracing::warn!(error = %e, "memory::load_recent panicked during cache warm"),
-        }
-    }
-
-    /// Push a new entry into the cache, evicting the oldest if necessary.
-    pub async fn push(&self, entry: MemoryEntry) {
-        let mut guard = self.inner.write().await;
-        if guard.len() >= CACHE_SIZE {
-            guard.pop_front();
-        }
-        guard.push_back(entry);
-    }
-
-    /// Return a snapshot of all cached entries in chronological order.
-    pub async fn snapshot(&self) -> Vec<MemoryEntry> {
-        self.inner.read().await.iter().cloned().collect()
-    }
-
-    /// Empty the cache.  Called when the persistent store is wiped by an
-    /// external command (`amaebi memory clear`) so that subsequent requests
-    /// do not replay stale history.
-    pub async fn clear(&self) {
-        self.inner.write().await.clear();
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Shared daemon state
@@ -94,24 +22,31 @@ pub struct DaemonState {
     pub tokens: TokenCache,
     /// Tool executor — `LocalExecutor` now; swappable with `DockerExecutor` in Phase 4.
     pub executor: Box<dyn ToolExecutor>,
-    /// Serialises concurrent `memory::append` calls within this process so that
-    /// parallel client connections cannot interleave their writes to the memory file.
-    pub memory_lock: tokio::sync::Mutex<()>,
-    /// In-memory cache of recent conversation history; avoids disk I/O on the hot path.
-    pub memory_cache: MemoryCache,
+    /// Persistent SQLite connection opened once at startup.
+    ///
+    /// Wrapped in `Mutex` so that concurrent `spawn_blocking` tasks serialise
+    /// all reads and writes through a single connection without re-running the
+    /// schema setup (`PRAGMA`s, `CREATE TABLE`, triggers) on every request.
+    pub db: Arc<Mutex<rusqlite::Connection>>,
 }
 
 impl DaemonState {
-    pub fn new() -> Result<Self> {
+    /// Create a new `DaemonState`, opening the SQLite DB inside
+    /// `spawn_blocking` so the file I/O never blocks the async reactor.
+    pub async fn new() -> Result<Self> {
         let http = reqwest::Client::builder()
             .build()
             .context("building HTTP client")?;
+        let db_path = memory_db::db_path().context("resolving memory DB path")?;
+        let conn = tokio::task::spawn_blocking(move || memory_db::init_db(&db_path))
+            .await
+            .unwrap_or_else(|e| Err(anyhow::anyhow!("DB init panicked: {e}")))
+            .context("opening memory DB")?;
         Ok(Self {
             http,
             tokens: TokenCache::new(),
             executor: Box::new(tools::LocalExecutor),
-            memory_lock: tokio::sync::Mutex::new(()),
-            memory_cache: MemoryCache::new(),
+            db: Arc::new(Mutex::new(conn)),
         })
     }
 }
@@ -131,8 +66,7 @@ pub async fn run(socket: PathBuf) -> Result<()> {
 
     tracing::info!(path = %socket.display(), "daemon listening");
 
-    let state = Arc::new(DaemonState::new()?);
-    state.memory_cache.load_from_disk().await;
+    let state = Arc::new(DaemonState::new().await?);
 
     loop {
         match listener.accept().await {
@@ -168,9 +102,48 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
     let req: Request = serde_json::from_str(&line).context("parsing request JSON")?;
 
     match req {
-        Request::ClearCache => {
-            tracing::info!("received cache clear request");
-            state.memory_cache.clear().await;
+        Request::ClearMemory => {
+            tracing::info!("received memory clear request");
+            let db = Arc::clone(&state.db);
+            let result = tokio::task::spawn_blocking(move || {
+                let conn = db.lock().unwrap_or_else(|p| p.into_inner());
+                memory_db::clear(&conn)
+            })
+            .await
+            .unwrap_or_else(|e| Err(anyhow::anyhow!("DB clear panicked: {e}")));
+            if let Err(e) = result {
+                tracing::warn!(error = %e, "failed to clear memory DB");
+            }
+            write_frame(&mut writer, &Response::Done).await?;
+        }
+
+        Request::StoreMemory { user, assistant } => {
+            store_conversation(&state, &user, &assistant).await;
+            write_frame(&mut writer, &Response::Done).await?;
+        }
+
+        Request::RetrieveContext { prompt } => {
+            let db = Arc::clone(&state.db);
+            let entries = tokio::task::spawn_blocking(move || {
+                let conn = db.lock().unwrap_or_else(|p| p.into_inner());
+                memory_db::retrieve_context(&conn, &prompt, 4, 10)
+            })
+            .await
+            .unwrap_or_else(|e| Err(anyhow::anyhow!("memory read panicked: {e}")))
+            .unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "failed to retrieve memory context via IPC");
+                vec![]
+            });
+            for entry in entries {
+                write_frame(
+                    &mut writer,
+                    &Response::MemoryEntry {
+                        role: entry.role,
+                        content: entry.content,
+                    },
+                )
+                .await?;
+            }
             write_frame(&mut writer, &Response::Done).await?;
         }
 
@@ -205,21 +178,7 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
 
             match run_agentic_loop(&state, &model, messages, &mut writer).await {
                 Ok(response_text) => {
-                    // Serialise memory writes within this process; file-level flock in
-                    // memory::append handles cross-process protection.
-                    let mem_guard = state.memory_lock.lock().await;
-                    let mem_result = tokio::task::spawn_blocking(move || {
-                        memory::append(&prompt, &response_text)
-                    })
-                    .await
-                    .unwrap_or_else(|e| Err(anyhow::anyhow!("memory::append panicked: {e}")));
-                    // Release the lock immediately after the write — before logging —
-                    // so other connections are not blocked while we format a warning.
-                    drop(mem_guard);
-                    match mem_result {
-                        Ok(entry) => state.memory_cache.push(entry).await,
-                        Err(e) => tracing::warn!(error = %e, "failed to save memory"),
-                    }
+                    store_conversation(&state, &prompt, &response_text).await;
                 }
                 Err(e) => {
                     tracing::error!(error = %e, "agentic loop error");
@@ -237,6 +196,70 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Memory helpers — canonical DB access for daemon and ACP agent
+// ---------------------------------------------------------------------------
+
+/// Retrieve conversation context for `prompt` from SQLite.
+///
+/// Returns the last 4 turns (recency) plus up to 10 FTS-relevant entries,
+/// deduplicated and sorted chronologically, as `Message` values ready for
+/// injection into a Copilot API request.
+pub(crate) async fn retrieve_memory_context(state: &DaemonState, prompt: &str) -> Vec<Message> {
+    let db = Arc::clone(&state.db);
+    let prompt_owned = prompt.to_owned();
+    match tokio::task::spawn_blocking(move || {
+        let conn = db.lock().unwrap_or_else(|p| p.into_inner());
+        memory_db::retrieve_context(&conn, &prompt_owned, 4, 10)
+    })
+    .await
+    {
+        Ok(Ok(entries)) => entries
+            .into_iter()
+            .map(|e| {
+                if e.role == "user" {
+                    Message::user(e.content)
+                } else {
+                    Message::assistant(Some(e.content), vec![])
+                }
+            })
+            .collect(),
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "failed to load memory context from SQLite");
+            vec![]
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "memory context load task panicked");
+            vec![]
+        }
+    }
+}
+
+/// Persist a user/assistant exchange to SQLite.
+///
+/// Runs inside `spawn_blocking`; locks `state.db` to serialise concurrent
+/// writes within this process.  Best-effort: errors are logged but not
+/// propagated.
+pub(crate) async fn store_conversation(state: &DaemonState, user: &str, assistant: &str) {
+    let db = Arc::clone(&state.db);
+    let user_owned = user.to_owned();
+    let assistant_owned = assistant.to_owned();
+    let result = tokio::task::spawn_blocking(move || {
+        let timestamp = chrono::Utc::now().to_rfc3339();
+        let mut conn = db.lock().unwrap_or_else(|p| p.into_inner());
+        // Write the user/assistant pair atomically so they are never split.
+        let tx = conn.transaction().context("beginning memory transaction")?;
+        memory_db::store_memory(&tx, &timestamp, "", "user", &user_owned, "")?;
+        memory_db::store_memory(&tx, &timestamp, "", "assistant", &assistant_owned, "")?;
+        tx.commit().context("committing memory transaction")
+    })
+    .await
+    .unwrap_or_else(|e| Err(anyhow::anyhow!("memory write panicked: {e}")));
+    if let Err(e) = result {
+        tracing::warn!(error = %e, "failed to save memory");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -397,6 +420,47 @@ where
 }
 
 // ---------------------------------------------------------------------------
+// Skill-file injection
+// ---------------------------------------------------------------------------
+
+/// Read global config files from `~/.amaebi/` and inject them as system messages.
+///
+/// Loads `AGENTS.md` and `SOUL.md` from the user's amaebi home directory
+/// (`~/.amaebi/`).  Files that do not exist or are whitespace-only are
+/// silently skipped.  No per-project or CWD-relative files are read.
+pub(crate) async fn inject_skill_files(messages: &mut Vec<Message>) {
+    let home = match amaebi_home() {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::debug!(error = %e, "could not resolve amaebi home for skill injection");
+            return;
+        }
+    };
+    inject_skill_files_from(messages, &home).await;
+}
+
+/// Internal helper used by [`inject_skill_files`] and tests.
+async fn inject_skill_files_from(messages: &mut Vec<Message>, amaebi_home: &std::path::Path) {
+    const FIXED_FILES: &[(&str, &str)] =
+        &[("AGENTS.md", "## Agent Guidelines"), ("SOUL.md", "## Soul")];
+    for (filename, header) in FIXED_FILES {
+        let path = amaebi_home.join(filename);
+        match tokio::fs::read_to_string(&path).await {
+            Ok(content) => {
+                let trimmed = content.trim();
+                if !trimmed.is_empty() {
+                    messages.push(Message::system(format!("{header}\n\n{trimmed}")));
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                tracing::debug!(file = %path.display(), error = %e, "could not read config file");
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Message construction
 // ---------------------------------------------------------------------------
 
@@ -417,16 +481,10 @@ pub(crate) async fn build_messages(
 
     let mut messages = vec![Message::system(system)];
 
-    // Inject recent conversation history as proper user/assistant turn pairs
-    // rather than embedding it in the system prompt.  This preserves role
-    // separation and prevents a malicious assistant response stored in memory
-    // from being able to override system-level instructions.
-    //
-    // Reads from the in-memory cache — no disk I/O on the hot path.
-    let entries = state.memory_cache.snapshot().await;
-    for entry in entries {
-        messages.push(Message::user(entry.user));
-        messages.push(Message::assistant(Some(entry.assistant), vec![]));
+    inject_skill_files(&mut messages).await;
+
+    for msg in retrieve_memory_context(state, prompt).await {
+        messages.push(msg);
     }
 
     messages.push(Message::user(prompt.to_owned()));
@@ -441,75 +499,59 @@ pub(crate) async fn build_messages(
 mod tests {
     use super::*;
 
-    fn make_entry(user: &str, assistant: &str) -> MemoryEntry {
-        MemoryEntry {
-            timestamp: "2024-01-01T00:00:00Z".to_string(),
-            user: user.to_string(),
-            assistant: assistant.to_string(),
-        }
+    // ------------------------------------------------------------------
+    // inject_skill_files tests
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn skill_files_agents_and_soul_injected_from_home() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("AGENTS.md"), "agent guidelines").unwrap();
+        std::fs::write(dir.path().join("SOUL.md"), "soul content").unwrap();
+
+        let mut messages: Vec<Message> = vec![];
+        inject_skill_files_from(&mut messages, dir.path()).await;
+
+        assert_eq!(messages.len(), 2);
+        let body = |m: &Message| m.content.as_deref().unwrap_or("").to_owned();
+        assert!(body(&messages[0]).contains("## Agent Guidelines"));
+        assert!(body(&messages[0]).contains("agent guidelines"));
+        assert!(body(&messages[1]).contains("## Soul"));
+        assert!(body(&messages[1]).contains("soul content"));
     }
 
     #[tokio::test]
-    async fn cache_starts_empty() {
-        let cache = MemoryCache::new();
-        assert!(cache.snapshot().await.is_empty());
+    async fn skill_files_absent_produces_no_messages() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut messages: Vec<Message> = vec![];
+        inject_skill_files_from(&mut messages, dir.path()).await;
+        assert!(messages.is_empty());
     }
 
     #[tokio::test]
-    async fn cache_push_and_snapshot() {
-        let cache = MemoryCache::new();
-        cache.push(make_entry("hello", "world")).await;
-        let snap = cache.snapshot().await;
-        assert_eq!(snap.len(), 1);
-        assert_eq!(snap[0].user, "hello");
-        assert_eq!(snap[0].assistant, "world");
+    async fn skill_files_empty_file_skipped() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("AGENTS.md"), "   \n  ").unwrap();
+        let mut messages: Vec<Message> = vec![];
+        inject_skill_files_from(&mut messages, dir.path()).await;
+        assert!(
+            messages.is_empty(),
+            "whitespace-only file must not inject a message"
+        );
     }
 
     #[tokio::test]
-    async fn cache_evicts_oldest_at_capacity() {
-        let cache = MemoryCache::new();
-        for i in 0..=CACHE_SIZE {
-            cache
-                .push(make_entry(&format!("u{i}"), &format!("a{i}")))
-                .await;
-        }
-        let snap = cache.snapshot().await;
-        assert_eq!(snap.len(), CACHE_SIZE);
-        // Oldest entry (u0) should have been evicted.
-        assert_eq!(snap[0].user, "u1");
-        assert_eq!(snap[CACHE_SIZE - 1].user, format!("u{CACHE_SIZE}"));
-    }
-
-    #[tokio::test]
-    async fn cache_preserves_order() {
-        let cache = MemoryCache::new();
-        cache.push(make_entry("first", "a")).await;
-        cache.push(make_entry("second", "b")).await;
-        cache.push(make_entry("third", "c")).await;
-        let snap = cache.snapshot().await;
-        assert_eq!(snap[0].user, "first");
-        assert_eq!(snap[1].user, "second");
-        assert_eq!(snap[2].user, "third");
-    }
-
-    #[tokio::test]
-    async fn cache_clear_empties_all_entries() {
-        let cache = MemoryCache::new();
-        cache.push(make_entry("a", "b")).await;
-        cache.push(make_entry("c", "d")).await;
-        assert_eq!(cache.snapshot().await.len(), 2);
-        cache.clear().await;
-        assert!(cache.snapshot().await.is_empty());
-    }
-
-    #[tokio::test]
-    async fn cache_clear_then_push_works() {
-        let cache = MemoryCache::new();
-        cache.push(make_entry("old", "data")).await;
-        cache.clear().await;
-        cache.push(make_entry("new", "data")).await;
-        let snap = cache.snapshot().await;
-        assert_eq!(snap.len(), 1);
-        assert_eq!(snap[0].user, "new");
+    async fn skill_files_partial_presence() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // Only SOUL.md present.
+        std::fs::write(dir.path().join("SOUL.md"), "soul only").unwrap();
+        let mut messages: Vec<Message> = vec![];
+        inject_skill_files_from(&mut messages, dir.path()).await;
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0]
+            .content
+            .as_deref()
+            .unwrap_or("")
+            .contains("soul only"));
     }
 }

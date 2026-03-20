@@ -9,7 +9,7 @@ mod client;
 mod copilot;
 mod daemon;
 mod ipc;
-mod memory;
+mod memory_db;
 mod models;
 #[cfg(test)]
 mod test_utils;
@@ -45,7 +45,7 @@ async fn main() -> Result<()> {
             let http = reqwest::Client::new();
             auth_flow::ensure_authenticated(&http, &client_id, skip_validate).await
         }
-        cli::Command::Acp { model } => agent_server::run(model).await,
+        cli::Command::Acp { model, socket } => agent_server::run(model, socket).await,
         cli::Command::Models => models::run().await,
         cli::Command::Memory { action, socket } => run_memory(action, socket).await,
     }
@@ -137,47 +137,58 @@ fn sanitize(s: &str) -> String {
 async fn run_memory(action: cli::MemoryAction, socket: std::path::PathBuf) -> Result<()> {
     match action {
         cli::MemoryAction::List => {
-            let entries = memory::load_recent(20)?;
+            let db_path = memory_db::db_path()?;
+            let conn = memory_db::init_db(&db_path)?;
+            let entries = memory_db::get_recent(&conn, 40)?;
             if entries.is_empty() {
                 println!("No memories stored.");
             } else {
                 for e in &entries {
                     println!(
-                        "[{}]\n  Q: {}\n  A: {}\n",
+                        "[{}] ({})\n  {}\n",
                         sanitize(&e.timestamp),
-                        sanitize(&e.user),
-                        sanitize(&e.assistant)
+                        sanitize(&e.role),
+                        sanitize(&e.content)
                     );
                 }
             }
             Ok(())
         }
         cli::MemoryAction::Search { query } => {
-            let entries = memory::search(&query)?;
+            let db_path = memory_db::db_path()?;
+            let conn = memory_db::init_db(&db_path)?;
+            let entries = memory_db::search_relevant(&conn, &query, 20)?;
             if entries.is_empty() {
                 println!("No matches for {:?}.", query);
             } else {
                 for e in &entries {
                     println!(
-                        "[{}]\n  Q: {}\n  A: {}\n",
+                        "[{}] ({})\n  {}\n",
                         sanitize(&e.timestamp),
-                        sanitize(&e.user),
-                        sanitize(&e.assistant)
+                        sanitize(&e.role),
+                        sanitize(&e.content)
                     );
                 }
             }
             Ok(())
         }
         cli::MemoryAction::Clear => {
-            memory::clear()?;
-            // Best-effort: notify a running daemon to clear its in-memory cache.
+            // Clear SQLite.
+            let db_path = memory_db::db_path()?;
+            if db_path.exists() {
+                let conn = memory_db::init_db(&db_path)?;
+                memory_db::clear(&conn)?;
+            }
+            // Best-effort: notify a running daemon to also clear its SQLite DB.
             // Silently ignores connection failures (daemon may not be running).
             notify_daemon_cache_clear(&socket).await;
             println!("Memory cleared.");
             Ok(())
         }
         cli::MemoryAction::Count => {
-            let n = memory::count()?;
+            let db_path = memory_db::db_path()?;
+            let conn = memory_db::init_db(&db_path)?;
+            let n = memory_db::count(&conn)?;
             println!("{n}");
             Ok(())
         }
@@ -197,7 +208,7 @@ async fn notify_daemon_cache_clear(socket: &std::path::Path) {
     };
     let (reader, mut writer) = tokio::io::split(stream);
 
-    let Ok(mut line) = serde_json::to_string(&ipc::Request::ClearCache) else {
+    let Ok(mut line) = serde_json::to_string(&ipc::Request::ClearMemory) else {
         return;
     };
     line.push('\n');
