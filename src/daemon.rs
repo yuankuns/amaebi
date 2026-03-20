@@ -384,15 +384,10 @@ where
 // Skill-file injection
 // ---------------------------------------------------------------------------
 
-/// Read skill/config files from `~/.amaebi/` and inject them as system messages.
+/// Read config files from `~/.amaebi/` and inject them as system messages.
 ///
-/// - `AGENTS.md` and `SOUL.md` are loaded directly from `~/.amaebi/`.
-/// - Skills are loaded from `~/.amaebi/skills/<name>/SKILL.md` (one per subdirectory).
-///   Each skill is injected with the header `## Skill: <name>`.
-///
-/// Files/directories that do not exist are silently skipped.
-/// Empty or whitespace-only files are skipped.
-/// Skills are injected in sorted directory-name order for determinism.
+/// `AGENTS.md` and `SOUL.md` are loaded directly from `~/.amaebi/`.
+/// Files that do not exist or are whitespace-only are silently skipped.
 pub(crate) async fn inject_skill_files(messages: &mut Vec<Message>) {
     let home = match amaebi_home() {
         Ok(p) => p,
@@ -406,7 +401,6 @@ pub(crate) async fn inject_skill_files(messages: &mut Vec<Message>) {
 
 /// Internal helper used by [`inject_skill_files`] and tests.
 async fn inject_skill_files_from(messages: &mut Vec<Message>, amaebi_home: &std::path::Path) {
-    // Fixed config files loaded from amaebi_home.
     const FIXED_FILES: &[(&str, &str)] =
         &[("AGENTS.md", "## Agent Guidelines"), ("SOUL.md", "## Soul")];
     for (filename, header) in FIXED_FILES {
@@ -423,52 +417,6 @@ async fn inject_skill_files_from(messages: &mut Vec<Message>, amaebi_home: &std:
                 tracing::debug!(file = %path.display(), error = %e, "could not read config file");
             }
         }
-    }
-
-    // Skills: each subdirectory of ~/.amaebi/skills/ may contain a SKILL.md.
-    let skills_dir = amaebi_home.join("skills");
-    let mut read_dir = match tokio::fs::read_dir(&skills_dir).await {
-        Ok(rd) => rd,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
-        Err(e) => {
-            tracing::debug!(dir = %skills_dir.display(), error = %e, "could not read skills directory");
-            return;
-        }
-    };
-
-    // Collect (skill_name, content) pairs for sorting.
-    let mut skills: Vec<(String, String)> = vec![];
-    while let Ok(Some(entry)) = read_dir.next_entry().await {
-        let ft = match entry.file_type().await {
-            Ok(ft) => ft,
-            Err(_) => continue,
-        };
-        if !ft.is_dir() {
-            continue;
-        }
-        let skill_name = match entry.file_name().into_string() {
-            Ok(n) => n,
-            Err(_) => continue,
-        };
-        let skill_md = entry.path().join("SKILL.md");
-        match tokio::fs::read_to_string(&skill_md).await {
-            Ok(content) => {
-                let trimmed = content.trim();
-                if !trimmed.is_empty() {
-                    skills.push((skill_name, trimmed.to_owned()));
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => {
-                tracing::debug!(file = %skill_md.display(), error = %e, "could not read SKILL.md");
-            }
-        }
-    }
-
-    // Deterministic injection order.
-    skills.sort_by(|a, b| a.0.cmp(&b.0));
-    for (name, content) in skills {
-        messages.push(Message::system(format!("## Skill: {name}\n\n{content}")));
     }
 }
 
@@ -565,110 +513,5 @@ mod tests {
             .as_deref()
             .unwrap_or("")
             .contains("soul only"));
-    }
-
-    #[tokio::test]
-    async fn skill_dirs_injected_with_header() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let skills = dir.path().join("skills");
-        std::fs::create_dir_all(skills.join("my-skill")).unwrap();
-        std::fs::write(skills.join("my-skill/SKILL.md"), "do stuff").unwrap();
-
-        let mut messages: Vec<Message> = vec![];
-        inject_skill_files_from(&mut messages, dir.path()).await;
-
-        assert_eq!(messages.len(), 1);
-        let body = messages[0].content.as_deref().unwrap_or("");
-        assert!(
-            body.contains("## Skill: my-skill"),
-            "header missing: {body}"
-        );
-        assert!(body.contains("do stuff"), "content missing: {body}");
-    }
-
-    #[tokio::test]
-    async fn skill_dirs_injected_in_sorted_order() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let skills = dir.path().join("skills");
-        for name in &["zzz", "aaa", "mmm"] {
-            std::fs::create_dir_all(skills.join(name)).unwrap();
-            std::fs::write(
-                skills.join(name).join("SKILL.md"),
-                format!("{name} content"),
-            )
-            .unwrap();
-        }
-
-        let mut messages: Vec<Message> = vec![];
-        inject_skill_files_from(&mut messages, dir.path()).await;
-
-        assert_eq!(messages.len(), 3);
-        let names: Vec<&str> = messages
-            .iter()
-            .map(|m| {
-                let body = m.content.as_deref().unwrap_or("");
-                if body.contains("aaa") {
-                    "aaa"
-                } else if body.contains("mmm") {
-                    "mmm"
-                } else {
-                    "zzz"
-                }
-            })
-            .collect();
-        assert_eq!(names, vec!["aaa", "mmm", "zzz"]);
-    }
-
-    #[tokio::test]
-    async fn skill_dir_without_skill_md_is_skipped() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let skills = dir.path().join("skills");
-        // Subdirectory exists but has no SKILL.md.
-        std::fs::create_dir_all(skills.join("empty-skill")).unwrap();
-
-        let mut messages: Vec<Message> = vec![];
-        inject_skill_files_from(&mut messages, dir.path()).await;
-        assert!(messages.is_empty());
-    }
-
-    #[tokio::test]
-    async fn skill_dir_non_directory_files_are_skipped() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let skills = dir.path().join("skills");
-        std::fs::create_dir_all(&skills).unwrap();
-        // A plain file at the skill level — must be ignored.
-        std::fs::write(skills.join("not-a-dir.md"), "content").unwrap();
-        // A real skill directory.
-        std::fs::create_dir_all(skills.join("real-skill")).unwrap();
-        std::fs::write(skills.join("real-skill/SKILL.md"), "real content").unwrap();
-
-        let mut messages: Vec<Message> = vec![];
-        inject_skill_files_from(&mut messages, dir.path()).await;
-
-        assert_eq!(messages.len(), 1);
-        assert!(messages[0]
-            .content
-            .as_deref()
-            .unwrap_or("")
-            .contains("real content"));
-    }
-
-    #[tokio::test]
-    async fn fixed_files_and_skills_combined() {
-        let dir = tempfile::TempDir::new().unwrap();
-        std::fs::write(dir.path().join("AGENTS.md"), "agent rules").unwrap();
-        let skills = dir.path().join("skills");
-        std::fs::create_dir_all(skills.join("alpha")).unwrap();
-        std::fs::write(skills.join("alpha/SKILL.md"), "alpha instructions").unwrap();
-
-        let mut messages: Vec<Message> = vec![];
-        inject_skill_files_from(&mut messages, dir.path()).await;
-
-        // AGENTS.md first, then skill alpha.
-        assert_eq!(messages.len(), 2);
-        let body0 = messages[0].content.as_deref().unwrap_or("");
-        let body1 = messages[1].content.as_deref().unwrap_or("");
-        assert!(body0.contains("## Agent Guidelines"));
-        assert!(body1.contains("## Skill: alpha"));
     }
 }
