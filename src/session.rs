@@ -247,6 +247,80 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_get_or_create_same_dir_returns_same_uuid() {
+        // Stress test: 50 threads all calling get_or_create on the same dir.
+        // All must receive the same UUID — only one thread creates, the rest read.
+        let _guard = with_temp_home();
+        let dir = tempdir().unwrap();
+        let dir_path = dir.path().to_path_buf();
+
+        let handles: Vec<_> = (0..50)
+            .map(|_| {
+                let p = dir_path.clone();
+                std::thread::spawn(move || get_or_create(&p).unwrap())
+            })
+            .collect();
+
+        let ids: Vec<String> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let first = &ids[0];
+        for id in &ids {
+            assert_eq!(id, first, "all threads must see the same UUID");
+        }
+    }
+
+    #[test]
+    fn concurrent_different_dirs_no_corruption() {
+        // 20 threads, each with a unique directory — no data races or corruption.
+        let _guard = with_temp_home();
+        let dirs: Vec<_> = (0..20).map(|_| tempdir().unwrap()).collect();
+        let paths: Vec<_> = dirs.iter().map(|d| d.path().to_path_buf()).collect();
+
+        let handles: Vec<_> = paths
+            .iter()
+            .cloned()
+            .map(|p| std::thread::spawn(move || get_or_create(&p).unwrap()))
+            .collect();
+
+        let ids: Vec<String> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        // All UUIDs must be unique.
+        let unique: std::collections::HashSet<&String> = ids.iter().collect();
+        assert_eq!(unique.len(), ids.len(), "each dir must get a unique UUID");
+
+        // Verify they all persisted correctly.
+        for (path, expected_id) in paths.iter().zip(ids.iter()) {
+            assert_eq!(&get_or_create(path).unwrap(), expected_id);
+        }
+    }
+
+    #[test]
+    fn concurrent_reset_and_read() {
+        // One thread resets, others read — no panics or corruption.
+        let _guard = with_temp_home();
+        let dir = tempdir().unwrap();
+        let _ = get_or_create(dir.path()).unwrap(); // seed
+
+        let dir_path = dir.path().to_path_buf();
+        let handles: Vec<_> = (0..30)
+            .map(|i| {
+                let p = dir_path.clone();
+                std::thread::spawn(move || {
+                    if i == 0 {
+                        reset(&p).unwrap()
+                    } else {
+                        get_or_create(&p).unwrap()
+                    }
+                })
+            })
+            .collect();
+
+        // All threads must complete without error.
+        for h in handles {
+            let id = h.join().unwrap();
+            assert!(!id.is_empty());
+        }
+    }
+
+    #[test]
     fn persists_across_calls() {
         let _guard = with_temp_home();
         let dir = tempdir().unwrap();
