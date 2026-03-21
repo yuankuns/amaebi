@@ -651,6 +651,106 @@ where
 
         match resp.finish_reason {
             FinishReason::Stop | FinishReason::Length => {
+                // Check if the model is asking for clarification via the
+                // [WAITING_FOR_INPUT] protocol marker.
+                if resp.text.trim_start().starts_with("[WAITING_FOR_INPUT]") {
+                    let clarification_prompt = resp
+                        .text
+                        .trim_start()
+                        .strip_prefix("[WAITING_FOR_INPUT]")
+                        .unwrap_or(&resp.text)
+                        .trim()
+                        .to_owned();
+
+                    // Tell the client we need input.
+                    write_frame(
+                        writer,
+                        &Response::WaitingForInput {
+                            prompt: clarification_prompt.clone(),
+                        },
+                    )
+                    .await?;
+
+                    // Record the assistant's question in history.
+                    messages.push(Message::assistant(Some(resp.text), vec![]));
+
+                    // Block until the user replies via the steering channel.
+                    // Timeout after 5 minutes to avoid infinite hangs.
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(300),
+                        steer_rx.recv(),
+                    )
+                    .await
+                    {
+                        Ok(Some(user_reply)) => {
+                            messages.push(Message::user(user_reply));
+                            write_frame(writer, &Response::SteerAck).await?;
+                            continue;
+                        }
+                        Ok(None) => {
+                            // Channel closed — client disconnected.
+                            final_text = clarification_prompt;
+                            break;
+                        }
+                        Err(_timeout) => {
+                            write_frame(
+                                writer,
+                                &Response::Text {
+                                    chunk: "\n[timed out waiting for input]\n".into(),
+                                },
+                            )
+                            .await?;
+                            final_text = clarification_prompt;
+                            break;
+                        }
+                    }
+                }
+
+                // Multi-turn heuristic: if the model's response ends with a
+                // question mark, treat it as an implicit request for
+                // clarification and keep the session alive for follow-up.
+                if resp.text.trim_end().ends_with('?') {
+                    let question = resp.text.trim().to_owned();
+
+                    write_frame(
+                        writer,
+                        &Response::WaitingForInput {
+                            prompt: question.clone(),
+                        },
+                    )
+                    .await?;
+
+                    messages.push(Message::assistant(Some(resp.text), vec![]));
+
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(300),
+                        steer_rx.recv(),
+                    )
+                    .await
+                    {
+                        Ok(Some(user_reply)) => {
+                            messages.push(Message::user(user_reply));
+                            write_frame(writer, &Response::SteerAck).await?;
+                            continue;
+                        }
+                        Ok(None) => {
+                            final_text = question;
+                            break;
+                        }
+                        Err(_timeout) => {
+                            write_frame(
+                                writer,
+                                &Response::Text {
+                                    chunk: "\n[timed out waiting for input]\n".into(),
+                                },
+                            )
+                            .await?;
+                            final_text = question;
+                            break;
+                        }
+                    }
+                }
+
                 final_text = resp.text;
                 break;
             }
