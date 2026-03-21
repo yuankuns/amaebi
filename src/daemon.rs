@@ -920,6 +920,15 @@ async fn run_cron_scheduler(state: Arc<DaemonState>) {
                 guard.insert(job.id.clone());
             }
 
+            // Stamp last_run BEFORE spawning so that if the daemon restarts
+            // while the job is in flight, due_jobs won't immediately re-fire
+            // it on the next tick (the in-memory running_jobs guard is lost
+            // across restarts, but the DB timestamp persists).
+            let now_str = now.to_rfc3339();
+            if let Err(e) = cron::update_last_run(&job.id, &now_str) {
+                tracing::warn!(error = %e, id = %job.id, "cron: failed to pre-stamp last_run");
+            }
+
             let state = Arc::clone(&state);
             let running = Arc::clone(&running_jobs);
             tokio::spawn(async move {
