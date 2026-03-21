@@ -83,7 +83,10 @@ impl Config {
         // Longest-prefix match: find the most specific configured ancestor.
         let mut best: Option<(&str, u64)> = None;
         for (key, &minutes) in &self.ttl_minutes {
-            if key == "default" {
+            // Skip the global default key and any tier-name keys (e.g.
+            // "ephemeral", "persistent").  Only canonical path keys (those
+            // beginning with '/') are eligible as ancestor prefixes.
+            if !key.starts_with('/') {
                 continue;
             }
             // Require a path-separator boundary so that e.g. key
@@ -204,6 +207,20 @@ mod tests {
         assert_eq!(
             cfg.ttl_for("/home/syk/projects-old"),
             Duration::from_secs(30 * 60), // falls back to hardcoded default
+        );
+    }
+
+    #[test]
+    fn tier_name_key_not_used_as_path_prefix() {
+        // "ephemeral" and "persistent" are tier names, not directory paths.
+        // They must never act as ancestor prefixes for real paths.
+        let mut cfg = Config::default();
+        cfg.ttl_minutes.insert("ephemeral".into(), 5);
+        cfg.ttl_minutes.insert("persistent".into(), 1440);
+        // A real path should fall through to the hardcoded default.
+        assert_eq!(
+            cfg.ttl_for("/home/syk/anything"),
+            Duration::from_secs(30 * 60),
         );
     }
 
