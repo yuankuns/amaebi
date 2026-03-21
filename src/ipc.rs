@@ -13,6 +13,52 @@ pub enum Request {
         /// Chat model to use (e.g. "gpt-4o").
         model: String,
     },
+    /// Inject a user correction into a running agentic loop on the same connection.
+    ///
+    /// The daemon drains these between model turns and injects each message as a
+    /// `user` turn, then responds with [`Response::SteerAck`].  If the `session_id`
+    /// does not match the active loop the frame is silently ignored (logged at
+    /// debug level); no error response is sent.
+    Steer {
+        /// Session UUID to steer (matches the `session_id` of the active `Chat`).
+        session_id: String,
+        /// The correction text to inject as a user message.
+        message: String,
+    },
+    /// Submit a task to run entirely in the background.
+    ///
+    /// The daemon spawns the agentic loop in a background `tokio::spawn`, responds
+    /// immediately with [`Response::DetachAccepted`], and saves the final output to
+    /// `~/.amaebi/inbox.db` when the loop completes.
+    SubmitDetach {
+        /// The user's prompt text.
+        prompt: String,
+        /// Value of `$TMUX_PANE` at the time the client was invoked, if set.
+        tmux_pane: Option<String>,
+        /// Session UUID to associate with this task.
+        session_id: Option<String>,
+        /// Chat model to use (e.g. "gpt-4o").
+        model: String,
+    },
+    /// Resume a prior session by UUID, loading its **full** chronological history
+    /// from the SQLite memory store.
+    ///
+    /// Unlike [`Request::Chat`], which applies a sliding-window cap over recent
+    /// turns, this variant bypasses the `MAX_HISTORY` limit so the LLM receives the
+    /// entire persisted conversation for `session_id`.  History is read from the
+    /// SQLite DB on every call, so it survives daemon restarts.
+    /// Useful for multi-day projects where full context matters.
+    Resume {
+        /// The prompt to send in this turn.
+        prompt: String,
+        /// Value of `$TMUX_PANE` at the time the client was invoked, if set.
+        tmux_pane: Option<String>,
+        /// Session UUID to re-hydrate.  Required — this variant always targets a
+        /// specific historical session.
+        session_id: String,
+        /// Chat model to use (e.g. "gpt-4o").
+        model: String,
+    },
     /// Ask the daemon to clear its persisted SQLite memory database.
     ///
     /// Sent after `amaebi memory clear` so the running daemon also clears its
@@ -52,6 +98,16 @@ pub enum Response {
     Error { message: String },
     /// The agent is about to invoke a tool — the client may display this.
     ToolUse { name: String, detail: String },
+    /// Acknowledgement that a [`Request::Steer`] correction was injected.
+    SteerAck,
+    /// Confirms that a [`Request::SubmitDetach`] was accepted.
+    ///
+    /// Sent immediately before the daemon starts the background task.  The client
+    /// should print the session ID and exit cleanly.
+    DetachAccepted {
+        /// The session UUID under which the task will run.
+        session_id: String,
+    },
     /// A single memory entry returned in response to [`Request::RetrieveContext`].
     MemoryEntry {
         /// `"user"` or `"assistant"`.
@@ -118,6 +174,81 @@ mod tests {
     }
 
     #[test]
+    fn request_steer_round_trip() {
+        let req = Request::Steer {
+            session_id: "abc-123".into(),
+            message: "no, keep the old signature".into(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["type"], "steer");
+        assert_eq!(v["session_id"], "abc-123");
+        assert_eq!(v["message"], "no, keep the old signature");
+        let back: Request = serde_json::from_str(&json).unwrap();
+        let Request::Steer {
+            session_id,
+            message,
+        } = back
+        else {
+            panic!("expected Steer variant");
+        };
+        assert_eq!(session_id, "abc-123");
+        assert_eq!(message, "no, keep the old signature");
+    }
+
+    #[test]
+    fn request_submit_detach_round_trip() {
+        let req = Request::SubmitDetach {
+            prompt: "run tests".into(),
+            tmux_pane: None,
+            session_id: Some("uuid-abc".into()),
+            model: "gpt-4o".into(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["type"], "submit_detach");
+        assert_eq!(v["prompt"], "run tests");
+        let back: Request = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, Request::SubmitDetach { .. }));
+    }
+
+    #[test]
+    fn request_resume_round_trip() {
+        let req = Request::Resume {
+            prompt: "continue".into(),
+            tmux_pane: Some("%3".into()),
+            session_id: "old-uuid".into(),
+            model: "gpt-4o".into(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["type"], "resume");
+        assert_eq!(v["session_id"], "old-uuid");
+        let back: Request = serde_json::from_str(&json).unwrap();
+        let Request::Resume {
+            session_id, prompt, ..
+        } = back
+        else {
+            panic!("expected Resume variant");
+        };
+        assert_eq!(session_id, "old-uuid");
+        assert_eq!(prompt, "continue");
+    }
+
+    #[test]
+    fn response_detach_accepted_round_trip() {
+        let r = Response::DetachAccepted {
+            session_id: "task-uuid".into(),
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["type"], "detach_accepted");
+        assert_eq!(v["session_id"], "task-uuid");
+        let back: Response = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, Response::DetachAccepted { .. }));
+    }
+
+    #[test]
     fn request_clear_memory_round_trip() {
         let req = Request::ClearMemory;
         let json = serde_json::to_string(&req).unwrap();
@@ -163,6 +294,19 @@ mod tests {
         assert_eq!(v["type"], "tool_use");
         assert_eq!(v["name"], "shell_command");
         assert_eq!(v["detail"], "ls -la");
+    }
+
+    #[test]
+    fn response_steer_ack_has_snake_case_type() {
+        let v: serde_json::Value = serde_json::to_value(Response::SteerAck).unwrap();
+        assert_eq!(v["type"], "steer_ack");
+    }
+
+    #[test]
+    fn response_steer_ack_round_trip() {
+        let json = r#"{"type":"steer_ack"}"#;
+        let r: Response = serde_json::from_str(json).unwrap();
+        assert!(matches!(r, Response::SteerAck));
     }
 
     #[test]
@@ -212,6 +356,8 @@ mod tests {
             r#"{"type":"done"}"#,
             r#"{"type":"error","message":"fail"}"#,
             r#"{"type":"tool_use","name":"read_file","detail":"/tmp/x"}"#,
+            r#"{"type":"steer_ack"}"#,
+            r#"{"type":"detach_accepted","session_id":"uuid-1"}"#,
             r#"{"type":"memory_entry","role":"user","content":"hi"}"#,
         ];
         for frame in frames {
@@ -222,6 +368,8 @@ mod tests {
                     | Response::Done
                     | Response::Error { .. }
                     | Response::ToolUse { .. }
+                    | Response::SteerAck
+                    | Response::DetachAccepted { .. }
                     | Response::MemoryEntry { .. }
             ));
         }

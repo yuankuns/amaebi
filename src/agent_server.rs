@@ -261,10 +261,15 @@ impl acp::Agent for AmaebiAgent {
         let (result_tx, result_rx) = oneshot::channel::<Result<String, String>>();
 
         // Run the agentic loop in a background local task.
+        // ACP mode has no steering channel — create a channel and immediately
+        // drop the sender so the receiver observes a closed channel.
+        let (steer_tx, mut steer_rx) = tokio::sync::mpsc::channel::<String>(1);
+        drop(steer_tx);
         tokio::task::spawn_local(async move {
-            let outcome = run_agentic_loop(&state, &model, messages, &mut write_half)
-                .await
-                .map_err(|e| format!("{e:#}"));
+            let outcome =
+                run_agentic_loop(&state, &model, messages, &mut write_half, &mut steer_rx)
+                    .await
+                    .map_err(|e| format!("{e:#}"));
             let _ = result_tx.send(outcome);
             // Dropping write_half closes the pipe, signalling EOF to the reader.
         });
@@ -303,6 +308,15 @@ impl acp::Agent for AmaebiAgent {
                 }
                 Response::ToolUse { .. } | Response::MemoryEntry { .. } => {
                     // Not relevant on the ACP forwarding path.
+                }
+                Response::SteerAck => {
+                    // ACP mode never sends Steer requests, so SteerAck should
+                    // never arrive here — log and continue.
+                    tracing::debug!("unexpected SteerAck in ACP mode");
+                }
+                Response::DetachAccepted { .. } => {
+                    // ACP mode never submits detach requests.
+                    tracing::debug!("unexpected DetachAccepted in ACP mode");
                 }
             }
         }

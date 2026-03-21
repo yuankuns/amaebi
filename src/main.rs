@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 
 mod agent_server;
@@ -6,11 +6,15 @@ mod auth;
 mod auth_flow;
 mod cli;
 mod client;
+mod config;
 mod copilot;
+mod cron;
 mod daemon;
+mod inbox;
 mod ipc;
 mod memory_db;
 mod models;
+mod session;
 #[cfg(test)]
 mod test_utils;
 mod tools;
@@ -27,17 +31,45 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = cli::Cli::parse();
+
+    // Print a bell notification if there are unread cron reports.
+    // Shown only for user-facing commands; silently skipped if the inbox db
+    // does not exist yet (no cron tasks have ever run).
+    if matches!(
+        &cli.command,
+        cli::Command::Ask { .. }
+            | cli::Command::Session { .. }
+            | cli::Command::Memory { .. }
+            | cli::Command::Cache { .. }
+    ) {
+        print_inbox_notification();
+    }
+
     match cli.command {
         cli::Command::Daemon { socket } => daemon::run(socket).await,
         cli::Command::Ask {
             prompt,
             socket,
             model,
-        } => match client::run(socket, prompt, model).await {
-            Ok(()) => Ok(()),
-            Err(e) if e.is::<client::Interrupted>() => std::process::exit(130),
-            Err(e) => Err(e),
-        },
+            detach,
+            resume,
+        } => {
+            if detach {
+                client::run_detach(socket, prompt, model).await
+            } else if let Some(session_uuid) = resume {
+                match client::run_resume(socket, prompt, model, session_uuid).await {
+                    Ok(()) => Ok(()),
+                    Err(e) if e.is::<client::Interrupted>() => std::process::exit(130),
+                    Err(e) => Err(e),
+                }
+            } else {
+                match client::run(socket, prompt, model).await {
+                    Ok(()) => Ok(()),
+                    Err(e) if e.is::<client::Interrupted>() => std::process::exit(130),
+                    Err(e) => Err(e),
+                }
+            }
+        }
         cli::Command::Auth {
             client_id,
             skip_validate,
@@ -48,6 +80,10 @@ async fn main() -> Result<()> {
         cli::Command::Acp { model, socket } => agent_server::run(model, socket).await,
         cli::Command::Models => models::run().await,
         cli::Command::Memory { action, socket } => run_memory(action, socket).await,
+        cli::Command::Session { action } => run_session(action),
+        cli::Command::Cache { action } => run_cache(action),
+        cli::Command::Inbox { action } => run_inbox(action),
+        cli::Command::Cron { action } => run_cron(action),
     }
 }
 
@@ -193,6 +229,276 @@ async fn run_memory(action: cli::MemoryAction, socket: std::path::PathBuf) -> Re
             Ok(())
         }
     }
+}
+
+/// Print a bell notification to stderr if there are unread inbox reports.
+///
+/// Silently no-ops if the inbox database does not yet exist or cannot be read,
+/// so a cold-start installation never creates dotfiles just from running `amaebi ask`.
+fn print_inbox_notification() {
+    // Only open the DB if it already exists — avoids creating inbox.db on cold start.
+    let db_path = match inbox::db_path() {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::debug!(error = %e, "could not resolve inbox db path for notification");
+            return;
+        }
+    };
+    if !db_path.exists() {
+        return;
+    }
+    match inbox::InboxStore::open() {
+        Ok(store) => match store.unread_count() {
+            Ok(0) => {}
+            Ok(n) => {
+                let noun = if n == 1 { "report" } else { "reports" };
+                eprintln!("[🔔 You have {n} unread cron {noun}. Run `amaebi inbox list` to read.]");
+            }
+            Err(e) => tracing::debug!(error = %e, "could not check inbox unread count"),
+        },
+        Err(e) => tracing::debug!(error = %e, "could not open inbox store for notification"),
+    }
+}
+
+fn run_inbox(action: cli::InboxAction) -> Result<()> {
+    let store = inbox::InboxStore::open().context("opening inbox database")?;
+    match action {
+        cli::InboxAction::List { all } => {
+            let reports = if all {
+                store.get_all()?
+            } else {
+                store.get_unread()?
+            };
+            if reports.is_empty() {
+                if all {
+                    println!("Inbox is empty.");
+                } else {
+                    println!("No unread cron reports.");
+                }
+            } else {
+                for r in &reports {
+                    let status = if r.read { "read" } else { "UNREAD" };
+                    println!(
+                        "[{}] #{} — {} ({})\n  Task: {}\n",
+                        status,
+                        r.id,
+                        r.created_at,
+                        r.session_id,
+                        sanitize(&r.task_description),
+                    );
+                }
+                let unread = reports.iter().filter(|r| !r.read).count();
+                if unread > 0 {
+                    println!("{unread} unread. Use `amaebi inbox read <id>` to view a report.");
+                }
+            }
+            Ok(())
+        }
+        cli::InboxAction::Read { id } => match store.get_by_id(id)? {
+            None => anyhow::bail!("no report with id {id}"),
+            Some(report) => {
+                println!("Task: {}", sanitize(&report.task_description));
+                println!("Session: {}", report.session_id);
+                println!("Created: {}", report.created_at);
+                println!();
+                println!("{}", sanitize(&report.output));
+                store.mark_read(id)?;
+                Ok(())
+            }
+        },
+        cli::InboxAction::MarkRead => {
+            store.mark_all_read()?;
+            println!("All reports marked as read.");
+            Ok(())
+        }
+        cli::InboxAction::Clear => {
+            store.clear()?;
+            println!("Inbox cleared.");
+            Ok(())
+        }
+    }
+}
+
+fn run_session(action: cli::SessionAction) -> Result<()> {
+    let cwd = std::env::current_dir().context("getting current directory")?;
+    match action {
+        cli::SessionAction::Show => match session::current(&cwd)? {
+            Some(id) => println!("{id}"),
+            None => println!("(none)"),
+        },
+        cli::SessionAction::New => {
+            let id = session::reset(&cwd)?;
+            println!("{id}");
+        }
+        cli::SessionAction::Status => {
+            let entries = session::list_all()?;
+            if entries.is_empty() {
+                println!("No sessions.");
+            } else {
+                let mut entries: Vec<_> = entries.into_iter().collect();
+                entries.sort_by(|a, b| b.1.last_accessed.cmp(&a.1.last_accessed));
+                for (dir, rec) in &entries {
+                    println!(
+                        "{}\n  uuid:     {}\n  created:  {}\n  accessed: {}\n  tier:     {}\n",
+                        dir, rec.uuid, rec.created_at, rec.last_accessed, rec.ttl_tier
+                    );
+                }
+                println!("{} session(s) total.", entries.len());
+            }
+        }
+        cli::SessionAction::Clear {
+            dry_run,
+            default_ttl,
+            ephemeral_ttl,
+            persistent_ttl,
+        } => {
+            let mut ttls = std::collections::HashMap::new();
+            ttls.insert("default".to_string(), default_ttl);
+            ttls.insert("ephemeral".to_string(), ephemeral_ttl);
+            ttls.insert("persistent".to_string(), persistent_ttl);
+
+            let removed = session::clear_expired(&ttls, dry_run)?;
+            if removed.is_empty() {
+                println!("No expired sessions.");
+            } else {
+                let verb = if dry_run { "Would remove" } else { "Removed" };
+                for (dir, rec) in &removed {
+                    println!(
+                        "{verb}: {} (uuid: {}, last: {}, tier: {})",
+                        dir, rec.uuid, rec.last_accessed, rec.ttl_tier
+                    );
+                }
+                println!("\n{} {} session(s).", verb, removed.len());
+            }
+        }
+        cli::SessionAction::SetTier { tier } => {
+            let uuid = session::get_or_create_with_tier(&cwd, &tier)?;
+            println!("Session {uuid} set to tier \"{tier}\"");
+        }
+    }
+    Ok(())
+}
+
+fn run_cache(action: cli::CacheAction) -> Result<()> {
+    match action {
+        cli::CacheAction::Prune {
+            max_memory,
+            dry_run,
+            aggressive,
+        } => {
+            let verb = if dry_run { "Would prune" } else { "Pruned" };
+
+            // 1. Prune expired sessions.
+            let cfg = config::Config::load();
+            let session_count = if aggressive {
+                // Aggressive mode: remove ALL sessions from sessions.json.
+                let all = session::list_all()?;
+                let count = all.len();
+                if !dry_run && count > 0 {
+                    // Use clear_expired with TTL of 0 to expire everything.
+                    let mut ttls = std::collections::HashMap::new();
+                    ttls.insert("default".to_string(), 0u64);
+                    ttls.insert("ephemeral".to_string(), 0u64);
+                    ttls.insert("persistent".to_string(), 0u64);
+                    let _ = session::clear_expired(&ttls, false)?;
+                }
+                count
+            } else {
+                // Use config-based TTLs for tier-aware expiry.
+                let mut ttls = std::collections::HashMap::new();
+                let default_secs = cfg.default_ttl().as_secs();
+                ttls.insert("default".to_string(), default_secs);
+                ttls.insert("ephemeral".to_string(), 300u64);
+                ttls.insert("persistent".to_string(), 86400u64);
+                // Merge per-tier and per-directory overrides from config.
+                // Directory-path keys (starting with '/') are passed through
+                // so that session.rs::clear_expired can apply them directly.
+                for (key, &minutes) in &cfg.ttl_minutes {
+                    if key != "default" {
+                        ttls.insert(key.clone(), minutes * 60);
+                    }
+                }
+                let removed = session::clear_expired(&ttls, dry_run)?;
+                removed.len()
+            };
+            println!("{verb} {session_count} session(s).");
+
+            // 2. Prune memory entries (max_memory not supported with SQLite backend).
+            if let Some(_max) = max_memory {
+                tracing::warn!(
+                    "--max-memory is not supported in the SQLite memory backend; ignoring"
+                );
+            }
+
+            Ok(())
+        }
+        cli::CacheAction::Stats => {
+            let sessions = session::list_all()?;
+            let db_path = memory_db::db_path()?;
+            let conn = memory_db::init_db(&db_path)?;
+            let mem_count = memory_db::count(&conn)?;
+            let mem_bytes = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
+
+            println!("Sessions: {}", sessions.len());
+            for (dir, rec) in &sessions {
+                println!("  {} ({}, tier: {})", dir, rec.uuid, rec.ttl_tier);
+            }
+            println!("\nMemory entries: {mem_count}");
+            println!("Memory disk usage: {}", format_bytes(mem_bytes));
+
+            Ok(())
+        }
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    }
+}
+
+fn run_cron(action: cli::CronAction) -> Result<()> {
+    match action {
+        cli::CronAction::Add {
+            description,
+            schedule,
+        } => {
+            // Validate the expression before writing to disk.
+            cron::parse_schedule(&schedule)
+                .with_context(|| format!("invalid cron expression: {schedule:?}"))?;
+            let id = cron::add_job(&description, &schedule)?;
+            println!("Cron job added: {id}");
+            println!("  Description: {description}");
+            println!("  Schedule:    {schedule}");
+        }
+        cli::CronAction::List => {
+            let jobs = cron::load_jobs()?;
+            if jobs.is_empty() {
+                println!("No cron jobs scheduled.");
+            } else {
+                for job in &jobs {
+                    let last = job.last_run.as_deref().unwrap_or("never");
+                    println!(
+                        "[{}] {}\n  schedule:   {}\n  created:    {}\n  last_run:   {}\n",
+                        job.id, job.description, job.schedule, job.created_at, last
+                    );
+                }
+                println!("{} job(s) total.", jobs.len());
+            }
+        }
+        cli::CronAction::Delete { id } => {
+            if cron::delete_job(&id)? {
+                println!("Cron job {id} deleted.");
+            } else {
+                anyhow::bail!("no cron job with id {id:?}");
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Tell a running daemon to flush its in-memory conversation cache.

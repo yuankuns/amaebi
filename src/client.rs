@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use std::io::IsTerminal as _;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -6,6 +7,7 @@ use tokio::net::UnixStream;
 use tokio::signal::unix::{signal, SignalKind};
 
 use crate::ipc::{Request, Response};
+use crate::session;
 
 /// How long the user has to press Ctrl-C a second time to exit.
 const DOUBLE_CTRLC_WINDOW: Duration = Duration::from_secs(2);
@@ -29,12 +31,7 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
     // for the entire command lifecycle, including the connection attempt.
     let mut sigint = signal(SignalKind::interrupt()).context("setting up SIGINT handler")?;
 
-    let stream = UnixStream::connect(&socket).await.with_context(|| {
-        format!(
-            "connecting to daemon at {} — is it running? (`amaebi daemon`)",
-            socket.display()
-        )
-    })?;
+    let stream = connect_or_start_daemon(&socket).await?;
 
     let (reader, mut writer) = tokio::io::split(stream);
 
@@ -43,11 +40,25 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
         .or_else(|| std::env::var("AMAEBI_MODEL").ok())
         .unwrap_or_else(|| "gpt-4o".to_string());
 
+    // Resolve the session UUID for the current working directory.
+    // Wrapped in spawn_blocking because session::get_or_create does file I/O.
+    let cwd = std::env::current_dir().context("getting current directory")?;
+    let session_id = tokio::task::spawn_blocking(move || session::get_or_create(&cwd))
+        .await
+        .context("session::get_or_create panicked")?
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "failed to resolve session id; using \"global\"");
+            "global".to_string()
+        });
+
+    // Keep a copy for the steering requests and the exit footer.
+    let session_id_copy = session_id.clone();
+
     // Build and send the request as a single JSON line.
     let req = Request::Chat {
         prompt,
         tmux_pane: std::env::var("TMUX_PANE").ok(),
-        session_id: None,
+        session_id: Some(session_id),
         model,
     };
     let mut req_line = serde_json::to_string(&req).context("serializing request")?;
@@ -59,10 +70,22 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
 
     // Stream responses to stdout until Done or Error.
     // Interleave with SIGINT so we can implement double-Ctrl-C-to-exit.
+    // When stdout is a terminal, also read stdin so the user can steer the
+    // agent mid-flight by typing a line and pressing Enter.
     let mut lines = BufReader::new(reader).lines();
     let mut stdout = tokio::io::stdout();
     // Timestamp of the first Ctrl-C press; None means no pending first press.
     let mut last_ctrl_c: Option<Instant> = None;
+
+    // Stdin reader — only created when stdin is a TTY (interactive terminal).
+    // Piped invocations (`echo "fix" | amaebi ask "..."`) have stdin as a
+    // pipe, not a TTY, so we skip the reader to avoid blocking on EOF.
+    let use_stdin = std::io::stdin().is_terminal();
+    let mut stdin_lines: Option<BufReader<tokio::io::Stdin>> = if use_stdin {
+        Some(BufReader::new(tokio::io::stdin()))
+    } else {
+        None
+    };
 
     loop {
         tokio::select! {
@@ -126,8 +149,43 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
                             _ => eprintln!("🔧 {name}: {detail}"),
                         }
                     }
+                    Response::SteerAck => {
+                        // The daemon has acknowledged our steering message.
+                        // No visible output — the next model turn will incorporate it.
+                        tracing::debug!("steer acknowledged by daemon");
+                    }
+                    Response::DetachAccepted { .. } => {
+                        // Should never arrive in a normal foreground Chat loop.
+                        tracing::debug!("unexpected DetachAccepted in foreground loop");
+                    }
                     Response::MemoryEntry { .. } => {
                         // Not sent to the CLI client — daemon-internal only.
+                    }
+                }
+            }
+
+            // Read a line from stdin and send it as a steering correction.
+            // This arm is disabled (pending forever) when stdout is not a TTY.
+            steer_line = next_stdin_line(&mut stdin_lines) => {
+                match steer_line {
+                    Some(text) => {
+                        let steer_req = Request::Steer {
+                            session_id: session_id_copy.clone(),
+                            message: text,
+                        };
+                        let mut frame =
+                            serde_json::to_string(&steer_req).context("serializing Steer")?;
+                        frame.push('\n');
+                        // If the daemon has already finished and closed the
+                        // connection, the write will fail — swallow the error
+                        // so the response loop can drain normally.
+                        let _ = writer.write_all(frame.as_bytes()).await;
+                        let _ = writer.flush().await;
+                    }
+                    None => {
+                        // Ctrl+D on stdin — detach gracefully (task continues
+                        // on the daemon side; we stop reading stdin).
+                        stdin_lines = None;
                     }
                 }
             }
@@ -137,6 +195,287 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
     // Ensure the cursor ends up on a fresh line.
     stdout.write_all(b"\n").await.context("writing newline")?;
 
+    // Print a dim session footer so the UUID is visible in scrollback for
+    // use with `amaebi ask --resume <uuid>`.  Suppressed when stderr is not
+    // a terminal (e.g., piped invocations).
+    if std::io::stderr().is_terminal() {
+        eprintln!("\x1b[2m[Session: {}]\x1b[0m", session_id_copy);
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Detach mode
+// ---------------------------------------------------------------------------
+
+/// Submit a task to the daemon in detached (background) mode.
+///
+/// Sends [`Request::SubmitDetach`], waits for [`Response::DetachAccepted`],
+/// prints the session ID to stderr, and exits `0`.  The daemon continues
+/// running the agentic loop in the background; results appear in the inbox.
+pub async fn run_detach(socket: PathBuf, prompt: String, model: Option<String>) -> Result<()> {
+    let stream = connect_or_start_daemon(&socket).await?;
+    let (reader, mut writer) = tokio::io::split(stream);
+
+    let model = model
+        .or_else(|| std::env::var("AMAEBI_MODEL").ok())
+        .unwrap_or_else(|| "gpt-4o".to_string());
+
+    let cwd = std::env::current_dir().context("getting current directory")?;
+    let session_id = tokio::task::spawn_blocking(move || session::get_or_create(&cwd))
+        .await
+        .context("session::get_or_create panicked")?
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "failed to resolve session id; using \"global\"");
+            "global".to_string()
+        });
+
+    let req = Request::SubmitDetach {
+        prompt,
+        tmux_pane: std::env::var("TMUX_PANE").ok(),
+        session_id: Some(session_id),
+        model,
+    };
+    let mut req_line = serde_json::to_string(&req).context("serializing detach request")?;
+    req_line.push('\n');
+    writer
+        .write_all(req_line.as_bytes())
+        .await
+        .context("sending detach request to daemon")?;
+
+    // Wait for the single DetachAccepted (or Error) frame.
+    let mut lines = BufReader::new(reader).lines();
+    let line = lines
+        .next_line()
+        .await
+        .context("reading detach response")?
+        .context("daemon closed connection without responding")?;
+    let resp: Response = serde_json::from_str(&line).context("parsing detach response")?;
+    match resp {
+        Response::DetachAccepted { session_id } => {
+            eprintln!("Task accepted. Running in background under session {session_id}.");
+            eprintln!("Check `amaebi inbox list` for the result when done.");
+            Ok(())
+        }
+        Response::Error { message } => anyhow::bail!("{message}"),
+        other => anyhow::bail!("unexpected response from daemon: {other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Resume mode
+// ---------------------------------------------------------------------------
+
+/// Resume a prior session, loading its full history, then stream the reply.
+///
+/// Sends [`Request::Resume`] to the daemon, which bypasses the normal
+/// `MAX_HISTORY` sliding-window and re-hydrates the complete chronological
+/// conversation.  The streaming display loop is identical to [`run`].
+pub async fn run_resume(
+    socket: PathBuf,
+    prompt: String,
+    model: Option<String>,
+    session_uuid: String,
+) -> Result<()> {
+    let mut sigint = signal(SignalKind::interrupt()).context("setting up SIGINT handler")?;
+
+    let stream = connect_or_start_daemon(&socket).await?;
+    let (reader, mut writer) = tokio::io::split(stream);
+
+    let model = model
+        .or_else(|| std::env::var("AMAEBI_MODEL").ok())
+        .unwrap_or_else(|| "gpt-4o".to_string());
+
+    let req = Request::Resume {
+        prompt,
+        tmux_pane: std::env::var("TMUX_PANE").ok(),
+        session_id: session_uuid.clone(),
+        model,
+    };
+    let mut req_line = serde_json::to_string(&req).context("serializing resume request")?;
+    req_line.push('\n');
+    writer
+        .write_all(req_line.as_bytes())
+        .await
+        .context("sending resume request to daemon")?;
+
+    // Streaming display loop — identical to run().
+    let mut lines = BufReader::new(reader).lines();
+    let mut stdout = tokio::io::stdout();
+    let mut last_ctrl_c: Option<Instant> = None;
+
+    let use_stdin = std::io::stdin().is_terminal();
+    let mut stdin_lines: Option<BufReader<tokio::io::Stdin>> = if use_stdin {
+        Some(BufReader::new(tokio::io::stdin()))
+    } else {
+        None
+    };
+
+    loop {
+        tokio::select! {
+            biased;
+
+            result = sigint.recv() => {
+                let Some(_) = result else { break; };
+                let now = Instant::now();
+                if is_within_window(last_ctrl_c, now, DOUBLE_CTRLC_WINDOW) {
+                    eprintln!();
+                    let _ = stdout.flush().await;
+                    let _ = tokio::io::stderr().flush().await;
+                    return Err(anyhow::Error::new(Interrupted));
+                }
+                eprintln!(
+                    "\nPress Ctrl-C again within {}s to exit",
+                    DOUBLE_CTRLC_WINDOW.as_secs()
+                );
+                last_ctrl_c = Some(now);
+            }
+
+            result = lines.next_line() => {
+                let line = result.context("reading response from daemon")?;
+                let Some(line) = line else { break; };
+                let resp: Response = serde_json::from_str(&line).context("parsing response")?;
+                match resp {
+                    Response::Text { chunk } => {
+                        stdout.write_all(chunk.as_bytes()).await.context("writing to stdout")?;
+                        stdout.flush().await.context("flushing stdout")?;
+                    }
+                    Response::Done => break,
+                    Response::Error { message } => anyhow::bail!("{message}"),
+                    Response::ToolUse { name, detail } => {
+                        eprintln!();
+                        match name.as_str() {
+                            "shell_command" => eprintln!("```bash\n$ {detail}\n```"),
+                            "read_file" => eprintln!("📄 {detail}"),
+                            "edit_file" => eprintln!("✏️  {detail}"),
+                            "tmux_send_keys" => eprintln!("⌨️  send-keys: {detail}"),
+                            "tmux_capture_pane" => eprintln!("🖥️  capture: {detail}"),
+                            _ => eprintln!("🔧 {name}: {detail}"),
+                        }
+                    }
+                    Response::SteerAck => {
+                        tracing::debug!("steer acknowledged by daemon");
+                    }
+                    Response::DetachAccepted { .. } => {
+                        tracing::debug!("unexpected DetachAccepted in resume loop");
+                    }
+                    Response::MemoryEntry { .. } => {
+                        // Not sent to the CLI client — daemon-internal only.
+                    }
+                }
+            }
+
+            steer_line = next_stdin_line(&mut stdin_lines) => {
+                match steer_line {
+                    Some(text) => {
+                        let steer_req = Request::Steer {
+                            session_id: session_uuid.clone(),
+                            message: text,
+                        };
+                        let mut frame = serde_json::to_string(&steer_req)
+                            .context("serializing Steer")?;
+                        frame.push('\n');
+                        let _ = writer.write_all(frame.as_bytes()).await;
+                        let _ = writer.flush().await;
+                    }
+                    None => {
+                        stdin_lines = None;
+                    }
+                }
+            }
+        }
+    }
+
+    stdout.write_all(b"\n").await.context("writing newline")?;
+
+    if std::io::stderr().is_terminal() {
+        eprintln!("\x1b[2m[Session: {}]\x1b[0m", session_uuid);
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Stdin helper
+// ---------------------------------------------------------------------------
+
+/// Read the next line from an optional stdin `Lines` reader.
+///
+/// Returns `Some(line)` when the user types a line, `None` on EOF (Ctrl+D),
+/// and **never resolves** (`std::future::pending`) when `lines` is `None`.
+/// This allows the caller to include this as an always-present arm in
+/// `tokio::select!` without special-casing the TTY check in the macro body.
+async fn next_stdin_line(lines: &mut Option<BufReader<tokio::io::Stdin>>) -> Option<String> {
+    match lines {
+        Some(buf) => {
+            let mut line = String::new();
+            match tokio::io::AsyncBufReadExt::read_line(buf, &mut line).await {
+                Ok(0) => None, // EOF
+                Ok(_) => {
+                    // Strip trailing newline.
+                    if line.ends_with('\n') {
+                        line.pop();
+                        if line.ends_with('\r') {
+                            line.pop();
+                        }
+                    }
+                    Some(line)
+                }
+                Err(_) => None,
+            }
+        }
+        None => std::future::pending().await,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Daemon auto-start
+// ---------------------------------------------------------------------------
+
+/// Connect to the daemon socket, starting the daemon in the background if it
+/// is not already running.
+///
+/// On the first failed connection attempt the daemon binary is spawned with
+/// `stdin`/`stdout`/`stderr` all redirected to `/dev/null`.  Connection is
+/// then retried with exponential back-off up to ~5 seconds before giving up.
+async fn connect_or_start_daemon(socket: &std::path::Path) -> Result<UnixStream> {
+    // Happy path: daemon is already running.
+    if let Ok(stream) = UnixStream::connect(socket).await {
+        return Ok(stream);
+    }
+
+    // Spawn the daemon in the background.
+    tracing::info!(path = %socket.display(), "daemon not reachable; auto-starting");
+    start_daemon(socket).await?;
+
+    // Retry with exponential back-off (100 ms, 200 ms, 400 ms … capped at 1 s).
+    for attempt in 0u32..10 {
+        let wait_ms = 100u64 << attempt.min(3); // 100, 200, 400, 800, 800, …
+        tokio::time::sleep(Duration::from_millis(wait_ms)).await;
+        if let Ok(stream) = UnixStream::connect(socket).await {
+            return Ok(stream);
+        }
+    }
+
+    anyhow::bail!(
+        "daemon did not become ready in time — socket: {}",
+        socket.display()
+    )
+}
+
+/// Spawn the amaebi daemon as a detached background process.
+async fn start_daemon(socket: &std::path::Path) -> Result<()> {
+    let exe = std::env::current_exe().context("finding current executable path")?;
+    tokio::process::Command::new(&exe)
+        .arg("daemon")
+        .arg("--socket")
+        .arg(socket)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .with_context(|| format!("spawning daemon from {}", exe.display()))?;
     Ok(())
 }
 

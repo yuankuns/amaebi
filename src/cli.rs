@@ -31,6 +31,16 @@ pub enum Command {
         /// Model to use (overrides AMAEBI_MODEL env var; default: gpt-4o).
         #[arg(long)]
         model: Option<String>,
+        /// Submit the task in the background; print a task ID to stderr and exit
+        /// immediately.  The result is deposited into `amaebi inbox` when done.
+        /// Cannot be combined with --resume.
+        #[arg(long, conflicts_with = "resume")]
+        detach: bool,
+        /// Resume a prior session by UUID, loading its full chronological history
+        /// instead of the normal sliding-window context (last N turns).
+        /// Cannot be combined with --detach.
+        #[arg(long, conflicts_with = "detach")]
+        resume: Option<String>,
     },
     /// Authenticate with GitHub Copilot via the device flow.
     Auth {
@@ -71,6 +81,38 @@ pub enum Command {
         #[arg(long, default_value = DEFAULT_SOCKET, global = true)]
         socket: PathBuf,
     },
+    /// Manage the session identity for the current directory.
+    ///
+    /// Each directory has a stable UUID stored in `~/.amaebi/sessions.json`.
+    /// The daemon uses this UUID to isolate per-project conversation history.
+    Session {
+        #[command(subcommand)]
+        action: SessionAction,
+    },
+    /// Manage cache state (sessions, memory, disk usage).
+    Cache {
+        #[command(subcommand)]
+        action: CacheAction,
+    },
+    /// Manage scheduled cron jobs.
+    ///
+    /// Jobs are stored in `~/.amaebi/cron.db` and executed autonomously by
+    /// a running daemon process.  Results are deposited into `amaebi inbox`.
+    ///
+    /// Example: amaebi cron add "check disk usage" --cron "0 9 * * *"
+    Cron {
+        #[command(subcommand)]
+        action: CronAction,
+    },
+    /// Read reports from completed cron tasks.
+    ///
+    /// Cron tasks run autonomously in the background; their output is stored
+    /// in `~/.amaebi/inbox.db`.  A bell notification is printed at the start
+    /// of every `amaebi ask` invocation when unread reports are present.
+    Inbox {
+        #[command(subcommand)]
+        action: InboxAction,
+    },
 }
 
 #[derive(clap::Subcommand, Debug)]
@@ -86,4 +128,106 @@ pub enum MemoryAction {
     Clear,
     /// Show total number of stored memories.
     Count,
+}
+
+#[derive(clap::Subcommand, Debug)]
+pub enum SessionAction {
+    /// Show the session UUID for the current directory.
+    ///
+    /// Prints the UUID if one has been assigned, or "(none)" if the current
+    /// directory has not started a session yet.
+    Show,
+    /// Reset the session for the current directory by generating a new UUID.
+    ///
+    /// The old conversation context is abandoned; the next `amaebi ask` will
+    /// start with a blank slate.
+    New,
+    /// List all session mappings with their last-access timestamps.
+    Status,
+    /// Clear expired session entries from `~/.amaebi/sessions.json`.
+    Clear {
+        /// Show which entries would be evicted without actually removing them.
+        #[arg(long)]
+        dry_run: bool,
+        /// TTL in seconds for the "default" tier (default: 1800).
+        #[arg(long, default_value = "1800")]
+        default_ttl: u64,
+        /// TTL in seconds for the "ephemeral" tier (default: 300).
+        #[arg(long, default_value = "300")]
+        ephemeral_ttl: u64,
+        /// TTL in seconds for the "persistent" tier (default: 86400).
+        #[arg(long, default_value = "86400")]
+        persistent_ttl: u64,
+    },
+    /// Set the TTL tier for the current directory's session.
+    SetTier {
+        /// Tier name (e.g. "default", "ephemeral", "persistent").
+        tier: String,
+    },
+}
+
+#[derive(clap::Subcommand, Debug)]
+pub enum InboxAction {
+    /// List all unread cron reports (default view).
+    ///
+    /// Pass `--all` to include already-read reports.
+    List {
+        /// Include reports that have already been read.
+        #[arg(long)]
+        all: bool,
+    },
+    /// Display a specific report and mark it as read.
+    Read {
+        /// The numeric ID of the report (shown in `inbox list`).
+        id: i64,
+    },
+    /// Mark all unread reports as read without displaying them.
+    MarkRead,
+    /// Delete all inbox reports.
+    Clear,
+}
+
+#[derive(clap::Subcommand, Debug)]
+pub enum CronAction {
+    /// Add a new cron job.
+    Add {
+        /// Task description used as the LLM prompt when the job fires.
+        description: String,
+        /// 5-field cron expression (min hour dom mon dow).
+        ///
+        /// Supports: `*`, `n`, `n-m`, `*/n`, and comma-separated lists.
+        /// Example: "0 9 * * *" runs every day at 09:00 UTC.
+        #[arg(long = "cron")]
+        schedule: String,
+    },
+    /// List all scheduled cron jobs.
+    List,
+    /// Delete a cron job by its UUID.
+    Delete {
+        /// UUID of the job to remove (shown in `cron list`).
+        id: String,
+    },
+}
+
+#[derive(clap::Subcommand, Debug)]
+pub enum CacheAction {
+    /// Prune stale history and session allocation state.
+    ///
+    /// Removes expired sessions from `sessions.json`.  The SQLite memory
+    /// backend does not support entry-level trimming, so `--max-memory` is
+    /// accepted for backwards compatibility but has no effect.
+    Prune {
+        /// Maximum memory entries to keep (oldest are removed first).
+        /// NOTE: ignored when using the SQLite memory backend (the default).
+        #[arg(long)]
+        max_memory: Option<usize>,
+        /// Show what would be pruned without actually doing it.
+        #[arg(long)]
+        dry_run: bool,
+        /// Force prune ALL sessions (ignores TTL; keeps only active ones).
+        #[arg(long)]
+        aggressive: bool,
+    },
+    /// Show cache statistics (session count, memory entry count, disk usage).
+    Stats,
 }

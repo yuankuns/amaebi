@@ -200,6 +200,55 @@ pub fn get_recent(conn: &Connection, limit: usize) -> Result<Vec<DbMemoryEntry>>
     Ok(entries)
 }
 
+/// Return all messages for a given `session_id` in chronological order.
+///
+/// Used by `--resume` to reload full conversation history from the DB
+/// without FTS5 filtering.  Returns an empty list when no rows match.
+pub fn get_session_history(conn: &Connection, session_id: &str) -> Result<Vec<DbMemoryEntry>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, timestamp, session_id, role, content, summary
+             FROM memories
+             WHERE session_id = ?1
+             ORDER BY id ASC",
+        )
+        .context("preparing get_session_history query")?;
+
+    let entries = stmt
+        .query_map(params![session_id], row_to_entry)
+        .context("executing get_session_history")?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .context("collecting session history results")?;
+    Ok(entries)
+}
+
+/// Return the most recent `limit` messages for a given `session_id` in
+/// chronological order.  Used for the sliding-window history in Chat mode.
+pub fn get_session_recent(
+    conn: &Connection,
+    session_id: &str,
+    limit: usize,
+) -> Result<Vec<DbMemoryEntry>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, timestamp, session_id, role, content, summary
+             FROM memories
+             WHERE session_id = ?1
+             ORDER BY id DESC
+             LIMIT ?2",
+        )
+        .context("preparing get_session_recent query")?;
+
+    let mut entries = stmt
+        .query_map(params![session_id, limit as i64], row_to_entry)
+        .context("executing get_session_recent")?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .context("collecting session recent results")?;
+
+    entries.reverse(); // chronological order
+    Ok(entries)
+}
+
 /// Return the total number of rows in the `memories` table.
 pub fn count(conn: &Connection) -> Result<usize> {
     conn.query_row("SELECT COUNT(*) FROM memories", [], |r| r.get::<_, i64>(0))
@@ -440,5 +489,52 @@ mod tests {
         assert_eq!(escape_fts5_query("hello world"), "\"hello world\"");
         assert_eq!(escape_fts5_query("say \"hi\""), "\"say \"\"hi\"\"\"");
         assert_eq!(escape_fts5_query(""), "\"\"");
+    }
+
+    #[test]
+    fn test_get_session_history() {
+        let (conn, _dir) = open_test_db();
+        store_memory(&conn, "2026-01-01T00:00:00Z", "sess-1", "user", "hello", "").unwrap();
+        store_memory(
+            &conn,
+            "2026-01-01T00:00:01Z",
+            "sess-1",
+            "assistant",
+            "hi",
+            "",
+        )
+        .unwrap();
+        store_memory(&conn, "2026-01-01T00:00:02Z", "sess-2", "user", "other", "").unwrap();
+
+        let history = get_session_history(&conn, "sess-1").unwrap();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].content, "hello");
+        assert_eq!(history[1].content, "hi");
+
+        let other = get_session_history(&conn, "sess-2").unwrap();
+        assert_eq!(other.len(), 1);
+
+        let empty = get_session_history(&conn, "nonexistent").unwrap();
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn test_get_session_recent() {
+        let (conn, _dir) = open_test_db();
+        for i in 0..10 {
+            store_memory(
+                &conn,
+                "2026-01-01T00:00:00Z",
+                "s1",
+                "user",
+                &format!("msg {i}"),
+                "",
+            )
+            .unwrap();
+        }
+        let recent = get_session_recent(&conn, "s1", 4).unwrap();
+        assert_eq!(recent.len(), 4);
+        assert_eq!(recent[0].content, "msg 6");
+        assert_eq!(recent[3].content, "msg 9");
     }
 }
