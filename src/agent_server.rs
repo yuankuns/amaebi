@@ -306,9 +306,7 @@ impl acp::Agent for AmaebiAgent {
                 Response::Error { message } => {
                     return Err(acp::Error::internal_error().data(message));
                 }
-                Response::ToolUse { .. }
-                | Response::MemoryEntry { .. }
-                | Response::WaitingForInput { .. } => {
+                Response::ToolUse { .. } | Response::MemoryEntry { .. } => {
                     // Not relevant on the ACP forwarding path.
                 }
                 Response::SteerAck => {

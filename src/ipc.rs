@@ -115,15 +115,6 @@ pub enum Response {
         /// The message content.
         content: String,
     },
-    /// The daemon is waiting for interactive user input before proceeding.
-    ///
-    /// Sent when the model asks a clarifying question or ends its response
-    /// with a question mark.  The client should display a prompt and forward
-    /// the user's reply as a [`Request::Steer`] frame.
-    WaitingForInput {
-        /// The question or prompt text to display to the user.
-        prompt: String,
-    },
 }
 
 // ---------------------------------------------------------------------------
@@ -359,19 +350,6 @@ mod tests {
     }
 
     #[test]
-    fn response_waiting_for_input_round_trip() {
-        let r = Response::WaitingForInput {
-            prompt: "Which language?".into(),
-        };
-        let json = serde_json::to_string(&r).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(v["type"], "waiting_for_input");
-        assert_eq!(v["prompt"], "Which language?");
-        let back: Response = serde_json::from_str(&json).unwrap();
-        assert!(matches!(back, Response::WaitingForInput { .. }));
-    }
-
-    #[test]
     fn response_all_variants_round_trip() {
         let frames = [
             r#"{"type":"text","chunk":"hello"}"#,
@@ -381,7 +359,6 @@ mod tests {
             r#"{"type":"steer_ack"}"#,
             r#"{"type":"detach_accepted","session_id":"uuid-1"}"#,
             r#"{"type":"memory_entry","role":"user","content":"hi"}"#,
-            r#"{"type":"waiting_for_input","prompt":"Which language?"}"#,
         ];
         for frame in frames {
             let r: Response = serde_json::from_str(frame).unwrap();
@@ -394,7 +371,6 @@ mod tests {
                     | Response::SteerAck
                     | Response::DetachAccepted { .. }
                     | Response::MemoryEntry { .. }
-                    | Response::WaitingForInput { .. }
             ));
         }
     }
