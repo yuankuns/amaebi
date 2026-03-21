@@ -395,7 +395,9 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
 
             // Resolve session first so the steer reader can validate the
             // session_id on incoming Steer frames.
-            let sid = session_id.unwrap_or_default();
+            // Older clients that omit session_id get a fresh UUID so their
+            // history and steer lookups are isolated (not all lumped under "").
+            let sid = session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
             // Steering channel: the spawned reader task sends user corrections
             // here; the agentic loop drains them between model turns.
@@ -567,10 +569,10 @@ const MAX_TOOL_OUTPUT_CHARS: usize = 8_000;
 /// (or an error).  Executes tool calls and feeds results back in a loop.
 ///
 /// `steer_rx` receives user corrections injected mid-flight from the CLI's
-/// stdin.  Any messages in the channel are drained **between tool turns**
-/// (after all tool results are appended but before the next model call) and
-/// pushed as `user` messages.  A [`Response::SteerAck`] frame is sent for
-/// each message consumed.
+/// stdin.  Pending steers are drained **at the start of every loop iteration**
+/// (before the model call), so corrections are visible regardless of whether
+/// the previous turn used tools or returned Stop/Length.  A
+/// [`Response::SteerAck`] frame is sent for each message consumed.
 ///
 /// `stream_chat` retries 5xx, 429, and transport errors internally up to its
 /// `MAX_RETRIES`, but those errors can still surface here if retries are
@@ -589,6 +591,14 @@ where
     let final_text;
 
     loop {
+        // Drain any steering corrections that arrived since the last model
+        // call (covers non-tool turns and the time between tool completion
+        // and the next iteration).
+        while let Ok(steer_msg) = steer_rx.try_recv() {
+            messages.push(Message::user(steer_msg));
+            write_frame(writer, &Response::SteerAck).await?;
+        }
+
         // Re-fetch the token on every iteration so long-running agentic loops
         // survive token expiration.
         let token = state
@@ -746,13 +756,8 @@ where
                     messages.push(Message::tool_result(&tc.id, result));
                 }
 
-                // Drain any steering corrections that arrived while tools were
-                // running.  Each is injected as a fresh `user` turn so the
-                // model sees it before its next response.
-                while let Ok(steer_msg) = steer_rx.try_recv() {
-                    messages.push(Message::user(steer_msg));
-                    write_frame(writer, &Response::SteerAck).await?;
-                }
+                // Steers that arrived during tool execution are drained at
+                // the top of the next loop iteration, before the model call.
             }
 
             FinishReason::Other(ref reason) => {
@@ -937,7 +942,8 @@ async fn run_cron_job(state: Arc<DaemonState>, job: &cron::CronJob) {
     // Resolve model from env var (same default as CLI client).
     let model = std::env::var("AMAEBI_MODEL").unwrap_or_else(|_| "gpt-4o".to_string());
 
-    let messages = build_messages(&job.description, None, &[]);
+    let mut messages = build_messages(&job.description, None, &[]);
+    inject_skill_files(&mut messages).await;
     let mut sink = tokio::io::sink();
     let (_steer_tx, mut steer_rx) = tokio::sync::mpsc::channel::<String>(1);
 

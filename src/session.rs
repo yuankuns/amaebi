@@ -373,12 +373,33 @@ pub fn clear_expired(
 
     for key in keys {
         let rec = &map[&key];
-        // Resolution order: directory-path key → tier-name key → "default" → 30 min.
-        let tier_ttl = ttl_secs
-            .get(&key)
-            .or_else(|| ttl_secs.get(&rec.ttl_tier))
-            .or_else(|| ttl_secs.get("default"))
-            .copied()
+        // Resolution order (mirrors Config::ttl_for):
+        //   1. exact directory-path key
+        //   2. longest ancestor-prefix key (path must start with '/')
+        //   3. tier-name key
+        //   4. "default" key
+        //   5. hardcoded 30-minute fallback
+        let exact = ttl_secs.get(&key).copied();
+        let ancestor = if exact.is_none() {
+            let mut best: Option<(usize, u64)> = None; // (key_len, secs)
+            for (k, &secs) in ttl_secs.iter() {
+                if !k.starts_with('/') {
+                    continue;
+                }
+                let is_ancestor = key == *k
+                    || key.starts_with(k.as_str()) && key.as_bytes().get(k.len()) == Some(&b'/');
+                if is_ancestor && best.is_none_or(|(prev_len, _)| k.len() > prev_len) {
+                    best = Some((k.len(), secs));
+                }
+            }
+            best.map(|(_, secs)| secs)
+        } else {
+            None
+        };
+        let tier_ttl = exact
+            .or(ancestor)
+            .or_else(|| ttl_secs.get(&rec.ttl_tier).copied())
+            .or_else(|| ttl_secs.get("default").copied())
             .unwrap_or(30 * 60);
 
         if let Ok(accessed) = chrono::DateTime::parse_from_rfc3339(&rec.last_accessed) {

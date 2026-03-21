@@ -77,9 +77,10 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
     // Timestamp of the first Ctrl-C press; None means no pending first press.
     let mut last_ctrl_c: Option<Instant> = None;
 
-    // Stdin reader — only created when stdout is a TTY so that piped
-    // invocations (`amaebi ask "..." | grep foo`) never block on stdin.
-    let use_stdin = std::io::stdout().is_terminal();
+    // Stdin reader — only created when stdin is a TTY (interactive terminal).
+    // Piped invocations (`echo "fix" | amaebi ask "..."`) have stdin as a
+    // pipe, not a TTY, so we skip the reader to avoid blocking on EOF.
+    let use_stdin = std::io::stdin().is_terminal();
     let mut stdin_lines: Option<BufReader<tokio::io::Stdin>> = if use_stdin {
         Some(BufReader::new(tokio::io::stdin()))
     } else {
@@ -304,7 +305,7 @@ pub async fn run_resume(
     let mut stdout = tokio::io::stdout();
     let mut last_ctrl_c: Option<Instant> = None;
 
-    let use_stdin = std::io::stdout().is_terminal();
+    let use_stdin = std::io::stdin().is_terminal();
     let mut stdin_lines: Option<BufReader<tokio::io::Stdin>> = if use_stdin {
         Some(BufReader::new(tokio::io::stdin()))
     } else {
