@@ -655,12 +655,13 @@ where
         match resp.finish_reason {
             FinishReason::Stop | FinishReason::Length => {
                 // Check if the model is asking for clarification via the
-                // [WAITING_FOR_INPUT] protocol marker.
-                if resp.text.trim_start().starts_with("[WAITING_FOR_INPUT]") {
+                // [WAITING_FOR_INPUT] protocol marker.  Require the marker at
+                // byte 0 (no trim_start) so detection aligns with
+                // parse_sse_stream's prefix-suppression logic.
+                if resp.text.starts_with(copilot::WAITING_MARKER) {
                     let clarification_prompt = resp
                         .text
-                        .trim_start()
-                        .strip_prefix("[WAITING_FOR_INPUT]")
+                        .strip_prefix(copilot::WAITING_MARKER)
                         .unwrap_or(&resp.text)
                         .trim()
                         .to_owned();

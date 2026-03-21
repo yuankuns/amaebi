@@ -161,11 +161,17 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
                     Response::MemoryEntry { .. } => {
                         // Not sent to the CLI client — daemon-internal only.
                     }
-                    Response::WaitingForInput { .. } => {
-                        // Daemon signals it needs a reply.  Print a blank line
-                        // to separate from LLM output, then leave the cursor
-                        // on the same line as '> ' so user input appears inline.
-                        eprint!("\n> ");
+                    Response::WaitingForInput { prompt } => {
+                        // Daemon signals it needs a reply.  When prompt is
+                        // empty the question was already on screen via Text
+                        // chunks; just show the cursor.  When non-empty, print
+                        // the extra context first, then the cursor line.
+                        if prompt.is_empty() {
+                            eprint!("\n>");
+                        } else {
+                            eprintln!("\n{prompt}");
+                            eprint!(">");
+                        }
                         let _ = tokio::io::stderr().flush().await;
                     }
                 }
@@ -370,8 +376,13 @@ pub async fn run_resume(
                     Response::MemoryEntry { .. } => {
                         // Not sent to the CLI client — daemon-internal only.
                     }
-                    Response::WaitingForInput { .. } => {
-                        eprint!("\n> ");
+                    Response::WaitingForInput { prompt } => {
+                        if prompt.is_empty() {
+                            eprint!("\n>");
+                        } else {
+                            eprintln!("\n{prompt}");
+                            eprint!(">");
+                        }
                         let _ = tokio::io::stderr().flush().await;
                     }
                 }

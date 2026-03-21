@@ -118,10 +118,18 @@ pub enum Response {
     /// The daemon is waiting for interactive user input before proceeding.
     ///
     /// Sent when the model asks a clarifying question or ends its response
-    /// with a question mark.  The client should display a prompt and forward
-    /// the user's reply as a [`Request::Steer`] frame.
+    /// with a question mark.  The client should display a `>` cursor and
+    /// forward the user's reply as a [`Request::Steer`] frame.
     WaitingForInput {
-        /// The question or prompt text to display to the user.
+        /// Optional clarification text to display above the `>` cursor.
+        ///
+        /// **Empty string** (the common case): the question was already
+        /// streamed to the client as [`Response::Text`] chunks, so the
+        /// client should only show a bare `>` cursor.
+        ///
+        /// **Non-empty**: the daemon has additional context to display that
+        /// was not part of the streamed text (e.g. a synthesised prompt);
+        /// the client should print this text before the `>` cursor.
         prompt: String,
     },
 }

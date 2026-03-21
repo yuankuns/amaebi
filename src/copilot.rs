@@ -683,7 +683,8 @@ where
 
 /// Protocol marker the model emits to signal it needs interactive input.
 /// Stripped from streamed Text chunks so it never appears in the terminal.
-const WAITING_MARKER: &str = "[WAITING_FOR_INPUT]";
+/// Exported so `daemon.rs` can use the same constant for detection.
+pub const WAITING_MARKER: &str = "[WAITING_FOR_INPUT]";
 
 async fn parse_sse_stream<W>(resp: reqwest::Response, writer: &mut W) -> Result<CopilotResponse>
 where
@@ -783,6 +784,12 @@ where
     }
 
     // Stream closed without [DONE].
+    // Flush any prefix that was still buffered — the response was too short
+    // to contain WAITING_MARKER so we must forward it rather than drop it.
+    if !prefix_checked && !prefix_buf.is_empty() {
+        write_frame(writer, &Response::Text { chunk: prefix_buf }).await?;
+        writer.flush().await?;
+    }
     tracing::debug!("SSE stream closed without [DONE]");
     Ok(acc.finalize())
 }
