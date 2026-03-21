@@ -678,11 +678,15 @@ where
                     .await?;
 
                     // Record the assistant's question in history using the
-                    // stripped text (marker removed) so it doesn't pollute context.
-                    messages.push(Message::assistant(
-                        Some(clarification_prompt.clone()),
-                        vec![],
-                    ));
+                    // stripped text (marker removed).  Use None when the
+                    // stripped text is empty to match the existing pattern
+                    // used in the tool-call branch (empty assistant text → None).
+                    let cp_text = if clarification_prompt.is_empty() {
+                        None
+                    } else {
+                        Some(clarification_prompt.clone())
+                    };
+                    messages.push(Message::assistant(cp_text, vec![]));
 
                     // Block until the user replies via the steering channel.
                     // Timeout after 5 minutes to avoid infinite hangs.
