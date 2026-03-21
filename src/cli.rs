@@ -33,11 +33,13 @@ pub enum Command {
         model: Option<String>,
         /// Submit the task in the background; print a task ID to stderr and exit
         /// immediately.  The result is deposited into `amaebi inbox` when done.
-        #[arg(long)]
+        /// Cannot be combined with --resume.
+        #[arg(long, conflicts_with = "resume")]
         detach: bool,
         /// Resume a prior session by UUID, loading its full chronological history
         /// instead of the normal sliding-window context (last N turns).
-        #[arg(long)]
+        /// Cannot be combined with --detach.
+        #[arg(long, conflicts_with = "detach")]
         resume: Option<String>,
     },
     /// Authenticate with GitHub Copilot via the device flow.
@@ -211,11 +213,12 @@ pub enum CronAction {
 pub enum CacheAction {
     /// Prune stale history and session allocation state.
     ///
-    /// Removes expired sessions from `sessions.json` and optionally trims
-    /// the memory JSONL file to a maximum number of entries.
+    /// Removes expired sessions from `sessions.json`.  The SQLite memory
+    /// backend does not support entry-level trimming, so `--max-memory` is
+    /// accepted for backwards compatibility but has no effect.
     Prune {
         /// Maximum memory entries to keep (oldest are removed first).
-        /// Defaults to keeping all entries.
+        /// NOTE: ignored when using the SQLite memory backend (the default).
         #[arg(long)]
         max_memory: Option<usize>,
         /// Show what would be pruned without actually doing it.

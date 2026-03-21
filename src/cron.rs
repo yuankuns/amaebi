@@ -192,6 +192,8 @@ impl CronStore {
             params![id, description, schedule, created_at],
         )
         .context("inserting cron job")?;
+        // WAL file may have been created by the INSERT; secure it now.
+        let _ = self.restrict_sidecar_permissions();
         Ok(id)
     }
 
@@ -201,6 +203,7 @@ impl CronStore {
         let n = conn
             .execute("DELETE FROM cron_jobs WHERE id = ?1", params![id])
             .context("deleting cron job")?;
+        let _ = self.restrict_sidecar_permissions();
         Ok(n > 0)
     }
 
@@ -212,6 +215,7 @@ impl CronStore {
             params![timestamp, id],
         )
         .context("updating cron job last_run")?;
+        let _ = self.restrict_sidecar_permissions();
         Ok(())
     }
 }

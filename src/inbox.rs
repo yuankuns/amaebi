@@ -172,7 +172,10 @@ impl InboxStore {
             params![session_id, task_description, output, created_at],
         )
         .context("inserting inbox report")?;
-        Ok(conn.last_insert_rowid())
+        let id = conn.last_insert_rowid();
+        // WAL file may have been created by the INSERT; secure it now.
+        let _ = self.restrict_sidecar_permissions();
+        Ok(id)
     }
 
     /// Mark a single report as read by its `id`.
@@ -180,6 +183,7 @@ impl InboxStore {
         let conn = self.connect()?;
         conn.execute("UPDATE inbox SET read = 1 WHERE id = ?1", params![id])
             .context("marking report as read")?;
+        let _ = self.restrict_sidecar_permissions();
         Ok(())
     }
 
@@ -188,6 +192,7 @@ impl InboxStore {
         let conn = self.connect()?;
         conn.execute("UPDATE inbox SET read = 1 WHERE read = 0", [])
             .context("marking all reports as read")?;
+        let _ = self.restrict_sidecar_permissions();
         Ok(())
     }
 
@@ -197,6 +202,7 @@ impl InboxStore {
         let conn = self.connect()?;
         conn.execute("DELETE FROM inbox WHERE id = ?1", params![id])
             .context("deleting inbox report")?;
+        let _ = self.restrict_sidecar_permissions();
         Ok(())
     }
 
@@ -205,6 +211,7 @@ impl InboxStore {
         let conn = self.connect()?;
         conn.execute("DELETE FROM inbox", [])
             .context("clearing inbox")?;
+        let _ = self.restrict_sidecar_permissions();
         Ok(())
     }
 

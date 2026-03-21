@@ -190,9 +190,10 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                 return Ok(());
             }
 
-            // Fall back to "" to stay compatible with history rows written by
-            // older clients that did not send a session_id.
-            let sid = session_id.unwrap_or_default();
+            // Generate a fresh UUID for detached tasks when the client does
+            // not provide one, so every background task has a stable identifier
+            // that appears in inbox reports and can be resumed later.
+            let sid = session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
             // Acknowledge immediately — client can exit after this.
             write_frame(
@@ -295,10 +296,22 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
             }
 
             let (steer_tx, mut steer_rx) = tokio::sync::mpsc::channel::<String>(16);
+            let expected_resume_sid = session_id.clone();
             tokio::spawn(async move {
                 while let Ok(Some(frame)) = lines.next_line().await {
                     match serde_json::from_str::<Request>(&frame) {
-                        Ok(Request::Steer { message, .. }) => {
+                        Ok(Request::Steer {
+                            session_id: steer_sid,
+                            message,
+                        }) => {
+                            if steer_sid != expected_resume_sid {
+                                tracing::debug!(
+                                    expected = %expected_resume_sid,
+                                    got = %steer_sid,
+                                    "ignoring steer frame with mismatched session_id on resume"
+                                );
+                                continue;
+                            }
                             if steer_tx.send(message).await.is_err() {
                                 break;
                             }
@@ -377,6 +390,10 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                 return Ok(());
             }
 
+            // Resolve session first so the steer reader can validate the
+            // session_id on incoming Steer frames.
+            let sid = session_id.unwrap_or_default();
+
             // Steering channel: the spawned reader task sends user corrections
             // here; the agentic loop drains them between model turns.
             let (steer_tx, mut steer_rx) = tokio::sync::mpsc::channel::<String>(16);
@@ -386,10 +403,22 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
             // the running agentic loop can inject them between tool turns.
             // The task exits when the client closes the connection (EOF) or
             // when steer_tx is dropped (agentic loop finished).
+            let expected_chat_sid = sid.clone();
             tokio::spawn(async move {
                 while let Ok(Some(frame)) = lines.next_line().await {
                     match serde_json::from_str::<Request>(&frame) {
-                        Ok(Request::Steer { message, .. }) => {
+                        Ok(Request::Steer {
+                            session_id: steer_sid,
+                            message,
+                        }) => {
+                            if steer_sid != expected_chat_sid {
+                                tracing::debug!(
+                                    expected = %expected_chat_sid,
+                                    got = %steer_sid,
+                                    "ignoring steer frame with mismatched session_id on chat"
+                                );
+                                continue;
+                            }
                             if steer_tx.send(message).await.is_err() {
                                 break; // agentic loop has finished; channel closed
                             }
@@ -401,10 +430,6 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                     }
                 }
             });
-
-            // Resolve session — fall back to "" to stay compatible with history
-            // rows written by older clients that did not send a session_id.
-            let sid = session_id.unwrap_or_default();
 
             // Load recent history from SQLite (sliding window).
             let db = Arc::clone(&state.db);

@@ -13,4 +13,5 @@
 
 ## Architecture
 - SQLite is the source of truth for `memory_db`, `inbox.db`, and `cron.db`. Do not use `.jsonl` or `.json` files for state storage. Avoid `tempfile` atomic writes for data that belongs in SQLite.
+  - Exception: `~/.amaebi/sessions.json` is a lightweight non-authoritative directory→UUID mapping cache. It is intentionally JSON (not SQLite) because it is written by every CLI invocation and must tolerate concurrent readers without WAL overhead.
 - Respect the Dual-Channel UX: the CLI is meant to stream output while asynchronously reading `stdin` for `Request::Steer` events.
