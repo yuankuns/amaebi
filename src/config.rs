@@ -67,8 +67,13 @@ impl Config {
 
     /// Resolve the TTL duration for a given directory path.
     ///
-    /// Checks for an exact canonical-path match first, then falls back to
-    /// the `"default"` key, and finally to `DEFAULT_TTL_MINUTES`.
+    /// Resolution order (highest priority first):
+    /// 1. Exact match on `dir` in `ttl_minutes`.
+    /// 2. Longest ancestor-prefix match: the most specific configured path
+    ///    that is a true parent of `dir` (i.e. `dir` starts with the key
+    ///    followed by `/`, or equals the key exactly).
+    /// 3. The `"default"` key in `ttl_minutes`.
+    /// 4. `DEFAULT_TTL_MINUTES` (30 minutes).
     #[allow(dead_code)]
     pub fn ttl_for(&self, dir: &str) -> Duration {
         // Exact match on canonical directory path.
@@ -81,7 +86,11 @@ impl Config {
             if key == "default" {
                 continue;
             }
-            if dir.starts_with(key.as_str()) {
+            // Require a path-separator boundary so that e.g. key
+            // "/home/user/projects" does not match "/home/user/projects-old".
+            let is_ancestor = dir == key.as_str()
+                || dir.starts_with(key.as_str()) && dir.as_bytes().get(key.len()) == Some(&b'/');
+            if is_ancestor {
                 match best {
                     Some((prev_key, _)) if key.len() > prev_key.len() => {
                         best = Some((key.as_str(), minutes));
@@ -184,6 +193,17 @@ mod tests {
         assert_eq!(
             cfg.ttl_for("/some/random/path"),
             Duration::from_secs(30 * 60)
+        );
+    }
+
+    #[test]
+    fn sibling_path_does_not_match() {
+        // "/home/syk/projects-old" must NOT inherit the TTL for "/home/syk/projects".
+        let mut cfg = Config::default();
+        cfg.ttl_minutes.insert("/home/syk/projects".into(), 120);
+        assert_eq!(
+            cfg.ttl_for("/home/syk/projects-old"),
+            Duration::from_secs(30 * 60), // falls back to hardcoded default
         );
     }
 
