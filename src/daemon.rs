@@ -678,11 +678,8 @@ where
 
                     // Block until the user replies via the steering channel.
                     // Timeout after 5 minutes to avoid infinite hangs.
-                    match tokio::time::timeout(
-                        std::time::Duration::from_secs(300),
-                        steer_rx.recv(),
-                    )
-                    .await
+                    match tokio::time::timeout(std::time::Duration::from_secs(300), steer_rx.recv())
+                        .await
                     {
                         Ok(Some(user_reply)) => {
                             messages.push(Message::user(user_reply));
@@ -728,11 +725,8 @@ where
 
                     messages.push(Message::assistant(Some(resp.text), vec![]));
 
-                    match tokio::time::timeout(
-                        std::time::Duration::from_secs(300),
-                        steer_rx.recv(),
-                    )
-                    .await
+                    match tokio::time::timeout(std::time::Duration::from_secs(300), steer_rx.recv())
+                        .await
                     {
                         Ok(Some(user_reply)) => {
                             messages.push(Message::user(user_reply));
