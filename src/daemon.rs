@@ -232,8 +232,11 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
 
                 // Use a sink writer — output frames are discarded; we only
                 // need the return value (final_text) for the inbox.
+                // Drop the sender immediately (`_`) so steer_rx.recv() in the
+                // agentic loop returns None at once instead of timing out if
+                // the model ends with '?'.
                 let mut sink = tokio::io::sink();
-                let (_steer_tx, mut steer_rx) = tokio::sync::mpsc::channel::<String>(1);
+                let (_, mut steer_rx) = tokio::sync::mpsc::channel::<String>(1);
 
                 match run_agentic_loop(&state, &model, messages, &mut sink, &mut steer_rx).await {
                     Ok(final_text) => {
@@ -651,6 +654,119 @@ where
 
         match resp.finish_reason {
             FinishReason::Stop | FinishReason::Length => {
+                // Check if the model is asking for clarification via the
+                // [WAITING_FOR_INPUT] protocol marker.  Use trim_start() so
+                // detection is robust to any leading whitespace the model emits
+                // before the marker (parse_sse_stream suppresses the marker
+                // only when it sits at byte 0, but detection must not miss it
+                // when it doesn't).
+                if resp.text.trim_start().starts_with(copilot::WAITING_MARKER) {
+                    let clarification_prompt = resp
+                        .text
+                        .trim_start()
+                        .strip_prefix(copilot::WAITING_MARKER)
+                        .unwrap_or(&resp.text)
+                        .trim()
+                        .to_owned();
+
+                    // Tell the client we need input.  The marker and clarification
+                    // text were already suppressed/streamed by parse_sse_stream,
+                    // so pass an empty prompt here to avoid duplicating on screen.
+                    write_frame(
+                        writer,
+                        &Response::WaitingForInput {
+                            prompt: String::new(),
+                        },
+                    )
+                    .await?;
+
+                    // Record the assistant's question in history using the
+                    // stripped text (marker removed).  Use None when the
+                    // stripped text is empty to match the existing pattern
+                    // used in the tool-call branch (empty assistant text → None).
+                    let cp_text = if clarification_prompt.is_empty() {
+                        None
+                    } else {
+                        Some(clarification_prompt.clone())
+                    };
+                    messages.push(Message::assistant(cp_text, vec![]));
+
+                    // Block until the user replies via the steering channel.
+                    // Timeout after 5 minutes to avoid infinite hangs.
+                    match tokio::time::timeout(std::time::Duration::from_secs(300), steer_rx.recv())
+                        .await
+                    {
+                        Ok(Some(user_reply)) => {
+                            messages.push(Message::user(user_reply));
+                            write_frame(writer, &Response::SteerAck).await?;
+                            continue;
+                        }
+                        Ok(None) => {
+                            // Channel closed — client disconnected.
+                            final_text = clarification_prompt;
+                            break;
+                        }
+                        Err(_timeout) => {
+                            write_frame(
+                                writer,
+                                &Response::Text {
+                                    chunk: "\n[timed out waiting for input]\n".into(),
+                                },
+                            )
+                            .await?;
+                            final_text = clarification_prompt;
+                            break;
+                        }
+                    }
+                }
+
+                // Multi-turn heuristic: if the model's response ends with a
+                // question mark, treat it as an implicit request for
+                // clarification and keep the session alive for follow-up.
+                if resp.text.trim_end().ends_with('?') {
+                    let question = resp.text.trim().to_owned();
+
+                    // The full LLM text was already streamed to the client as
+                    // Response::Text chunks by stream_chat.  Send an empty
+                    // prompt here so the client only shows the '>' cursor
+                    // without duplicating the already-displayed question text.
+                    write_frame(
+                        writer,
+                        &Response::WaitingForInput {
+                            prompt: String::new(),
+                        },
+                    )
+                    .await?;
+
+                    // Use the trimmed question (no marker contamination) in history.
+                    messages.push(Message::assistant(Some(question.clone()), vec![]));
+
+                    match tokio::time::timeout(std::time::Duration::from_secs(300), steer_rx.recv())
+                        .await
+                    {
+                        Ok(Some(user_reply)) => {
+                            messages.push(Message::user(user_reply));
+                            write_frame(writer, &Response::SteerAck).await?;
+                            continue;
+                        }
+                        Ok(None) => {
+                            final_text = question;
+                            break;
+                        }
+                        Err(_timeout) => {
+                            write_frame(
+                                writer,
+                                &Response::Text {
+                                    chunk: "\n[timed out waiting for input]\n".into(),
+                                },
+                            )
+                            .await?;
+                            final_text = question;
+                            break;
+                        }
+                    }
+                }
+
                 final_text = resp.text;
                 break;
             }
@@ -953,8 +1069,10 @@ async fn run_cron_job(state: Arc<DaemonState>, job: &cron::CronJob) {
 
     let mut messages = build_messages(&job.description, None, &[]);
     inject_skill_files(&mut messages).await;
+    // Cron jobs are non-interactive: drop the sender immediately so steer_rx.recv()
+    // returns None at once if the model ends with '?', rather than timing out.
     let mut sink = tokio::io::sink();
-    let (_steer_tx, mut steer_rx) = tokio::sync::mpsc::channel::<String>(1);
+    let (_, mut steer_rx) = tokio::sync::mpsc::channel::<String>(1);
 
     let result = run_agentic_loop(&state, &model, messages, &mut sink, &mut steer_rx).await;
 

@@ -681,6 +681,11 @@ where
     parse_sse_stream(resp, writer).await
 }
 
+/// Protocol marker the model emits to signal it needs interactive input.
+/// Detected in the fully-accumulated `resp.text` after streaming completes;
+/// exported so `daemon.rs` can share the same constant.
+pub const WAITING_MARKER: &str = "[WAITING_FOR_INPUT]";
+
 async fn parse_sse_stream<W>(resp: reqwest::Response, writer: &mut W) -> Result<CopilotResponse>
 where
     W: AsyncWriteExt + Unpin,

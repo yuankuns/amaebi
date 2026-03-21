@@ -161,6 +161,19 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
                     Response::MemoryEntry { .. } => {
                         // Not sent to the CLI client — daemon-internal only.
                     }
+                    Response::WaitingForInput { prompt } => {
+                        // Daemon signals it needs a reply.  When prompt is
+                        // empty the question was already on screen via Text
+                        // chunks; just show the cursor.  When non-empty, print
+                        // the extra context first, then the cursor line.
+                        if prompt.is_empty() {
+                            eprint!("\n>");
+                        } else {
+                            eprintln!("\n{prompt}");
+                            eprint!(">");
+                        }
+                        let _ = tokio::io::stderr().flush().await;
+                    }
                 }
             }
 
@@ -199,7 +212,7 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
     // use with `amaebi ask --resume <uuid>`.  Suppressed when stderr is not
     // a terminal (e.g., piped invocations).
     if std::io::stderr().is_terminal() {
-        eprintln!("\x1b[2m[Session: {}]\x1b[0m", session_id_copy);
+        eprintln!("\nSession completed. ID: {}", session_id_copy);
     }
 
     Ok(())
@@ -363,6 +376,15 @@ pub async fn run_resume(
                     Response::MemoryEntry { .. } => {
                         // Not sent to the CLI client — daemon-internal only.
                     }
+                    Response::WaitingForInput { prompt } => {
+                        if prompt.is_empty() {
+                            eprint!("\n>");
+                        } else {
+                            eprintln!("\n{prompt}");
+                            eprint!(">");
+                        }
+                        let _ = tokio::io::stderr().flush().await;
+                    }
                 }
             }
 
@@ -390,7 +412,7 @@ pub async fn run_resume(
     stdout.write_all(b"\n").await.context("writing newline")?;
 
     if std::io::stderr().is_terminal() {
-        eprintln!("\x1b[2m[Session: {}]\x1b[0m", session_uuid);
+        eprintln!("\nSession completed. ID: {}", session_uuid);
     }
 
     Ok(())
