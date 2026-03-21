@@ -373,10 +373,13 @@ pub fn clear_expired(
 
     for key in keys {
         let rec = &map[&key];
-        let tier_ttl = ttl_secs.get(&rec.ttl_tier).copied().unwrap_or(
-            // Fall back to "default" tier, then 30 minutes.
-            ttl_secs.get("default").copied().unwrap_or(30 * 60),
-        );
+        // Resolution order: directory-path key → tier-name key → "default" → 30 min.
+        let tier_ttl = ttl_secs
+            .get(&key)
+            .or_else(|| ttl_secs.get(&rec.ttl_tier))
+            .or_else(|| ttl_secs.get("default"))
+            .copied()
+            .unwrap_or(30 * 60);
 
         if let Ok(accessed) = chrono::DateTime::parse_from_rfc3339(&rec.last_accessed) {
             let age = now.signed_duration_since(accessed).num_seconds().max(0) as u64;

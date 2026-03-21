@@ -26,8 +26,21 @@ const DEFAULT_TTL_MINUTES: u64 = 30;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
-    /// Per-directory TTL overrides.  The key `"default"` sets the global
-    /// default; other keys are canonical directory paths.
+    /// TTL overrides keyed by one of three kinds of identifier (minutes):
+    ///
+    /// * `"default"` — global fallback when no other key matches.
+    /// * tier name (e.g. `"ephemeral"`, `"persistent"`) — overrides the
+    ///   built-in TTL for all sessions whose `ttl_tier` matches that name.
+    /// * canonical directory path (e.g. `"/home/syk/projectX"`) — overrides
+    ///   the TTL for the session associated with that exact directory.
+    ///   Longest-prefix matching applies: the most specific ancestor path wins.
+    ///
+    /// Resolution order (highest priority first):
+    /// 1. exact directory-path match
+    /// 2. longest ancestor directory-path prefix
+    /// 3. tier-name match
+    /// 4. `"default"` key
+    /// 5. built-in 30-minute fallback
     #[serde(default)]
     pub ttl_minutes: HashMap<String, u64>,
 }

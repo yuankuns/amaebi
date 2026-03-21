@@ -16,8 +16,9 @@ pub enum Request {
     /// Inject a user correction into a running agentic loop on the same connection.
     ///
     /// The daemon drains these between model turns and injects each message as a
-    /// `user` turn, then responds with [`Response::SteerAck`].  If no agentic loop
-    /// is currently running for `session_id` this returns [`Response::Error`].
+    /// `user` turn, then responds with [`Response::SteerAck`].  If the `session_id`
+    /// does not match the active loop the frame is silently ignored (logged at
+    /// debug level); no error response is sent.
     Steer {
         /// Session UUID to steer (matches the `session_id` of the active `Chat`).
         session_id: String,

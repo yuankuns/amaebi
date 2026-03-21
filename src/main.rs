@@ -410,9 +410,11 @@ fn run_cache(action: cli::CacheAction) -> Result<()> {
                 ttls.insert("default".to_string(), default_secs);
                 ttls.insert("ephemeral".to_string(), 300u64);
                 ttls.insert("persistent".to_string(), 86400u64);
-                // Merge any per-tier overrides from config ttl_minutes.
+                // Merge per-tier and per-directory overrides from config.
+                // Directory-path keys (starting with '/') are passed through
+                // so that session.rs::clear_expired can apply them directly.
                 for (key, &minutes) in &cfg.ttl_minutes {
-                    if key != "default" && !key.starts_with('/') {
+                    if key != "default" {
                         ttls.insert(key.clone(), minutes * 60);
                     }
                 }

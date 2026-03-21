@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -125,7 +126,9 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
         }
 
         Request::StoreMemory { user, assistant } => {
-            store_conversation(&state, "", &user, &assistant).await;
+            // Use a stable session id for ACP-sourced memory so it lands in
+            // the same logical bucket as other global (non-directory) writes.
+            store_conversation(&state, "global", &user, &assistant).await;
             write_frame(&mut writer, &Response::Done).await?;
         }
 
@@ -877,10 +880,17 @@ fn build_messages_inner(
 /// Never returns (runs for the lifetime of the daemon).  Each due job is
 /// spawned as an independent `tokio::task` so that slow LLM calls do not
 /// block subsequent ticks.
+///
+/// A `running_jobs` guard prevents a second spawn of the same job if the
+/// previous invocation is still running (e.g. job takes >60 s with a 1-min
+/// schedule).  The guard is cleared when `run_cron_job` returns.
 async fn run_cron_scheduler(state: Arc<DaemonState>) {
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
     // Skip missed ticks — don't fire a backlog of jobs if the daemon was paused.
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    // Set of job IDs currently executing; prevents duplicate concurrent runs.
+    let running_jobs: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
 
     loop {
         interval.tick().await;
@@ -895,16 +905,30 @@ async fn run_cron_scheduler(state: Arc<DaemonState>) {
         };
 
         for job in cron::due_jobs(&jobs, &now) {
+            // Skip if a previous run of this job is still in flight.
+            {
+                let mut guard = running_jobs.lock().unwrap_or_else(|p| p.into_inner());
+                if guard.contains(&job.id) {
+                    tracing::debug!(id = %job.id, "cron: job still running, skipping tick");
+                    continue;
+                }
+                guard.insert(job.id.clone());
+            }
+
             let state = Arc::clone(&state);
+            let running = Arc::clone(&running_jobs);
             tokio::spawn(async move {
-                run_cron_job(state, job).await;
+                run_cron_job(Arc::clone(&state), &job).await;
+                // Clear the guard so the next tick can re-fire the job.
+                let mut guard = running.lock().unwrap_or_else(|p| p.into_inner());
+                guard.remove(&job.id);
             });
         }
     }
 }
 
 /// Execute a single cron job: runs the agentic loop, saves output to inbox.
-async fn run_cron_job(state: Arc<DaemonState>, job: cron::CronJob) {
+async fn run_cron_job(state: Arc<DaemonState>, job: &cron::CronJob) {
     tracing::info!(id = %job.id, description = %job.description, "cron: firing job");
 
     // Generate a fresh session UUID for this run.
