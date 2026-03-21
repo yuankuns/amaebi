@@ -662,11 +662,13 @@ where
                         .trim()
                         .to_owned();
 
-                    // Tell the client we need input.
+                    // Tell the client we need input.  The clarification text
+                    // was already streamed as Response::Text chunks, so pass
+                    // an empty prompt to avoid duplicating it on screen.
                     write_frame(
                         writer,
                         &Response::WaitingForInput {
-                            prompt: clarification_prompt.clone(),
+                            prompt: String::new(),
                         },
                     )
                     .await?;
@@ -712,10 +714,14 @@ where
                 if resp.text.trim_end().ends_with('?') {
                     let question = resp.text.trim().to_owned();
 
+                    // The full LLM text was already streamed to the client as
+                    // Response::Text chunks by stream_chat.  Send an empty
+                    // prompt here so the client only shows the '>' cursor
+                    // without duplicating the already-displayed question text.
                     write_frame(
                         writer,
                         &Response::WaitingForInput {
-                            prompt: question.clone(),
+                            prompt: String::new(),
                         },
                     )
                     .await?;
