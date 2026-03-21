@@ -681,6 +681,10 @@ where
     parse_sse_stream(resp, writer).await
 }
 
+/// Protocol marker the model emits to signal it needs interactive input.
+/// Stripped from streamed Text chunks so it never appears in the terminal.
+const WAITING_MARKER: &str = "[WAITING_FOR_INPUT]";
+
 async fn parse_sse_stream<W>(resp: reqwest::Response, writer: &mut W) -> Result<CopilotResponse>
 where
     W: AsyncWriteExt + Unpin,
@@ -688,6 +692,11 @@ where
     let mut stream = resp.bytes_stream();
     let mut buf = String::new();
     let mut acc = SseAccumulator::default();
+
+    // Buffer the opening chars of the response to check for WAITING_MARKER
+    // before forwarding any Text frames to the client.
+    let mut prefix_buf = String::with_capacity(WAITING_MARKER.len());
+    let mut prefix_checked = false;
 
     while let Some(chunk) = stream.next().await {
         let bytes = chunk.context("reading SSE chunk")?;
@@ -699,23 +708,67 @@ where
 
             if let Some(data) = line.strip_prefix("data: ") {
                 if data == "[DONE]" {
+                    // Flush any buffered prefix that never reached WAITING_MARKER.len()
+                    // (response was shorter than the marker — cannot be a marker).
+                    if !prefix_checked && !prefix_buf.is_empty() {
+                        write_frame(
+                            writer,
+                            &Response::Text {
+                                chunk: prefix_buf.clone(),
+                            },
+                        )
+                        .await?;
+                        writer.flush().await?;
+                    }
                     tracing::debug!("SSE stream complete");
                     return Ok(acc.finalize());
                 }
                 match serde_json::from_str::<ChatChunk>(data) {
                     Ok(chunk) => {
-                        // Forward any text content to the client immediately.
+                        // Forward any text content to the client immediately,
+                        // suppressing the WAITING_MARKER prefix if present.
                         for choice in &chunk.choices {
                             if let Some(ref text) = choice.delta.content {
                                 if !text.is_empty() {
-                                    write_frame(
-                                        writer,
-                                        &Response::Text {
-                                            chunk: text.clone(),
-                                        },
-                                    )
-                                    .await?;
-                                    writer.flush().await?;
+                                    if prefix_checked {
+                                        write_frame(
+                                            writer,
+                                            &Response::Text {
+                                                chunk: text.clone(),
+                                            },
+                                        )
+                                        .await?;
+                                        writer.flush().await?;
+                                    } else {
+                                        prefix_buf.push_str(text);
+                                        if prefix_buf.len() >= WAITING_MARKER.len() {
+                                            prefix_checked = true;
+                                            if prefix_buf.starts_with(WAITING_MARKER) {
+                                                // Suppress the marker; forward only the remainder.
+                                                let rest =
+                                                    prefix_buf[WAITING_MARKER.len()..].to_owned();
+                                                prefix_buf.clear();
+                                                if !rest.is_empty() {
+                                                    write_frame(
+                                                        writer,
+                                                        &Response::Text { chunk: rest },
+                                                    )
+                                                    .await?;
+                                                    writer.flush().await?;
+                                                }
+                                            } else {
+                                                // Not a marker — flush the buffer as-is.
+                                                let to_forward = std::mem::take(&mut prefix_buf);
+                                                write_frame(
+                                                    writer,
+                                                    &Response::Text { chunk: to_forward },
+                                                )
+                                                .await?;
+                                                writer.flush().await?;
+                                            }
+                                        }
+                                        // else: still buffering; wait for more chunks.
+                                    }
                                 }
                             }
                         }

@@ -161,18 +161,11 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
                     Response::MemoryEntry { .. } => {
                         // Not sent to the CLI client — daemon-internal only.
                     }
-                    Response::WaitingForInput { prompt } => {
-                        // The daemon is asking for interactive clarification.
-                        // Add a blank line to visually separate from LLM output,
-                        // then show the '>' cursor.  Only display the prompt
-                        // text when it is non-empty (i.e. the daemon hasn't
-                        // already streamed it as Text chunks).
-                        eprintln!();
-                        if prompt.is_empty() {
-                            eprintln!(">");
-                        } else {
-                            eprintln!("> {prompt}");
-                        }
+                    Response::WaitingForInput { .. } => {
+                        // Daemon signals it needs a reply.  Print a blank line
+                        // to separate from LLM output, then leave the cursor
+                        // on the same line as '> ' so user input appears inline.
+                        eprint!("\n> ");
                         let _ = tokio::io::stderr().flush().await;
                     }
                 }
@@ -377,13 +370,8 @@ pub async fn run_resume(
                     Response::MemoryEntry { .. } => {
                         // Not sent to the CLI client — daemon-internal only.
                     }
-                    Response::WaitingForInput { prompt } => {
-                        eprintln!();
-                        if prompt.is_empty() {
-                            eprintln!(">");
-                        } else {
-                            eprintln!("> {prompt}");
-                        }
+                    Response::WaitingForInput { .. } => {
+                        eprint!("\n> ");
                         let _ = tokio::io::stderr().flush().await;
                     }
                 }

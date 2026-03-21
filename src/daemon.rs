@@ -232,8 +232,11 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
 
                 // Use a sink writer — output frames are discarded; we only
                 // need the return value (final_text) for the inbox.
+                // Drop the sender immediately (`_`) so steer_rx.recv() in the
+                // agentic loop returns None at once instead of timing out if
+                // the model ends with '?'.
                 let mut sink = tokio::io::sink();
-                let (_steer_tx, mut steer_rx) = tokio::sync::mpsc::channel::<String>(1);
+                let (_, mut steer_rx) = tokio::sync::mpsc::channel::<String>(1);
 
                 match run_agentic_loop(&state, &model, messages, &mut sink, &mut steer_rx).await {
                     Ok(final_text) => {
@@ -662,9 +665,9 @@ where
                         .trim()
                         .to_owned();
 
-                    // Tell the client we need input.  The clarification text
-                    // was already streamed as Response::Text chunks, so pass
-                    // an empty prompt to avoid duplicating it on screen.
+                    // Tell the client we need input.  The marker and clarification
+                    // text were already suppressed/streamed by parse_sse_stream,
+                    // so pass an empty prompt here to avoid duplicating on screen.
                     write_frame(
                         writer,
                         &Response::WaitingForInput {
@@ -673,8 +676,12 @@ where
                     )
                     .await?;
 
-                    // Record the assistant's question in history.
-                    messages.push(Message::assistant(Some(resp.text), vec![]));
+                    // Record the assistant's question in history using the
+                    // stripped text (marker removed) so it doesn't pollute context.
+                    messages.push(Message::assistant(
+                        Some(clarification_prompt.clone()),
+                        vec![],
+                    ));
 
                     // Block until the user replies via the steering channel.
                     // Timeout after 5 minutes to avoid infinite hangs.
@@ -723,7 +730,8 @@ where
                     )
                     .await?;
 
-                    messages.push(Message::assistant(Some(resp.text), vec![]));
+                    // Use the trimmed question (no marker contamination) in history.
+                    messages.push(Message::assistant(Some(question.clone()), vec![]));
 
                     match tokio::time::timeout(std::time::Duration::from_secs(300), steer_rx.recv())
                         .await
@@ -1053,8 +1061,10 @@ async fn run_cron_job(state: Arc<DaemonState>, job: &cron::CronJob) {
 
     let mut messages = build_messages(&job.description, None, &[]);
     inject_skill_files(&mut messages).await;
+    // Cron jobs are non-interactive: drop the sender immediately so steer_rx.recv()
+    // returns None at once if the model ends with '?', rather than timing out.
     let mut sink = tokio::io::sink();
-    let (_steer_tx, mut steer_rx) = tokio::sync::mpsc::channel::<String>(1);
+    let (_, mut steer_rx) = tokio::sync::mpsc::channel::<String>(1);
 
     let result = run_agentic_loop(&state, &model, messages, &mut sink, &mut steer_rx).await;
 
