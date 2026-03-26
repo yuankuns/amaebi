@@ -1,8 +1,17 @@
-//! SQLite-backed memory storage with FTS5 full-text search.
+//! SQLite-backed memory storage with FTS5 full-text search and session compaction.
 //!
-//! Replaces the append-only JSONL store as the primary persistence layer.
-//! Stores individual messages (one row per turn) with role metadata, enabling
-//! both recency-based retrieval and semantic full-text search.
+//! Two tables are maintained in `~/.amaebi/memory.db`:
+//!
+//! * **`memories`** — one row per conversation turn (user or assistant message),
+//!   indexed by FTS5 for semantic search.  The sliding-window cap in the daemon
+//!   limits how many recent turns are injected per request.
+//!
+//! * **`session_summaries`** — one compact LLM-generated summary per session UUID,
+//!   written lazily by `compact_session` in two cases:
+//!   - **Cross-session**: when a new session starts, old sessions without a summary
+//!     are compacted so future sessions can learn from them.
+//!   - **Within-session**: when a session's history grows beyond the sliding-window
+//!     cap, the dropped turns are preserved as a running summary.
 //!
 //! # Concurrency
 //!
@@ -28,15 +37,13 @@ use crate::auth::amaebi_home;
 pub struct DbMemoryEntry {
     pub id: i64,
     pub timestamp: String,
-    /// Groups messages from the same conversation.  Stored for future use;
-    /// callers may leave this as an empty string.
-    #[allow(dead_code)]
+    /// Groups messages from the same conversation.
     pub session_id: String,
     /// `"user"` or `"assistant"`.
     pub role: String,
     pub content: String,
-    /// Optional AI-generated summary for compact context injection.
-    /// Stored for future use; callers may leave this as an empty string.
+    /// Reserved column in the `memories` table.  Per-session compacted summaries
+    /// are stored in the separate `session_summaries` table, not here.
     #[allow(dead_code)]
     pub summary: String,
 }
@@ -91,6 +98,16 @@ CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE ON memories BEGIN
     INSERT INTO memories_fts(rowid, content, summary)
     VALUES (new.id, new.content, new.summary);
 END;
+
+-- One compacted summary per session.  Written lazily by compact_session when:
+-- (a) a new session starts in the same folder (cross-session learning), or
+-- (b) the session history grows beyond the sliding-window cap (within-session).
+-- Provides cross-session context without injecting full raw history.
+CREATE TABLE IF NOT EXISTS session_summaries (
+    session_id TEXT PRIMARY KEY,
+    summary    TEXT NOT NULL,
+    timestamp  TEXT NOT NULL
+);
 ";
 
 // ---------------------------------------------------------------------------
@@ -222,6 +239,37 @@ pub fn get_session_history(conn: &Connection, session_id: &str) -> Result<Vec<Db
     Ok(entries)
 }
 
+/// Return the oldest `limit` messages for a given `session_id` in chronological order.
+///
+/// Used by `compact_session` to summarise only the turns that the sliding window
+/// is dropping, so the summary and the raw history window do not overlap.
+pub fn get_session_oldest(
+    conn: &Connection,
+    session_id: &str,
+    limit: usize,
+) -> Result<Vec<DbMemoryEntry>> {
+    if limit == 0 {
+        return Ok(vec![]);
+    }
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, timestamp, session_id, role, content, summary
+             FROM memories
+             WHERE session_id = ?1
+             ORDER BY id ASC
+             LIMIT ?2",
+        )
+        .context("preparing get_session_oldest query")?;
+
+    let entries = stmt
+        .query_map(params![session_id, limit as i64], row_to_entry)
+        .context("executing get_session_oldest")?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .context("collecting session oldest results")?;
+
+    Ok(entries) // already in chronological (ASC) order
+}
+
 /// Return the most recent `limit` messages for a given `session_id` in
 /// chronological order.  Used for the sliding-window history in Chat mode.
 pub fn get_session_recent(
@@ -256,13 +304,129 @@ pub fn count(conn: &Connection) -> Result<usize> {
         .map(|n| n as usize)
 }
 
-/// Delete all rows from `memories` (and rebuild the FTS index).
+/// Delete all rows from `memories` (and rebuild the FTS index) and all session summaries.
 pub fn clear(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "DELETE FROM memories;
-         INSERT INTO memories_fts(memories_fts) VALUES ('rebuild');",
+         INSERT INTO memories_fts(memories_fts) VALUES ('rebuild');
+         DELETE FROM session_summaries;",
     )
     .context("clearing memories")
+}
+
+/// Upsert a compacted summary for `session_id`.
+///
+/// Called by `compact_session` in the daemon.  `timestamp` should be an RFC 3339 UTC string.
+pub fn store_session_summary(
+    conn: &Connection,
+    session_id: &str,
+    summary: &str,
+    timestamp: &str,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO session_summaries (session_id, summary, timestamp)
+         VALUES (?1, ?2, ?3)
+         ON CONFLICT(session_id) DO UPDATE SET
+             summary   = excluded.summary,
+             timestamp = excluded.timestamp",
+        params![session_id, summary, timestamp],
+    )
+    .context("storing session summary")?;
+    Ok(())
+}
+
+/// Return the total number of message rows for `session_id`.
+///
+/// Used to decide whether the session history is long enough to warrant
+/// within-session compaction (i.e., the sliding window is dropping turns).
+pub fn count_session_turns(conn: &Connection, session_id: &str) -> Result<usize> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM memories WHERE session_id = ?1",
+        params![session_id],
+        |r| r.get::<_, i64>(0),
+    )
+    .context("counting session turns")
+    .map(|n| n as usize)
+}
+
+/// Return the compacted summary for `session_id` if one exists, otherwise `None`.
+///
+/// Used to inject an ongoing session's own running summary before its recent
+/// turns when the history has grown beyond the sliding-window cap.
+pub fn get_session_own_summary(conn: &Connection, session_id: &str) -> Result<Option<String>> {
+    let mut stmt = conn
+        .prepare("SELECT summary FROM session_summaries WHERE session_id = ?1 LIMIT 1")
+        .context("preparing get_session_own_summary")?;
+    let mut rows = stmt
+        .query(params![session_id])
+        .context("executing get_session_own_summary")?;
+    if let Some(row) = rows.next().context("reading session summary row")? {
+        Ok(Some(row.get(0).context("reading summary column")?))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Return session IDs that have conversation history but no compacted summary yet,
+/// excluding `exclude_session`.  Used to find old sessions to compact when a new
+/// session starts.
+pub fn get_sessions_without_summary(
+    conn: &Connection,
+    exclude_session: &str,
+    limit: usize,
+) -> Result<Vec<String>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT DISTINCT m.session_id
+             FROM memories m
+             WHERE m.session_id != ?1
+               AND m.session_id != ''
+               AND m.session_id NOT IN (SELECT session_id FROM session_summaries)
+             LIMIT ?2",
+        )
+        .context("preparing get_sessions_without_summary")?;
+
+    let sessions = stmt
+        .query_map(params![exclude_session, limit as i64], |row| {
+            row.get::<_, String>(0)
+        })
+        .context("executing get_sessions_without_summary")?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .context("collecting uncompacted sessions")?;
+
+    Ok(sessions)
+}
+
+/// Return up to `limit` summaries from sessions other than `exclude_session`,
+/// ordered oldest-first so the caller can inject them chronologically.
+///
+/// Excludes the current session so the model does not see a stale summary of
+/// the conversation it is actively participating in.
+pub fn get_recent_summaries(
+    conn: &Connection,
+    exclude_session: &str,
+    limit: usize,
+) -> Result<Vec<String>> {
+    // Fetch most-recent first, then reverse so injection is chronological.
+    let mut stmt = conn
+        .prepare(
+            "SELECT summary FROM session_summaries
+             WHERE session_id != ?1
+             ORDER BY timestamp DESC
+             LIMIT ?2",
+        )
+        .context("preparing get_recent_summaries")?;
+
+    let mut summaries = stmt
+        .query_map(params![exclude_session, limit as i64], |row| {
+            row.get::<_, String>(0)
+        })
+        .context("executing get_recent_summaries")?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .context("collecting summaries")?;
+
+    summaries.reverse(); // oldest first → model reads history in order
+    Ok(summaries)
 }
 
 // ---------------------------------------------------------------------------
