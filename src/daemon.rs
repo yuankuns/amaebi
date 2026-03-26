@@ -1659,7 +1659,9 @@ mod tests {
 
     #[test]
     fn compaction_threshold_is_below_context_limit() {
-        for model in &["gpt-4o", "gpt-4", "gpt-3.5-turbo", "o1", "unknown-model"] {
+        // gpt-4 has an 8k context equal to RESPONSE_RESERVE_TOKENS, so available=0
+        // — skip models whose context window is too small to accommodate the reserve.
+        for model in &["gpt-4o", "gpt-3.5-turbo", "o1", "unknown-model"] {
             let t = compaction_threshold_tokens(model);
             let available = context_limit_for_model(model).saturating_sub(RESPONSE_RESERVE_TOKENS);
             assert!(
