@@ -271,6 +271,34 @@ pub fn get_session_oldest(
     Ok(entries) // already in chronological (ASC) order
 }
 
+/// Return the most recent `limit` messages for a given `session_id` in
+/// chronological order.  Only used in tests.
+#[cfg(test)]
+pub fn get_session_recent(
+    conn: &Connection,
+    session_id: &str,
+    limit: usize,
+) -> Result<Vec<DbMemoryEntry>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, timestamp, session_id, role, content, summary
+             FROM memories
+             WHERE session_id = ?1
+             ORDER BY id DESC
+             LIMIT ?2",
+        )
+        .context("preparing get_session_recent query")?;
+
+    let mut entries = stmt
+        .query_map(params![session_id, limit as i64], row_to_entry)
+        .context("executing get_session_recent")?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .context("collecting session recent results")?;
+
+    entries.reverse(); // chronological order
+    Ok(entries)
+}
+
 /// Return the total number of rows in the `memories` table.
 pub fn count(conn: &Connection) -> Result<usize> {
     conn.query_row("SELECT COUNT(*) FROM memories", [], |r| r.get::<_, i64>(0))
