@@ -13,8 +13,16 @@ use crate::ipc::{write_frame, Request, Response};
 use crate::memory_db;
 use crate::tools::{self, ToolExecutor};
 
-/// How many history entries (user+assistant pairs) to inject as context.
-const MAX_HISTORY: usize = 20;
+/// Tokens reserved for model output — matches `max_tokens` in the request body.
+const RESPONSE_RESERVE_TOKENS: usize = 8_192;
+/// Compact session history when prompt tokens exceed this fraction of available input.
+const COMPACTION_THRESHOLD: f64 = 0.85;
+/// Minimum recent user/assistant *pairs* to keep in the hot tail after a token-budget trim.
+const HOT_TAIL_PAIRS: usize = 3;
+/// How many past-session summaries to prepend to the system message.
+const MAX_SUMMARIES: usize = 5;
+/// Maximum chars per injected past-session summary.
+const MAX_SUMMARY_CHARS: usize = 500;
 
 /// State shared across all concurrent client connections via `Arc`.
 pub struct DaemonState {
@@ -49,6 +57,66 @@ impl DaemonState {
             db: Arc::new(Mutex::new(conn)),
         })
     }
+}
+
+// ---------------------------------------------------------------------------
+// Token budget helpers
+// ---------------------------------------------------------------------------
+
+/// Approximate GPT-4o token count for a message list.
+///
+/// Uses tiktoken o200k_base (GPT-4o's encoding) with the OpenAI overhead formula:
+/// 4 tokens per message + role + content + 3 priming tokens for the reply.
+/// The tokenizer is initialised lazily on the first call (OnceLock).
+fn count_message_tokens(messages: &[Message]) -> usize {
+    use std::sync::OnceLock;
+    static BPE: OnceLock<tiktoken_rs::CoreBPE> = OnceLock::new();
+    let bpe = BPE.get_or_init(|| {
+        tiktoken_rs::o200k_base().expect("failed to load o200k_base tokenizer")
+    });
+
+    let mut total = 3usize; // priming tokens for the assistant reply
+    for msg in messages {
+        total += 4; // per-message overhead: <|start|>, role, separator, <|end|>
+        total += bpe.encode_with_special_tokens(&msg.role).len();
+        if let Some(ref content) = msg.content {
+            total += bpe.encode_with_special_tokens(content).len();
+        }
+        if !msg.tool_calls.is_empty() {
+            if let Ok(s) = serde_json::to_string(&msg.tool_calls) {
+                total += bpe.encode_with_special_tokens(&s).len();
+            }
+        }
+    }
+    total
+}
+
+/// Context window size for `model`, matched by prefix (longest wins).
+///
+/// Falls back to a conservative 32 k for unknown models so we never send
+/// more tokens than the server can handle.
+fn context_limit_for_model(model: &str) -> usize {
+    // Ordered longest-prefix-first so that e.g. "gpt-4-turbo" beats "gpt-4".
+    const TABLE: &[(&str, usize)] = &[
+        ("gpt-4o",       128_000),
+        ("gpt-4-turbo",  128_000),
+        ("gpt-4",          8_192),
+        ("gpt-3.5-turbo", 16_385),
+        ("o1",           200_000),
+        ("o3",           200_000),
+        ("claude",       200_000),
+    ];
+    TABLE
+        .iter()
+        .find(|(prefix, _)| model.starts_with(prefix))
+        .map(|(_, limit)| *limit)
+        .unwrap_or(32_768) // conservative default for unknown models
+}
+
+/// Token threshold above which compaction should be triggered for `model`.
+fn compaction_threshold_tokens(model: &str) -> usize {
+    let available = context_limit_for_model(model).saturating_sub(RESPONSE_RESERVE_TOKENS);
+    (available as f64 * COMPACTION_THRESHOLD) as usize
 }
 
 // ---------------------------------------------------------------------------
@@ -210,12 +278,12 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
             // Spawn the agentic loop as a fully detached background task.
             let state = Arc::clone(&state);
             tokio::spawn(async move {
-                // Load recent history from SQLite.
+                // Load full session history from SQLite; token budget trims it below.
                 let db = Arc::clone(&state.db);
                 let sid_clone = sid.clone();
                 let history = tokio::task::spawn_blocking(move || {
                     let conn = db.lock().unwrap_or_else(|p| p.into_inner());
-                    memory_db::get_session_recent(&conn, &sid_clone, MAX_HISTORY * 2)
+                    memory_db::get_session_history(&conn, &sid_clone)
                 })
                 .await
                 .unwrap_or_else(|e| {
@@ -227,8 +295,18 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                     vec![]
                 });
 
-                let mut messages = build_messages(&prompt, tmux_pane.as_deref(), &history);
+                let mut messages =
+                    build_messages(&prompt, tmux_pane.as_deref(), &history, &[], None);
                 inject_skill_files(&mut messages).await;
+
+                // Pre-flight token check: trim to hot tail if over budget.
+                let threshold = compaction_threshold_tokens(&model);
+                if count_message_tokens(&messages) > threshold {
+                    let hot = HOT_TAIL_PAIRS * 2;
+                    let trimmed = if history.len() > hot { &history[history.len() - hot..] } else { &history[..] };
+                    messages = build_messages(&prompt, tmux_pane.as_deref(), trimmed, &[], None);
+                    inject_skill_files(&mut messages).await;
+                }
 
                 // Use a sink writer — output frames are discarded; we only
                 // need the return value (final_text) for the inbox.
@@ -239,7 +317,7 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                 let (_, mut steer_rx) = tokio::sync::mpsc::channel::<String>(1);
 
                 match run_agentic_loop(&state, &model, messages, &mut sink, &mut steer_rx).await {
-                    Ok(final_text) => {
+                    Ok((final_text, _)) => {
                         let user_text = truncate_chars(prompt.clone(), MAX_PROMPT_CHARS);
                         let assistant_text = truncate_chars(final_text.clone(), MAX_RESPONSE_CHARS);
 
@@ -329,28 +407,48 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                 }
             });
 
-            // Resume: load the FULL history from SQLite without a sliding-window cap.
+            // Resume: load the FULL history from SQLite without a sliding-window cap,
+            // plus summaries from other sessions for cross-session context.
             let db = Arc::clone(&state.db);
             let sid_clone = session_id.clone();
-            let history = tokio::task::spawn_blocking(move || {
+            let (history, summaries) = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
                 let conn = db.lock().unwrap_or_else(|p| p.into_inner());
-                memory_db::get_session_history(&conn, &sid_clone)
+                let history = memory_db::get_session_history(&conn, &sid_clone)?;
+                let summaries =
+                    memory_db::get_recent_summaries(&conn, &sid_clone, MAX_SUMMARIES)?;
+                Ok((history, summaries))
             })
             .await
             .unwrap_or_else(|e| {
                 tracing::warn!(error = %e, "resume history load panicked");
-                Ok(vec![])
+                Ok((vec![], vec![]))
             })
             .unwrap_or_else(|e| {
                 tracing::warn!(error = %e, "failed to load resume history");
-                vec![]
+                (vec![], vec![])
             });
 
-            let mut messages = build_messages_resume(&prompt, tmux_pane.as_deref(), &history);
+            // Resume: full history for re-hydration; token budget trims if needed.
+            let mut messages = build_messages(
+                &prompt,
+                tmux_pane.as_deref(),
+                &history,
+                &summaries,
+                None,
+            );
             inject_skill_files(&mut messages).await;
 
+            // Pre-flight token check.
+            let threshold = compaction_threshold_tokens(&model);
+            if count_message_tokens(&messages) > threshold {
+                let hot = HOT_TAIL_PAIRS * 2;
+                let trimmed = if history.len() > hot { &history[history.len() - hot..] } else { &history[..] };
+                messages = build_messages(&prompt, tmux_pane.as_deref(), trimmed, &summaries, None);
+                inject_skill_files(&mut messages).await;
+            }
+
             match run_agentic_loop(&state, &model, messages, &mut writer, &mut steer_rx).await {
-                Ok(response_text) => {
+                Ok((response_text, _)) => {
                     let user_text = truncate_chars(prompt.clone(), MAX_PROMPT_CHARS);
                     let assistant_text = truncate_chars(response_text.clone(), MAX_RESPONSE_CHARS);
 
@@ -439,34 +537,99 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                 }
             });
 
-            // Load recent history from SQLite (sliding window).
+            // Load full session history, past-session summaries, and the session's own
+            // running summary (if any) for token-budget-driven compaction decisions.
             let db = Arc::clone(&state.db);
             let sid_clone = sid.clone();
-            let history = tokio::task::spawn_blocking(move || {
-                let conn = db.lock().unwrap_or_else(|p| p.into_inner());
-                // MAX_HISTORY entries × 2 rows (user+assistant) per entry
-                memory_db::get_session_recent(&conn, &sid_clone, MAX_HISTORY * 2)
-            })
-            .await
-            .unwrap_or_else(|e| {
-                tracing::warn!(error = %e, "session history load panicked");
-                Ok(vec![])
-            })
-            .unwrap_or_else(|e| {
-                tracing::warn!(error = %e, "failed to load session history");
-                vec![]
-            });
+            let (history, past_summaries, own_summary) =
+                tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+                    let conn = db.lock().unwrap_or_else(|p| p.into_inner());
+                    let history = memory_db::get_session_history(&conn, &sid_clone)?;
+                    let past_summaries =
+                        memory_db::get_recent_summaries(&conn, &sid_clone, MAX_SUMMARIES)?;
+                    let own_summary = memory_db::get_session_own_summary(&conn, &sid_clone)?;
+                    Ok((history, past_summaries, own_summary))
+                })
+                .await
+                .unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "session history load panicked");
+                    Ok((vec![], vec![], None))
+                })
+                .unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "failed to load session history");
+                    (vec![], vec![], None)
+                });
 
-            let mut messages = build_messages(&prompt, tmux_pane.as_deref(), &history);
+            // Cross-session: if this is the first turn of a new session, compact any
+            // old sessions that have never been summarised.
+            if history.is_empty() {
+                let db = Arc::clone(&state.db);
+                let sid_clone = sid.clone();
+                let old_sessions = tokio::task::spawn_blocking(move || {
+                    let conn = db.lock().unwrap_or_else(|p| p.into_inner());
+                    memory_db::get_sessions_without_summary(&conn, &sid_clone, MAX_SUMMARIES)
+                })
+                .await
+                .unwrap_or_else(|_| Ok(vec![]))
+                .unwrap_or_default();
+
+                for old_sid in old_sessions {
+                    // Cross-session: summarise the full closed session (keep_recent = 0).
+                    tokio::spawn(compact_session(
+                        Arc::clone(&state),
+                        old_sid,
+                        model.clone(),
+                        0,
+                    ));
+                }
+            }
+
+            let mut messages = build_messages(
+                &prompt,
+                tmux_pane.as_deref(),
+                &history,
+                &past_summaries,
+                own_summary.as_deref(),
+            );
             inject_skill_files(&mut messages).await;
 
+            // Pre-flight token check: if over the compaction threshold, trim to hot tail.
+            let threshold = compaction_threshold_tokens(&model);
+            if count_message_tokens(&messages) > threshold {
+                let hot = HOT_TAIL_PAIRS * 2;
+                let trimmed = if history.len() > hot { &history[history.len() - hot..] } else { &history[..] };
+                messages = build_messages(
+                    &prompt,
+                    tmux_pane.as_deref(),
+                    trimmed,
+                    &past_summaries,
+                    own_summary.as_deref(),
+                );
+                inject_skill_files(&mut messages).await;
+                tracing::debug!(
+                    hot_tail = trimmed.len(),
+                    "pre-flight token trim: history reduced to hot tail"
+                );
+            }
+
             match run_agentic_loop(&state, &model, messages, &mut writer, &mut steer_rx).await {
-                Ok(response_text) => {
+                Ok((response_text, prompt_tokens)) => {
                     let user_text = truncate_chars(prompt.clone(), MAX_PROMPT_CHARS);
                     let assistant_text = truncate_chars(response_text.clone(), MAX_RESPONSE_CHARS);
 
                     // Persist to SQLite memory store.
                     store_conversation(&state, &sid, &user_text, &assistant_text).await;
+
+                    // Within-session compaction: if prompt tokens exceeded the threshold
+                    // and no summary exists yet, compact the portion before the hot tail.
+                    if prompt_tokens > threshold && own_summary.is_none() {
+                        tokio::spawn(compact_session(
+                            Arc::clone(&state),
+                            sid.clone(),
+                            model.clone(),
+                            HOT_TAIL_PAIRS * 2, // keep hot tail out of the summary
+                        ));
+                    }
                 }
                 Err(e) => {
                     tracing::error!(error = %e, "agentic loop error");
@@ -555,6 +718,94 @@ pub(crate) async fn store_conversation(
 }
 
 // ---------------------------------------------------------------------------
+// Session compaction
+// ---------------------------------------------------------------------------
+
+/// Summarise a portion of a session's history and persist it to `session_summaries`.
+///
+/// Triggered lazily via `tokio::spawn` in two cases:
+/// 1. **Cross-session** (`keep_recent = 0`): a closed session is summarised in full
+///    so future sessions can learn from it.
+/// 2. **Within-session** (`keep_recent = HOT_TAIL_PAIRS * 2`): only the turns that the
+///    token-budget trim is *dropping* are summarised — the recent `keep_recent` rows are
+///    excluded so the summary and the raw hot tail never overlap.
+///
+/// Uses the same agentic loop as normal requests (handles token refresh and retries),
+/// but with a sink writer and a dropped steer sender so it is fully non-interactive.
+/// Best-effort: errors are only logged.
+async fn compact_session(
+    state: Arc<DaemonState>,
+    session_id: String,
+    model: String,
+    keep_recent: usize,
+) {
+    let db = Arc::clone(&state.db);
+    let sid = session_id.clone();
+    let history = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let conn = db.lock().unwrap_or_else(|p| p.into_inner());
+        let total = memory_db::count_session_turns(&conn, &sid)?;
+        // How many of the oldest turns to summarise: all of them for cross-session
+        // (keep_recent == 0), or only the portion beyond the sliding window for
+        // within-session so summary and raw history window do not overlap.
+        let to_summarise = total.saturating_sub(keep_recent);
+        memory_db::get_session_oldest(&conn, &sid, to_summarise)
+    })
+    .await
+    .unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "compact_session: history load panicked");
+        Ok(vec![])
+    })
+    .unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "compact_session: failed to load history");
+        vec![]
+    });
+
+    if history.is_empty() {
+        return;
+    }
+
+    let mut messages = vec![Message::system(
+        "You are a memory compactor. Given a conversation, output 3-5 bullet points \
+         capturing the key outcomes, decisions, and facts learned. \
+         Be concise and factual. Output only the bullet points, no preamble.",
+    )];
+    for entry in &history {
+        let content = truncate_chars(entry.content.clone(), 1_500);
+        match entry.role.as_str() {
+            "user" => messages.push(Message::user(content)),
+            "assistant" => messages.push(Message::assistant(Some(content), vec![])),
+            _ => {}
+        }
+    }
+
+    // Sink writer + dropped sender = non-interactive, no output.
+    let mut sink = tokio::io::sink();
+    let (_, mut steer_rx) = tokio::sync::mpsc::channel::<String>(1);
+
+    match run_agentic_loop(&state, &model, messages, &mut sink, &mut steer_rx).await {
+        Ok((summary, _)) if !summary.trim().is_empty() => {
+            let db = Arc::clone(&state.db);
+            let sid = session_id.clone();
+            let ts = chrono::Utc::now().to_rfc3339();
+            let summary = summary.trim().to_owned();
+            let result = tokio::task::spawn_blocking(move || {
+                let conn = db.lock().unwrap_or_else(|p| p.into_inner());
+                memory_db::store_session_summary(&conn, &sid, &summary, &ts)
+            })
+            .await
+            .unwrap_or_else(|e| Err(anyhow::anyhow!("compact_session write panicked: {e}")));
+            if let Err(e) = result {
+                tracing::warn!(error = %e, "compact_session: failed to store summary");
+            } else {
+                tracing::debug!(session_id = %session_id, "session compacted");
+            }
+        }
+        Ok(_) => tracing::debug!(session_id = %session_id, "compact_session: empty summary (ignored)"),
+        Err(e) => tracing::warn!(error = %e, "compact_session: API error"),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Agentic loop
 // ---------------------------------------------------------------------------
 
@@ -586,12 +837,19 @@ pub(crate) async fn run_agentic_loop<W>(
     mut messages: Vec<Message>,
     writer: &mut W,
     steer_rx: &mut tokio::sync::mpsc::Receiver<String>,
-) -> Result<String>
+) -> Result<(String, usize)>
 where
     W: AsyncWriteExt + Unpin,
 {
     let schemas = tools::tool_schemas();
     let final_text;
+    let mut last_prompt_tokens = 0usize;
+    // Set to true once the model has executed at least one tool call so we can
+    // detect a silent stop (empty text) after tool execution and force a conclusion.
+    let mut tools_were_used = false;
+    // Allow at most one conclusion-nudge to avoid an infinite retry loop if the
+    // model stubbornly keeps returning empty text.
+    let mut conclusion_nudge_sent = false;
 
     loop {
         // Drain any steering corrections that arrived since the last model
@@ -652,6 +910,23 @@ where
                 }
             };
 
+        last_prompt_tokens = resp.prompt_tokens;
+
+        // Borrow-only match to extract a label for logging; does not consume resp.
+        let finish_label = match &resp.finish_reason {
+            FinishReason::Stop => "stop",
+            FinishReason::Length => "length",
+            FinishReason::ToolCalls => "tool_calls",
+            FinishReason::Other(_) => "other",
+        };
+        tracing::debug!(
+            finish_reason = finish_label,
+            prompt_tokens = resp.prompt_tokens,
+            text_len = resp.text.len(),
+            tools_were_used,
+            "model turn complete"
+        );
+
         match resp.finish_reason {
             FinishReason::Stop | FinishReason::Length => {
                 // Check if the model is asking for clarification via the
@@ -703,10 +978,12 @@ where
                         }
                         Ok(None) => {
                             // Channel closed — client disconnected.
+                            tracing::debug!("session end: client disconnected while waiting for WAITING_FOR_INPUT reply");
                             final_text = clarification_prompt;
                             break;
                         }
                         Err(_timeout) => {
+                            tracing::debug!("session end: timed out waiting for WAITING_FOR_INPUT reply (300s)");
                             write_frame(
                                 writer,
                                 &Response::Text {
@@ -750,10 +1027,12 @@ where
                             continue;
                         }
                         Ok(None) => {
+                            tracing::debug!("session end: client disconnected while waiting for question reply");
                             final_text = question;
                             break;
                         }
                         Err(_timeout) => {
+                            tracing::debug!("session end: timed out waiting for question reply (300s)");
                             write_frame(
                                 writer,
                                 &Response::Text {
@@ -767,11 +1046,39 @@ where
                     }
                 }
 
+                // Safety net: if the model ends silently after having used tools,
+                // inject one follow-up asking for a conclusion rather than letting
+                // the session end without visible output.
+                if resp.text.is_empty() && tools_were_used && !conclusion_nudge_sent {
+                    tracing::debug!("session: empty Stop after tool use — nudging for conclusion");
+                    conclusion_nudge_sent = true;
+                    messages.push(Message::assistant(None, vec![]));
+                    messages.push(Message::user(
+                        "Please summarise what you just did and the outcome.".to_owned(),
+                    ));
+                    continue;
+                }
+
+                let reason = if resp.text.is_empty() {
+                    "stop/length with empty text"
+                } else if finish_label == "length" {
+                    "length limit reached"
+                } else {
+                    "normal stop"
+                };
+                tracing::debug!(
+                    reason,
+                    tools_were_used,
+                    conclusion_nudge_sent,
+                    text_preview = &resp.text.chars().take(80).collect::<String>(),
+                    "session end"
+                );
                 final_text = resp.text;
                 break;
             }
 
             FinishReason::ToolCalls => {
+                tools_were_used = true;
                 let api_calls: Vec<ApiToolCall> = resp
                     .tool_calls
                     .iter()
@@ -877,7 +1184,7 @@ where
             }
 
             FinishReason::Other(ref reason) => {
-                tracing::warn!(finish_reason = %reason, "unexpected finish reason, stopping");
+                tracing::warn!(finish_reason = %reason, "session end: unexpected finish reason");
                 let warning = format!("\n[stopped: unexpected finish reason '{reason}']");
                 write_frame(writer, &Response::Text { chunk: warning }).await?;
                 final_text = resp.text;
@@ -887,7 +1194,7 @@ where
     }
 
     write_frame(writer, &Response::Done).await?;
-    Ok(final_text)
+    Ok((final_text, last_prompt_tokens))
 }
 
 // ---------------------------------------------------------------------------
@@ -935,51 +1242,55 @@ async fn inject_skill_files_from(messages: &mut Vec<Message>, amaebi_home: &std:
 // Message construction
 // ---------------------------------------------------------------------------
 
+/// Build a message list for a Chat or Resume turn.
+///
+/// `past_summaries` — compacted summaries from other sessions (cross-session context).
+/// `own_summary`    — this session's running summary, injected before the history
+///                    rows so the model sees: summary → history → prompt.
+///
+/// All `history` rows are included without a sliding-window cap.  Callers are
+/// responsible for trimming the history slice to a token budget before calling
+/// (see the pre-flight check in `Request::Chat` / `Request::Resume` handlers).
 pub(crate) fn build_messages(
     prompt: &str,
     tmux_pane: Option<&str>,
     history: &[memory_db::DbMemoryEntry],
-) -> Vec<Message> {
-    build_messages_inner(prompt, tmux_pane, history, false)
-}
-
-/// Like [`build_messages`] but loads the **full** chronological history without
-/// the `MAX_HISTORY` sliding-window cap.  Used by the `--resume` path to
-/// re-hydrate a complete prior session.
-pub(crate) fn build_messages_resume(
-    prompt: &str,
-    tmux_pane: Option<&str>,
-    history: &[memory_db::DbMemoryEntry],
-) -> Vec<Message> {
-    build_messages_inner(prompt, tmux_pane, history, true)
-}
-
-fn build_messages_inner(
-    prompt: &str,
-    tmux_pane: Option<&str>,
-    history: &[memory_db::DbMemoryEntry],
-    full_history: bool,
+    past_summaries: &[String],
+    own_summary: Option<&str>,
 ) -> Vec<Message> {
     let mut system = "You are a helpful, concise AI assistant embedded in a tmux terminal. \
                       Answer in plain text; avoid markdown unless the user asks for it. \
                       You have tools available to inspect the terminal, run commands, \
-                      and read or edit files — use them when they help you answer accurately."
+                      and read or edit files — use them when they help you answer accurately. \
+                      After using any tool, you MUST always follow up with a text response \
+                      summarising what you did and the outcome — never end silently after a tool call."
         .to_owned();
 
     if let Some(pane) = tmux_pane {
         system.push_str(&format!(" The user's active tmux pane is {pane}."));
     }
 
+    if !past_summaries.is_empty() {
+        system.push_str("\n\nSummaries from past sessions (oldest first):\n");
+        for s in past_summaries {
+            system.push_str(&truncate_chars(s.clone(), MAX_SUMMARY_CHARS));
+            system.push('\n');
+        }
+    }
+
     let mut messages = vec![Message::system(system)];
 
-    // In normal mode apply a sliding-window cap; in resume mode load everything.
-    let max_rows = MAX_HISTORY * 2; // each exchange = 2 rows (user + assistant)
-    let window = if full_history || history.len() <= max_rows {
-        history
-    } else {
-        &history[history.len() - max_rows..]
-    };
-    for entry in window {
+    // If this session has been partially compacted, prepend the running summary
+    // so the model knows what happened before the history window.
+    if let Some(summary) = own_summary {
+        let summary = truncate_chars(summary.to_owned(), MAX_SUMMARY_CHARS * 2);
+        messages.push(Message::user(
+            "[Summary of earlier in this session]".to_owned(),
+        ));
+        messages.push(Message::assistant(Some(summary), vec![]));
+    }
+
+    for entry in history {
         let content = truncate_chars(entry.content.clone(), MAX_HISTORY_CHARS);
         match entry.role.as_str() {
             "user" => messages.push(Message::user(content)),
@@ -1067,7 +1378,7 @@ async fn run_cron_job(state: Arc<DaemonState>, job: &cron::CronJob) {
     // Resolve model from env var (same default as CLI client).
     let model = std::env::var("AMAEBI_MODEL").unwrap_or_else(|_| "gpt-4o".to_string());
 
-    let mut messages = build_messages(&job.description, None, &[]);
+    let mut messages = build_messages(&job.description, None, &[], &[], None);
     inject_skill_files(&mut messages).await;
     // Cron jobs are non-interactive: drop the sender immediately so steer_rx.recv()
     // returns None at once if the model ends with '?', rather than timing out.
@@ -1077,7 +1388,7 @@ async fn run_cron_job(state: Arc<DaemonState>, job: &cron::CronJob) {
     let result = run_agentic_loop(&state, &model, messages, &mut sink, &mut steer_rx).await;
 
     let (output, run_ok) = match result {
-        Ok(final_text) => {
+        Ok((final_text, _)) => {
             store_conversation(&state, &session_id, &job.description, &final_text).await;
             (final_text, true)
         }
@@ -1212,30 +1523,30 @@ mod tests {
 
     #[test]
     fn build_messages_empty_history() {
-        let msgs = build_messages("hello", None, &[]);
+        let msgs = build_messages("hello", None, &[], &[], None);
         assert_eq!(msgs.len(), 2);
     }
 
     #[test]
     fn build_messages_injects_history_rows() {
         let history = make_history(2); // 4 rows: u0, a0, u1, a1
-        let msgs = build_messages("q3", None, &history);
+        let msgs = build_messages("q3", None, &history, &[], None);
         // system + 4 history rows + user
         assert_eq!(msgs.len(), 6);
     }
 
     #[test]
-    fn build_messages_caps_history_at_max() {
-        let history = make_history(MAX_HISTORY + 1);
-        let msgs = build_messages("new", None, &history);
-        // system + MAX_HISTORY*2 rows (sliding window) + user
-        let expected = 1 + MAX_HISTORY * 2 + 1;
-        assert_eq!(msgs.len(), expected);
+    fn build_messages_all_history_included() {
+        // build_messages no longer caps — all rows are included.
+        let history = make_history(10);
+        let msgs = build_messages("new", None, &history, &[], None);
+        // system + 20 history rows + user
+        assert_eq!(msgs.len(), 22);
     }
 
     #[test]
     fn build_messages_tmux_pane_in_system() {
-        let msgs = build_messages("prompt", Some("%3"), &[]);
+        let msgs = build_messages("prompt", Some("%3"), &[], &[], None);
         let content = msgs[0].content.as_deref().unwrap_or("");
         assert!(
             content.contains("%3"),
@@ -1243,34 +1554,77 @@ mod tests {
         );
     }
 
-    // ---- build_messages_resume tests -----
+    #[test]
+    fn build_messages_injects_past_summaries_into_system() {
+        let summaries = vec!["- Fixed the auth bug.".to_owned(), "- Added cron.".to_owned()];
+        let msgs = build_messages("hi", None, &[], &summaries, None);
+        let system = msgs[0].content.as_deref().unwrap_or("");
+        assert!(system.contains("Fixed the auth bug"), "summaries must appear in system message");
+        assert!(system.contains("Added cron"), "all summaries must be injected");
+    }
 
     #[test]
-    fn build_messages_resume_loads_all_history_beyond_max() {
-        let history = make_history(MAX_HISTORY + 1);
-        let msgs = build_messages_resume("new", None, &history);
-        let expected = 1 + (MAX_HISTORY + 1) * 2 + 1;
-        assert_eq!(
-            msgs.len(),
-            expected,
-            "resume should load full history, not just last {MAX_HISTORY}"
+    fn build_messages_own_summary_inserted_before_history() {
+        let history = make_history(1); // 2 rows: u0, a0
+        let msgs = build_messages("q", None, &history, &[], Some("- Did X earlier."));
+        // system + [user summary label + assistant summary] + 2 history rows + user
+        assert_eq!(msgs.len(), 6);
+        // The summary pair comes before the history rows.
+        let summary_placeholder = msgs[1].content.as_deref().unwrap_or("");
+        assert!(
+            summary_placeholder.contains("Summary of earlier"),
+            "summary label must appear before history"
+        );
+    }
+
+    // ---- token budget tests -----
+
+    #[test]
+    fn count_message_tokens_increases_with_content() {
+        let short = vec![Message::system("hi"), Message::user("hello")];
+        let long = vec![
+            Message::system("hi"),
+            Message::user("hello ".repeat(200)),
+        ];
+        assert!(
+            count_message_tokens(&long) > count_message_tokens(&short),
+            "longer content must produce higher token count"
         );
     }
 
     #[test]
-    fn build_messages_resume_small_history_unchanged() {
-        let history = make_history(2);
-        let normal = build_messages("q3", None, &history);
-        let resume = build_messages_resume("q3", None, &history);
-        assert_eq!(normal.len(), resume.len());
+    fn count_message_tokens_empty_list() {
+        // Empty list: only the 3 priming tokens.
+        assert_eq!(count_message_tokens(&[]), 3);
     }
 
     #[test]
-    fn build_messages_caps_at_max_history_normal() {
-        let history = make_history(MAX_HISTORY + 1);
-        let msgs = build_messages("new", None, &history);
-        let expected = 1 + MAX_HISTORY * 2 + 1;
-        assert_eq!(msgs.len(), expected);
+    fn context_limit_for_known_models() {
+        assert_eq!(context_limit_for_model("gpt-4o"), 128_000);
+        assert_eq!(context_limit_for_model("gpt-4o-mini"), 128_000);
+        assert_eq!(context_limit_for_model("gpt-4-turbo"), 128_000);
+        assert_eq!(context_limit_for_model("gpt-4"), 8_192);
+        assert_eq!(context_limit_for_model("gpt-3.5-turbo"), 16_385);
+        assert_eq!(context_limit_for_model("o1-preview"), 200_000);
+        assert_eq!(context_limit_for_model("o3-mini"), 200_000);
+        assert_eq!(context_limit_for_model("claude-3-5-sonnet"), 200_000);
+    }
+
+    #[test]
+    fn context_limit_unknown_model_is_conservative() {
+        // Unknown models fall back to 32k — never 0, never larger than any known model.
+        let limit = context_limit_for_model("some-future-model-xyz");
+        assert_eq!(limit, 32_768);
+    }
+
+    #[test]
+    fn compaction_threshold_is_below_context_limit() {
+        for model in &["gpt-4o", "gpt-4", "gpt-3.5-turbo", "o1", "unknown-model"] {
+            let t = compaction_threshold_tokens(model);
+            let available = context_limit_for_model(model).saturating_sub(RESPONSE_RESERVE_TOKENS);
+            assert!(t < available, "model={model}: threshold must be below available input budget");
+            assert!(t > 0, "model={model}: threshold must be positive");
+        }
     }
 
     // ---- inject_skill_files tests -----
