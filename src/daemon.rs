@@ -605,8 +605,10 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
             inject_skill_files(&mut messages).await;
 
             // Pre-flight token check: if over the compaction threshold, trim to hot tail.
+            // Also record whether we had to trim — that alone is enough to schedule
+            // compaction even if the API does not return usage data.
             let threshold = compaction_threshold_tokens(&model);
-            if count_message_tokens(&messages) > threshold {
+            let pre_flight_trimmed = if count_message_tokens(&messages) > threshold {
                 let hot = HOT_TAIL_PAIRS * 2;
                 let trimmed = if history.len() > hot {
                     &history[history.len() - hot..]
@@ -625,7 +627,14 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                     hot_tail = trimmed.len(),
                     "pre-flight token trim: history reduced to hot tail"
                 );
-            }
+                true
+            } else {
+                false
+            };
+
+            // Snapshot the token count before messages is moved into the loop.
+            // Used as a fallback when the API returns prompt_tokens = 0.
+            let pre_send_tokens = count_message_tokens(&messages);
 
             match run_agentic_loop(&state, &model, messages, &mut writer, &mut steer_rx).await {
                 Ok((response_text, prompt_tokens)) => {
@@ -635,9 +644,21 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                     // Persist to SQLite memory store.
                     store_conversation(&state, &sid, &user_text, &assistant_text).await;
 
-                    // Within-session compaction: if prompt tokens exceeded the threshold
-                    // and no summary exists yet, compact the portion before the hot tail.
-                    if prompt_tokens > threshold {
+                    // Within-session compaction: trigger when the context is large enough.
+                    // Two signals both warrant compaction:
+                    //   1. pre_flight_trimmed — the full history already exceeded the
+                    //      threshold before we sent the request; the API's prompt_tokens
+                    //      reflects only the trimmed slice and would never cross the
+                    //      threshold on its own.
+                    //   2. effective_tokens > threshold — the API confirmed the request
+                    //      consumed more than the compaction threshold.  Fall back to the
+                    //      pre-send tiktoken estimate when the server returns 0.
+                    let effective_tokens = if prompt_tokens > 0 {
+                        prompt_tokens
+                    } else {
+                        pre_send_tokens
+                    };
+                    if pre_flight_trimmed || effective_tokens > threshold {
                         tokio::spawn(compact_session(
                             Arc::clone(&state),
                             sid.clone(),
