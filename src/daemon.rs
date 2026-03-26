@@ -852,7 +852,7 @@ where
     let final_text;
     let mut tools_were_used = false;
     let mut conclusion_nudge_sent = false;
-    let mut last_prompt_tokens = 0usize;
+    let mut last_prompt_tokens: usize;
 
     loop {
         // Drain any steering corrections that arrived since the last model
