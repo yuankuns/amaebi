@@ -181,7 +181,7 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
             // This arm is disabled (pending forever) when stdout is not a TTY.
             steer_line = next_stdin_line(&mut stdin_lines) => {
                 match steer_line {
-                    Some(text) => {
+                    Some(text) if !text.trim().is_empty() => {
                         let steer_req = Request::Steer {
                             session_id: session_id_copy.clone(),
                             message: text,
@@ -194,6 +194,10 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
                         // so the response loop can drain normally.
                         let _ = writer.write_all(frame.as_bytes()).await;
                         let _ = writer.flush().await;
+                    }
+                    Some(_) => {
+                        // Empty or whitespace-only line (e.g. bare Enter, terminal
+                        // focus/integration escape sequences) — discard silently.
                     }
                     None => {
                         // Ctrl+D on stdin — detach gracefully (task continues
@@ -390,7 +394,7 @@ pub async fn run_resume(
 
             steer_line = next_stdin_line(&mut stdin_lines) => {
                 match steer_line {
-                    Some(text) => {
+                    Some(text) if !text.trim().is_empty() => {
                         let steer_req = Request::Steer {
                             session_id: session_uuid.clone(),
                             message: text,
@@ -400,6 +404,9 @@ pub async fn run_resume(
                         frame.push('\n');
                         let _ = writer.write_all(frame.as_bytes()).await;
                         let _ = writer.flush().await;
+                    }
+                    Some(_) => {
+                        // Empty or whitespace-only line — discard silently.
                     }
                     None => {
                         stdin_lines = None;
