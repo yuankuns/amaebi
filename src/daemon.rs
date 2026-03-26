@@ -1600,7 +1600,10 @@ mod tests {
             system.contains("Fixed the auth bug"),
             "summaries must appear in system message"
         );
-        assert!(system.contains("Added cron"), "all summaries must be injected");
+        assert!(
+            system.contains("Added cron"),
+            "all summaries must be injected"
+        );
     }
 
     #[test]
