@@ -592,6 +592,8 @@ where
 {
     let schemas = tools::tool_schemas();
     let final_text;
+    let mut tools_were_used = false;
+    let mut conclusion_nudge_sent = false;
 
     loop {
         // Drain any steering corrections that arrived since the last model
@@ -652,6 +654,19 @@ where
                 }
             };
 
+        let finish_label = match &resp.finish_reason {
+            FinishReason::Stop => "stop",
+            FinishReason::Length => "length",
+            FinishReason::ToolCalls => "tool_calls",
+            FinishReason::Other(_) => "other",
+        };
+        tracing::debug!(
+            finish_reason = finish_label,
+            text_len = resp.text.len(),
+            tools_were_used,
+            "model turn complete"
+        );
+
         match resp.finish_reason {
             FinishReason::Stop | FinishReason::Length => {
                 // Check if the model is asking for clarification via the
@@ -703,10 +718,22 @@ where
                         }
                         Ok(None) => {
                             // Channel closed — client disconnected.
+                            tracing::debug!(
+                                reason = "client_disconnected",
+                                context = "waiting_for_input_reply",
+                                tools_were_used,
+                                "session end"
+                            );
                             final_text = clarification_prompt;
                             break;
                         }
                         Err(_timeout) => {
+                            tracing::debug!(
+                                reason = "input_timeout_300s",
+                                context = "waiting_for_input_reply",
+                                tools_were_used,
+                                "session end"
+                            );
                             write_frame(
                                 writer,
                                 &Response::Text {
@@ -750,10 +777,22 @@ where
                             continue;
                         }
                         Ok(None) => {
+                            tracing::debug!(
+                                reason = "client_disconnected",
+                                context = "waiting_for_question_reply",
+                                tools_were_used,
+                                "session end"
+                            );
                             final_text = question;
                             break;
                         }
                         Err(_timeout) => {
+                            tracing::debug!(
+                                reason = "input_timeout_300s",
+                                context = "waiting_for_question_reply",
+                                tools_were_used,
+                                "session end"
+                            );
                             write_frame(
                                 writer,
                                 &Response::Text {
@@ -767,11 +806,52 @@ where
                     }
                 }
 
+                // Safety net: if the model ends silently after having used tools,
+                // inject one follow-up asking for a conclusion rather than letting
+                // the session end without visible output.
+                if resp.text.is_empty() && tools_were_used && !conclusion_nudge_sent {
+                    tracing::debug!("session: empty Stop after tool use — nudging for conclusion");
+                    conclusion_nudge_sent = true;
+                    messages.push(Message::assistant(None, vec![]));
+                    messages.push(Message::user(
+                        "Please summarise what you just did and the outcome.".to_owned(),
+                    ));
+                    continue;
+                }
+
+                let reason = if resp.text.is_empty() {
+                    "stop_empty_text"
+                } else if finish_label == "length" {
+                    "length_limit"
+                } else {
+                    "stop"
+                };
+                tracing::debug!(
+                    reason,
+                    finish_reason = finish_label,
+                    text_len = resp.text.len(),
+                    tools_were_used,
+                    conclusion_nudge_sent,
+                    text_preview = &resp.text.chars().take(80).collect::<String>(),
+                    "session end"
+                );
+                // Notify the user when the model hit the output token limit.
+                if finish_label == "length" {
+                    write_frame(
+                        writer,
+                        &Response::Text {
+                            chunk: "\n[response truncated — output token limit reached]\n".into(),
+                        },
+                    )
+                    .await?;
+                }
+
                 final_text = resp.text;
                 break;
             }
 
             FinishReason::ToolCalls => {
+                tools_were_used = true;
                 let api_calls: Vec<ApiToolCall> = resp
                     .tool_calls
                     .iter()
@@ -877,7 +957,7 @@ where
             }
 
             FinishReason::Other(ref reason) => {
-                tracing::warn!(finish_reason = %reason, "unexpected finish reason, stopping");
+                tracing::warn!(finish_reason = %reason, "session end: unexpected finish reason");
                 let warning = format!("\n[stopped: unexpected finish reason '{reason}']");
                 write_frame(writer, &Response::Text { chunk: warning }).await?;
                 final_text = resp.text;
@@ -963,7 +1043,9 @@ fn build_messages_inner(
     let mut system = "You are a helpful, concise AI assistant embedded in a tmux terminal. \
                       Answer in plain text; avoid markdown unless the user asks for it. \
                       You have tools available to inspect the terminal, run commands, \
-                      and read or edit files — use them when they help you answer accurately."
+                      and read or edit files — use them when they help you answer accurately. \
+                      After using any tool, you MUST always follow up with a text response \
+                      summarising what you did and the outcome — never end silently after a tool call."
         .to_owned();
 
     if let Some(pane) = tmux_pane {
