@@ -1329,7 +1329,21 @@ where
                 };
                 messages.push(Message::assistant(assistant_text, api_calls));
 
-                for tc in &resp.tool_calls {
+                let tool_calls_snapshot = &resp.tool_calls;
+                let mut interrupted_at: Option<usize> = None;
+
+                for (i, tc) in tool_calls_snapshot.iter().enumerate() {
+                    // Check for a mid-execution steer before running this tool.
+                    // If the user pressed Ctrl-C and typed a correction, honour
+                    // it immediately: skip this and all remaining tools.
+                    if let Ok(steer_msg) = steer_rx.try_recv() {
+                        tracing::debug!("mid-execution steer received; interrupting tool chain at index {i}");
+                        messages.push(Message::user(steer_msg));
+                        write_frame(writer, &Response::SteerAck).await?;
+                        interrupted_at = Some(i);
+                        break;
+                    }
+
                     tracing::debug!(tool = %tc.name, "executing tool");
 
                     let tool_detail = {
@@ -1407,6 +1421,19 @@ where
                     };
 
                     messages.push(Message::tool_result(&tc.id, result));
+                }
+
+                // If the user injected a steer mid-chain, push placeholder
+                // tool results for the tools that were never executed.  The
+                // OpenAI API requires a tool_result for every tool_call in the
+                // assistant message, even if we didn't actually run them.
+                if let Some(skip_from) = interrupted_at {
+                    for tc in &tool_calls_snapshot[skip_from..] {
+                        messages.push(Message::tool_result(
+                            &tc.id,
+                            "[interrupted by user before execution]",
+                        ));
+                    }
                 }
 
                 // Steers that arrived during tool execution are drained at

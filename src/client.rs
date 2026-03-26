@@ -108,11 +108,13 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
                     let _ = tokio::io::stderr().flush().await;
                     return Err(anyhow::Error::new(Interrupted));
                 }
-                // First press (or expired window): remind the user and record time.
-                eprintln!(
-                    "\nPress Ctrl-C again within {}s to exit",
-                    DOUBLE_CTRLC_WINDOW.as_secs()
-                );
+                // First press (or expired window): interrupt the agent and prompt
+                // for a steering correction.  The existing stdin reader will
+                // pick up whatever the user types and send it as a Steer.
+                // Double Ctrl-C (handled above) exits.
+                eprintln!("\n[interrupted — type a correction and press Enter, or Ctrl-C again to exit]");
+                eprint!(">");
+                let _ = tokio::io::stderr().flush().await;
                 last_ctrl_c = Some(now);
             }
 
@@ -348,10 +350,9 @@ pub async fn run_resume(
                     let _ = tokio::io::stderr().flush().await;
                     return Err(anyhow::Error::new(Interrupted));
                 }
-                eprintln!(
-                    "\nPress Ctrl-C again within {}s to exit",
-                    DOUBLE_CTRLC_WINDOW.as_secs()
-                );
+                eprintln!("\n[interrupted — type a correction and press Enter, or Ctrl-C again to exit]");
+                eprint!(">");
+                let _ = tokio::io::stderr().flush().await;
                 last_ctrl_c = Some(now);
             }
 
