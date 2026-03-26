@@ -659,6 +659,20 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                         pre_send_tokens
                     };
                     if pre_flight_trimmed || effective_tokens > threshold {
+                        tracing::info!(
+                            session = %sid,
+                            effective_tokens,
+                            threshold,
+                            pre_flight_trimmed,
+                            "compacting conversation history"
+                        );
+                        let _ = write_frame(
+                            &mut writer,
+                            &Response::Text {
+                                chunk: "\n[compacting conversation history…]\n".into(),
+                            },
+                        )
+                        .await;
                         tokio::spawn(compact_session(
                             Arc::clone(&state),
                             sid.clone(),
