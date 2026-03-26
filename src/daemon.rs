@@ -71,9 +71,8 @@ impl DaemonState {
 fn count_message_tokens(messages: &[Message]) -> usize {
     use std::sync::OnceLock;
     static BPE: OnceLock<tiktoken_rs::CoreBPE> = OnceLock::new();
-    let bpe = BPE.get_or_init(|| {
-        tiktoken_rs::o200k_base().expect("failed to load o200k_base tokenizer")
-    });
+    let bpe =
+        BPE.get_or_init(|| tiktoken_rs::o200k_base().expect("failed to load o200k_base tokenizer"));
 
     let mut total = 3usize; // priming tokens for the assistant reply
     for msg in messages {
@@ -98,13 +97,13 @@ fn count_message_tokens(messages: &[Message]) -> usize {
 fn context_limit_for_model(model: &str) -> usize {
     // Ordered longest-prefix-first so that e.g. "gpt-4-turbo" beats "gpt-4".
     const TABLE: &[(&str, usize)] = &[
-        ("gpt-4o",       128_000),
-        ("gpt-4-turbo",  128_000),
-        ("gpt-4",          8_192),
+        ("gpt-4o", 128_000),
+        ("gpt-4-turbo", 128_000),
+        ("gpt-4", 8_192),
         ("gpt-3.5-turbo", 16_385),
-        ("o1",           200_000),
-        ("o3",           200_000),
-        ("claude",       200_000),
+        ("o1", 200_000),
+        ("o3", 200_000),
+        ("claude", 200_000),
     ];
     TABLE
         .iter()
@@ -303,7 +302,11 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                 let threshold = compaction_threshold_tokens(&model);
                 if count_message_tokens(&messages) > threshold {
                     let hot = HOT_TAIL_PAIRS * 2;
-                    let trimmed = if history.len() > hot { &history[history.len() - hot..] } else { &history[..] };
+                    let trimmed = if history.len() > hot {
+                        &history[history.len() - hot..]
+                    } else {
+                        &history[..]
+                    };
                     messages = build_messages(&prompt, tmux_pane.as_deref(), trimmed, &[], None);
                     inject_skill_files(&mut messages).await;
                 }
@@ -414,8 +417,7 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
             let (history, summaries) = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
                 let conn = db.lock().unwrap_or_else(|p| p.into_inner());
                 let history = memory_db::get_session_history(&conn, &sid_clone)?;
-                let summaries =
-                    memory_db::get_recent_summaries(&conn, &sid_clone, MAX_SUMMARIES)?;
+                let summaries = memory_db::get_recent_summaries(&conn, &sid_clone, MAX_SUMMARIES)?;
                 Ok((history, summaries))
             })
             .await
@@ -429,20 +431,19 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
             });
 
             // Resume: full history for re-hydration; token budget trims if needed.
-            let mut messages = build_messages(
-                &prompt,
-                tmux_pane.as_deref(),
-                &history,
-                &summaries,
-                None,
-            );
+            let mut messages =
+                build_messages(&prompt, tmux_pane.as_deref(), &history, &summaries, None);
             inject_skill_files(&mut messages).await;
 
             // Pre-flight token check.
             let threshold = compaction_threshold_tokens(&model);
             if count_message_tokens(&messages) > threshold {
                 let hot = HOT_TAIL_PAIRS * 2;
-                let trimmed = if history.len() > hot { &history[history.len() - hot..] } else { &history[..] };
+                let trimmed = if history.len() > hot {
+                    &history[history.len() - hot..]
+                } else {
+                    &history[..]
+                };
                 messages = build_messages(&prompt, tmux_pane.as_deref(), trimmed, &summaries, None);
                 inject_skill_files(&mut messages).await;
             }
@@ -597,7 +598,11 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
             let threshold = compaction_threshold_tokens(&model);
             if count_message_tokens(&messages) > threshold {
                 let hot = HOT_TAIL_PAIRS * 2;
-                let trimmed = if history.len() > hot { &history[history.len() - hot..] } else { &history[..] };
+                let trimmed = if history.len() > hot {
+                    &history[history.len() - hot..]
+                } else {
+                    &history[..]
+                };
                 messages = build_messages(
                     &prompt,
                     tmux_pane.as_deref(),
@@ -800,7 +805,9 @@ async fn compact_session(
                 tracing::debug!(session_id = %session_id, "session compacted");
             }
         }
-        Ok(_) => tracing::debug!(session_id = %session_id, "compact_session: empty summary (ignored)"),
+        Ok(_) => {
+            tracing::debug!(session_id = %session_id, "compact_session: empty summary (ignored)")
+        }
         Err(e) => tracing::warn!(error = %e, "compact_session: API error"),
     }
 }
@@ -1583,10 +1590,16 @@ mod tests {
 
     #[test]
     fn build_messages_injects_past_summaries_into_system() {
-        let summaries = vec!["- Fixed the auth bug.".to_owned(), "- Added cron.".to_owned()];
+        let summaries = vec![
+            "- Fixed the auth bug.".to_owned(),
+            "- Added cron.".to_owned(),
+        ];
         let msgs = build_messages("hi", None, &[], &summaries, None);
         let system = msgs[0].content.as_deref().unwrap_or("");
-        assert!(system.contains("Fixed the auth bug"), "summaries must appear in system message");
+        assert!(
+            system.contains("Fixed the auth bug"),
+            "summaries must appear in system message"
+        );
         assert!(system.contains("Added cron"), "all summaries must be injected");
     }
 
@@ -1609,10 +1622,7 @@ mod tests {
     #[test]
     fn count_message_tokens_increases_with_content() {
         let short = vec![Message::system("hi"), Message::user("hello")];
-        let long = vec![
-            Message::system("hi"),
-            Message::user("hello ".repeat(200)),
-        ];
+        let long = vec![Message::system("hi"), Message::user("hello ".repeat(200))];
         assert!(
             count_message_tokens(&long) > count_message_tokens(&short),
             "longer content must produce higher token count"
@@ -1649,7 +1659,10 @@ mod tests {
         for model in &["gpt-4o", "gpt-4", "gpt-3.5-turbo", "o1", "unknown-model"] {
             let t = compaction_threshold_tokens(model);
             let available = context_limit_for_model(model).saturating_sub(RESPONSE_RESERVE_TOKENS);
-            assert!(t < available, "model={model}: threshold must be below available input budget");
+            assert!(
+                t < available,
+                "model={model}: threshold must be below available input budget"
+            );
             assert!(t > 0, "model={model}: threshold must be positive");
         }
     }
