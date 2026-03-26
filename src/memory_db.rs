@@ -703,4 +703,59 @@ mod tests {
         assert_eq!(recent[0].content, "msg 6");
         assert_eq!(recent[3].content, "msg 9");
     }
+
+    #[test]
+    fn store_session_summary_upserts() {
+        let (conn, _dir) = open_test_db();
+
+        store_session_summary(&conn, "s1", "first summary", "2026-01-01T00:00:00Z").unwrap();
+        let s1 = get_session_own_summary(&conn, "s1").unwrap();
+        assert_eq!(s1.as_deref(), Some("first summary"));
+
+        // Upsert — should update, not create a second row.
+        store_session_summary(&conn, "s1", "updated summary", "2026-01-02T00:00:00Z").unwrap();
+        let s2 = get_session_own_summary(&conn, "s1").unwrap();
+        assert_eq!(s2.as_deref(), Some("updated summary"));
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_summaries WHERE session_id = 's1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "upsert must not create duplicate rows");
+    }
+
+    #[test]
+    fn get_session_own_summary_returns_none_when_absent() {
+        let (conn, _dir) = open_test_db();
+        let result = get_session_own_summary(&conn, "no-such-session").unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn get_sessions_without_summary_excludes_current_and_summarised() {
+        let (conn, _dir) = open_test_db();
+        store_memory(&conn, "2026-01-01T00:00:00Z", "s1", "user", "hi", "").unwrap();
+        store_memory(&conn, "2026-01-01T00:00:00Z", "s2", "user", "hi", "").unwrap();
+        store_memory(&conn, "2026-01-01T00:00:00Z", "s3", "user", "hi", "").unwrap();
+        store_session_summary(&conn, "s2", "summary for s2", "2026-01-01T00:00:00Z").unwrap();
+
+        // s1 has no summary; s2 has a summary; s3 is the "current" session (excluded).
+        let unsummarised = get_sessions_without_summary(&conn, "s3", 10).unwrap();
+        assert_eq!(unsummarised, vec!["s1"]);
+    }
+
+    #[test]
+    fn get_recent_summaries_excludes_current_and_orders_oldest_first() {
+        let (conn, _dir) = open_test_db();
+        store_session_summary(&conn, "s1", "summary A", "2026-01-01T00:00:00Z").unwrap();
+        store_session_summary(&conn, "s2", "summary B", "2026-01-03T00:00:00Z").unwrap();
+        store_session_summary(&conn, "s3", "summary C", "2026-01-02T00:00:00Z").unwrap();
+
+        // Exclude s3 (current session); expect oldest-first order.
+        let summaries = get_recent_summaries(&conn, "s3", 10).unwrap();
+        assert_eq!(summaries, vec!["summary A", "summary B"]);
+    }
 }
