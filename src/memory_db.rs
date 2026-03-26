@@ -271,7 +271,6 @@ pub fn get_session_oldest(
     Ok(entries) // already in chronological (ASC) order
 }
 
-
 /// Return the total number of rows in the `memories` table.
 pub fn count(conn: &Connection) -> Result<usize> {
     conn.query_row("SELECT COUNT(*) FROM memories", [], |r| r.get::<_, i64>(0))
