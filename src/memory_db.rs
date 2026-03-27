@@ -72,7 +72,8 @@ CREATE TABLE IF NOT EXISTS memories (
     session_id TEXT    NOT NULL DEFAULT '',
     role       TEXT    NOT NULL CHECK (role IN ('user', 'assistant')),
     content    TEXT    NOT NULL,
-    summary    TEXT    NOT NULL DEFAULT ''
+    summary    TEXT    NOT NULL DEFAULT '',
+    archived   INTEGER NOT NULL DEFAULT 0
 );
 
 -- FTS5 content table mirrors the base table; triggers keep it in sync.
@@ -227,7 +228,7 @@ pub fn get_session_history(conn: &Connection, session_id: &str) -> Result<Vec<Db
         .prepare(
             "SELECT id, timestamp, session_id, role, content, summary
              FROM memories
-             WHERE session_id = ?1
+             WHERE session_id = ?1 AND archived = 0
              ORDER BY id ASC",
         )
         .context("preparing get_session_history query")?;
@@ -256,7 +257,7 @@ pub fn get_session_oldest(
         .prepare(
             "SELECT id, timestamp, session_id, role, content, summary
              FROM memories
-             WHERE session_id = ?1
+             WHERE session_id = ?1 AND archived = 0
              ORDER BY id ASC
              LIMIT ?2",
         )
@@ -343,12 +344,38 @@ pub fn store_session_summary(
 /// within-session compaction (i.e., the sliding window is dropping turns).
 pub fn count_session_turns(conn: &Connection, session_id: &str) -> Result<usize> {
     conn.query_row(
-        "SELECT COUNT(*) FROM memories WHERE session_id = ?1",
+        "SELECT COUNT(*) FROM memories WHERE session_id = ?1 AND archived = 0",
         params![session_id],
         |r| r.get::<_, i64>(0),
     )
     .context("counting session turns")
     .map(|n| n as usize)
+}
+
+/// Mark a set of memory rows as archived so they are excluded from future history loads.
+///
+/// Called by `compact_session` after a summary is successfully stored.
+/// Archived turns are kept in the DB for audit purposes but never re-loaded
+/// into the context window or re-compacted.
+pub fn archive_session_turns(conn: &Connection, ids: &[i64]) -> Result<()> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    // Build a parameterised IN list.  rusqlite does not support binding a slice
+    // directly, so we construct the placeholders manually.
+    let placeholders = ids
+        .iter()
+        .enumerate()
+        .map(|(i, _)| format!("?{}", i + 1))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!("UPDATE memories SET archived = 1 WHERE id IN ({placeholders})");
+    let mut stmt = conn
+        .prepare(&sql)
+        .context("preparing archive_session_turns")?;
+    stmt.execute(rusqlite::params_from_iter(ids))
+        .context("archiving session turns")?;
+    Ok(())
 }
 
 /// Return the compacted summary for `session_id` if one exists, otherwise `None`.

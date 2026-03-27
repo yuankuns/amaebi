@@ -709,13 +709,11 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                         pre_send_tokens,
                         "compaction check"
                     );
-                    // Only compact when no summary exists yet.  Once a summary is
-                    // stored, future turns load it and build_messages produces a
-                    // smaller slice, so pre_flight_trimmed becomes false naturally.
-                    // This prevents spawning a new compact_session on every turn
-                    // while the session stays above the threshold.
-                    if own_summary.is_none() && (pre_flight_trimmed || effective_tokens > threshold)
-                    {
+                    // Compact whenever the context is over budget.  After compaction,
+                    // the archived turns are excluded from future history loads, so
+                    // the loaded window shrinks and this condition naturally goes false
+                    // until enough new turns accumulate to push past the threshold again.
+                    if pre_flight_trimmed || effective_tokens > threshold {
                         tracing::info!(
                             session = %sid,
                             effective_tokens,
@@ -843,12 +841,12 @@ async fn compact_session(
 ) {
     let db = Arc::clone(&state.db);
     let sid = session_id.clone();
-    let history = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+    // Load the non-archived turns to summarise, plus any existing summary so the
+    // new summary can incorporate it (cumulative re-compaction).
+    let (history, existing_summary) = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
         let conn = db.lock().unwrap_or_else(|p| p.into_inner());
         let total = memory_db::count_session_turns(&conn, &sid)?;
-        // How many of the oldest turns to summarise: all of them for cross-session
-        // (keep_recent == 0), or only the portion beyond the sliding window for
-        // within-session so summary and raw history window do not overlap.
+        // Only summarise non-archived turns; keep_recent holds the hot tail out.
         let to_summarise = total.saturating_sub(keep_recent);
         tracing::debug!(
             session_id = %sid,
@@ -857,27 +855,40 @@ async fn compact_session(
             to_summarise,
             "compact_session: loaded history counts"
         );
-        memory_db::get_session_oldest(&conn, &sid, to_summarise)
+        let history = memory_db::get_session_oldest(&conn, &sid, to_summarise)?;
+        let existing_summary = memory_db::get_session_own_summary(&conn, &sid)?;
+        Ok((history, existing_summary))
     })
     .await
     .unwrap_or_else(|e| {
         tracing::warn!(error = %e, "compact_session: history load panicked");
-        Ok(vec![])
+        Ok((vec![], None))
     })
     .unwrap_or_else(|e| {
         tracing::warn!(error = %e, "compact_session: failed to load history");
-        vec![]
+        (vec![], None)
     });
 
     if history.is_empty() {
         return;
     }
 
+    // Build the compaction prompt.  If a previous summary exists, inject it before
+    // the new turns so the new summary is cumulative (covers all archived history).
     let mut messages = vec![Message::system(
-        "You are a memory compactor. Given a conversation, output 3-5 bullet points \
-         capturing the key outcomes, decisions, and facts learned. \
-         Be concise and factual. Output only the bullet points, no preamble.",
+        "You are a memory compactor. Output 3-5 bullet points capturing the key outcomes, \
+         decisions, and facts. Be concise and factual. Output only the bullet points, no preamble.",
     )];
+
+    if let Some(ref prev) = existing_summary {
+        // Re-compaction: show the previous summary as an already-produced assistant
+        // turn so the model can extend it with the new turns that follow.
+        messages.push(Message::user(
+            "Summarise the conversation so far:".to_owned(),
+        ));
+        messages.push(Message::assistant(Some(prev.clone()), vec![]));
+    }
+
     for entry in &history {
         let content = truncate_chars(entry.content.clone(), 1_500);
         match entry.role.as_str() {
@@ -887,12 +898,20 @@ async fn compact_session(
         }
     }
     // The API requires the last message to be from the user role.
-    // Append a prompt if the history ended on an assistant turn.
-    if messages.last().is_some_and(|m| m.role == "assistant") {
+    // For re-compaction always append the update request so the model knows to
+    // produce a combined summary rather than just continue the conversation.
+    if existing_summary.is_some() {
+        messages.push(Message::user(
+            "Produce an updated combined summary covering everything above.".to_owned(),
+        ));
+    } else if messages.last().is_some_and(|m| m.role == "assistant") {
         messages.push(Message::user(
             "Summarise the conversation above into 3-5 bullet points.".to_owned(),
         ));
     }
+
+    // Collect the IDs to archive on success.
+    let ids_to_archive: Vec<i64> = history.iter().map(|e| e.id).collect();
 
     // Sink writer + dropped sender = non-interactive, no output.
     let mut sink = tokio::io::sink();
@@ -906,7 +925,8 @@ async fn compact_session(
             let summary = summary.trim().to_owned();
             let result = tokio::task::spawn_blocking(move || {
                 let conn = db.lock().unwrap_or_else(|p| p.into_inner());
-                memory_db::store_session_summary(&conn, &sid, &summary, &ts)
+                memory_db::store_session_summary(&conn, &sid, &summary, &ts)?;
+                memory_db::archive_session_turns(&conn, &ids_to_archive)
             })
             .await
             .unwrap_or_else(|e| Err(anyhow::anyhow!("compact_session write panicked: {e}")));
