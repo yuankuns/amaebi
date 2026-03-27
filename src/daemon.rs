@@ -844,6 +844,13 @@ async fn compact_session(
             _ => {}
         }
     }
+    // The API requires the last message to be from the user role.
+    // Append a prompt if the history ended on an assistant turn.
+    if messages.last().is_some_and(|m| m.role == "assistant") {
+        messages.push(Message::user(
+            "Summarise the conversation above into 3-5 bullet points.".to_owned(),
+        ));
+    }
 
     // Sink writer + dropped sender = non-interactive, no output.
     let mut sink = tokio::io::sink();
