@@ -664,6 +664,14 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                     } else {
                         pre_send_tokens
                     };
+                    tracing::debug!(
+                        effective_tokens,
+                        threshold,
+                        pre_flight_trimmed,
+                        prompt_tokens,
+                        pre_send_tokens,
+                        "compaction check"
+                    );
                     if pre_flight_trimmed || effective_tokens > threshold {
                         tracing::info!(
                             session = %sid,
