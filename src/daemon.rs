@@ -808,6 +808,13 @@ async fn compact_session(
         // (keep_recent == 0), or only the portion beyond the sliding window for
         // within-session so summary and raw history window do not overlap.
         let to_summarise = total.saturating_sub(keep_recent);
+        tracing::debug!(
+            session_id = %sid,
+            total,
+            keep_recent,
+            to_summarise,
+            "compact_session: loaded history counts"
+        );
         memory_db::get_session_oldest(&conn, &sid, to_summarise)
     })
     .await
