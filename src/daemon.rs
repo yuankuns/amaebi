@@ -121,6 +121,12 @@ fn context_limit_for_model(model: &str) -> usize {
 /// accommodate `RESPONSE_RESERVE_TOKENS`, disabling compaction/trimming for
 /// those models rather than triggering it on every turn.
 fn compaction_threshold_tokens(model: &str) -> usize {
+    // Allow manual override for debugging: AMAEBI_COMPACTION_THRESHOLD=<tokens>
+    if let Ok(val) = std::env::var("AMAEBI_COMPACTION_THRESHOLD") {
+        if let Ok(n) = val.parse::<usize>() {
+            return n;
+        }
+    }
     let available = context_limit_for_model(model).saturating_sub(RESPONSE_RESERVE_TOKENS);
     if available == 0 {
         return usize::MAX;
@@ -666,13 +672,7 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                             pre_flight_trimmed,
                             "compacting conversation history"
                         );
-                        let _ = write_frame(
-                            &mut writer,
-                            &Response::Text {
-                                chunk: "\n[compacting conversation history…]\n".into(),
-                            },
-                        )
-                        .await;
+                        let _ = write_frame(&mut writer, &Response::Compacting).await;
                         tokio::spawn(compact_session(
                             Arc::clone(&state),
                             sid.clone(),

@@ -149,6 +149,13 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
                             _ => eprintln!("🔧 {name}: {detail}"),
                         }
                     }
+                    Response::Compacting => {
+                        if std::io::stdout().is_terminal() {
+                            eprintln!("\n\x1b[1;5;34m[compacting conversation history…]\x1b[0m");
+                        } else {
+                            eprintln!("\n[compacting conversation history…]");
+                        }
+                    }
                     Response::SteerAck => {
                         // The daemon has acknowledged our steering message.
                         // No visible output — the next model turn will incorporate it.
@@ -369,6 +376,13 @@ pub async fn run_resume(
                             "tmux_send_keys" => eprintln!("⌨️  send-keys: {detail}"),
                             "tmux_capture_pane" => eprintln!("🖥️  capture: {detail}"),
                             _ => eprintln!("🔧 {name}: {detail}"),
+                        }
+                    }
+                    Response::Compacting => {
+                        if std::io::stdout().is_terminal() {
+                            eprintln!("\n\x1b[1;5;34m[compacting conversation history…]\x1b[0m");
+                        } else {
+                            eprintln!("\n[compacting conversation history…]");
                         }
                     }
                     Response::SteerAck => {
