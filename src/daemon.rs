@@ -470,6 +470,7 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                     let assistant_text = truncate_chars(response_text.clone(), MAX_RESPONSE_CHARS);
 
                     store_conversation(&state, &session_id, &user_text, &assistant_text).await;
+                    write_frame(&mut writer, &Response::Done).await?;
                 }
                 Err(e) => {
                     tracing::error!(error = %e, "resume agentic loop error");
@@ -688,6 +689,7 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                             HOT_TAIL_PAIRS * 2, // keep hot tail out of the summary
                         ));
                     }
+                    write_frame(&mut writer, &Response::Done).await?;
                 }
                 Err(e) => {
                     tracing::error!(error = %e, "agentic loop error");
@@ -1280,7 +1282,6 @@ where
         }
     }
 
-    write_frame(writer, &Response::Done).await?;
     Ok((final_text, last_prompt_tokens))
 }
 
