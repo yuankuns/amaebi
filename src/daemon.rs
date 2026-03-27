@@ -63,34 +63,61 @@ impl DaemonState {
 // Token budget helpers
 // ---------------------------------------------------------------------------
 
-/// Approximate GPT-4o token count for a message list.
+/// Approximate token count for a message list.
 ///
 /// Uses tiktoken o200k_base (GPT-4o's encoding) with the OpenAI overhead formula:
 /// 4 tokens per message + role + content + 3 priming tokens for the reply.
 /// The tokenizer is initialised lazily on the first call (OnceLock).
+///
+/// Falls back to a conservative char-based estimate (~4 chars/token) if the
+/// tokenizer cannot be loaded, so a failed initialisation never panics the daemon.
 fn count_message_tokens(messages: &[Message]) -> usize {
     use std::sync::OnceLock;
-    static BPE: OnceLock<tiktoken_rs::CoreBPE> = OnceLock::new();
-    let bpe =
-        BPE.get_or_init(|| tiktoken_rs::o200k_base().expect("failed to load o200k_base tokenizer"));
+    static BPE: OnceLock<Result<tiktoken_rs::CoreBPE, String>> = OnceLock::new();
+    let bpe_result = BPE.get_or_init(|| {
+        tiktoken_rs::o200k_base().map_err(|e| format!("failed to load o200k_base tokenizer: {e}"))
+    });
 
-    let mut total = 3usize; // priming tokens for the assistant reply
-    for msg in messages {
-        total += 4; // per-message overhead: <|start|>, role, separator, <|end|>
-        total += bpe.encode_with_special_tokens(&msg.role).len();
-        if let Some(ref content) = msg.content {
-            total += bpe.encode_with_special_tokens(content).len();
-        }
-        if !msg.tool_calls.is_empty() {
-            if let Ok(s) = serde_json::to_string(&msg.tool_calls) {
-                total += bpe.encode_with_special_tokens(&s).len();
+    match bpe_result {
+        Ok(bpe) => {
+            let mut total = 3usize; // priming tokens for the assistant reply
+            for msg in messages {
+                total += 4; // per-message overhead: <|start|>, role, separator, <|end|>
+                total += bpe.encode_with_special_tokens(&msg.role).len();
+                if let Some(ref content) = msg.content {
+                    total += bpe.encode_with_special_tokens(content).len();
+                }
+                if !msg.tool_calls.is_empty() {
+                    if let Ok(s) = serde_json::to_string(&msg.tool_calls) {
+                        total += bpe.encode_with_special_tokens(&s).len();
+                    }
+                }
+                if let Some(ref id) = msg.tool_call_id {
+                    total += bpe.encode_with_special_tokens(id).len();
+                }
             }
+            total
         }
-        if let Some(ref id) = msg.tool_call_id {
-            total += bpe.encode_with_special_tokens(id).len();
+        Err(e) => {
+            tracing::warn!(error = %e, "tokenizer unavailable; using char-based estimate");
+            let mut char_count = 0usize;
+            for msg in messages {
+                char_count += msg.role.len();
+                if let Some(ref content) = msg.content {
+                    char_count += content.len();
+                }
+                if !msg.tool_calls.is_empty() {
+                    if let Ok(s) = serde_json::to_string(&msg.tool_calls) {
+                        char_count += s.len();
+                    }
+                }
+                if let Some(ref id) = msg.tool_call_id {
+                    char_count += id.len();
+                }
+            }
+            3 + messages.len() * 4 + char_count.div_ceil(4)
         }
     }
-    total
 }
 
 /// Context window size for `model`, matched by prefix (longest wins).
@@ -427,28 +454,37 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
             });
 
             // Resume: load the FULL history from SQLite without a sliding-window cap,
-            // plus summaries from other sessions for cross-session context.
+            // plus summaries from other sessions for cross-session context,
+            // and the session's own running summary if one was already compacted.
             let db = Arc::clone(&state.db);
             let sid_clone = session_id.clone();
-            let (history, summaries) = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-                let conn = db.lock().unwrap_or_else(|p| p.into_inner());
-                let history = memory_db::get_session_history(&conn, &sid_clone)?;
-                let summaries = memory_db::get_recent_summaries(&conn, &sid_clone, MAX_SUMMARIES)?;
-                Ok((history, summaries))
-            })
-            .await
-            .unwrap_or_else(|e| {
-                tracing::warn!(error = %e, "resume history load panicked");
-                Ok((vec![], vec![]))
-            })
-            .unwrap_or_else(|e| {
-                tracing::warn!(error = %e, "failed to load resume history");
-                (vec![], vec![])
-            });
+            let (history, summaries, own_summary) =
+                tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+                    let conn = db.lock().unwrap_or_else(|p| p.into_inner());
+                    let history = memory_db::get_session_history(&conn, &sid_clone)?;
+                    let summaries =
+                        memory_db::get_recent_summaries(&conn, &sid_clone, MAX_SUMMARIES)?;
+                    let own_summary = memory_db::get_session_own_summary(&conn, &sid_clone)?;
+                    Ok((history, summaries, own_summary))
+                })
+                .await
+                .unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "resume history load panicked");
+                    Ok((vec![], vec![], None))
+                })
+                .unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "failed to load resume history");
+                    (vec![], vec![], None)
+                });
 
             // Resume: full history for re-hydration; token budget trims if needed.
-            let mut messages =
-                build_messages(&prompt, tmux_pane.as_deref(), &history, &summaries, None);
+            let mut messages = build_messages(
+                &prompt,
+                tmux_pane.as_deref(),
+                &history,
+                &summaries,
+                own_summary.as_deref(),
+            );
             inject_skill_files(&mut messages).await;
 
             // Pre-flight token check.
@@ -673,7 +709,13 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                         pre_send_tokens,
                         "compaction check"
                     );
-                    if pre_flight_trimmed || effective_tokens > threshold {
+                    // Only compact when no summary exists yet.  Once a summary is
+                    // stored, future turns load it and build_messages produces a
+                    // smaller slice, so pre_flight_trimmed becomes false naturally.
+                    // This prevents spawning a new compact_session on every turn
+                    // while the session stays above the threshold.
+                    if own_summary.is_none() && (pre_flight_trimmed || effective_tokens > threshold)
+                    {
                         tracing::info!(
                             session = %sid,
                             effective_tokens,
@@ -1727,6 +1769,8 @@ mod tests {
 
     #[test]
     fn compaction_threshold_is_below_context_limit() {
+        // Unset the override so this test always exercises the default formula.
+        std::env::remove_var("AMAEBI_COMPACTION_THRESHOLD");
         for model in &["gpt-4o", "gpt-4", "gpt-3.5-turbo", "o1", "unknown-model"] {
             let t = compaction_threshold_tokens(model);
             let available = context_limit_for_model(model).saturating_sub(RESPONSE_RESERVE_TOKENS);

@@ -150,7 +150,7 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
                         }
                     }
                     Response::Compacting => {
-                        if std::io::stdout().is_terminal() {
+                        if std::io::stderr().is_terminal() {
                             eprintln!("\n\x1b[1;5;34m[compacting conversation history…]\x1b[0m");
                         } else {
                             eprintln!("\n[compacting conversation history…]");
@@ -203,8 +203,7 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
                         let _ = writer.flush().await;
                     }
                     Some(_) => {
-                        // Empty or whitespace-only line (e.g. bare Enter, terminal
-                        // focus/integration escape sequences) — discard silently.
+                        // Empty or whitespace-only line (e.g. bare Enter) — discard silently.
                     }
                     None => {
                         // Ctrl+D on stdin — detach gracefully (task continues
@@ -379,7 +378,7 @@ pub async fn run_resume(
                         }
                     }
                     Response::Compacting => {
-                        if std::io::stdout().is_terminal() {
+                        if std::io::stderr().is_terminal() {
                             eprintln!("\n\x1b[1;5;34m[compacting conversation history…]\x1b[0m");
                         } else {
                             eprintln!("\n[compacting conversation history…]");

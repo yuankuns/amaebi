@@ -3,15 +3,15 @@
 //! Two tables are maintained in `~/.amaebi/memory.db`:
 //!
 //! * **`memories`** — one row per conversation turn (user or assistant message),
-//!   indexed by FTS5 for semantic search.  The sliding-window cap in the daemon
-//!   limits how many recent turns are injected per request.
+//!   indexed by FTS5 for semantic search.  The daemon loads full history and trims
+//!   it to a token budget, keeping a "hot tail" of recent turns verbatim.
 //!
 //! * **`session_summaries`** — one compact LLM-generated summary per session UUID,
 //!   written lazily by `compact_session` in two cases:
 //!   - **Cross-session**: when a new session starts, old sessions without a summary
 //!     are compacted so future sessions can learn from them.
-//!   - **Within-session**: when a session's history grows beyond the sliding-window
-//!     cap, the dropped turns are preserved as a running summary.
+//!   - **Within-session**: when a session's token budget is exhausted, older turns
+//!     are summarised while the recent "hot tail" is kept verbatim.
 //!
 //! # Concurrency
 //!
@@ -353,8 +353,8 @@ pub fn count_session_turns(conn: &Connection, session_id: &str) -> Result<usize>
 
 /// Return the compacted summary for `session_id` if one exists, otherwise `None`.
 ///
-/// Used to inject an ongoing session's own running summary before its recent
-/// turns when the history has grown beyond the sliding-window cap.
+/// Used to inject an ongoing session's own running summary before its hot-tail
+/// turns when the full history no longer fits the token budget.
 pub fn get_session_own_summary(conn: &Connection, session_id: &str) -> Result<Option<String>> {
     let mut stmt = conn
         .prepare("SELECT summary FROM session_summaries WHERE session_id = ?1 LIMIT 1")
@@ -379,11 +379,14 @@ pub fn get_sessions_without_summary(
 ) -> Result<Vec<String>> {
     let mut stmt = conn
         .prepare(
-            "SELECT DISTINCT m.session_id
-             FROM memories m
-             WHERE m.session_id != ?1
-               AND m.session_id != ''
-               AND m.session_id NOT IN (SELECT session_id FROM session_summaries)
+            "SELECT session_id FROM (
+                 SELECT m.session_id, MIN(m.id) AS first_id
+                 FROM memories m
+                 WHERE m.session_id != ?1
+                   AND m.session_id != ''
+                   AND m.session_id NOT IN (SELECT session_id FROM session_summaries)
+                 GROUP BY m.session_id
+             ) ORDER BY first_id ASC
              LIMIT ?2",
         )
         .context("preparing get_sessions_without_summary")?;
