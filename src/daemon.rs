@@ -36,6 +36,12 @@ pub struct DaemonState {
     /// all reads and writes through a single connection without re-running the
     /// schema setup (`PRAGMA`s, `CREATE TABLE`, triggers) on every request.
     pub db: Arc<Mutex<rusqlite::Connection>>,
+    /// Sessions that currently have a compaction task in flight.
+    ///
+    /// Before spawning a new `compact_session` for a within-session compaction,
+    /// insert the session ID.  The task removes itself on completion.  If the
+    /// ID is already present, skip the spawn to prevent overlapping compactions.
+    pub compacting_sessions: Arc<Mutex<HashSet<String>>>,
 }
 
 impl DaemonState {
@@ -55,6 +61,7 @@ impl DaemonState {
             tokens: TokenCache::new(),
             executor: Box::new(tools::LocalExecutor),
             db: Arc::new(Mutex::new(conn)),
+            compacting_sessions: Arc::new(Mutex::new(HashSet::new())),
         })
     }
 }
@@ -99,7 +106,11 @@ fn count_message_tokens(messages: &[Message]) -> usize {
             total
         }
         Err(e) => {
-            tracing::warn!(error = %e, "tokenizer unavailable; using char-based estimate");
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static WARNED: AtomicBool = AtomicBool::new(false);
+            if !WARNED.swap(true, Ordering::Relaxed) {
+                tracing::warn!(error = %e, "tokenizer unavailable; using char-based estimate");
+            }
             let mut char_count = 0usize;
             for msg in messages {
                 char_count += msg.role.len();
@@ -728,12 +739,19 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                             "compacting conversation history"
                         );
                         let _ = write_frame(&mut writer, &Response::Compacting).await;
-                        tokio::spawn(compact_session(
-                            Arc::clone(&state),
-                            sid.clone(),
-                            model.clone(),
-                            HOT_TAIL_PAIRS * 2, // keep hot tail out of the summary
-                        ));
+                        // Guard against overlapping compactions for the same session.
+                        let already_compacting = {
+                            let mut guard = state.compacting_sessions.lock().unwrap_or_else(|p| p.into_inner());
+                            !guard.insert(sid.clone())
+                        };
+                        if !already_compacting {
+                            tokio::spawn(compact_session(
+                                Arc::clone(&state),
+                                sid.clone(),
+                                model.clone(),
+                                HOT_TAIL_PAIRS * 2, // keep hot tail out of the summary
+                            ));
+                        }
                     }
                     write_frame(&mut writer, &Response::Done).await?;
                 }
@@ -942,8 +960,10 @@ async fn compact_session(
             let ts = chrono::Utc::now().to_rfc3339();
             let result = tokio::task::spawn_blocking(move || {
                 let conn = db.lock().unwrap_or_else(|p| p.into_inner());
+                let tx = conn.unchecked_transaction().context("compact_session: begin transaction")?;
                 memory_db::store_session_summary(&conn, &sid, &summary, &ts)?;
-                memory_db::archive_session_turns(&conn, &ids_to_archive)
+                memory_db::archive_session_turns(&conn, &ids_to_archive)?;
+                tx.commit().context("compact_session: commit transaction")
             })
             .await
             .unwrap_or_else(|e| Err(anyhow::anyhow!("compact_session write panicked: {e}")));
@@ -958,6 +978,8 @@ async fn compact_session(
         }
         Err(ref e) => tracing::warn!(error = %e, "compact_session: API error"),
     }
+    // Always remove the in-flight guard so future turns can trigger compaction again.
+    state.compacting_sessions.lock().unwrap_or_else(|p| p.into_inner()).remove(&session_id);
 }
 
 // ---------------------------------------------------------------------------
@@ -1805,6 +1827,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn compaction_threshold_is_below_context_limit() {
         // Unset the override so this test always exercises the default formula.
         std::env::remove_var("AMAEBI_COMPACTION_THRESHOLD");

@@ -185,6 +185,7 @@ pub fn search_relevant(conn: &Connection, query: &str, limit: usize) -> Result<V
              FROM memories m
              JOIN memories_fts ON memories_fts.rowid = m.id
              WHERE memories_fts MATCH ?1
+               AND m.archived = 0
              ORDER BY memories_fts.rank
              LIMIT ?2",
         )
@@ -204,6 +205,7 @@ pub fn get_recent(conn: &Connection, limit: usize) -> Result<Vec<DbMemoryEntry>>
         .prepare(
             "SELECT id, timestamp, session_id, role, content, summary
              FROM memories
+             WHERE archived = 0
              ORDER BY id DESC
              LIMIT ?1",
         )
@@ -361,20 +363,23 @@ pub fn archive_session_turns(conn: &Connection, ids: &[i64]) -> Result<()> {
     if ids.is_empty() {
         return Ok(());
     }
-    // Build a parameterised IN list.  rusqlite does not support binding a slice
-    // directly, so we construct the placeholders manually.
-    let placeholders = ids
-        .iter()
-        .enumerate()
-        .map(|(i, _)| format!("?{}", i + 1))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let sql = format!("UPDATE memories SET archived = 1 WHERE id IN ({placeholders})");
-    let mut stmt = conn
-        .prepare(&sql)
-        .context("preparing archive_session_turns")?;
-    stmt.execute(rusqlite::params_from_iter(ids))
-        .context("archiving session turns")?;
+    // SQLite has a hard limit of 999 bound parameters per statement.
+    // Process the ids in chunks to stay within that limit.
+    const CHUNK_SIZE: usize = 999;
+    for chunk in ids.chunks(CHUNK_SIZE) {
+        let placeholders = chunk
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("?{}", i + 1))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!("UPDATE memories SET archived = 1 WHERE id IN ({placeholders})");
+        let mut stmt = conn
+            .prepare(&sql)
+            .context("preparing archive_session_turns")?;
+        stmt.execute(rusqlite::params_from_iter(chunk))
+            .context("archiving session turns")?;
+    }
     Ok(())
 }
 

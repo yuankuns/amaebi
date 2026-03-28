@@ -392,6 +392,7 @@ mod tests {
             r#"{"type":"detach_accepted","session_id":"uuid-1"}"#,
             r#"{"type":"memory_entry","role":"user","content":"hi"}"#,
             r#"{"type":"waiting_for_input","prompt":"Which language?"}"#,
+            r#"{"type":"compacting"}"#,
         ];
         for frame in frames {
             let r: Response = serde_json::from_str(frame).unwrap();
@@ -405,6 +406,7 @@ mod tests {
                     | Response::DetachAccepted { .. }
                     | Response::MemoryEntry { .. }
                     | Response::WaitingForInput { .. }
+                    | Response::Compacting
             ));
         }
     }
