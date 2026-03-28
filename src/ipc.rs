@@ -115,8 +115,6 @@ pub enum Response {
         /// The message content.
         content: String,
     },
-    /// The daemon has started a background compaction of conversation history.
-    Compacting,
     /// The daemon is waiting for interactive user input before proceeding.
     ///
     /// Sent when the model asks a clarifying question or ends its response
