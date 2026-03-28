@@ -64,7 +64,7 @@ pub async fn execute_with_sandbox(
 
         tracing::debug!(command = %command, "running shell command via sandbox");
 
-        // Resolve cwd: use the workspace from the sandbox config or fall back to ".".
+        // Resolve cwd using std::env::current_dir(); falls back to "." on error.
         let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
 
         let output = tokio::task::spawn_blocking(move || sandbox.spawn(&command, &cwd))
@@ -391,7 +391,85 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
     }
 
-    // ---- unknown tool ---------------------------------------------------
+    // ---- execute_with_sandbox dispatch -----------------------------------
+
+    use crate::sandbox::{Access, Sandbox, SandboxConfig, SandboxOutput};
+    use std::sync::{Arc, Mutex};
+
+    /// A fake sandbox that records every command passed to `spawn`.
+    struct RecordingSandbox {
+        commands: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl Sandbox for RecordingSandbox {
+        fn name(&self) -> &str {
+            "recording"
+        }
+        fn available(&self) -> bool {
+            true
+        }
+        fn spawn(&self, cmd: &str, _cwd: &std::path::Path) -> anyhow::Result<SandboxOutput> {
+            self.commands.lock().unwrap().push(cmd.to_string());
+            Ok(SandboxOutput {
+                status: std::process::Command::new("true").status().unwrap(),
+                stdout: "sandbox-output".into(),
+                stderr: String::new(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_with_sandbox_routes_shell_command_through_sandbox() {
+        let recorded: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(vec![]));
+        let sandbox = Arc::new(RecordingSandbox {
+            commands: recorded.clone(),
+        });
+
+        let executor = LocalExecutor;
+        let result = execute_with_sandbox(
+            &executor,
+            sandbox,
+            "shell_command",
+            serde_json::json!({"command": "echo hi"}),
+        )
+        .await
+        .unwrap();
+
+        // The sandbox was invoked and returned its canned output.
+        assert!(result.contains("sandbox-output"), "got: {result}");
+        let cmds = recorded.lock().unwrap();
+        assert_eq!(cmds.len(), 1);
+        assert_eq!(cmds[0], "echo hi");
+    }
+
+    #[tokio::test]
+    async fn execute_with_sandbox_non_shell_tool_bypasses_sandbox() {
+        let recorded: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(vec![]));
+        let sandbox = Arc::new(RecordingSandbox {
+            commands: recorded.clone(),
+        });
+
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("hello.txt");
+        std::fs::write(&path, "file-content").unwrap();
+
+        let executor = LocalExecutor;
+        let result = execute_with_sandbox(
+            &executor,
+            sandbox,
+            "read_file",
+            serde_json::json!({"path": path.to_str().unwrap()}),
+        )
+        .await
+        .unwrap();
+
+        // Executor (not sandbox) handled it.
+        assert_eq!(result, "file-content");
+        // Sandbox was never called.
+        assert!(recorded.lock().unwrap().is_empty());
+    }
+
+    // ---- execute_with_sandbox --------------------------------------------
 
     #[tokio::test]
     async fn unknown_tool_returns_descriptive_error() {

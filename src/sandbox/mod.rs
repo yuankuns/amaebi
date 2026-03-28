@@ -1,3 +1,4 @@
+#[cfg(target_os = "linux")]
 pub mod landlock_seccomp;
 pub mod noop;
 
@@ -30,6 +31,10 @@ pub struct SandboxConfig {
     pub workspace_access: Access,
     pub network: bool,
     pub allowed_paths: Vec<(PathBuf, Access)>,
+    /// Note: Landlock uses an allowlist-only approach.  Paths listed here are
+    /// **not enforced** by the Landlock backend — access is denied implicitly
+    /// for any path not in `allowed_paths`.  This field is reserved for future
+    /// backends (e.g. seccomp) that support explicit denials.
     pub denied_paths: Vec<PathBuf>,
 }
 
@@ -83,7 +88,16 @@ pub fn create_backend(config: &SandboxConfig) -> Box<dyn Sandbox> {
     if !config.enabled {
         return Box::new(noop::NoopSandbox);
     }
+    // Warn if denied_paths is set — Landlock does not enforce explicit denials.
+    if !config.denied_paths.is_empty() {
+        tracing::warn!(
+            count = config.denied_paths.len(),
+            "sandbox: denied_paths is set but the Landlock backend uses allowlist-only \
+             enforcement; denied_paths will NOT be actively blocked"
+        );
+    }
     match config.backend.as_str() {
+        #[cfg(target_os = "linux")]
         "landlock" => Box::new(landlock_seccomp::LandlockSandbox::new(config.clone())),
         _ => Box::new(noop::NoopSandbox),
     }
@@ -123,6 +137,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn create_backend_landlock_returns_landlock() {
         let cfg = SandboxConfig {
             enabled: true,

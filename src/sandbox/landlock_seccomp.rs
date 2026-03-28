@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use landlock::{
-    Access as LLAccess, AccessFs, PathBeneath, PathFd, RulesetAttr, RulesetCreatedAttr,
+    Access as _, AccessFs, PathBeneath, PathFd, RulesetAttr as _, RulesetCreatedAttr as _,
     RulesetStatus, ABI as LandlockABI,
 };
 use std::os::unix::process::CommandExt;
@@ -15,10 +15,11 @@ use super::{Access, Sandbox, SandboxConfig, SandboxOutput};
 /// child process after `fork()` but before `exec()`) to install Landlock
 /// rules in the child only, so the parent daemon is unaffected.
 ///
-/// If the running kernel does not support Landlock (kernel < 5.13, or the
-/// feature is compiled out), the restriction silently degrades and the command
-/// runs without isolation rather than failing.  `available()` reflects whether
-/// full enforcement was possible on the last `spawn` call; it is advisory only.
+/// `available()` checks whether the running kernel supports Landlock ABI v1.
+/// It does **not** reflect the outcome of the last `spawn` call.  If the
+/// kernel does not support Landlock the restriction degrades gracefully and
+/// errors may be logged to stderr, but the command still runs without
+/// isolation rather than failing hard.
 pub struct LandlockSandbox {
     config: SandboxConfig,
 }
@@ -75,9 +76,18 @@ impl Sandbox for LandlockSandbox {
 
         // Configured allowed paths
         for (p, acc) in &allowed_paths {
-            if p.exists() {
-                let rw = *acc == Access::Rw;
-                rules.push((p.to_string_lossy().into_owned(), rw));
+            match acc {
+                Access::None => {} // skip — don't grant any access
+                Access::Ro => {
+                    if p.exists() {
+                        rules.push((p.to_string_lossy().into_owned(), false));
+                    }
+                }
+                Access::Rw => {
+                    if p.exists() {
+                        rules.push((p.to_string_lossy().into_owned(), true));
+                    }
+                }
             }
         }
 
@@ -87,11 +97,12 @@ impl Sandbox for LandlockSandbox {
         // Safety: pre_exec runs in the child after fork, before exec.
         // All values captured here are cloned plain data (Vec<(String, bool)>),
         // so no async resources or Mutexes are shared.
+        // IMPORTANT: Do not call tracing/logging macros inside pre_exec —
+        // they are not async-signal-safe and can deadlock after fork.
         unsafe {
             command.pre_exec(move || {
                 if let Err(e) = apply_landlock_rules(&rules) {
-                    // Log to stderr (visible in daemon logs if the parent
-                    // captures stderr) but do not abort — degrade gracefully.
+                    // Write to stderr directly (async-signal-safe write).
                     eprintln!("[sandbox/landlock] restriction failed (degraded): {e}");
                 }
                 Ok(())
@@ -114,6 +125,10 @@ impl Sandbox for LandlockSandbox {
 ///
 /// Called inside the child process (inside `pre_exec`).  Returns `Ok(())`
 /// on success or graceful degradation, `Err` only on unexpected I/O errors.
+///
+/// IMPORTANT: This function must not call tracing macros or any code that
+/// acquires locks held by other threads — it runs after `fork()` in a
+/// single-threaded child and such calls can deadlock.
 fn apply_landlock_rules(rules: &[(String, bool)]) -> Result<()> {
     // Compose the full set of filesystem accesses we handle.
     let handled = AccessFs::from_all(LandlockABI::V1);
@@ -153,15 +168,15 @@ fn apply_landlock_rules(rules: &[(String, bool)]) -> Result<()> {
         .restrict_self()
         .context("landlock: restrict_self")?;
 
+    // Do NOT use tracing here — we are inside pre_exec (post-fork child).
+    // Use stderr directly if you need to report enforcement status.
     match status.ruleset {
-        RulesetStatus::FullyEnforced => {
-            tracing::debug!("landlock: fully enforced");
-        }
+        RulesetStatus::FullyEnforced => {}
         RulesetStatus::PartiallyEnforced => {
-            tracing::debug!("landlock: partially enforced (older kernel ABI)");
+            eprintln!("[sandbox/landlock] partially enforced (older kernel ABI)");
         }
         RulesetStatus::NotEnforced => {
-            tracing::debug!("landlock: not enforced (kernel lacks support)");
+            eprintln!("[sandbox/landlock] not enforced (kernel lacks support)");
         }
     }
 
@@ -209,8 +224,12 @@ mod tests {
         assert!(out.status.success());
     }
 
+    /// Landlock uses an allowlist-only model: any path not in `allowed_paths`
+    /// is implicitly denied.  This test verifies that a path omitted from the
+    /// allowlist is inaccessible — it does NOT test `denied_paths` enforcement
+    /// (which the Landlock backend does not implement).
     #[test]
-    fn denied_paths_are_blocked_when_landlock_available() {
+    fn path_not_in_allowlist_is_implicitly_denied() {
         // Create a "secret" directory under /var/tmp so it's not covered by
         // the default /tmp allowed path.
         let secret_base = std::path::Path::new("/var/tmp");
@@ -245,7 +264,8 @@ mod tests {
             return;
         }
 
-        // The secret dir is NOT in allowed_paths, so it should be denied.
+        // The secret dir is NOT in allowed_paths, so it should be denied
+        // implicitly by the Landlock allowlist.
         let out = sb
             .spawn(
                 &format!("cat '{}'", secret.join("file.txt").display()),
@@ -255,7 +275,7 @@ mod tests {
         // Under Landlock the cat should fail (non-zero exit).
         assert!(
             !out.status.success(),
-            "reading denied path should fail; stdout={:?} stderr={:?}",
+            "reading path absent from allowlist should fail; stdout={:?} stderr={:?}",
             out.stdout,
             out.stderr
         );
