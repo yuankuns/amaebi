@@ -76,6 +76,9 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
     let mut stdout = tokio::io::stdout();
     // Timestamp of the first Ctrl-C press; None means no pending first press.
     let mut last_ctrl_c: Option<Instant> = None;
+    // Set to true after the first Ctrl-C press to suppress daemon output
+    // while the user is typing a steering correction.  Cleared on SteerAck.
+    let mut steer_pending = false;
 
     // Stdin reader — only created when stdin is a TTY (interactive terminal).
     // Piped invocations (`echo "fix" | amaebi ask "..."`) have stdin as a
@@ -112,6 +115,7 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
                 // for a steering correction.  The existing stdin reader will
                 // pick up whatever the user types and send it as a Steer.
                 // Double Ctrl-C (handled above) exits.
+                steer_pending = true;
                 if use_stdin {
                     eprintln!("\n[interrupted — type a correction and press Enter, or Ctrl-C again to exit]");
                     eprint!(">");
@@ -133,38 +137,48 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
                     serde_json::from_str(&line).context("parsing response frame")?;
                 match resp {
                     Response::Text { chunk } => {
-                        stdout
-                            .write_all(chunk.as_bytes())
-                            .await
-                            .context("writing to stdout")?;
-                        stdout.flush().await.context("flushing stdout")?;
+                        // Suppress output while the user is typing a steering correction
+                        // to prevent mixing daemon output with the user's input.
+                        if !steer_pending {
+                            stdout
+                                .write_all(chunk.as_bytes())
+                                .await
+                                .context("writing to stdout")?;
+                            stdout.flush().await.context("flushing stdout")?;
+                        }
                     }
                     Response::Done => break,
                     Response::Error { message } => {
                         anyhow::bail!("{message}");
                     }
                     Response::ToolUse { name, detail } => {
-                        // Tool notifications go to stderr so stdout stays clean for the AI response.
-                        eprintln!();
-                        match name.as_str() {
-                            "shell_command" => eprintln!("```bash\n$ {detail}\n```"),
-                            "read_file" => eprintln!("📄 {detail}"),
-                            "edit_file" => eprintln!("✏️  {detail}"),
-                            "tmux_send_keys" => eprintln!("⌨️  send-keys: {detail}"),
-                            "tmux_capture_pane" => eprintln!("🖥️  capture: {detail}"),
-                            _ => eprintln!("🔧 {name}: {detail}"),
+                        // Suppress tool notifications while steering is pending.
+                        if !steer_pending {
+                            // Tool notifications go to stderr so stdout stays clean for the AI response.
+                            eprintln!();
+                            match name.as_str() {
+                                "shell_command" => eprintln!("```bash\n$ {detail}\n```"),
+                                "read_file" => eprintln!("📄 {detail}"),
+                                "edit_file" => eprintln!("✏️  {detail}"),
+                                "tmux_send_keys" => eprintln!("⌨️  send-keys: {detail}"),
+                                "tmux_capture_pane" => eprintln!("🖥️  capture: {detail}"),
+                                _ => eprintln!("🔧 {name}: {detail}"),
+                            }
                         }
                     }
                     Response::Compacting => {
-                        if std::io::stderr().is_terminal() {
-                            eprintln!("\n\x1b[1;5;34m[compacting conversation history…]\x1b[0m");
-                        } else {
-                            eprintln!("\n[compacting conversation history…]");
+                        if !steer_pending {
+                            if std::io::stderr().is_terminal() {
+                                eprintln!("\n\x1b[1;5;34m[compacting conversation history…]\x1b[0m");
+                            } else {
+                                eprintln!("\n[compacting conversation history…]");
+                            }
                         }
                     }
                     Response::SteerAck => {
                         // The daemon has acknowledged our steering message.
-                        // No visible output — the next model turn will incorporate it.
+                        // Resume output rendering for the next model turn.
+                        steer_pending = false;
                         tracing::debug!("steer acknowledged by daemon");
                     }
                     Response::DetachAccepted { .. } => {
@@ -333,6 +347,9 @@ pub async fn run_resume(
     let mut lines = BufReader::new(reader).lines();
     let mut stdout = tokio::io::stdout();
     let mut last_ctrl_c: Option<Instant> = None;
+    // Set to true after the first Ctrl-C press to suppress daemon output
+    // while the user is typing a steering correction.  Cleared on SteerAck.
+    let mut steer_pending = false;
 
     let use_stdin = std::io::stdin().is_terminal();
     let mut stdin_lines: Option<BufReader<tokio::io::Stdin>> = if use_stdin {
@@ -354,6 +371,7 @@ pub async fn run_resume(
                     let _ = tokio::io::stderr().flush().await;
                     return Err(anyhow::Error::new(Interrupted));
                 }
+                steer_pending = true;
                 if std::io::stdin().is_terminal() {
                     eprintln!("\n[interrupted — type a correction and press Enter, or Ctrl-C again to exit]");
                     eprint!(">");
@@ -370,30 +388,40 @@ pub async fn run_resume(
                 let resp: Response = serde_json::from_str(&line).context("parsing response")?;
                 match resp {
                     Response::Text { chunk } => {
-                        stdout.write_all(chunk.as_bytes()).await.context("writing to stdout")?;
-                        stdout.flush().await.context("flushing stdout")?;
+                        // Suppress output while the user is typing a steering correction.
+                        if !steer_pending {
+                            stdout.write_all(chunk.as_bytes()).await.context("writing to stdout")?;
+                            stdout.flush().await.context("flushing stdout")?;
+                        }
                     }
                     Response::Done => break,
                     Response::Error { message } => anyhow::bail!("{message}"),
                     Response::ToolUse { name, detail } => {
-                        eprintln!();
-                        match name.as_str() {
-                            "shell_command" => eprintln!("```bash\n$ {detail}\n```"),
-                            "read_file" => eprintln!("📄 {detail}"),
-                            "edit_file" => eprintln!("✏️  {detail}"),
-                            "tmux_send_keys" => eprintln!("⌨️  send-keys: {detail}"),
-                            "tmux_capture_pane" => eprintln!("🖥️  capture: {detail}"),
-                            _ => eprintln!("🔧 {name}: {detail}"),
+                        // Suppress tool notifications while steering is pending.
+                        if !steer_pending {
+                            eprintln!();
+                            match name.as_str() {
+                                "shell_command" => eprintln!("```bash\n$ {detail}\n```"),
+                                "read_file" => eprintln!("📄 {detail}"),
+                                "edit_file" => eprintln!("✏️  {detail}"),
+                                "tmux_send_keys" => eprintln!("⌨️  send-keys: {detail}"),
+                                "tmux_capture_pane" => eprintln!("🖥️  capture: {detail}"),
+                                _ => eprintln!("🔧 {name}: {detail}"),
+                            }
                         }
                     }
                     Response::Compacting => {
-                        if std::io::stderr().is_terminal() {
-                            eprintln!("\n\x1b[1;5;34m[compacting conversation history…]\x1b[0m");
-                        } else {
-                            eprintln!("\n[compacting conversation history…]");
+                        if !steer_pending {
+                            if std::io::stderr().is_terminal() {
+                                eprintln!("\n\x1b[1;5;34m[compacting conversation history…]\x1b[0m");
+                            } else {
+                                eprintln!("\n[compacting conversation history…]");
+                            }
                         }
                     }
                     Response::SteerAck => {
+                        // Resume output rendering for the next model turn.
+                        steer_pending = false;
                         tracing::debug!("steer acknowledged by daemon");
                     }
                     Response::DetachAccepted { .. } => {
