@@ -13,8 +13,16 @@ use crate::ipc::{write_frame, Request, Response};
 use crate::memory_db;
 use crate::tools::{self, ToolExecutor};
 
-/// How many history entries (user+assistant pairs) to inject as context.
-const MAX_HISTORY: usize = 20;
+/// Tokens reserved for model output — matches `max_tokens` in the request body (4096).
+const RESPONSE_RESERVE_TOKENS: usize = 4_096;
+/// Compact session history when prompt tokens exceed this fraction of available input.
+const COMPACTION_THRESHOLD: f64 = 0.85;
+/// Minimum recent user/assistant *pairs* to keep in the hot tail after a token-budget trim.
+const HOT_TAIL_PAIRS: usize = 3;
+/// How many past-session summaries to prepend to the system message.
+const MAX_SUMMARIES: usize = 5;
+/// Maximum chars per injected past-session summary.
+const MAX_SUMMARY_CHARS: usize = 500;
 
 /// State shared across all concurrent client connections via `Arc`.
 pub struct DaemonState {
@@ -28,6 +36,12 @@ pub struct DaemonState {
     /// all reads and writes through a single connection without re-running the
     /// schema setup (`PRAGMA`s, `CREATE TABLE`, triggers) on every request.
     pub db: Arc<Mutex<rusqlite::Connection>>,
+    /// Sessions that currently have a compaction task in flight.
+    ///
+    /// Before spawning a new `compact_session` for a within-session compaction,
+    /// insert the session ID.  The task removes itself on completion.  If the
+    /// ID is already present, skip the spawn to prevent overlapping compactions.
+    pub compacting_sessions: Arc<Mutex<HashSet<String>>>,
 }
 
 impl DaemonState {
@@ -47,8 +61,115 @@ impl DaemonState {
             tokens: TokenCache::new(),
             executor: Box::new(tools::LocalExecutor),
             db: Arc::new(Mutex::new(conn)),
+            compacting_sessions: Arc::new(Mutex::new(HashSet::new())),
         })
     }
+}
+
+// ---------------------------------------------------------------------------
+// Token budget helpers
+// ---------------------------------------------------------------------------
+
+/// Approximate token count for a message list.
+///
+/// Uses tiktoken o200k_base (GPT-4o's encoding) with the OpenAI overhead formula:
+/// 4 tokens per message + role + content + 3 priming tokens for the reply.
+/// The tokenizer is initialised lazily on the first call (OnceLock).
+///
+/// Falls back to a conservative char-based estimate (~4 chars/token) if the
+/// tokenizer cannot be loaded, so a failed initialisation never panics the daemon.
+fn count_message_tokens(messages: &[Message]) -> usize {
+    use std::sync::OnceLock;
+    static BPE: OnceLock<Result<tiktoken_rs::CoreBPE, String>> = OnceLock::new();
+    let bpe_result = BPE.get_or_init(|| {
+        tiktoken_rs::o200k_base().map_err(|e| format!("failed to load o200k_base tokenizer: {e}"))
+    });
+
+    match bpe_result {
+        Ok(bpe) => {
+            let mut total = 3usize; // priming tokens for the assistant reply
+            for msg in messages {
+                total += 4; // per-message overhead: <|start|>, role, separator, <|end|>
+                total += bpe.encode_with_special_tokens(&msg.role).len();
+                if let Some(ref content) = msg.content {
+                    total += bpe.encode_with_special_tokens(content).len();
+                }
+                if !msg.tool_calls.is_empty() {
+                    if let Ok(s) = serde_json::to_string(&msg.tool_calls) {
+                        total += bpe.encode_with_special_tokens(&s).len();
+                    }
+                }
+                if let Some(ref id) = msg.tool_call_id {
+                    total += bpe.encode_with_special_tokens(id).len();
+                }
+            }
+            total
+        }
+        Err(e) => {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static WARNED: AtomicBool = AtomicBool::new(false);
+            if !WARNED.swap(true, Ordering::Relaxed) {
+                tracing::warn!(error = %e, "tokenizer unavailable; using char-based estimate");
+            }
+            let mut char_count = 0usize;
+            for msg in messages {
+                char_count += msg.role.len();
+                if let Some(ref content) = msg.content {
+                    char_count += content.len();
+                }
+                if !msg.tool_calls.is_empty() {
+                    if let Ok(s) = serde_json::to_string(&msg.tool_calls) {
+                        char_count += s.len();
+                    }
+                }
+                if let Some(ref id) = msg.tool_call_id {
+                    char_count += id.len();
+                }
+            }
+            3 + messages.len() * 4 + char_count.div_ceil(4)
+        }
+    }
+}
+
+/// Context window size for `model`, matched by prefix (longest wins).
+///
+/// Falls back to a conservative 32 k for unknown models so we never send
+/// more tokens than the server can handle.
+fn context_limit_for_model(model: &str) -> usize {
+    // Ordered longest-prefix-first so that e.g. "gpt-4-turbo" beats "gpt-4".
+    const TABLE: &[(&str, usize)] = &[
+        ("gpt-4o", 128_000),
+        ("gpt-4-turbo", 128_000),
+        ("gpt-4", 8_192),
+        ("gpt-3.5-turbo", 16_385),
+        ("o1", 200_000),
+        ("o3", 200_000),
+        ("claude", 1_000_000),
+    ];
+    TABLE
+        .iter()
+        .find(|(prefix, _)| model.starts_with(prefix))
+        .map(|(_, limit)| *limit)
+        .unwrap_or(32_768) // conservative default for unknown models
+}
+
+/// Token threshold above which compaction should be triggered for `model`.
+///
+/// Returns `usize::MAX` for models whose context window is too small to
+/// accommodate `RESPONSE_RESERVE_TOKENS`, disabling compaction/trimming for
+/// those models rather than triggering it on every turn.
+fn compaction_threshold_tokens(model: &str) -> usize {
+    // Allow manual override for debugging: AMAEBI_COMPACTION_THRESHOLD=<tokens>
+    if let Ok(val) = std::env::var("AMAEBI_COMPACTION_THRESHOLD") {
+        if let Ok(n) = val.parse::<usize>() {
+            return n;
+        }
+    }
+    let available = context_limit_for_model(model).saturating_sub(RESPONSE_RESERVE_TOKENS);
+    if available == 0 {
+        return usize::MAX;
+    }
+    (available as f64 * COMPACTION_THRESHOLD) as usize
 }
 
 // ---------------------------------------------------------------------------
@@ -210,12 +331,12 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
             // Spawn the agentic loop as a fully detached background task.
             let state = Arc::clone(&state);
             tokio::spawn(async move {
-                // Load recent history from SQLite.
+                // Load full session history from SQLite; token budget trims it below.
                 let db = Arc::clone(&state.db);
                 let sid_clone = sid.clone();
                 let history = tokio::task::spawn_blocking(move || {
                     let conn = db.lock().unwrap_or_else(|p| p.into_inner());
-                    memory_db::get_session_recent(&conn, &sid_clone, MAX_HISTORY * 2)
+                    memory_db::get_session_history(&conn, &sid_clone)
                 })
                 .await
                 .unwrap_or_else(|e| {
@@ -227,8 +348,22 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                     vec![]
                 });
 
-                let mut messages = build_messages(&prompt, tmux_pane.as_deref(), &history);
+                let mut messages =
+                    build_messages(&prompt, tmux_pane.as_deref(), &history, &[], None);
                 inject_skill_files(&mut messages).await;
+
+                // Pre-flight token check: trim to hot tail if over budget.
+                let threshold = compaction_threshold_tokens(&model);
+                if count_message_tokens(&messages) > threshold {
+                    let hot = HOT_TAIL_PAIRS * 2;
+                    let trimmed = if history.len() > hot {
+                        &history[history.len() - hot..]
+                    } else {
+                        &history[..]
+                    };
+                    messages = build_messages(&prompt, tmux_pane.as_deref(), trimmed, &[], None);
+                    inject_skill_files(&mut messages).await;
+                }
 
                 // Use a sink writer — output frames are discarded; we only
                 // need the return value (final_text) for the inbox.
@@ -239,7 +374,7 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                 let (_, mut steer_rx) = tokio::sync::mpsc::channel::<String>(1);
 
                 match run_agentic_loop(&state, &model, messages, &mut sink, &mut steer_rx).await {
-                    Ok(final_text) => {
+                    Ok((final_text, _)) => {
                         let user_text = truncate_chars(prompt.clone(), MAX_PROMPT_CHARS);
                         let assistant_text = truncate_chars(final_text.clone(), MAX_RESPONSE_CHARS);
 
@@ -329,32 +464,66 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                 }
             });
 
-            // Resume: load the FULL history from SQLite without a sliding-window cap.
+            // Resume: load the FULL history from SQLite without a sliding-window cap,
+            // plus summaries from other sessions for cross-session context,
+            // and the session's own running summary if one was already compacted.
             let db = Arc::clone(&state.db);
             let sid_clone = session_id.clone();
-            let history = tokio::task::spawn_blocking(move || {
-                let conn = db.lock().unwrap_or_else(|p| p.into_inner());
-                memory_db::get_session_history(&conn, &sid_clone)
-            })
-            .await
-            .unwrap_or_else(|e| {
-                tracing::warn!(error = %e, "resume history load panicked");
-                Ok(vec![])
-            })
-            .unwrap_or_else(|e| {
-                tracing::warn!(error = %e, "failed to load resume history");
-                vec![]
-            });
+            let (history, summaries, own_summary) =
+                tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+                    let conn = db.lock().unwrap_or_else(|p| p.into_inner());
+                    let history = memory_db::get_session_history(&conn, &sid_clone)?;
+                    let summaries =
+                        memory_db::get_recent_summaries(&conn, &sid_clone, MAX_SUMMARIES)?;
+                    let own_summary = memory_db::get_session_own_summary(&conn, &sid_clone)?;
+                    Ok((history, summaries, own_summary))
+                })
+                .await
+                .unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "resume history load panicked");
+                    Ok((vec![], vec![], None))
+                })
+                .unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "failed to load resume history");
+                    (vec![], vec![], None)
+                });
 
-            let mut messages = build_messages_resume(&prompt, tmux_pane.as_deref(), &history);
+            // Resume: full history for re-hydration; token budget trims if needed.
+            let mut messages = build_messages(
+                &prompt,
+                tmux_pane.as_deref(),
+                &history,
+                &summaries,
+                own_summary.as_deref(),
+            );
             inject_skill_files(&mut messages).await;
 
+            // Pre-flight token check.
+            let threshold = compaction_threshold_tokens(&model);
+            if count_message_tokens(&messages) > threshold {
+                let hot = HOT_TAIL_PAIRS * 2;
+                let trimmed = if history.len() > hot {
+                    &history[history.len() - hot..]
+                } else {
+                    &history[..]
+                };
+                messages = build_messages(
+                    &prompt,
+                    tmux_pane.as_deref(),
+                    trimmed,
+                    &summaries,
+                    own_summary.as_deref(),
+                );
+                inject_skill_files(&mut messages).await;
+            }
+
             match run_agentic_loop(&state, &model, messages, &mut writer, &mut steer_rx).await {
-                Ok(response_text) => {
+                Ok((response_text, _)) => {
                     let user_text = truncate_chars(prompt.clone(), MAX_PROMPT_CHARS);
                     let assistant_text = truncate_chars(response_text.clone(), MAX_RESPONSE_CHARS);
 
                     store_conversation(&state, &session_id, &user_text, &assistant_text).await;
+                    write_frame(&mut writer, &Response::Done).await?;
                 }
                 Err(e) => {
                     tracing::error!(error = %e, "resume agentic loop error");
@@ -439,34 +608,155 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                 }
             });
 
-            // Load recent history from SQLite (sliding window).
+            // Load full session history, past-session summaries, and the session's own
+            // running summary (if any) for token-budget-driven compaction decisions.
             let db = Arc::clone(&state.db);
             let sid_clone = sid.clone();
-            let history = tokio::task::spawn_blocking(move || {
-                let conn = db.lock().unwrap_or_else(|p| p.into_inner());
-                // MAX_HISTORY entries × 2 rows (user+assistant) per entry
-                memory_db::get_session_recent(&conn, &sid_clone, MAX_HISTORY * 2)
-            })
-            .await
-            .unwrap_or_else(|e| {
-                tracing::warn!(error = %e, "session history load panicked");
-                Ok(vec![])
-            })
-            .unwrap_or_else(|e| {
-                tracing::warn!(error = %e, "failed to load session history");
-                vec![]
-            });
+            let (history, past_summaries, own_summary) =
+                tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+                    let conn = db.lock().unwrap_or_else(|p| p.into_inner());
+                    let history = memory_db::get_session_history(&conn, &sid_clone)?;
+                    let past_summaries =
+                        memory_db::get_recent_summaries(&conn, &sid_clone, MAX_SUMMARIES)?;
+                    let own_summary = memory_db::get_session_own_summary(&conn, &sid_clone)?;
+                    Ok((history, past_summaries, own_summary))
+                })
+                .await
+                .unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "session history load panicked");
+                    Ok((vec![], vec![], None))
+                })
+                .unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "failed to load session history");
+                    (vec![], vec![], None)
+                });
 
-            let mut messages = build_messages(&prompt, tmux_pane.as_deref(), &history);
+            // Cross-session: if this is the first turn of a new session, compact any
+            // old sessions that have never been summarised.
+            if history.is_empty() {
+                let db = Arc::clone(&state.db);
+                let sid_clone = sid.clone();
+                let old_sessions = tokio::task::spawn_blocking(move || {
+                    let conn = db.lock().unwrap_or_else(|p| p.into_inner());
+                    memory_db::get_sessions_without_summary(&conn, &sid_clone, MAX_SUMMARIES)
+                })
+                .await
+                .unwrap_or_else(|_| Ok(vec![]))
+                .unwrap_or_default();
+
+                for old_sid in old_sessions {
+                    // Cross-session: summarise the full closed session (keep_recent = 0).
+                    tokio::spawn(compact_session(
+                        Arc::clone(&state),
+                        old_sid,
+                        model.clone(),
+                        0,
+                    ));
+                }
+            }
+
+            let mut messages = build_messages(
+                &prompt,
+                tmux_pane.as_deref(),
+                &history,
+                &past_summaries,
+                own_summary.as_deref(),
+            );
             inject_skill_files(&mut messages).await;
 
+            // Pre-flight token check: if over the compaction threshold, trim to hot tail.
+            // Also record whether we had to trim — that alone is enough to schedule
+            // compaction even if the API does not return usage data.
+            let threshold = compaction_threshold_tokens(&model);
+            let pre_flight_trimmed = if count_message_tokens(&messages) > threshold {
+                let hot = HOT_TAIL_PAIRS * 2;
+                let trimmed = if history.len() > hot {
+                    &history[history.len() - hot..]
+                } else {
+                    &history[..]
+                };
+                messages = build_messages(
+                    &prompt,
+                    tmux_pane.as_deref(),
+                    trimmed,
+                    &past_summaries,
+                    own_summary.as_deref(),
+                );
+                inject_skill_files(&mut messages).await;
+                tracing::debug!(
+                    hot_tail = trimmed.len(),
+                    "pre-flight token trim: history reduced to hot tail"
+                );
+                true
+            } else {
+                false
+            };
+
+            // Snapshot the token count before messages is moved into the loop.
+            // Used as a fallback when the API returns prompt_tokens = 0.
+            let pre_send_tokens = count_message_tokens(&messages);
+
             match run_agentic_loop(&state, &model, messages, &mut writer, &mut steer_rx).await {
-                Ok(response_text) => {
+                Ok((response_text, prompt_tokens)) => {
                     let user_text = truncate_chars(prompt.clone(), MAX_PROMPT_CHARS);
                     let assistant_text = truncate_chars(response_text.clone(), MAX_RESPONSE_CHARS);
 
                     // Persist to SQLite memory store.
                     store_conversation(&state, &sid, &user_text, &assistant_text).await;
+
+                    // Within-session compaction: trigger when the context is large enough.
+                    // Two signals both warrant compaction:
+                    //   1. pre_flight_trimmed — the full history already exceeded the
+                    //      threshold before we sent the request; the API's prompt_tokens
+                    //      reflects only the trimmed slice and would never cross the
+                    //      threshold on its own.
+                    //   2. effective_tokens > threshold — the API confirmed the request
+                    //      consumed more than the compaction threshold.  Fall back to the
+                    //      pre-send tiktoken estimate when the server returns 0.
+                    let effective_tokens = if prompt_tokens > 0 {
+                        prompt_tokens
+                    } else {
+                        pre_send_tokens
+                    };
+                    tracing::debug!(
+                        effective_tokens,
+                        threshold,
+                        pre_flight_trimmed,
+                        prompt_tokens,
+                        pre_send_tokens,
+                        "compaction check"
+                    );
+                    // Compact whenever the context is over budget.  After compaction,
+                    // the archived turns are excluded from future history loads, so
+                    // the loaded window shrinks and this condition naturally goes false
+                    // until enough new turns accumulate to push past the threshold again.
+                    if pre_flight_trimmed || effective_tokens > threshold {
+                        tracing::info!(
+                            session = %sid,
+                            effective_tokens,
+                            threshold,
+                            pre_flight_trimmed,
+                            "compacting conversation history"
+                        );
+                        let _ = write_frame(&mut writer, &Response::Compacting).await;
+                        // Guard against overlapping compactions for the same session.
+                        let already_compacting = {
+                            let mut guard = state
+                                .compacting_sessions
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner());
+                            !guard.insert(sid.clone())
+                        };
+                        if !already_compacting {
+                            tokio::spawn(compact_session(
+                                Arc::clone(&state),
+                                sid.clone(),
+                                model.clone(),
+                                HOT_TAIL_PAIRS * 2, // keep hot tail out of the summary
+                            ));
+                        }
+                    }
+                    write_frame(&mut writer, &Response::Done).await?;
                 }
                 Err(e) => {
                     tracing::error!(error = %e, "agentic loop error");
@@ -555,6 +845,170 @@ pub(crate) async fn store_conversation(
 }
 
 // ---------------------------------------------------------------------------
+// Session compaction
+// ---------------------------------------------------------------------------
+
+/// Summarise a portion of a session's history and persist it to `session_summaries`.
+///
+/// Triggered lazily via `tokio::spawn` in two cases:
+/// 1. **Cross-session** (`keep_recent = 0`): a closed session is summarised in full
+///    so future sessions can learn from it.
+/// 2. **Within-session** (`keep_recent = HOT_TAIL_PAIRS * 2`): only the turns that the
+///    token-budget trim is *dropping* are summarised — the recent `keep_recent` rows are
+///    excluded so the summary and the raw hot tail never overlap.
+///
+/// Uses the same agentic loop as normal requests (handles token refresh and retries),
+/// but with a sink writer and a dropped steer sender so it is fully non-interactive.
+/// Best-effort: errors are only logged.
+/// RAII guard that removes `session_id` from `compacting_sessions` when dropped,
+/// ensuring the slot is freed on every exit path (early return, error, or normal).
+struct CompactingGuard {
+    compacting_sessions: Arc<Mutex<HashSet<String>>>,
+    session_id: String,
+}
+
+impl Drop for CompactingGuard {
+    fn drop(&mut self) {
+        self.compacting_sessions
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&self.session_id);
+    }
+}
+
+async fn compact_session(
+    state: Arc<DaemonState>,
+    session_id: String,
+    model: String,
+    keep_recent: usize,
+) {
+    // Hold a guard so `compacting_sessions` is cleaned up on every exit path.
+    let _guard = CompactingGuard {
+        compacting_sessions: Arc::clone(&state.compacting_sessions),
+        session_id: session_id.clone(),
+    };
+
+    let db = Arc::clone(&state.db);
+    let sid = session_id.clone();
+    // Load the non-archived turns to summarise, plus any existing summary so the
+    // new summary can incorporate it (cumulative re-compaction).
+    let (history, existing_summary) = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let conn = db.lock().unwrap_or_else(|p| p.into_inner());
+        let total = memory_db::count_session_turns(&conn, &sid)?;
+        // Only summarise non-archived turns; keep_recent holds the hot tail out.
+        let to_summarise = total.saturating_sub(keep_recent);
+        tracing::debug!(
+            session_id = %sid,
+            total,
+            keep_recent,
+            to_summarise,
+            "compact_session: loaded history counts"
+        );
+        let history = memory_db::get_session_oldest(&conn, &sid, to_summarise)?;
+        let existing_summary = memory_db::get_session_own_summary(&conn, &sid)?;
+        Ok((history, existing_summary))
+    })
+    .await
+    .unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "compact_session: history load panicked");
+        Ok((vec![], None))
+    })
+    .unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "compact_session: failed to load history");
+        (vec![], None)
+    });
+
+    if history.is_empty() {
+        return;
+    }
+
+    // Build the compaction prompt.  If a previous summary exists, inject it before
+    // the new turns so the new summary is cumulative (covers all archived history).
+    let mut messages = vec![Message::system(
+        "You are a memory compactor. Output 3-5 bullet points capturing the key outcomes, \
+         decisions, and facts. Be concise and factual. Output only the bullet points, no preamble.",
+    )];
+
+    if let Some(ref prev) = existing_summary {
+        // Re-compaction: show the previous summary as an already-produced assistant
+        // turn so the model can extend it with the new turns that follow.
+        messages.push(Message::user(
+            "Summarise the conversation so far:".to_owned(),
+        ));
+        messages.push(Message::assistant(Some(prev.clone()), vec![]));
+    }
+
+    for entry in &history {
+        let content = truncate_chars(entry.content.clone(), 1_500);
+        match entry.role.as_str() {
+            "user" => messages.push(Message::user(content)),
+            "assistant" => messages.push(Message::assistant(Some(content), vec![])),
+            _ => {}
+        }
+    }
+    // The API requires the last message to be from the user role.
+    // For re-compaction always append the update request so the model knows to
+    // produce a combined summary rather than just continue the conversation.
+    if existing_summary.is_some() {
+        messages.push(Message::user(
+            "Produce an updated combined summary covering everything above.".to_owned(),
+        ));
+    } else if messages.last().is_some_and(|m| m.role == "assistant") {
+        messages.push(Message::user(
+            "Summarise the conversation above into 3-5 bullet points.".to_owned(),
+        ));
+    }
+
+    // Collect the IDs to archive on success.
+    let ids_to_archive: Vec<i64> = history.iter().map(|e| e.id).collect();
+
+    // Use a direct API call with no tools so the model cannot execute shell
+    // commands during background summarisation.
+    let compact_result: Result<String> = async {
+        let token = state
+            .tokens
+            .get(&state.http)
+            .await
+            .context("compact_session: refreshing token")?;
+        let mut sink = tokio::io::sink();
+        let resp =
+            copilot::stream_chat(&state.http, &token, &model, &messages, &[], &mut sink).await?;
+        Ok(resp.text)
+    }
+    .await;
+
+    match compact_result {
+        Ok(ref text) if !text.trim().is_empty() => {
+            let summary = text.trim().to_owned();
+            let db = Arc::clone(&state.db);
+            let sid = session_id.clone();
+            let ts = chrono::Utc::now().to_rfc3339();
+            let result = tokio::task::spawn_blocking(move || {
+                let conn = db.lock().unwrap_or_else(|p| p.into_inner());
+                let tx = conn
+                    .unchecked_transaction()
+                    .context("compact_session: begin transaction")?;
+                memory_db::store_session_summary(&conn, &sid, &summary, &ts)?;
+                memory_db::archive_session_turns(&conn, &ids_to_archive)?;
+                tx.commit().context("compact_session: commit transaction")
+            })
+            .await
+            .unwrap_or_else(|e| Err(anyhow::anyhow!("compact_session write panicked: {e}")));
+            if let Err(e) = result {
+                tracing::warn!(error = %e, "compact_session: failed to store summary");
+            } else {
+                tracing::debug!(session_id = %session_id, "session compacted");
+            }
+        }
+        Ok(_) => {
+            tracing::debug!(session_id = %session_id, "compact_session: empty summary (ignored)")
+        }
+        Err(ref e) => tracing::warn!(error = %e, "compact_session: API error"),
+    }
+    // _guard is dropped here (and on any earlier return), releasing the slot.
+}
+
+// ---------------------------------------------------------------------------
 // Agentic loop
 // ---------------------------------------------------------------------------
 
@@ -586,7 +1040,7 @@ pub(crate) async fn run_agentic_loop<W>(
     mut messages: Vec<Message>,
     writer: &mut W,
     steer_rx: &mut tokio::sync::mpsc::Receiver<String>,
-) -> Result<String>
+) -> Result<(String, usize)>
 where
     W: AsyncWriteExt + Unpin,
 {
@@ -594,6 +1048,7 @@ where
     let final_text;
     let mut tools_were_used = false;
     let mut conclusion_nudge_sent = false;
+    let mut last_prompt_tokens: usize;
 
     loop {
         // Drain any steering corrections that arrived since the last model
@@ -653,6 +1108,8 @@ where
                     }
                 }
             };
+
+        last_prompt_tokens = resp.prompt_tokens;
 
         let finish_label = match &resp.finish_reason {
             FinishReason::Stop => "stop",
@@ -966,8 +1423,7 @@ where
         }
     }
 
-    write_frame(writer, &Response::Done).await?;
-    Ok(final_text)
+    Ok((final_text, last_prompt_tokens))
 }
 
 // ---------------------------------------------------------------------------
@@ -1015,30 +1471,21 @@ async fn inject_skill_files_from(messages: &mut Vec<Message>, amaebi_home: &std:
 // Message construction
 // ---------------------------------------------------------------------------
 
+/// Build a message list for a Chat or Resume turn.
+///
+/// `past_summaries` — compacted summaries from other sessions (cross-session context).
+/// `own_summary`    — this session's running summary, injected before the history
+///                    rows so the model sees: summary → history → prompt.
+///
+/// All `history` rows are included without a sliding-window cap.  Callers are
+/// responsible for trimming the history slice to a token budget before calling
+/// (see the pre-flight check in `Request::Chat` / `Request::Resume` handlers).
 pub(crate) fn build_messages(
     prompt: &str,
     tmux_pane: Option<&str>,
     history: &[memory_db::DbMemoryEntry],
-) -> Vec<Message> {
-    build_messages_inner(prompt, tmux_pane, history, false)
-}
-
-/// Like [`build_messages`] but loads the **full** chronological history without
-/// the `MAX_HISTORY` sliding-window cap.  Used by the `--resume` path to
-/// re-hydrate a complete prior session.
-pub(crate) fn build_messages_resume(
-    prompt: &str,
-    tmux_pane: Option<&str>,
-    history: &[memory_db::DbMemoryEntry],
-) -> Vec<Message> {
-    build_messages_inner(prompt, tmux_pane, history, true)
-}
-
-fn build_messages_inner(
-    prompt: &str,
-    tmux_pane: Option<&str>,
-    history: &[memory_db::DbMemoryEntry],
-    full_history: bool,
+    past_summaries: &[String],
+    own_summary: Option<&str>,
 ) -> Vec<Message> {
     let mut system = "You are a helpful, concise AI assistant embedded in a tmux terminal. \
                       Answer in plain text; avoid markdown unless the user asks for it. \
@@ -1052,16 +1499,27 @@ fn build_messages_inner(
         system.push_str(&format!(" The user's active tmux pane is {pane}."));
     }
 
+    if !past_summaries.is_empty() {
+        system.push_str("\n\nSummaries from past sessions (oldest first):\n");
+        for s in past_summaries {
+            system.push_str(&truncate_chars(s.clone(), MAX_SUMMARY_CHARS));
+            system.push('\n');
+        }
+    }
+
     let mut messages = vec![Message::system(system)];
 
-    // In normal mode apply a sliding-window cap; in resume mode load everything.
-    let max_rows = MAX_HISTORY * 2; // each exchange = 2 rows (user + assistant)
-    let window = if full_history || history.len() <= max_rows {
-        history
-    } else {
-        &history[history.len() - max_rows..]
-    };
-    for entry in window {
+    // If this session has been partially compacted, prepend the running summary
+    // so the model knows what happened before the history window.
+    if let Some(summary) = own_summary {
+        let summary = truncate_chars(summary.to_owned(), MAX_SUMMARY_CHARS * 2);
+        messages.push(Message::user(
+            "[Summary of earlier in this session]".to_owned(),
+        ));
+        messages.push(Message::assistant(Some(summary), vec![]));
+    }
+
+    for entry in history {
         let content = truncate_chars(entry.content.clone(), MAX_HISTORY_CHARS);
         match entry.role.as_str() {
             "user" => messages.push(Message::user(content)),
@@ -1149,7 +1607,7 @@ async fn run_cron_job(state: Arc<DaemonState>, job: &cron::CronJob) {
     // Resolve model from env var (same default as CLI client).
     let model = std::env::var("AMAEBI_MODEL").unwrap_or_else(|_| "gpt-4o".to_string());
 
-    let mut messages = build_messages(&job.description, None, &[]);
+    let mut messages = build_messages(&job.description, None, &[], &[], None);
     inject_skill_files(&mut messages).await;
     // Cron jobs are non-interactive: drop the sender immediately so steer_rx.recv()
     // returns None at once if the model ends with '?', rather than timing out.
@@ -1159,7 +1617,7 @@ async fn run_cron_job(state: Arc<DaemonState>, job: &cron::CronJob) {
     let result = run_agentic_loop(&state, &model, messages, &mut sink, &mut steer_rx).await;
 
     let (output, run_ok) = match result {
-        Ok(final_text) => {
+        Ok((final_text, _)) => {
             store_conversation(&state, &session_id, &job.description, &final_text).await;
             (final_text, true)
         }
@@ -1294,30 +1752,30 @@ mod tests {
 
     #[test]
     fn build_messages_empty_history() {
-        let msgs = build_messages("hello", None, &[]);
+        let msgs = build_messages("hello", None, &[], &[], None);
         assert_eq!(msgs.len(), 2);
     }
 
     #[test]
     fn build_messages_injects_history_rows() {
         let history = make_history(2); // 4 rows: u0, a0, u1, a1
-        let msgs = build_messages("q3", None, &history);
+        let msgs = build_messages("q3", None, &history, &[], None);
         // system + 4 history rows + user
         assert_eq!(msgs.len(), 6);
     }
 
     #[test]
-    fn build_messages_caps_history_at_max() {
-        let history = make_history(MAX_HISTORY + 1);
-        let msgs = build_messages("new", None, &history);
-        // system + MAX_HISTORY*2 rows (sliding window) + user
-        let expected = 1 + MAX_HISTORY * 2 + 1;
-        assert_eq!(msgs.len(), expected);
+    fn build_messages_all_history_included() {
+        // build_messages no longer caps — all rows are included.
+        let history = make_history(10);
+        let msgs = build_messages("new", None, &history, &[], None);
+        // system + 20 history rows + user
+        assert_eq!(msgs.len(), 22);
     }
 
     #[test]
     fn build_messages_tmux_pane_in_system() {
-        let msgs = build_messages("prompt", Some("%3"), &[]);
+        let msgs = build_messages("prompt", Some("%3"), &[], &[], None);
         let content = msgs[0].content.as_deref().unwrap_or("");
         assert!(
             content.contains("%3"),
@@ -1325,34 +1783,89 @@ mod tests {
         );
     }
 
-    // ---- build_messages_resume tests -----
-
     #[test]
-    fn build_messages_resume_loads_all_history_beyond_max() {
-        let history = make_history(MAX_HISTORY + 1);
-        let msgs = build_messages_resume("new", None, &history);
-        let expected = 1 + (MAX_HISTORY + 1) * 2 + 1;
-        assert_eq!(
-            msgs.len(),
-            expected,
-            "resume should load full history, not just last {MAX_HISTORY}"
+    fn build_messages_injects_past_summaries_into_system() {
+        let summaries = vec![
+            "- Fixed the auth bug.".to_owned(),
+            "- Added cron.".to_owned(),
+        ];
+        let msgs = build_messages("hi", None, &[], &summaries, None);
+        let system = msgs[0].content.as_deref().unwrap_or("");
+        assert!(
+            system.contains("Fixed the auth bug"),
+            "summaries must appear in system message"
+        );
+        assert!(
+            system.contains("Added cron"),
+            "all summaries must be injected"
         );
     }
 
     #[test]
-    fn build_messages_resume_small_history_unchanged() {
-        let history = make_history(2);
-        let normal = build_messages("q3", None, &history);
-        let resume = build_messages_resume("q3", None, &history);
-        assert_eq!(normal.len(), resume.len());
+    fn build_messages_own_summary_inserted_before_history() {
+        let history = make_history(1); // 2 rows: u0, a0
+        let msgs = build_messages("q", None, &history, &[], Some("- Did X earlier."));
+        // system + [user summary label + assistant summary] + 2 history rows + user
+        assert_eq!(msgs.len(), 6);
+        // The summary pair comes before the history rows.
+        let summary_placeholder = msgs[1].content.as_deref().unwrap_or("");
+        assert!(
+            summary_placeholder.contains("Summary of earlier"),
+            "summary label must appear before history"
+        );
+    }
+
+    // ---- token budget tests -----
+
+    #[test]
+    fn count_message_tokens_increases_with_content() {
+        let short = vec![Message::system("hi"), Message::user("hello")];
+        let long = vec![Message::system("hi"), Message::user("hello ".repeat(200))];
+        assert!(
+            count_message_tokens(&long) > count_message_tokens(&short),
+            "longer content must produce higher token count"
+        );
     }
 
     #[test]
-    fn build_messages_caps_at_max_history_normal() {
-        let history = make_history(MAX_HISTORY + 1);
-        let msgs = build_messages("new", None, &history);
-        let expected = 1 + MAX_HISTORY * 2 + 1;
-        assert_eq!(msgs.len(), expected);
+    fn count_message_tokens_empty_list() {
+        // Empty list: only the 3 priming tokens.
+        assert_eq!(count_message_tokens(&[]), 3);
+    }
+
+    #[test]
+    fn context_limit_for_known_models() {
+        assert_eq!(context_limit_for_model("gpt-4o"), 128_000);
+        assert_eq!(context_limit_for_model("gpt-4o-mini"), 128_000);
+        assert_eq!(context_limit_for_model("gpt-4-turbo"), 128_000);
+        assert_eq!(context_limit_for_model("gpt-4"), 8_192);
+        assert_eq!(context_limit_for_model("gpt-3.5-turbo"), 16_385);
+        assert_eq!(context_limit_for_model("o1-preview"), 200_000);
+        assert_eq!(context_limit_for_model("o3-mini"), 200_000);
+        assert_eq!(context_limit_for_model("claude-3-5-sonnet"), 1_000_000);
+    }
+
+    #[test]
+    fn context_limit_unknown_model_is_conservative() {
+        // Unknown models fall back to 32k — never 0, never larger than any known model.
+        let limit = context_limit_for_model("some-future-model-xyz");
+        assert_eq!(limit, 32_768);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn compaction_threshold_is_below_context_limit() {
+        // Unset the override so this test always exercises the default formula.
+        std::env::remove_var("AMAEBI_COMPACTION_THRESHOLD");
+        for model in &["gpt-4o", "gpt-4", "gpt-3.5-turbo", "o1", "unknown-model"] {
+            let t = compaction_threshold_tokens(model);
+            let available = context_limit_for_model(model).saturating_sub(RESPONSE_RESERVE_TOKENS);
+            assert!(
+                t < available,
+                "model={model}: threshold must be below available input budget"
+            );
+            assert!(t > 0, "model={model}: threshold must be positive");
+        }
     }
 
     // ---- inject_skill_files tests -----

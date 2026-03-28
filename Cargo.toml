@@ -21,9 +21,11 @@ async-trait = "0.1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 uuid = { version = "1", features = ["v4"] }
 rusqlite = { version = "0.39", features = ["bundled"] }
+tiktoken-rs = "0.9"
 agent-client-protocol = "0.10.2"
 tokio-util = { version = "0.7", features = ["compat"] }
 fs2 = "0.4"
 
 [dev-dependencies]
 tempfile = "3"
+serial_test = "3"
