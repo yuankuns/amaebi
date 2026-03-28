@@ -741,7 +741,10 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                         let _ = write_frame(&mut writer, &Response::Compacting).await;
                         // Guard against overlapping compactions for the same session.
                         let already_compacting = {
-                            let mut guard = state.compacting_sessions.lock().unwrap_or_else(|p| p.into_inner());
+                            let mut guard = state
+                                .compacting_sessions
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner());
                             !guard.insert(sid.clone())
                         };
                         if !already_compacting {
@@ -960,7 +963,9 @@ async fn compact_session(
             let ts = chrono::Utc::now().to_rfc3339();
             let result = tokio::task::spawn_blocking(move || {
                 let conn = db.lock().unwrap_or_else(|p| p.into_inner());
-                let tx = conn.unchecked_transaction().context("compact_session: begin transaction")?;
+                let tx = conn
+                    .unchecked_transaction()
+                    .context("compact_session: begin transaction")?;
                 memory_db::store_session_summary(&conn, &sid, &summary, &ts)?;
                 memory_db::archive_session_turns(&conn, &ids_to_archive)?;
                 tx.commit().context("compact_session: commit transaction")
@@ -979,7 +984,11 @@ async fn compact_session(
         Err(ref e) => tracing::warn!(error = %e, "compact_session: API error"),
     }
     // Always remove the in-flight guard so future turns can trigger compaction again.
-    state.compacting_sessions.lock().unwrap_or_else(|p| p.into_inner()).remove(&session_id);
+    state
+        .compacting_sessions
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(&session_id);
 }
 
 // ---------------------------------------------------------------------------
