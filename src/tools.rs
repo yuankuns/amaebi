@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use std::sync::Arc;
 use tokio::process::Command;
 
 // ---------------------------------------------------------------------------
@@ -30,6 +31,68 @@ impl ToolExecutor for LocalExecutor {
             "edit_file" => edit_file(args).await,
             other => anyhow::bail!("unknown tool: {other}"),
         }
+    }
+}
+
+// Blanket impl so callers can pass &Box<dyn ToolExecutor> without dereferencing.
+#[async_trait::async_trait]
+impl ToolExecutor for Box<dyn ToolExecutor> {
+    async fn execute(&self, name: &str, args: serde_json::Value) -> Result<String> {
+        (**self).execute(name, args).await
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Sandbox-aware dispatch
+// ---------------------------------------------------------------------------
+
+/// Execute a tool, routing `shell_command` through the provided sandbox.
+///
+/// All other tools are dispatched to `executor` unchanged, preserving
+/// identical behaviour for non-shell tools regardless of sandbox state.
+pub async fn execute_with_sandbox(
+    executor: &dyn ToolExecutor,
+    sandbox: Arc<dyn crate::sandbox::Sandbox>,
+    name: &str,
+    args: serde_json::Value,
+) -> Result<String> {
+    if name == "shell_command" {
+        let command = args["command"]
+            .as_str()
+            .context("shell_command: missing string argument 'command'")?
+            .to_owned();
+
+        tracing::debug!(command = %command, "running shell command via sandbox");
+
+        // Resolve cwd: use the workspace from the sandbox config or fall back to ".".
+        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+
+        let output = tokio::task::spawn_blocking(move || sandbox.spawn(&command, &cwd))
+            .await
+            .context("shell_command: spawn_blocking panicked")??;
+
+        let stdout = output.stdout;
+        let stderr = output.stderr;
+        let exit_code = output.status.code().unwrap_or(-1);
+
+        let mut result = String::new();
+        if !stdout.is_empty() {
+            result.push_str(stdout.trim_end());
+        }
+        if !stderr.is_empty() {
+            if !result.is_empty() {
+                result.push_str("\n[stderr]\n");
+            }
+            result.push_str(stderr.trim_end());
+        }
+        if result.is_empty() {
+            result = format!("[exit {exit_code}]");
+        } else if !output.status.success() {
+            result.push_str(&format!("\n[exit {exit_code}]"));
+        }
+        Ok(result)
+    } else {
+        executor.execute(name, args).await
     }
 }
 

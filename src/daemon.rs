@@ -11,6 +11,7 @@ use crate::cron;
 use crate::inbox::InboxStore;
 use crate::ipc::{write_frame, Request, Response};
 use crate::memory_db;
+use crate::sandbox::{self, SandboxConfig};
 use crate::tools::{self, ToolExecutor};
 
 /// Tokens reserved for model output — matches `max_tokens` in the request body (4096).
@@ -30,6 +31,8 @@ pub struct DaemonState {
     pub tokens: TokenCache,
     /// Tool executor — `LocalExecutor` now; swappable with `DockerExecutor` in Phase 4.
     pub executor: Box<dyn ToolExecutor>,
+    /// Sandbox backend used for shell command isolation.
+    pub sandbox: Arc<dyn sandbox::Sandbox>,
     /// Persistent SQLite connection opened once at startup.
     ///
     /// Wrapped in `Mutex` so that concurrent `spawn_blocking` tasks serialise
@@ -60,6 +63,7 @@ impl DaemonState {
             http,
             tokens: TokenCache::new(),
             executor: Box::new(tools::LocalExecutor),
+            sandbox: Arc::from(sandbox::create_backend(&SandboxConfig::default())),
             db: Arc::new(Mutex::new(conn)),
             compacting_sessions: Arc::new(Mutex::new(HashSet::new())),
         })
@@ -1391,7 +1395,14 @@ where
                         }
                     };
 
-                    let result = match state.executor.execute(&tc.name, args).await {
+                    let result = match tools::execute_with_sandbox(
+                        &state.executor,
+                        Arc::clone(&state.sandbox),
+                        &tc.name,
+                        args,
+                    )
+                    .await
+                    {
                         Ok(output) => {
                             tracing::debug!(
                                 tool = %tc.name,
