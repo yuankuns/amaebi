@@ -496,7 +496,13 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                 } else {
                     &history[..]
                 };
-                messages = build_messages(&prompt, tmux_pane.as_deref(), trimmed, &summaries, None);
+                messages = build_messages(
+                    &prompt,
+                    tmux_pane.as_deref(),
+                    trimmed,
+                    &summaries,
+                    own_summary.as_deref(),
+                );
                 inject_skill_files(&mut messages).await;
             }
 
@@ -913,16 +919,27 @@ async fn compact_session(
     // Collect the IDs to archive on success.
     let ids_to_archive: Vec<i64> = history.iter().map(|e| e.id).collect();
 
-    // Sink writer + dropped sender = non-interactive, no output.
-    let mut sink = tokio::io::sink();
-    let (_, mut steer_rx) = tokio::sync::mpsc::channel::<String>(1);
+    // Use a direct API call with no tools so the model cannot execute shell
+    // commands during background summarisation.
+    let compact_result: Result<String> = async {
+        let token = state
+            .tokens
+            .get(&state.http)
+            .await
+            .context("compact_session: refreshing token")?;
+        let mut sink = tokio::io::sink();
+        let resp =
+            copilot::stream_chat(&state.http, &token, &model, &messages, &[], &mut sink).await?;
+        Ok(resp.text)
+    }
+    .await;
 
-    match run_agentic_loop(&state, &model, messages, &mut sink, &mut steer_rx).await {
-        Ok((summary, _)) if !summary.trim().is_empty() => {
+    match compact_result {
+        Ok(ref text) if !text.trim().is_empty() => {
+            let summary = text.trim().to_owned();
             let db = Arc::clone(&state.db);
             let sid = session_id.clone();
             let ts = chrono::Utc::now().to_rfc3339();
-            let summary = summary.trim().to_owned();
             let result = tokio::task::spawn_blocking(move || {
                 let conn = db.lock().unwrap_or_else(|p| p.into_inner());
                 memory_db::store_session_summary(&conn, &sid, &summary, &ts)?;
@@ -939,7 +956,7 @@ async fn compact_session(
         Ok(_) => {
             tracing::debug!(session_id = %session_id, "compact_session: empty summary (ignored)")
         }
-        Err(e) => tracing::warn!(error = %e, "compact_session: API error"),
+        Err(ref e) => tracing::warn!(error = %e, "compact_session: API error"),
     }
 }
 
