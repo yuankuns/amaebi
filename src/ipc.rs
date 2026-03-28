@@ -87,7 +87,7 @@ pub enum Request {
 ///
 /// Newline-delimited JSON: the daemon writes one frame per line;
 /// the client reads lines until `Done` or `Error`.
-#[derive(serde::Serialize, serde::Deserialize, Debug)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Response {
     /// A chunk of text to print immediately.

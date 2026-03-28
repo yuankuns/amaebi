@@ -76,9 +76,11 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
     let mut stdout = tokio::io::stdout();
     // Timestamp of the first Ctrl-C press; None means no pending first press.
     let mut last_ctrl_c: Option<Instant> = None;
-    // Set to true after the first Ctrl-C press to suppress daemon output
+    // Set to true after the first Ctrl-C press to buffer daemon output
     // while the user is typing a steering correction.  Cleared on SteerAck.
     let mut steer_pending = false;
+    // Frames received while steer_pending — flushed to the terminal on SteerAck.
+    let mut steer_buffer: Vec<Response> = Vec::new();
 
     // Stdin reader — only created when stdin is a TTY (interactive terminal).
     // Piped invocations (`echo "fix" | amaebi ask "..."`) have stdin as a
@@ -137,9 +139,11 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
                     serde_json::from_str(&line).context("parsing response frame")?;
                 match resp {
                     Response::Text { chunk } => {
-                        // Suppress output while the user is typing a steering correction
+                        // Buffer output while the user is typing a steering correction
                         // to prevent mixing daemon output with the user's input.
-                        if !steer_pending {
+                        if steer_pending {
+                            steer_buffer.push(Response::Text { chunk });
+                        } else {
                             stdout
                                 .write_all(chunk.as_bytes())
                                 .await
@@ -147,13 +151,19 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
                             stdout.flush().await.context("flushing stdout")?;
                         }
                     }
-                    Response::Done => break,
+                    Response::Done => {
+                        // Flush any buffered frames before exiting.
+                        flush_steer_buffer(&mut steer_buffer, &mut stdout).await?;
+                        break;
+                    }
                     Response::Error { message } => {
                         anyhow::bail!("{message}");
                     }
                     Response::ToolUse { name, detail } => {
-                        // Suppress tool notifications while steering is pending.
-                        if !steer_pending {
+                        // Buffer tool notifications while steering is pending.
+                        if steer_pending {
+                            steer_buffer.push(Response::ToolUse { name, detail });
+                        } else {
                             // Tool notifications go to stderr so stdout stays clean for the AI response.
                             eprintln!();
                             match name.as_str() {
@@ -167,18 +177,20 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
                         }
                     }
                     Response::Compacting => {
-                        if !steer_pending {
-                            if std::io::stderr().is_terminal() {
-                                eprintln!("\n\x1b[1;5;34m[compacting conversation history…]\x1b[0m");
-                            } else {
-                                eprintln!("\n[compacting conversation history…]");
-                            }
+                        if steer_pending {
+                            steer_buffer.push(Response::Compacting);
+                        } else if std::io::stderr().is_terminal() {
+                            eprintln!("\n\x1b[1;5;34m[compacting conversation history…]\x1b[0m");
+                        } else {
+                            eprintln!("\n[compacting conversation history…]");
                         }
                     }
                     Response::SteerAck => {
                         // The daemon has acknowledged our steering message.
-                        // Resume output rendering for the next model turn.
+                        // Flush buffered frames so the user can see what happened
+                        // before their correction took effect, then resume output.
                         steer_pending = false;
+                        flush_steer_buffer(&mut steer_buffer, &mut stdout).await?;
                         tracing::debug!("steer acknowledged by daemon");
                     }
                     Response::DetachAccepted { .. } => {
@@ -193,14 +205,15 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
                         // empty the question was already on screen via Text
                         // chunks; just show the cursor.  When non-empty, print
                         // the extra context first, then the cursor line.
-                        // Suppressed while steer is pending (user is typing).
-                        if !steer_pending {
-                            if prompt.is_empty() {
-                                eprint!("\n>");
-                            } else {
-                                eprintln!("\n{prompt}");
-                                eprint!(">");
-                            }
+                        // Buffer while steer is pending (user is typing).
+                        if steer_pending {
+                            steer_buffer.push(Response::WaitingForInput { prompt });
+                        } else if prompt.is_empty() {
+                            eprint!("\n>");
+                            let _ = tokio::io::stderr().flush().await;
+                        } else {
+                            eprintln!("\n{prompt}");
+                            eprint!(">");
                             let _ = tokio::io::stderr().flush().await;
                         }
                     }
@@ -350,9 +363,11 @@ pub async fn run_resume(
     let mut lines = BufReader::new(reader).lines();
     let mut stdout = tokio::io::stdout();
     let mut last_ctrl_c: Option<Instant> = None;
-    // Set to true after the first Ctrl-C press to suppress daemon output
+    // Set to true after the first Ctrl-C press to buffer daemon output
     // while the user is typing a steering correction.  Cleared on SteerAck.
     let mut steer_pending = false;
+    // Frames received while steer_pending — flushed to the terminal on SteerAck.
+    let mut steer_buffer: Vec<Response> = Vec::new();
 
     let use_stdin = std::io::stdin().is_terminal();
     let mut stdin_lines: Option<BufReader<tokio::io::Stdin>> = if use_stdin {
@@ -391,17 +406,25 @@ pub async fn run_resume(
                 let resp: Response = serde_json::from_str(&line).context("parsing response")?;
                 match resp {
                     Response::Text { chunk } => {
-                        // Suppress output while the user is typing a steering correction.
-                        if !steer_pending {
+                        // Buffer output while the user is typing a steering correction.
+                        if steer_pending {
+                            steer_buffer.push(Response::Text { chunk });
+                        } else {
                             stdout.write_all(chunk.as_bytes()).await.context("writing to stdout")?;
                             stdout.flush().await.context("flushing stdout")?;
                         }
                     }
-                    Response::Done => break,
+                    Response::Done => {
+                        // Flush any buffered frames before exiting.
+                        flush_steer_buffer(&mut steer_buffer, &mut stdout).await?;
+                        break;
+                    }
                     Response::Error { message } => anyhow::bail!("{message}"),
                     Response::ToolUse { name, detail } => {
-                        // Suppress tool notifications while steering is pending.
-                        if !steer_pending {
+                        // Buffer tool notifications while steering is pending.
+                        if steer_pending {
+                            steer_buffer.push(Response::ToolUse { name, detail });
+                        } else {
                             eprintln!();
                             match name.as_str() {
                                 "shell_command" => eprintln!("```bash\n$ {detail}\n```"),
@@ -414,17 +437,20 @@ pub async fn run_resume(
                         }
                     }
                     Response::Compacting => {
-                        if !steer_pending {
-                            if std::io::stderr().is_terminal() {
-                                eprintln!("\n\x1b[1;5;34m[compacting conversation history…]\x1b[0m");
-                            } else {
-                                eprintln!("\n[compacting conversation history…]");
-                            }
+                        if steer_pending {
+                            steer_buffer.push(Response::Compacting);
+                        } else if std::io::stderr().is_terminal() {
+                            eprintln!("\n\x1b[1;5;34m[compacting conversation history…]\x1b[0m");
+                        } else {
+                            eprintln!("\n[compacting conversation history…]");
                         }
                     }
                     Response::SteerAck => {
                         // Resume output rendering for the next model turn.
+                        // Flush buffered frames so the user can see what happened
+                        // before their correction took effect.
                         steer_pending = false;
+                        flush_steer_buffer(&mut steer_buffer, &mut stdout).await?;
                         tracing::debug!("steer acknowledged by daemon");
                     }
                     Response::DetachAccepted { .. } => {
@@ -434,13 +460,15 @@ pub async fn run_resume(
                         // Not sent to the CLI client — daemon-internal only.
                     }
                     Response::WaitingForInput { prompt } => {
-                        if !steer_pending {
-                            if prompt.is_empty() {
-                                eprint!("\n>");
-                            } else {
-                                eprintln!("\n{prompt}");
-                                eprint!(">");
-                            }
+                        // Buffer while steer is pending (user is typing).
+                        if steer_pending {
+                            steer_buffer.push(Response::WaitingForInput { prompt });
+                        } else if prompt.is_empty() {
+                            eprint!("\n>");
+                            let _ = tokio::io::stderr().flush().await;
+                        } else {
+                            eprintln!("\n{prompt}");
+                            eprint!(">");
                             let _ = tokio::io::stderr().flush().await;
                         }
                     }
@@ -511,6 +539,70 @@ async fn next_stdin_line(lines: &mut Option<BufReader<tokio::io::Stdin>>) -> Opt
         }
         None => std::future::pending().await,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Steer buffer helper
+// ---------------------------------------------------------------------------
+
+/// Flush buffered response frames that were held while a steer was pending.
+///
+/// Each frame is rendered to the terminal exactly as it would have been on
+/// first receipt.  A dim header is printed before the buffered frames so the
+/// user knows they're seeing suppressed output.
+async fn flush_steer_buffer(
+    buffer: &mut Vec<Response>,
+    stdout: &mut tokio::io::Stdout,
+) -> Result<()> {
+    if buffer.is_empty() {
+        return Ok(());
+    }
+    if std::io::stderr().is_terminal() {
+        eprintln!("\n\x1b[2m[output before steer took effect:]\x1b[0m");
+    } else {
+        eprintln!("\n[output before steer took effect:]");
+    }
+    for resp in buffer.drain(..) {
+        match resp {
+            Response::Text { chunk } => {
+                stdout
+                    .write_all(chunk.as_bytes())
+                    .await
+                    .context("writing buffered text to stdout")?;
+                stdout.flush().await.context("flushing stdout")?;
+            }
+            Response::ToolUse { name, detail } => {
+                eprintln!();
+                match name.as_str() {
+                    "shell_command" => eprintln!("```bash\n$ {detail}\n```"),
+                    "read_file" => eprintln!("📄 {detail}"),
+                    "edit_file" => eprintln!("✏️  {detail}"),
+                    "tmux_send_keys" => eprintln!("⌨️  send-keys: {detail}"),
+                    "tmux_capture_pane" => eprintln!("🖥️  capture: {detail}"),
+                    _ => eprintln!("🔧 {name}: {detail}"),
+                }
+            }
+            Response::Compacting => {
+                if std::io::stderr().is_terminal() {
+                    eprintln!("\n\x1b[1;5;34m[compacting conversation history…]\x1b[0m");
+                } else {
+                    eprintln!("\n[compacting conversation history…]");
+                }
+            }
+            Response::WaitingForInput { prompt } => {
+                if prompt.is_empty() {
+                    eprint!("\n>");
+                } else {
+                    eprintln!("\n{prompt}");
+                    eprint!(">");
+                }
+                let _ = tokio::io::stderr().flush().await;
+            }
+            // Other variants are not buffered; ignore defensively.
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
