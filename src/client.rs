@@ -149,6 +149,13 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
                             _ => eprintln!("🔧 {name}: {detail}"),
                         }
                     }
+                    Response::Compacting => {
+                        if std::io::stderr().is_terminal() {
+                            eprintln!("\n\x1b[1;5;34m[compacting conversation history…]\x1b[0m");
+                        } else {
+                            eprintln!("\n[compacting conversation history…]");
+                        }
+                    }
                     Response::SteerAck => {
                         // The daemon has acknowledged our steering message.
                         // No visible output — the next model turn will incorporate it.
@@ -181,7 +188,7 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
             // This arm is disabled (pending forever) when stdout is not a TTY.
             steer_line = next_stdin_line(&mut stdin_lines) => {
                 match steer_line {
-                    Some(text) => {
+                    Some(text) if !text.trim().is_empty() => {
                         let steer_req = Request::Steer {
                             session_id: session_id_copy.clone(),
                             message: text,
@@ -194,6 +201,9 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
                         // so the response loop can drain normally.
                         let _ = writer.write_all(frame.as_bytes()).await;
                         let _ = writer.flush().await;
+                    }
+                    Some(_) => {
+                        // Empty or whitespace-only line (e.g. bare Enter) — discard silently.
                     }
                     None => {
                         // Ctrl+D on stdin — detach gracefully (task continues
@@ -367,6 +377,13 @@ pub async fn run_resume(
                             _ => eprintln!("🔧 {name}: {detail}"),
                         }
                     }
+                    Response::Compacting => {
+                        if std::io::stderr().is_terminal() {
+                            eprintln!("\n\x1b[1;5;34m[compacting conversation history…]\x1b[0m");
+                        } else {
+                            eprintln!("\n[compacting conversation history…]");
+                        }
+                    }
                     Response::SteerAck => {
                         tracing::debug!("steer acknowledged by daemon");
                     }
@@ -390,7 +407,7 @@ pub async fn run_resume(
 
             steer_line = next_stdin_line(&mut stdin_lines) => {
                 match steer_line {
-                    Some(text) => {
+                    Some(text) if !text.trim().is_empty() => {
                         let steer_req = Request::Steer {
                             session_id: session_uuid.clone(),
                             message: text,
@@ -400,6 +417,9 @@ pub async fn run_resume(
                         frame.push('\n');
                         let _ = writer.write_all(frame.as_bytes()).await;
                         let _ = writer.flush().await;
+                    }
+                    Some(_) => {
+                        // Empty or whitespace-only line — discard silently.
                     }
                     None => {
                         stdin_lines = None;
