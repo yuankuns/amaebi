@@ -1337,7 +1337,9 @@ where
                     // If the user pressed Ctrl-C and typed a correction, honour
                     // it immediately: skip this and all remaining tools.
                     if let Ok(steer_msg) = steer_rx.try_recv() {
-                        tracing::debug!("mid-execution steer received; interrupting tool chain at index {i}");
+                        tracing::debug!(
+                            "mid-execution steer received; interrupting tool chain at index {i}"
+                        );
                         messages.push(Message::user(steer_msg));
                         write_frame(writer, &Response::SteerAck).await?;
                         interrupted_at = Some(i);
