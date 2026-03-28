@@ -860,12 +860,34 @@ pub(crate) async fn store_conversation(
 /// Uses the same agentic loop as normal requests (handles token refresh and retries),
 /// but with a sink writer and a dropped steer sender so it is fully non-interactive.
 /// Best-effort: errors are only logged.
+/// RAII guard that removes `session_id` from `compacting_sessions` when dropped,
+/// ensuring the slot is freed on every exit path (early return, error, or normal).
+struct CompactingGuard {
+    compacting_sessions: Arc<Mutex<HashSet<String>>>,
+    session_id: String,
+}
+
+impl Drop for CompactingGuard {
+    fn drop(&mut self) {
+        self.compacting_sessions
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&self.session_id);
+    }
+}
+
 async fn compact_session(
     state: Arc<DaemonState>,
     session_id: String,
     model: String,
     keep_recent: usize,
 ) {
+    // Hold a guard so `compacting_sessions` is cleaned up on every exit path.
+    let _guard = CompactingGuard {
+        compacting_sessions: Arc::clone(&state.compacting_sessions),
+        session_id: session_id.clone(),
+    };
+
     let db = Arc::clone(&state.db);
     let sid = session_id.clone();
     // Load the non-archived turns to summarise, plus any existing summary so the
@@ -983,12 +1005,7 @@ async fn compact_session(
         }
         Err(ref e) => tracing::warn!(error = %e, "compact_session: API error"),
     }
-    // Always remove the in-flight guard so future turns can trigger compaction again.
-    state
-        .compacting_sessions
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .remove(&session_id);
+    // _guard is dropped here (and on any earlier return), releasing the slot.
 }
 
 // ---------------------------------------------------------------------------
