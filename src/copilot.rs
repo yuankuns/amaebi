@@ -165,9 +165,6 @@ pub struct CopilotResponse {
     pub text: String,
     pub tool_calls: Vec<ToolCall>,
     pub finish_reason: FinishReason,
-    /// Input tokens consumed by this request, as reported by the API.
-    /// Zero when the server did not include usage data (e.g. older endpoints).
-    pub prompt_tokens: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -208,22 +205,11 @@ struct Choice {
     finish_reason: Option<String>,
 }
 
-/// Token usage reported in the final SSE chunk when `stream_options.include_usage` is set.
-#[derive(Deserialize, Debug, Default)]
-struct Usage {
-    #[serde(default)]
-    prompt_tokens: usize,
-}
-
 /// One SSE data line.  The Copilot API sometimes puts text in choices\[0\] and
 /// tool_calls in choices\[1\] — we always collect all choices.
-/// The final chunk (just before `[DONE]`) carries usage when requested.
 #[derive(Deserialize, Debug)]
 struct ChatChunk {
-    #[serde(default)]
     choices: Vec<Choice>,
-    #[serde(default)]
-    usage: Option<Usage>,
 }
 
 // ---------------------------------------------------------------------------
@@ -244,8 +230,6 @@ struct SseAccumulator {
     /// Keyed by the delta `index` field.
     partial_calls: HashMap<usize, PartialToolCall>,
     finish_reason: Option<String>,
-    /// Captured from the final usage chunk; zero if server did not include it.
-    prompt_tokens: usize,
 }
 
 impl SseAccumulator {
@@ -277,12 +261,6 @@ impl SseAccumulator {
                 if let Some(ref reason) = choice.finish_reason {
                     self.finish_reason = Some(reason.clone());
                 }
-            }
-        }
-        // Capture usage from the final chunk (non-zero when server includes it).
-        if let Some(ref usage) = chunk.usage {
-            if usage.prompt_tokens > 0 {
-                self.prompt_tokens = usage.prompt_tokens;
             }
         }
     }
@@ -317,7 +295,6 @@ impl SseAccumulator {
             text: self.text,
             tool_calls,
             finish_reason,
-            prompt_tokens: self.prompt_tokens,
         }
     }
 }
@@ -568,7 +545,6 @@ async fn send_with_retry(
         "tools": tools,
         "stream": true,
         "max_tokens": 4096,
-        "stream_options": { "include_usage": true },
     });
 
     let mut attempt = 0u32;
