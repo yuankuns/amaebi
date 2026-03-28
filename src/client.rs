@@ -12,6 +12,11 @@ use crate::session;
 /// How long the user has to press Ctrl-C a second time to exit.
 const DOUBLE_CTRLC_WINDOW: Duration = Duration::from_secs(2);
 
+/// Maximum number of frames buffered during a steer interaction.
+/// If exceeded, the oldest frames are dropped and a truncation notice is shown
+/// when the buffer is flushed.
+const STEER_BUFFER_MAX_FRAMES: usize = 1000;
+
 /// Returned when the user presses Ctrl-C twice within [`DOUBLE_CTRLC_WINDOW`].
 ///
 /// `main` catches this and exits with code 130 (the SIGINT convention).
@@ -94,8 +99,6 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
 
     loop {
         tokio::select! {
-            biased;
-
             // Handle Ctrl-C (SIGINT).
             result = sigint.recv() => {
                 // recv() returns None when the signal stream is closed; treat
@@ -142,7 +145,7 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
                         // Buffer output while the user is typing a steering correction
                         // to prevent mixing daemon output with the user's input.
                         if steer_pending {
-                            steer_buffer.push(Response::Text { chunk });
+                            push_steer_buffer(&mut steer_buffer, Response::Text { chunk });
                         } else {
                             stdout
                                 .write_all(chunk.as_bytes())
@@ -157,12 +160,15 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
                         break;
                     }
                     Response::Error { message } => {
+                        // Flush any buffered frames before surfacing the error
+                        // so the user can see what happened before it failed.
+                        flush_steer_buffer(&mut steer_buffer, &mut stdout).await?;
                         anyhow::bail!("{message}");
                     }
                     Response::ToolUse { name, detail } => {
                         // Buffer tool notifications while steering is pending.
                         if steer_pending {
-                            steer_buffer.push(Response::ToolUse { name, detail });
+                            push_steer_buffer(&mut steer_buffer, Response::ToolUse { name, detail });
                         } else {
                             // Tool notifications go to stderr so stdout stays clean for the AI response.
                             eprintln!();
@@ -178,7 +184,7 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
                     }
                     Response::Compacting => {
                         if steer_pending {
-                            steer_buffer.push(Response::Compacting);
+                            push_steer_buffer(&mut steer_buffer, Response::Compacting);
                         } else if std::io::stderr().is_terminal() {
                             eprintln!("\n\x1b[1;5;34m[compacting conversation history…]\x1b[0m");
                         } else {
@@ -190,6 +196,7 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
                         // Flush buffered frames so the user can see what happened
                         // before their correction took effect, then resume output.
                         steer_pending = false;
+                        last_ctrl_c = None;
                         flush_steer_buffer(&mut steer_buffer, &mut stdout).await?;
                         tracing::debug!("steer acknowledged by daemon");
                     }
@@ -207,7 +214,7 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
                         // the extra context first, then the cursor line.
                         // Buffer while steer is pending (user is typing).
                         if steer_pending {
-                            steer_buffer.push(Response::WaitingForInput { prompt });
+                            push_steer_buffer(&mut steer_buffer, Response::WaitingForInput { prompt });
                         } else if prompt.is_empty() {
                             eprint!("\n>");
                             let _ = tokio::io::stderr().flush().await;
@@ -378,8 +385,6 @@ pub async fn run_resume(
 
     loop {
         tokio::select! {
-            biased;
-
             result = sigint.recv() => {
                 let Some(_) = result else { break; };
                 let now = Instant::now();
@@ -408,7 +413,7 @@ pub async fn run_resume(
                     Response::Text { chunk } => {
                         // Buffer output while the user is typing a steering correction.
                         if steer_pending {
-                            steer_buffer.push(Response::Text { chunk });
+                            push_steer_buffer(&mut steer_buffer, Response::Text { chunk });
                         } else {
                             stdout.write_all(chunk.as_bytes()).await.context("writing to stdout")?;
                             stdout.flush().await.context("flushing stdout")?;
@@ -419,11 +424,14 @@ pub async fn run_resume(
                         flush_steer_buffer(&mut steer_buffer, &mut stdout).await?;
                         break;
                     }
-                    Response::Error { message } => anyhow::bail!("{message}"),
+                    Response::Error { message } => {
+                        flush_steer_buffer(&mut steer_buffer, &mut stdout).await?;
+                        anyhow::bail!("{message}")
+                    }
                     Response::ToolUse { name, detail } => {
                         // Buffer tool notifications while steering is pending.
                         if steer_pending {
-                            steer_buffer.push(Response::ToolUse { name, detail });
+                            push_steer_buffer(&mut steer_buffer, Response::ToolUse { name, detail });
                         } else {
                             eprintln!();
                             match name.as_str() {
@@ -438,7 +446,7 @@ pub async fn run_resume(
                     }
                     Response::Compacting => {
                         if steer_pending {
-                            steer_buffer.push(Response::Compacting);
+                            push_steer_buffer(&mut steer_buffer, Response::Compacting);
                         } else if std::io::stderr().is_terminal() {
                             eprintln!("\n\x1b[1;5;34m[compacting conversation history…]\x1b[0m");
                         } else {
@@ -450,6 +458,7 @@ pub async fn run_resume(
                         // Flush buffered frames so the user can see what happened
                         // before their correction took effect.
                         steer_pending = false;
+                        last_ctrl_c = None;
                         flush_steer_buffer(&mut steer_buffer, &mut stdout).await?;
                         tracing::debug!("steer acknowledged by daemon");
                     }
@@ -462,7 +471,7 @@ pub async fn run_resume(
                     Response::WaitingForInput { prompt } => {
                         // Buffer while steer is pending (user is typing).
                         if steer_pending {
-                            steer_buffer.push(Response::WaitingForInput { prompt });
+                            push_steer_buffer(&mut steer_buffer, Response::WaitingForInput { prompt });
                         } else if prompt.is_empty() {
                             eprint!("\n>");
                             let _ = tokio::io::stderr().flush().await;
@@ -544,6 +553,32 @@ async fn next_stdin_line(lines: &mut Option<BufReader<tokio::io::Stdin>>) -> Opt
 // ---------------------------------------------------------------------------
 // Steer buffer helper
 // ---------------------------------------------------------------------------
+
+/// Push a response frame onto the steer buffer, enforcing the cap.
+///
+/// If the buffer has reached [`STEER_BUFFER_MAX_FRAMES`], the oldest entry is
+/// dropped.  A synthetic truncation marker is inserted at position 0 only
+/// once (when it is not already there) so `flush_steer_buffer` can print a
+/// notice.  This keeps memory bounded regardless of how long the user takes
+/// to type their correction.
+fn push_steer_buffer(buffer: &mut Vec<Response>, frame: Response) {
+    if buffer.len() >= STEER_BUFFER_MAX_FRAMES {
+        buffer.remove(0);
+        // Ensure the first entry is the truncation sentinel.
+        match buffer.first() {
+            Some(Response::Text { chunk }) if chunk == "\n[some output was truncated]\n" => {}
+            _ => {
+                buffer.insert(
+                    0,
+                    Response::Text {
+                        chunk: "\n[some output was truncated]\n".to_string(),
+                    },
+                );
+            }
+        }
+    }
+    buffer.push(frame);
+}
 
 /// Flush buffered response frames that were held while a steer was pending.
 ///
