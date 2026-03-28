@@ -37,7 +37,15 @@ fn max_output_tokens_for_model(model: &str) -> usize {
 fn response_max_tokens(model: &str) -> usize {
     let model_max = max_output_tokens_for_model(model);
     let context_budget = context_limit_for_model(model) / 2;
-    model_max.min(context_budget)
+    let result = model_max.min(context_budget);
+    tracing::debug!(
+        model,
+        model_max,
+        context_budget,
+        max_tokens = result,
+        "resolved max output tokens"
+    );
+    result
 }
 /// Compact session history when prompt tokens exceed this fraction of available input.
 const COMPACTION_THRESHOLD: f64 = 0.85;
