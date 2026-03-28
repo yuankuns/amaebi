@@ -120,7 +120,7 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
                 // for a steering correction.  The existing stdin reader will
                 // pick up whatever the user types and send it as a Steer.
                 // Double Ctrl-C (handled above) exits.
-                steer_pending = true;
+                steer_pending = use_stdin;
                 if use_stdin {
                     eprintln!("\n[interrupted — type a correction and press Enter, or Ctrl-C again to exit]");
                     eprint!(">");
@@ -394,7 +394,7 @@ pub async fn run_resume(
                     let _ = tokio::io::stderr().flush().await;
                     return Err(anyhow::Error::new(Interrupted));
                 }
-                steer_pending = true;
+                steer_pending = std::io::stdin().is_terminal();
                 if std::io::stdin().is_terminal() {
                     eprintln!("\n[interrupted — type a correction and press Enter, or Ctrl-C again to exit]");
                     eprint!(">");
@@ -563,19 +563,33 @@ async fn next_stdin_line(lines: &mut Option<BufReader<tokio::io::Stdin>>) -> Opt
 /// to type their correction.
 fn push_steer_buffer(buffer: &mut Vec<Response>, frame: Response) {
     if buffer.len() >= STEER_BUFFER_MAX_FRAMES {
-        buffer.remove(0);
-        // Ensure the first entry is the truncation sentinel.
-        match buffer.first() {
-            Some(Response::Text { chunk }) if chunk == "\n[some output was truncated]\n" => {}
-            _ => {
-                buffer.insert(
-                    0,
-                    Response::Text {
-                        chunk: "\n[some output was truncated]\n".to_string(),
-                    },
-                );
+        // Evict the oldest *real* frame.  If a truncation sentinel is sitting
+        // at index 0, keep it and remove the frame at index 1 instead so the
+        // user always sees the "output was truncated" notice.
+        let has_sentinel = matches!(
+            buffer.first(),
+            Some(Response::Text { chunk }) if chunk == "\n[some output was truncated]\n"
+        );
+        if has_sentinel && buffer.len() > 1 {
+            buffer.remove(1);
+        } else {
+            buffer.remove(0);
+            // The sentinel was not present; insert it now so the user knows
+            // buffered output was dropped.
+            buffer.insert(
+                0,
+                Response::Text {
+                    chunk: "\n[some output was truncated]\n".to_string(),
+                },
+            );
+            // Inserting grew the buffer back to MAX_FRAMES; remove the entry
+            // now at index 1 (oldest real frame) to keep len == MAX_FRAMES - 1
+            // before the final push below.
+            if buffer.len() >= STEER_BUFFER_MAX_FRAMES {
+                buffer.remove(1);
             }
         }
+        // buffer.len() == STEER_BUFFER_MAX_FRAMES - 1 here.
     }
     buffer.push(frame);
 }

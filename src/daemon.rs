@@ -13,8 +13,15 @@ use crate::ipc::{write_frame, Request, Response};
 use crate::memory_db;
 use crate::tools::{self, ToolExecutor};
 
-/// Tokens reserved for model output — matches `max_tokens` in the request body (16384).
+/// Tokens reserved for model output — upper bound for `max_tokens` in the request body.
 const RESPONSE_RESERVE_TOKENS: usize = 16_384;
+
+/// Compute `max_tokens` for a request to `model`: capped at half the model's context window
+/// so it never exceeds what the model supports (e.g. gpt-4's 8 192-token limit).
+fn response_max_tokens(model: &str) -> usize {
+    let half_ctx = context_limit_for_model(model) / 2;
+    RESPONSE_RESERVE_TOKENS.min(half_ctx)
+}
 /// Compact session history when prompt tokens exceed this fraction of available input.
 const COMPACTION_THRESHOLD: f64 = 0.85;
 /// Minimum recent user/assistant *pairs* to keep in the hot tail after a token-budget trim.
@@ -972,8 +979,16 @@ async fn compact_session(
             .await
             .context("compact_session: refreshing token")?;
         let mut sink = tokio::io::sink();
-        let resp =
-            copilot::stream_chat(&state.http, &token, &model, &messages, &[], &mut sink).await?;
+        let resp = copilot::stream_chat(
+            &state.http,
+            &token,
+            &model,
+            &messages,
+            &[],
+            response_max_tokens(&model),
+            &mut sink,
+        )
+        .await?;
         Ok(resp.text)
     }
     .await;
@@ -1075,40 +1090,48 @@ where
         // for auth-adjacent ones (400/401/403) we evict the cache and retry once
         // with a fresh token. Any other error (exhausted retries, context overflow,
         // etc.) propagates.
-        let resp =
-            match copilot::stream_chat(&state.http, &token, model, &messages, &schemas, writer)
-                .await
-            {
-                Ok(r) => r,
-                Err(e) => {
-                    let is_auth_err = e
-                        .downcast_ref::<copilot::CopilotHttpError>()
-                        .is_some_and(|he| matches!(he.status.as_u16(), 400 | 401 | 403));
-                    if is_auth_err {
-                        tracing::warn!(
-                            error = %e,
-                            "Copilot auth error; evicting token cache and retrying once"
-                        );
-                        state.tokens.invalidate().await;
-                        let fresh_token = state
-                            .tokens
-                            .get(&state.http)
-                            .await
-                            .context("fetching fresh token after auth error")?;
-                        copilot::stream_chat(
-                            &state.http,
-                            &fresh_token,
-                            model,
-                            &messages,
-                            &schemas,
-                            writer,
-                        )
-                        .await?
-                    } else {
-                        return Err(e);
-                    }
+        let resp = match copilot::stream_chat(
+            &state.http,
+            &token,
+            model,
+            &messages,
+            &schemas,
+            response_max_tokens(model),
+            writer,
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                let is_auth_err = e
+                    .downcast_ref::<copilot::CopilotHttpError>()
+                    .is_some_and(|he| matches!(he.status.as_u16(), 400 | 401 | 403));
+                if is_auth_err {
+                    tracing::warn!(
+                        error = %e,
+                        "Copilot auth error; evicting token cache and retrying once"
+                    );
+                    state.tokens.invalidate().await;
+                    let fresh_token = state
+                        .tokens
+                        .get(&state.http)
+                        .await
+                        .context("fetching fresh token after auth error")?;
+                    copilot::stream_chat(
+                        &state.http,
+                        &fresh_token,
+                        model,
+                        &messages,
+                        &schemas,
+                        response_max_tokens(model),
+                        writer,
+                    )
+                    .await?
+                } else {
+                    return Err(e);
                 }
-            };
+            }
+        };
 
         last_prompt_tokens = resp.prompt_tokens;
 
@@ -1900,10 +1923,11 @@ mod tests {
         for model in &["gpt-4o", "gpt-4", "gpt-3.5-turbo", "o1", "unknown-model"] {
             let t = compaction_threshold_tokens(model);
             let available = context_limit_for_model(model).saturating_sub(RESPONSE_RESERVE_TOKENS);
-            // When the context window is too small to accommodate
-            // RESPONSE_RESERVE_TOKENS, compaction_threshold_tokens returns
-            // usize::MAX to disable compaction rather than triggering it on
-            // every turn.  Skip the < available / > 0 assertions for those.
+            // When context_limit minus RESPONSE_RESERVE_TOKENS leaves ≤1
+            // token, (available as f64 * COMPACTION_THRESHOLD) truncates to 0,
+            // so compaction_threshold_tokens returns usize::MAX to disable
+            // compaction rather than triggering it on every turn.
+            // Skip the < available / > 0 assertions for those.
             if available <= 1 {
                 assert_eq!(
                     t,
