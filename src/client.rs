@@ -112,8 +112,12 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
                 // for a steering correction.  The existing stdin reader will
                 // pick up whatever the user types and send it as a Steer.
                 // Double Ctrl-C (handled above) exits.
-                eprintln!("\n[interrupted — type a correction and press Enter, or Ctrl-C again to exit]");
-                eprint!(">");
+                if use_stdin {
+                    eprintln!("\n[interrupted — type a correction and press Enter, or Ctrl-C again to exit]");
+                    eprint!(">");
+                } else {
+                    eprintln!("\n[interrupted — press Ctrl-C again quickly to exit]");
+                }
                 let _ = tokio::io::stderr().flush().await;
                 last_ctrl_c = Some(now);
             }
@@ -350,8 +354,12 @@ pub async fn run_resume(
                     let _ = tokio::io::stderr().flush().await;
                     return Err(anyhow::Error::new(Interrupted));
                 }
-                eprintln!("\n[interrupted — type a correction and press Enter, or Ctrl-C again to exit]");
-                eprint!(">");
+                if std::io::stdin().is_terminal() {
+                    eprintln!("\n[interrupted — type a correction and press Enter, or Ctrl-C again to exit]");
+                    eprint!(">");
+                } else {
+                    eprintln!("\n[interrupted — press Ctrl-C again soon to exit]");
+                }
                 let _ = tokio::io::stderr().flush().await;
                 last_ctrl_c = Some(now);
             }

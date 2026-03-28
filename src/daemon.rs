@@ -1331,16 +1331,21 @@ where
 
                 let tool_calls_snapshot = &resp.tool_calls;
                 let mut interrupted_at: Option<usize> = None;
+                let mut steer_text: Option<String> = None;
 
                 for (i, tc) in tool_calls_snapshot.iter().enumerate() {
                     // Check for a mid-execution steer before running this tool.
                     // If the user pressed Ctrl-C and typed a correction, honour
                     // it immediately: skip this and all remaining tools.
-                    if let Ok(steer_msg) = steer_rx.try_recv() {
+                    if let Ok(msg) = steer_rx.try_recv() {
                         tracing::debug!(
                             "mid-execution steer received; interrupting tool chain at index {i}"
                         );
-                        messages.push(Message::user(steer_msg));
+                        // Stash the steer text — we must emit placeholder tool_result
+                        // entries for ALL skipped calls before appending the user message,
+                        // because the API requires assistant(tool_calls) →
+                        // tool(tool_result…) → user/assistant ordering.
+                        steer_text = Some(msg);
                         write_frame(writer, &Response::SteerAck).await?;
                         interrupted_at = Some(i);
                         break;
@@ -1435,6 +1440,11 @@ where
                             &tc.id,
                             "[interrupted by user before execution]",
                         ));
+                    }
+                    // Now it is safe to append the steer as a user turn: all
+                    // preceding tool_calls have a matching tool_result entry.
+                    if let Some(text) = steer_text {
+                        messages.push(Message::user(text));
                     }
                 }
 
