@@ -13,8 +13,8 @@ use crate::ipc::{write_frame, Request, Response};
 use crate::memory_db;
 use crate::tools::{self, ToolExecutor};
 
-/// Tokens reserved for model output — matches `max_tokens` in the request body (4096).
-const RESPONSE_RESERVE_TOKENS: usize = 4_096;
+/// Tokens reserved for model output — matches `max_tokens` in the request body (16384).
+const RESPONSE_RESERVE_TOKENS: usize = 16_384;
 /// Compact session history when prompt tokens exceed this fraction of available input.
 const COMPACTION_THRESHOLD: f64 = 0.85;
 /// Minimum recent user/assistant *pairs* to keep in the hot tail after a token-budget trim.
@@ -156,7 +156,7 @@ fn context_limit_for_model(model: &str) -> usize {
 /// Token threshold above which compaction should be triggered for `model`.
 ///
 /// Returns `usize::MAX` for models whose context window is too small to
-/// accommodate `RESPONSE_RESERVE_TOKENS`, disabling compaction/trimming for
+/// produce a non-zero compaction threshold, disabling compaction/trimming for
 /// those models rather than triggering it on every turn.
 fn compaction_threshold_tokens(model: &str) -> usize {
     // Allow manual override for debugging: AMAEBI_COMPACTION_THRESHOLD=<tokens>
@@ -166,10 +166,11 @@ fn compaction_threshold_tokens(model: &str) -> usize {
         }
     }
     let available = context_limit_for_model(model).saturating_sub(RESPONSE_RESERVE_TOKENS);
-    if available == 0 {
+    let threshold = (available as f64 * COMPACTION_THRESHOLD) as usize;
+    if threshold == 0 {
         return usize::MAX;
     }
-    (available as f64 * COMPACTION_THRESHOLD) as usize
+    threshold
 }
 
 // ---------------------------------------------------------------------------
@@ -1899,6 +1900,18 @@ mod tests {
         for model in &["gpt-4o", "gpt-4", "gpt-3.5-turbo", "o1", "unknown-model"] {
             let t = compaction_threshold_tokens(model);
             let available = context_limit_for_model(model).saturating_sub(RESPONSE_RESERVE_TOKENS);
+            // When the context window is too small to accommodate
+            // RESPONSE_RESERVE_TOKENS, compaction_threshold_tokens returns
+            // usize::MAX to disable compaction rather than triggering it on
+            // every turn.  Skip the < available / > 0 assertions for those.
+            if available <= 1 {
+                assert_eq!(
+                    t,
+                    usize::MAX,
+                    "model={model}: tiny-context model should return usize::MAX to disable compaction"
+                );
+                continue;
+            }
             assert!(
                 t < available,
                 "model={model}: threshold must be below available input budget"

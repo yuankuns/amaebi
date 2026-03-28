@@ -399,7 +399,7 @@ async fn send_with_retry(
         "messages": messages,
         "tools": tools,
         "stream": true,
-        "max_tokens": 4096,
+        "max_tokens": 16384,
         "stream_options": { "include_usage": true },
     });
 
