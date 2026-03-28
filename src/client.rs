@@ -193,13 +193,16 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
                         // empty the question was already on screen via Text
                         // chunks; just show the cursor.  When non-empty, print
                         // the extra context first, then the cursor line.
-                        if prompt.is_empty() {
-                            eprint!("\n>");
-                        } else {
-                            eprintln!("\n{prompt}");
-                            eprint!(">");
+                        // Suppressed while steer is pending (user is typing).
+                        if !steer_pending {
+                            if prompt.is_empty() {
+                                eprint!("\n>");
+                            } else {
+                                eprintln!("\n{prompt}");
+                                eprint!(">");
+                            }
+                            let _ = tokio::io::stderr().flush().await;
                         }
-                        let _ = tokio::io::stderr().flush().await;
                     }
                 }
             }
@@ -431,13 +434,15 @@ pub async fn run_resume(
                         // Not sent to the CLI client — daemon-internal only.
                     }
                     Response::WaitingForInput { prompt } => {
-                        if prompt.is_empty() {
-                            eprint!("\n>");
-                        } else {
-                            eprintln!("\n{prompt}");
-                            eprint!(">");
+                        if !steer_pending {
+                            if prompt.is_empty() {
+                                eprint!("\n>");
+                            } else {
+                                eprintln!("\n{prompt}");
+                                eprint!(">");
+                            }
+                            let _ = tokio::io::stderr().flush().await;
                         }
-                        let _ = tokio::io::stderr().flush().await;
                     }
                 }
             }
