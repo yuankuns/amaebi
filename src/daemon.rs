@@ -13,14 +13,31 @@ use crate::ipc::{write_frame, Request, Response};
 use crate::memory_db;
 use crate::tools::{self, ToolExecutor};
 
-/// Tokens reserved for model output — upper bound for `max_tokens` in the request body.
-const RESPONSE_RESERVE_TOKENS: usize = 16_384;
-
 /// Compute `max_tokens` for a request to `model`: capped at half the model's context window
 /// so it never exceeds what the model supports (e.g. gpt-4's 8 192-token limit).
+fn max_output_tokens_for_model(model: &str) -> usize {
+    // Ordered longest-prefix-first so that e.g. "gpt-4-turbo" beats "gpt-4".
+    const TABLE: &[(&str, usize)] = &[
+        ("gpt-4.1", 32_768),
+        ("gpt-4o", 16_384),
+        ("gpt-4-turbo", 4_096),
+        ("gpt-4", 8_192),
+        ("gpt-3.5-turbo", 4_096),
+        ("o1", 100_000),
+        ("o3", 100_000),
+        ("claude", 16_384),
+    ];
+    TABLE
+        .iter()
+        .find(|(prefix, _)| model.starts_with(prefix))
+        .map(|(_, limit)| *limit)
+        .unwrap_or(16_384) // conservative default for unknown models
+}
+
 fn response_max_tokens(model: &str) -> usize {
-    let half_ctx = context_limit_for_model(model) / 2;
-    RESPONSE_RESERVE_TOKENS.min(half_ctx)
+    let model_max = max_output_tokens_for_model(model);
+    let context_budget = context_limit_for_model(model) / 2;
+    model_max.min(context_budget)
 }
 /// Compact session history when prompt tokens exceed this fraction of available input.
 const COMPACTION_THRESHOLD: f64 = 0.85;
@@ -172,7 +189,7 @@ fn compaction_threshold_tokens(model: &str) -> usize {
             return n;
         }
     }
-    let available = context_limit_for_model(model).saturating_sub(RESPONSE_RESERVE_TOKENS);
+    let available = context_limit_for_model(model).saturating_sub(response_max_tokens(model));
     let threshold = (available as f64 * COMPACTION_THRESHOLD) as usize;
     if threshold == 0 {
         return usize::MAX;
@@ -1922,7 +1939,8 @@ mod tests {
         std::env::remove_var("AMAEBI_COMPACTION_THRESHOLD");
         for model in &["gpt-4o", "gpt-4", "gpt-3.5-turbo", "o1", "unknown-model"] {
             let t = compaction_threshold_tokens(model);
-            let available = context_limit_for_model(model).saturating_sub(RESPONSE_RESERVE_TOKENS);
+            let available =
+                context_limit_for_model(model).saturating_sub(response_max_tokens(model));
             // When context_limit minus RESPONSE_RESERVE_TOKENS leaves ≤1
             // token, (available as f64 * COMPACTION_THRESHOLD) truncates to 0,
             // so compaction_threshold_tokens returns usize::MAX to disable
