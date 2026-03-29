@@ -75,15 +75,16 @@ impl DaemonHandle {
     /// same home directory.
     ///
     /// The socket temp-dir is cleaned up as a side effect.
-    pub fn kill_and_keep_home(mut self) -> (PathBuf, TempDir) {
+    pub async fn kill_and_keep_home(mut self) -> (PathBuf, TempDir) {
         let _ = self.child.start_kill();
+        let _ = self.child.wait().await;
         // We can't partially move out of a Drop type, so take the TempDir via
         // a manual replacement and the PathBuf is already Clone.
         let home_path = self.home.clone();
         // Replace home_dir with a fresh TempDir so `self` can be dropped
         // without removing the actual home directory.
         let real_home_dir = std::mem::replace(&mut self.home_dir, TempDir::new().expect("tmp"));
-        // Drop `self` normally — child already killed above; socket dir cleaned.
+        // Drop `self` normally — child already waited above; socket dir cleaned.
         drop(self);
         (home_path, real_home_dir)
     }
@@ -250,29 +251,11 @@ pub async fn start_daemon_at_home_with_env(
 }
 
 fn find_amaebi_binary() -> Result<PathBuf> {
-    // The test binary is at <target>/<profile>/deps/integration_tests-<hash>.
-    // The daemon binary is at <target>/<profile>/amaebi.
-    let test_exe = std::env::current_exe().context("current_exe")?;
-    let profile_dir = test_exe
-        .parent()
-        .and_then(|p| p.parent()) // deps -> profile dir
-        .context("unexpected test exe path")?;
-
-    let candidate = profile_dir.join("amaebi");
-    if candidate.exists() {
-        return Ok(candidate);
-    }
-    // Fallback: try profile_dir itself (in case test binary is directly in profile dir)
-    let candidate2 = test_exe.parent().context("no parent")?.join("amaebi");
-    if candidate2.exists() {
-        return Ok(candidate2);
-    }
-
-    anyhow::bail!(
-        "could not find amaebi binary; searched {} and {}",
-        candidate.display(),
-        candidate2.display()
-    )
+    // CARGO_BIN_EXE_amaebi is set by Cargo for integration tests whose package
+    // declares a [[bin]] target named "amaebi".  It resolves to the absolute
+    // path of the compiled binary at compile time, so no runtime heuristics
+    // are needed.
+    Ok(PathBuf::from(env!("CARGO_BIN_EXE_amaebi")))
 }
 
 // ---------------------------------------------------------------------------
@@ -328,7 +311,6 @@ pub async fn send_resume(
 }
 
 /// Send a chat message and collect all response frames until `Done` or `Error`.
-/// Returns responses and a `ChatSession` that can be used to send steer messages.
 pub async fn send_message(client: &ClientHandle, prompt: &str) -> Result<Vec<Response>> {
     send_request(
         client,
@@ -367,10 +349,10 @@ impl ChatSession {
 /// Send a steer message to the daemon on a *new* connection (fire-and-forget).
 ///
 /// Note: for tests that need Steer delivered on the same connection as Chat,
-/// use `send_message_returning_session` instead.
+/// construct a `ChatSession` directly and call `ChatSession::steer`.
 #[allow(dead_code)]
 pub async fn send_steer(client: &ClientHandle, session_id: &str, message: &str) -> Result<()> {
-    // Re-use an existing ChatSession if you need Steer on the same connection.
+    // Re-use a ChatSession if you need Steer on the same connection.
     // This helper opens a fresh connection for callers that only need fire-and-forget.
     let stream = UnixStream::connect(&client.socket)
         .await

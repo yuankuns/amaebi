@@ -5,6 +5,17 @@
 //! 2. Starts the `amaebi daemon` binary, pointed at the mock server.
 //! 3. Connects a client to the daemon socket.
 //! 4. Exercises the daemon and asserts on the responses / captured requests.
+//!
+//! ## Current tests (8 total)
+//!
+//! 1. `test_basic_chat_roundtrip` — basic chat round-trip
+//! 2. `test_tool_call_roundtrip` — tool-call round-trip (shell echo)
+//! 3. `test_max_tokens_present_in_request` — max_tokens present and > 0 in LLM request
+//! 4. `test_request_format_valid` — LLM request contains model, stream:true, messages with roles
+//! 5. `test_compaction_triggered_at_threshold` — Compacting frame emitted when threshold exceeded
+//! 6. `test_compaction_preserves_summary` — summary text appears in next turn's messages
+//! 7. `test_hot_tail_preserved_after_compaction` — message count bounded to hot tail after compaction
+//! 8. `test_pre_flight_trim_on_resume` — resume loads history; pre-flight trim fires at low threshold
 
 mod support;
 
@@ -222,8 +233,7 @@ async fn test_compaction_triggered_at_threshold() {
     // --- Phase 2: restart daemon with low threshold ---
     // Destructure seed_daemon to keep home_dir alive (preserving the SQLite DB)
     // while killing only the child process and cleaning up the socket.
-    let (home_path, _home_dir) = seed_daemon.kill_and_keep_home();
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let (home_path, _home_dir) = seed_daemon.kill_and_keep_home().await;
 
     server.enqueue(ScriptedResponse::text_chunks(vec!["Trigger reply."]));
     server.enqueue(ScriptedResponse::text_chunks(vec![
@@ -278,7 +288,8 @@ async fn test_compaction_triggered_at_threshold() {
         reqs.len()
     );
 
-    let _ = trigger_child.kill();
+    let _ = trigger_child.kill().await;
+    let _ = trigger_child.wait().await;
 }
 
 // ---------------------------------------------------------------------------
@@ -318,8 +329,7 @@ async fn test_compaction_preserves_summary() {
     }
     server.take_requests();
 
-    let (home_path, _home_dir2) = seed_daemon.kill_and_keep_home();
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let (home_path, _home_dir2) = seed_daemon.kill_and_keep_home().await;
 
     // Phase 2: restart with low threshold → compaction fires on first turn.
     server.enqueue(ScriptedResponse::text_chunks(vec!["Turn A reply."]));
@@ -380,7 +390,8 @@ async fn test_compaction_preserves_summary() {
         "summary text not found in turn B messages. Content:\n{all_content}"
     );
 
-    let _ = child2.kill();
+    let _ = child2.kill().await;
+    let _ = child2.wait().await;
 }
 
 // ---------------------------------------------------------------------------
@@ -422,8 +433,7 @@ async fn test_hot_tail_preserved_after_compaction() {
     }
     server.take_requests();
 
-    let (home_path, _home_dir3) = seed_daemon.kill_and_keep_home();
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let (home_path, _home_dir3) = seed_daemon.kill_and_keep_home().await;
 
     // Phase 2: trigger compaction.
     server.enqueue(ScriptedResponse::text_chunks(vec!["Trigger reply."]));
@@ -492,7 +502,8 @@ async fn test_hot_tail_preserved_after_compaction() {
         HOT_TAIL + 4
     );
 
-    let _ = child2.kill();
+    let _ = child2.kill().await;
+    let _ = child2.wait().await;
 }
 
 // ---------------------------------------------------------------------------
@@ -570,8 +581,7 @@ async fn test_pre_flight_trim_on_resume() {
 
     // Phase 3: verify pre-flight trim fires when threshold is low.
     // Restart the daemon with the same home dir but low threshold.
-    let (home_path, _home_dir4) = daemon.kill_and_keep_home();
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let (home_path, _home_dir4) = daemon.kill_and_keep_home().await;
 
     // Seed 4 more turns so there's meaningful history (> HOT_TAIL_PAIRS*2 = 6 msgs).
     let (socket2, mut child2, _dir2) = start_daemon_at_home_with_env(
@@ -590,8 +600,8 @@ async fn test_pre_flight_trim_on_resume() {
             .unwrap_or_else(|e| panic!("extra seed {i}: {e}"));
     }
     server.take_requests();
-    let _ = child2.kill();
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let _ = child2.kill().await;
+    let _ = child2.wait().await;
 
     // Restart with low threshold; the resume/chat request should apply pre-flight trim.
     server.enqueue(ScriptedResponse::text_chunks(vec!["Trim resume reply."]));
@@ -641,5 +651,6 @@ async fn test_pre_flight_trim_on_resume() {
         "trim resume message count {hist3} exceeds expected hot tail bound"
     );
 
-    let _ = child3.kill();
+    let _ = child3.kill().await;
+    let _ = child3.wait().await;
 }
