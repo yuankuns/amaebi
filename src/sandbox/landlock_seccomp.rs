@@ -230,6 +230,251 @@ mod tests {
         assert!(out.status.success());
     }
 
+    // ------------------------------------------------------------------
+    // New regression tests for PR #21
+    // ------------------------------------------------------------------
+
+    /// Helper: create a LandlockSandbox with a single allowed_path entry.
+    fn sandbox_with_allowed(
+        tmp_workspace: &TempDir,
+        path: PathBuf,
+        access: Access,
+    ) -> LandlockSandbox {
+        LandlockSandbox::new(SandboxConfig {
+            enabled: true,
+            backend: "landlock".into(),
+            workspace: tmp_workspace.path().to_path_buf(),
+            workspace_access: Access::Rw,
+            allowed_paths: vec![(path, access)],
+            ..SandboxConfig::default()
+        })
+    }
+
+    /// Check Landlock fully-enforced status for the running kernel.
+    /// Returns `true` iff we can rely on restrictions being honored.
+    fn landlock_fully_enforced() -> bool {
+        use landlock::{Access as _, AccessFs, ABI as LandlockABI};
+        let result = (|| -> std::result::Result<bool, Box<dyn std::error::Error>> {
+            let handled = AccessFs::from_all(LandlockABI::V1);
+            let rc = landlock::Ruleset::default()
+                .handle_access(handled)?
+                .create()?;
+            let status = rc.restrict_self()?;
+            Ok(matches!(status.ruleset, RulesetStatus::FullyEnforced))
+        })();
+        result.unwrap_or(false)
+    }
+
+    #[test]
+    fn allowed_path_ro_permits_read() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("data.txt");
+        std::fs::write(&file, "read-me").unwrap();
+
+        let work = TempDir::new().unwrap();
+        let sb = sandbox_with_allowed(&work, tmp.path().to_path_buf(), Access::Ro);
+
+        let out = sb
+            .spawn(&format!("cat '{}'", file.display()), work.path())
+            .unwrap();
+        assert!(out.status.success(), "ro read failed: {:?}", out.stderr);
+        assert_eq!(out.stdout.trim(), "read-me");
+    }
+
+    #[test]
+    fn allowed_path_ro_denies_write() {
+        if !landlock_fully_enforced() {
+            eprintln!("landlock not fully enforced — skipping allowed_path_ro_denies_write");
+            return;
+        }
+
+        let secret_base = std::path::Path::new("/var/tmp");
+        if !secret_base.exists() {
+            eprintln!("allowed_path_ro_denies_write: /var/tmp not available — skipping");
+            return;
+        }
+        let ro_dir = match TempDir::new_in(secret_base) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("allowed_path_ro_denies_write: cannot create temp dir in /var/tmp ({e}) — skipping");
+                return;
+            }
+        };
+        let file = ro_dir.path().join("out.txt");
+        std::fs::write(&file, "original").unwrap();
+
+        let work = TempDir::new().unwrap();
+        let sb = sandbox_with_allowed(&work, ro_dir.path().to_path_buf(), Access::Ro);
+
+        let out = sb
+            .spawn(
+                &format!("echo overwrite > '{}'", file.display()),
+                work.path(),
+            )
+            .unwrap();
+        assert!(
+            !out.status.success(),
+            "write to ro path should fail; stderr={:?}",
+            out.stderr
+        );
+    }
+
+    #[test]
+    fn allowed_path_rw_permits_write() {
+        let rw_dir = TempDir::new().unwrap();
+        let file = rw_dir.path().join("out.txt");
+
+        let work = TempDir::new().unwrap();
+        let sb = sandbox_with_allowed(&work, rw_dir.path().to_path_buf(), Access::Rw);
+
+        let out = sb
+            .spawn(&format!("echo written > '{}'", file.display()), work.path())
+            .unwrap();
+        assert!(out.status.success(), "rw write failed: {:?}", out.stderr);
+        assert_eq!(std::fs::read_to_string(&file).unwrap().trim(), "written");
+    }
+
+    #[test]
+    fn access_none_skips_rule() {
+        if !landlock_fully_enforced() {
+            eprintln!("landlock not fully enforced — skipping access_none_skips_rule");
+            return;
+        }
+
+        let secret_base = std::path::Path::new("/var/tmp");
+        if !secret_base.exists() {
+            eprintln!("access_none_skips_rule: /var/tmp not available — skipping");
+            return;
+        }
+        let none_dir = match TempDir::new_in(secret_base) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!(
+                    "access_none_skips_rule: cannot create temp dir in /var/tmp ({e}) — skipping"
+                );
+                return;
+            }
+        };
+        let file = none_dir.path().join("secret.txt");
+        std::fs::write(&file, "invisible").unwrap();
+
+        let work = TempDir::new().unwrap();
+        // Access::None means no rule is added for this path → denied by Landlock allowlist
+        let sb = sandbox_with_allowed(&work, none_dir.path().to_path_buf(), Access::None);
+
+        let out = sb
+            .spawn(&format!("cat '{}'", file.display()), work.path())
+            .unwrap();
+        assert!(
+            !out.status.success(),
+            "Access::None path should be inaccessible; stdout={:?}",
+            out.stdout
+        );
+    }
+
+    #[test]
+    fn workspace_auto_added_to_allowed_paths() {
+        let workspace = TempDir::new().unwrap();
+        let file = workspace.path().join("ws_file.txt");
+        std::fs::write(&file, "workspace-data").unwrap();
+
+        let cfg = SandboxConfig {
+            enabled: true,
+            backend: "landlock".into(),
+            workspace: workspace.path().to_path_buf(),
+            workspace_access: Access::Ro,
+            allowed_paths: vec![],
+            ..SandboxConfig::default()
+        };
+        let sb = LandlockSandbox::new(cfg);
+
+        let out = sb
+            .spawn(&format!("cat '{}'", file.display()), workspace.path())
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "workspace read failed: {:?}",
+            out.stderr
+        );
+        assert_eq!(out.stdout.trim(), "workspace-data");
+    }
+
+    #[test]
+    fn multiple_allowed_paths() {
+        let ro_dir = TempDir::new().unwrap();
+        let rw_dir = TempDir::new().unwrap();
+        let ro_file = ro_dir.path().join("ro.txt");
+        std::fs::write(&ro_file, "readonly").unwrap();
+
+        let work = TempDir::new().unwrap();
+        let cfg = SandboxConfig {
+            enabled: true,
+            backend: "landlock".into(),
+            workspace: work.path().to_path_buf(),
+            workspace_access: Access::Rw,
+            allowed_paths: vec![
+                (ro_dir.path().to_path_buf(), Access::Ro),
+                (rw_dir.path().to_path_buf(), Access::Rw),
+            ],
+            ..SandboxConfig::default()
+        };
+        let sb = LandlockSandbox::new(cfg);
+
+        // Read from ro_dir
+        let out = sb
+            .spawn(&format!("cat '{}'", ro_file.display()), work.path())
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "multi-path ro read failed: {:?}",
+            out.stderr
+        );
+        assert_eq!(out.stdout.trim(), "readonly");
+
+        // Write to rw_dir
+        let rw_file = rw_dir.path().join("new.txt");
+        let out = sb
+            .spawn(
+                &format!("echo multi > '{}'", rw_file.display()),
+                work.path(),
+            )
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "multi-path rw write failed: {:?}",
+            out.stderr
+        );
+        assert_eq!(std::fs::read_to_string(&rw_file).unwrap().trim(), "multi");
+    }
+
+    #[test]
+    fn command_inherits_env() {
+        let work = TempDir::new().unwrap();
+        let cfg = SandboxConfig {
+            enabled: true,
+            backend: "landlock".into(),
+            workspace: work.path().to_path_buf(),
+            workspace_access: Access::Rw,
+            ..SandboxConfig::default()
+        };
+        let sb = LandlockSandbox::new(cfg);
+
+        // Use a fixed env var that should be inherited from the test process.
+        // We set it in the test process and check it appears in child output.
+        std::env::set_var("SANDBOX_TEST_VAR", "hello_sandbox");
+        let out = sb.spawn("echo $SANDBOX_TEST_VAR", work.path()).unwrap();
+        assert!(out.status.success(), "env command failed: {:?}", out.stderr);
+        assert!(
+            out.stdout.contains("hello_sandbox"),
+            "env not inherited; stdout={:?}",
+            out.stdout
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // End new regression tests
+    // ------------------------------------------------------------------
+
     /// Landlock uses an allowlist-only model: any path not in `allowed_paths`
     /// is implicitly denied.  This test verifies that a path omitted from the
     /// allowlist is inaccessible — it does NOT test `denied_paths` enforcement

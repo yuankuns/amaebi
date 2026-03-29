@@ -472,6 +472,84 @@ mod tests {
     // ---- execute_with_sandbox --------------------------------------------
 
     #[tokio::test]
+    async fn execute_with_sandbox_passes_config_to_backend() {
+        use crate::sandbox::{Access, SandboxConfig};
+
+        let tmp = TempDir::new().unwrap();
+        let allowed: Arc<Mutex<Vec<(std::path::PathBuf, Access)>>> = Arc::new(Mutex::new(vec![]));
+        let workspace_seen: Arc<Mutex<Option<std::path::PathBuf>>> = Arc::new(Mutex::new(None));
+
+        struct ConfigCaptureSandbox {
+            allowed: Arc<Mutex<Vec<(std::path::PathBuf, Access)>>>,
+            workspace: Arc<Mutex<Option<std::path::PathBuf>>>,
+            config: SandboxConfig,
+        }
+
+        impl Sandbox for ConfigCaptureSandbox {
+            fn name(&self) -> &str {
+                "config-capture"
+            }
+            fn available(&self) -> bool {
+                true
+            }
+            fn spawn(&self, _cmd: &str, cwd: &std::path::Path) -> anyhow::Result<SandboxOutput> {
+                *self.workspace.lock().unwrap() = Some(self.config.workspace.clone());
+                *self.allowed.lock().unwrap() = self.config.allowed_paths.clone();
+                Ok(SandboxOutput {
+                    status: std::process::Command::new("true").status().unwrap(),
+                    stdout: "captured".into(),
+                    stderr: String::new(),
+                })
+            }
+        }
+
+        let my_allowed = vec![
+            (tmp.path().join("a"), Access::Ro),
+            (tmp.path().join("b"), Access::Rw),
+        ];
+        let config = SandboxConfig {
+            enabled: true,
+            backend: "config-capture".into(),
+            workspace: tmp.path().to_path_buf(),
+            workspace_access: Access::Rw,
+            allowed_paths: my_allowed.clone(),
+            denied_paths: vec![],
+            network: false,
+        };
+        let sandbox = Arc::new(ConfigCaptureSandbox {
+            allowed: allowed.clone(),
+            workspace: workspace_seen.clone(),
+            config,
+        });
+
+        let executor = LocalExecutor;
+        let result = execute_with_sandbox(
+            &executor,
+            sandbox,
+            "shell_command",
+            serde_json::json!({"command": "echo propagated"}),
+        )
+        .await
+        .unwrap();
+
+        assert!(result.contains("captured"), "got: {result}");
+
+        // Verify workspace was propagated
+        let ws = workspace_seen.lock().unwrap().clone().unwrap();
+        assert_eq!(ws, tmp.path());
+
+        // Verify allowed_paths were propagated
+        let captured = allowed.lock().unwrap().clone();
+        assert_eq!(captured.len(), 2);
+        assert_eq!(captured[0].0, tmp.path().join("a"));
+        assert!(matches!(captured[0].1, Access::Ro));
+        assert_eq!(captured[1].0, tmp.path().join("b"));
+        assert!(matches!(captured[1].1, Access::Rw));
+    }
+
+    // ---- execute_with_sandbox --------------------------------------------
+
+    #[tokio::test]
     async fn unknown_tool_returns_descriptive_error() {
         let exec = LocalExecutor;
         let result = exec

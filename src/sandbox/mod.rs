@@ -168,4 +168,79 @@ mod tests {
         let backend = create_backend(&cfg);
         assert_eq!(backend.name(), "noop");
     }
+
+    // ------------------------------------------------------------------
+    // New regression tests for PR #21
+    // ------------------------------------------------------------------
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn enabled_config_creates_correct_backend() {
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        let cfg = SandboxConfig {
+            enabled: true,
+            backend: "landlock".into(),
+            workspace: tmp.path().to_path_buf(),
+            workspace_access: Access::Rw,
+            allowed_paths: vec![(PathBuf::from("/tmp"), Access::Rw)],
+            denied_paths: vec![],
+            network: false,
+        };
+        let backend = create_backend(&cfg);
+        assert_eq!(backend.name(), "landlock");
+        // Verify spawn works end-to-end through the config flow
+        let out = backend.spawn("echo cfg-ok", tmp.path()).unwrap();
+        assert!(out.status.success());
+        assert_eq!(out.stdout.trim(), "cfg-ok");
+    }
+
+    #[test]
+    fn noop_backend_allows_everything() {
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        let secret = tmp.path().join("secret.txt");
+        std::fs::write(&secret, "secret").unwrap();
+
+        // noop backend — no sandbox restrictions at all
+        let cfg = SandboxConfig {
+            enabled: true,
+            backend: "noop".into(),
+            workspace: tmp.path().to_path_buf(),
+            ..SandboxConfig::default()
+        };
+        let backend = create_backend(&cfg);
+        assert_eq!(backend.name(), "noop");
+
+        let out = backend
+            .spawn(&format!("cat '{}'", secret.display()), tmp.path())
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "noop should allow reads; stderr={:?}",
+            out.stderr
+        );
+        assert_eq!(out.stdout.trim(), "secret");
+
+        let write_file = tmp.path().join("written.txt");
+        let out = backend
+            .spawn(
+                &format!("echo noop-write > '{}'", write_file.display()),
+                tmp.path(),
+            )
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "noop should allow writes; stderr={:?}",
+            out.stderr
+        );
+        assert_eq!(
+            std::fs::read_to_string(&write_file).unwrap().trim(),
+            "noop-write"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // End new regression tests
+    // ------------------------------------------------------------------
 }
