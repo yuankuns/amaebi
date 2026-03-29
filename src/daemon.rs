@@ -1576,9 +1576,26 @@ where
                             "[interrupted by user before execution]",
                         ));
                     }
-                    // Now it is safe to append the steer as a user turn: all
-                    // preceding tool_calls have a matching tool_result entry.
-                    if let Some(text) = steer_text {
+                    // When the interrupt carried steer text, use it directly.
+                    // When it was interrupt-only (None), block until the user
+                    // sends a correction before starting the next model turn —
+                    // proceeding immediately would race against incoming steer
+                    // text and re-enter the model without user guidance.
+                    let effective_steer = if let Some(text) = steer_text {
+                        Some(text)
+                    } else {
+                        loop {
+                            match steer_rx.recv().await {
+                                Some(Some(t)) => {
+                                    write_frame(writer, &Response::SteerAck).await?;
+                                    break Some(t);
+                                }
+                                Some(None) => continue, // another bare interrupt; keep waiting
+                                None => break None,     // channel closed; proceed without steer
+                            }
+                        }
+                    };
+                    if let Some(text) = effective_steer {
                         messages.push(Message::user(text));
                     }
                 }
