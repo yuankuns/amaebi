@@ -88,18 +88,20 @@ pub fn create_backend(config: &SandboxConfig) -> Box<dyn Sandbox> {
     if !config.enabled {
         return Box::new(noop::NoopSandbox);
     }
-    // Warn if denied_paths is set — the Landlock backend uses allowlist-only
-    // enforcement and will not actively block these paths.
-    if !config.denied_paths.is_empty() {
-        tracing::warn!(
-            count = config.denied_paths.len(),
-            "sandbox: denied_paths is set but the current backend uses allowlist-only \
-             enforcement; denied_paths will NOT be actively blocked"
-        );
-    }
     match config.backend.as_str() {
         #[cfg(target_os = "linux")]
-        "landlock" => Box::new(landlock_seccomp::LandlockSandbox::new(config.clone())),
+        "landlock" => {
+            // Warn if denied_paths is set — the Landlock backend uses allowlist-only
+            // enforcement and will not actively block these paths.
+            if !config.denied_paths.is_empty() {
+                tracing::warn!(
+                    count = config.denied_paths.len(),
+                    "sandbox: denied_paths is set but the current backend uses allowlist-only \
+                     enforcement; denied_paths will NOT be actively blocked"
+                );
+            }
+            Box::new(landlock_seccomp::LandlockSandbox::new(config.clone()))
+        }
         #[cfg(not(target_os = "linux"))]
         "landlock" => {
             tracing::warn!(

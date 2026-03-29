@@ -472,7 +472,7 @@ mod tests {
     // ---- execute_with_sandbox --------------------------------------------
 
     #[tokio::test]
-    async fn execute_with_sandbox_passes_config_to_backend() {
+    async fn sandbox_captures_config_during_spawn() {
         use crate::sandbox::{Access, SandboxConfig};
 
         let tmp = TempDir::new().unwrap();
@@ -492,7 +492,7 @@ mod tests {
             fn available(&self) -> bool {
                 true
             }
-            fn spawn(&self, _cmd: &str, cwd: &std::path::Path) -> anyhow::Result<SandboxOutput> {
+            fn spawn(&self, _cmd: &str, _cwd: &std::path::Path) -> anyhow::Result<SandboxOutput> {
                 *self.workspace.lock().unwrap() = Some(self.config.workspace.clone());
                 *self.allowed.lock().unwrap() = self.config.allowed_paths.clone();
                 Ok(SandboxOutput {
