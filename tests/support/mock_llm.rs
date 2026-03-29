@@ -228,6 +228,11 @@ impl MockLlmServer {
     pub fn take_requests(&self) -> Vec<CapturedRequest> {
         std::mem::take(&mut *self.state.captured.lock().unwrap())
     }
+
+    /// Return the number of captured requests without draining the queue.
+    pub fn peek_request_count(&self) -> usize {
+        self.state.captured.lock().unwrap().len()
+    }
 }
 
 // ---------------------------------------------------------------------------

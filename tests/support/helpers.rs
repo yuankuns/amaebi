@@ -27,6 +27,12 @@ pub enum Request {
         session_id: String,
         message: String,
     },
+    Resume {
+        prompt: String,
+        tmux_pane: Option<String>,
+        session_id: String,
+        model: String,
+    },
 }
 
 /// A single frame streamed from the daemon back to the client.
@@ -51,8 +57,9 @@ pub enum Response {
 /// A running daemon process and the temp home dir it uses.
 pub struct DaemonHandle {
     pub socket: PathBuf,
+    pub home: PathBuf,
     pub child: Child,
-    _home: TempDir,
+    pub home_dir: TempDir,
     _socket_dir: TempDir,
 }
 
@@ -60,6 +67,86 @@ impl Drop for DaemonHandle {
     fn drop(&mut self) {
         let _ = self.child.start_kill();
     }
+}
+
+impl DaemonHandle {
+    /// Kill the daemon and return `(home_path, home_dir)` so the caller can
+    /// keep the SQLite database alive while spinning up a new daemon at the
+    /// same home directory.
+    ///
+    /// The socket temp-dir is cleaned up as a side effect.
+    pub fn kill_and_keep_home(mut self) -> (PathBuf, TempDir) {
+        let _ = self.child.start_kill();
+        // We can't partially move out of a Drop type, so take the TempDir via
+        // a manual replacement and the PathBuf is already Clone.
+        let home_path = self.home.clone();
+        // Replace home_dir with a fresh TempDir so `self` can be dropped
+        // without removing the actual home directory.
+        let real_home_dir = std::mem::replace(&mut self.home_dir, TempDir::new().expect("tmp"));
+        // Drop `self` normally — child already killed above; socket dir cleaned.
+        drop(self);
+        (home_path, real_home_dir)
+    }
+}
+
+/// Start the `amaebi daemon` binary with additional environment variables.
+pub async fn start_daemon_with_env(
+    mock_url: &str,
+    extra_env: &[(&str, &str)],
+) -> Result<DaemonHandle> {
+    let home_dir = TempDir::new().context("creating temp HOME")?;
+    let amaebi_dir = home_dir.path().join(".amaebi");
+    std::fs::create_dir_all(&amaebi_dir).context("creating .amaebi dir")?;
+    std::fs::write(
+        amaebi_dir.join("hosts.json"),
+        r#"{"github.com": {"oauth_token": "test-oauth-token", "user": "test-user"}}"#,
+    )
+    .context("writing dummy hosts.json")?;
+
+    let socket_dir = TempDir::new().context("creating temp socket dir")?;
+    let socket = socket_dir.path().join("amaebi.sock");
+
+    let exe = find_amaebi_binary()?;
+
+    let mut cmd = Command::new(&exe);
+    cmd.arg("daemon")
+        .arg("--socket")
+        .arg(&socket)
+        .env("HOME", home_dir.path())
+        .env("AMAEBI_COPILOT_URL", mock_url)
+        .env("AMAEBI_COPILOT_TOKEN", "test-api-token")
+        .env("RUST_LOG", "error")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+
+    let child = cmd
+        .spawn()
+        .with_context(|| format!("spawning daemon: {}", exe.display()))?;
+
+    for _ in 0..50 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if socket.exists() {
+            break;
+        }
+    }
+    anyhow::ensure!(
+        socket.exists(),
+        "daemon socket did not appear within 5 s: {}",
+        socket.display()
+    );
+
+    Ok(DaemonHandle {
+        socket,
+        home: home_dir.path().to_path_buf(),
+        child,
+        home_dir,
+        _socket_dir: socket_dir,
+    })
 }
 
 /// Start the `amaebi daemon` binary pointing at `mock_url` for the Copilot API.
@@ -108,10 +195,58 @@ pub async fn start_daemon(mock_url: &str) -> Result<DaemonHandle> {
 
     Ok(DaemonHandle {
         socket,
+        home: home_dir.path().to_path_buf(),
         child,
-        _home: home_dir,
+        home_dir,
         _socket_dir: socket_dir,
     })
+}
+
+/// Start a second daemon using an *existing* home directory (to share the SQLite DB)
+/// with different environment variables.  The caller must ensure the first daemon has
+/// been stopped before calling this, so that the socket lock and SQLite are free.
+pub async fn start_daemon_at_home_with_env(
+    home_path: &Path,
+    mock_url: &str,
+    extra_env: &[(&str, &str)],
+) -> Result<(PathBuf, Child, TempDir)> {
+    let socket_dir = TempDir::new().context("creating temp socket dir")?;
+    let socket = socket_dir.path().join("amaebi.sock");
+
+    let exe = find_amaebi_binary()?;
+
+    let mut cmd = Command::new(&exe);
+    cmd.arg("daemon")
+        .arg("--socket")
+        .arg(&socket)
+        .env("HOME", home_path)
+        .env("AMAEBI_COPILOT_URL", mock_url)
+        .env("AMAEBI_COPILOT_TOKEN", "test-api-token")
+        .env("RUST_LOG", "error")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+
+    let child = cmd
+        .spawn()
+        .with_context(|| format!("spawning daemon at home: {}", exe.display()))?;
+    for _ in 0..50 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if socket.exists() {
+            break;
+        }
+    }
+    anyhow::ensure!(
+        socket.exists(),
+        "daemon socket did not appear within 5 s: {}",
+        socket.display()
+    );
+
+    Ok((socket, child, socket_dir))
 }
 
 fn find_amaebi_binary() -> Result<PathBuf> {
@@ -152,6 +287,44 @@ pub fn connect_client(socket: &Path) -> ClientHandle {
     ClientHandle {
         socket: socket.to_path_buf(),
     }
+}
+
+/// Send a chat message with a specific session_id and model.
+pub async fn send_message_with_session(
+    client: &ClientHandle,
+    prompt: &str,
+    session_id: &str,
+    model: &str,
+) -> Result<Vec<Response>> {
+    send_request(
+        client,
+        &Request::Chat {
+            prompt: prompt.to_string(),
+            tmux_pane: None,
+            session_id: Some(session_id.to_string()),
+            model: model.to_string(),
+        },
+    )
+    .await
+}
+
+/// Send a resume request with a specific session_id and model.
+pub async fn send_resume(
+    client: &ClientHandle,
+    prompt: &str,
+    session_id: &str,
+    model: &str,
+) -> Result<Vec<Response>> {
+    send_request(
+        client,
+        &Request::Resume {
+            prompt: prompt.to_string(),
+            tmux_pane: None,
+            session_id: session_id.to_string(),
+            model: model.to_string(),
+        },
+    )
+    .await
 }
 
 /// Send a chat message and collect all response frames until `Done` or `Error`.
