@@ -145,6 +145,14 @@ impl TokenCache {
     /// Return a valid API token, fetching a fresh one if the cache is empty
     /// or the cached token is about to expire.
     pub async fn get(&self, http: &reqwest::Client) -> Result<String> {
+        // Allow tests to inject a pre-baked token via env var, bypassing the
+        // full OAuth flow (which requires real GitHub credentials).
+        if let Ok(tok) = std::env::var("AMAEBI_COPILOT_TOKEN") {
+            if !tok.trim().is_empty() {
+                return Ok(tok.trim().to_string());
+            }
+        }
+
         let mut guard = self.inner.lock().await;
 
         // Return cached token if it has more than 60 s left.
@@ -160,6 +168,37 @@ impl TokenCache {
         *guard = Some(cached);
         Ok(value)
     }
+}
+
+async fn fetch_api_token(http: &reqwest::Client) -> Result<CachedToken> {
+    let oauth_token = read_oauth_token()?;
+
+    tracing::debug!("fetching Copilot API token");
+
+    let resp = http
+        .get("https://api.github.com/copilot_internal/v2/token")
+        .header("Authorization", format!("token {oauth_token}"))
+        .header("Accept", "application/json")
+        .header("User-Agent", concat!("amaebi/", env!("CARGO_PKG_VERSION")))
+        .send()
+        .await
+        .context("fetching Copilot API token")?
+        .error_for_status()
+        .context("Copilot token endpoint returned an error")?;
+
+    let body: ApiTokenResponse = resp
+        .json()
+        .await
+        .context("parsing Copilot API token response")?;
+
+    // Subtract 60 s as a safety margin so we never use an about-to-expire token.
+    let ttl = Duration::from_secs(body.refresh_in.saturating_sub(60));
+    tracing::debug!(ttl_secs = ttl.as_secs(), "Copilot API token refreshed");
+
+    Ok(CachedToken {
+        value: body.token,
+        valid_until: Instant::now() + ttl,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -381,35 +420,4 @@ mod tests {
             assert_eq!(mode, 0o600, "hosts.json must be mode 0600");
         });
     }
-}
-
-async fn fetch_api_token(http: &reqwest::Client) -> Result<CachedToken> {
-    let oauth_token = read_oauth_token()?;
-
-    tracing::debug!("fetching Copilot API token");
-
-    let resp = http
-        .get("https://api.github.com/copilot_internal/v2/token")
-        .header("Authorization", format!("token {oauth_token}"))
-        .header("Accept", "application/json")
-        .header("User-Agent", concat!("amaebi/", env!("CARGO_PKG_VERSION")))
-        .send()
-        .await
-        .context("fetching Copilot API token")?
-        .error_for_status()
-        .context("Copilot token endpoint returned an error")?;
-
-    let body: ApiTokenResponse = resp
-        .json()
-        .await
-        .context("parsing Copilot API token response")?;
-
-    // Subtract 60 s as a safety margin so we never use an about-to-expire token.
-    let ttl = Duration::from_secs(body.refresh_in.saturating_sub(60));
-    tracing::debug!(ttl_secs = ttl.as_secs(), "Copilot API token refreshed");
-
-    Ok(CachedToken {
-        value: body.token,
-        valid_until: Instant::now() + ttl,
-    })
 }
