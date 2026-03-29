@@ -11,7 +11,12 @@ const CHAT_ENDPOINT: &str = "https://api.githubcopilot.com/chat/completions";
 
 /// Return the chat completions URL, allowing tests to override via env var.
 fn chat_endpoint() -> String {
-    std::env::var("AMAEBI_COPILOT_URL").unwrap_or_else(|_| CHAT_ENDPOINT.to_string())
+    if let Ok(url) = std::env::var("AMAEBI_COPILOT_URL") {
+        if !url.trim().is_empty() {
+            return url;
+        }
+    }
+    CHAT_ENDPOINT.to_string()
 }
 
 // ---------------------------------------------------------------------------

@@ -7,7 +7,7 @@
 //! server.enqueue(ScriptedResponse::text_chunks(vec!["Hello", " world"]));
 //! let url = server.url();         // e.g. "http://127.0.0.1:PORT/chat/completions"
 //! // … point daemon at url …
-//! let captured = server.take_requests().await;   // inspect what the daemon sent
+//! let captured = server.take_requests();   // inspect what the daemon sent
 //! ```
 
 use axum::{
@@ -27,6 +27,7 @@ use std::{
     time::Duration,
 };
 use tokio::sync::oneshot;
+use tokio_stream::wrappers::ReceiverStream;
 
 // ---------------------------------------------------------------------------
 // Scripted response types
@@ -366,39 +367,48 @@ async fn handle_completion(
         body: body_value,
     });
 
-    // Pop a scripted response.
-    let scripted = state
-        .responses
-        .lock()
-        .unwrap()
-        .pop_front()
-        .unwrap_or_else(|| ScriptedResponse::text_chunks(vec!["(no scripted response)"]));
-
-    // Build SSE body.
-    let mut sse_body = String::new();
-    for (chunk, delay) in &scripted.chunks {
-        if let Some(d) = delay {
-            tokio::time::sleep(*d).await;
+    // Pop a scripted response — fail fast if nothing queued.
+    let scripted = match state.responses.lock().unwrap().pop_front() {
+        Some(r) => r,
+        None => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "no scripted response queued".to_string(),
+            ))
         }
-        let line = match chunk {
-            Chunk::Text(t) => text_delta_event(t),
-            Chunk::ToolCallDelta {
-                index,
-                id,
-                function_name,
-                arguments_fragment,
-            } => tool_call_delta_event(*index, id, function_name, arguments_fragment),
-            Chunk::Finish(reason) => finish_event(reason),
-        };
-        sse_body.push_str(&line);
-    }
-    sse_body.push_str("data: [DONE]\n\n");
+    };
 
+    // Build a real async stream that yields SSE chunks with optional delays.
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::convert::Infallible>>(16);
+
+    tokio::spawn(async move {
+        for (chunk, delay) in scripted.chunks {
+            if let Some(d) = delay {
+                tokio::time::sleep(d).await;
+            }
+            let line = match &chunk {
+                Chunk::Text(t) => text_delta_event(t),
+                Chunk::ToolCallDelta {
+                    index,
+                    id,
+                    function_name,
+                    arguments_fragment,
+                } => tool_call_delta_event(*index, id, function_name, arguments_fragment),
+                Chunk::Finish(reason) => finish_event(reason),
+            };
+            if tx.send(Ok(bytes::Bytes::from(line))).await.is_err() {
+                return;
+            }
+        }
+        let _ = tx.send(Ok(bytes::Bytes::from("data: [DONE]\n\n"))).await;
+    });
+
+    let stream = ReceiverStream::new(rx);
     let response = AxumResponse::builder()
         .status(200)
         .header("Content-Type", "text/event-stream")
         .header("Cache-Control", "no-cache")
-        .body(Body::from(sse_body))
+        .body(Body::from_stream(stream))
         .expect("building SSE response");
 
     Ok(response)

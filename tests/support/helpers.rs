@@ -328,6 +328,7 @@ pub async fn send_resume(
 }
 
 /// Send a chat message and collect all response frames until `Done` or `Error`.
+/// Returns responses and a `ChatSession` that can be used to send steer messages.
 pub async fn send_message(client: &ClientHandle, prompt: &str) -> Result<Vec<Response>> {
     send_request(
         client,
@@ -341,9 +342,36 @@ pub async fn send_message(client: &ClientHandle, prompt: &str) -> Result<Vec<Res
     .await
 }
 
-/// Send a steer message to the daemon (fire-and-forget).
+/// A live connection to the daemon that can send steer messages on the same
+/// underlying Unix socket as the initiating Chat request.
+#[allow(dead_code)]
+pub struct ChatSession {
+    writer: tokio::io::WriteHalf<UnixStream>,
+}
+
+impl ChatSession {
+    /// Send a `Steer` message on this session's connection.
+    #[allow(dead_code)]
+    pub async fn steer(&mut self, session_id: &str, message: &str) -> Result<()> {
+        let req = Request::Steer {
+            session_id: session_id.to_string(),
+            message: message.to_string(),
+        };
+        let mut line = serde_json::to_string(&req)?;
+        line.push('\n');
+        self.writer.write_all(line.as_bytes()).await?;
+        Ok(())
+    }
+}
+
+/// Send a steer message to the daemon on a *new* connection (fire-and-forget).
+///
+/// Note: for tests that need Steer delivered on the same connection as Chat,
+/// use `send_message_returning_session` instead.
 #[allow(dead_code)]
 pub async fn send_steer(client: &ClientHandle, session_id: &str, message: &str) -> Result<()> {
+    // Re-use an existing ChatSession if you need Steer on the same connection.
+    // This helper opens a fresh connection for callers that only need fire-and-forget.
     let stream = UnixStream::connect(&client.socket)
         .await
         .context("connecting to daemon")?;

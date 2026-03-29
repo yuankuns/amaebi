@@ -148,7 +148,9 @@ impl TokenCache {
         // Allow tests to inject a pre-baked token via env var, bypassing the
         // full OAuth flow (which requires real GitHub credentials).
         if let Ok(tok) = std::env::var("AMAEBI_COPILOT_TOKEN") {
-            return Ok(tok);
+            if !tok.trim().is_empty() {
+                return Ok(tok);
+            }
         }
 
         let mut guard = self.inner.lock().await;

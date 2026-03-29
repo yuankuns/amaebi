@@ -60,7 +60,7 @@ async fn test_tool_call_roundtrip() {
     // First response: request a shell tool call that echoes a string.
     server.enqueue(ScriptedResponse::tool_call(
         "call-001",
-        "shell",
+        "shell_command",
         r#"{"command":"echo integration-test-marker"}"#,
     ));
     // Second response (after daemon sends tool result): plain text reply.
@@ -121,7 +121,8 @@ async fn test_max_tokens_sent_correctly() {
         reqs[0].body
     );
     let val = max_tokens.unwrap();
-    assert!(val > 0, "max_tokens should be positive, got {val}");
+    // The daemon uses a fixed max_tokens of 4096 (see copilot.rs send_with_retry).
+    assert_eq!(val, 4096, "max_tokens should equal 4096, got {val}");
 }
 
 // ---------------------------------------------------------------------------
