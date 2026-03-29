@@ -16,16 +16,11 @@ pub trait ToolExecutor: Send + Sync {
 // Local (host) executor
 // ---------------------------------------------------------------------------
 
+#[derive(Default)]
 pub struct LocalExecutor {
     /// Optional sandbox backend.  When `Some`, `shell_command` is routed
     /// through the sandbox instead of spawning `sh` directly.
     pub sandbox: Option<Box<dyn crate::sandbox::Sandbox>>,
-}
-
-impl Default for LocalExecutor {
-    fn default() -> Self {
-        Self { sandbox: None }
-    }
 }
 
 #[async_trait::async_trait]
@@ -300,6 +295,8 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sandbox::namespace::NamespaceSandbox;
+    use crate::sandbox::{NoopSandbox, SandboxConfig};
     use tempfile::TempDir;
 
     // ---- tool_schemas ----------------------------------------------------
@@ -394,6 +391,59 @@ mod tests {
             msg.contains("command"),
             "error should mention 'command': {msg}"
         );
+    }
+
+    // ---- shell_command with sandbox ------------------------------------
+
+    #[tokio::test]
+    async fn shell_command_with_noop_sandbox_captures_stdout() {
+        let exec = LocalExecutor {
+            sandbox: Some(Box::new(NoopSandbox)),
+        };
+        let out = exec
+            .execute(
+                "shell_command",
+                serde_json::json!({"command": "echo hello"}),
+            )
+            .await
+            .unwrap();
+        assert!(out.contains("hello"), "got: {out}");
+    }
+
+    #[tokio::test]
+    async fn shell_command_with_noop_sandbox_exit_code_on_failure() {
+        let exec = LocalExecutor {
+            sandbox: Some(Box::new(NoopSandbox)),
+        };
+        let out = exec
+            .execute("shell_command", serde_json::json!({"command": "exit 42"}))
+            .await
+            .unwrap();
+        assert!(out.contains("[exit 42]"), "got: {out}");
+    }
+
+    #[ignore]
+    #[tokio::test]
+    async fn shell_command_with_namespace_sandbox_runs_in_isolation() {
+        let tmp = TempDir::new().unwrap();
+        let sandbox = NamespaceSandbox::new(SandboxConfig {
+            workspace: tmp.path().to_path_buf(),
+            ro_paths: vec![],
+            rw_paths: vec![],
+            backend: "namespace".into(),
+            ..SandboxConfig::default()
+        });
+        let exec = LocalExecutor {
+            sandbox: Some(Box::new(sandbox)),
+        };
+        let out = exec
+            .execute(
+                "shell_command",
+                serde_json::json!({"command": "echo isolated"}),
+            )
+            .await
+            .unwrap();
+        assert!(out.contains("isolated"), "got: {out}");
     }
 
     // ---- read_file -------------------------------------------------------
