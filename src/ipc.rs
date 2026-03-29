@@ -59,6 +59,17 @@ pub enum Request {
         /// Chat model to use (e.g. "gpt-4o").
         model: String,
     },
+    /// Ask the daemon to abort the current tool execution and skip remaining
+    /// tool calls in the active agentic loop for the given session.
+    ///
+    /// Sent by the client immediately on the first Ctrl-C so the daemon can
+    /// stop mid-chain without waiting for the user to type a correction.
+    /// A [`Response::SteerAck`] is NOT sent in response; the loop simply
+    /// drains any pending steer messages at the start of the next iteration.
+    Interrupt {
+        /// Session UUID of the loop to interrupt.
+        session_id: String,
+    },
     /// Ask the daemon to clear its persisted SQLite memory database.
     ///
     /// Sent after `amaebi memory clear` so the running daemon also clears its
@@ -87,7 +98,7 @@ pub enum Request {
 ///
 /// Newline-delimited JSON: the daemon writes one frame per line;
 /// the client reads lines until `Done` or `Error`.
-#[derive(serde::Serialize, serde::Deserialize, Debug)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Response {
     /// A chunk of text to print immediately.
@@ -265,6 +276,23 @@ mod tests {
         };
         assert_eq!(session_id, "old-uuid");
         assert_eq!(prompt, "continue");
+    }
+
+    #[test]
+    fn request_interrupt_round_trip() {
+        let req = Request::Interrupt {
+            session_id: "sess-xyz".into(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["type"], "interrupt");
+        assert_eq!(v["session_id"], "sess-xyz");
+
+        let back: Request = serde_json::from_str(&json).unwrap();
+        let Request::Interrupt { session_id } = back else {
+            panic!("expected Interrupt variant");
+        };
+        assert_eq!(session_id, "sess-xyz");
     }
 
     #[test]

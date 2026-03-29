@@ -263,7 +263,7 @@ impl acp::Agent for AmaebiAgent {
         // Run the agentic loop in a background local task.
         // ACP mode has no steering channel — create a channel and immediately
         // drop the sender so the receiver observes a closed channel.
-        let (steer_tx, mut steer_rx) = tokio::sync::mpsc::channel::<String>(1);
+        let (steer_tx, mut steer_rx) = tokio::sync::mpsc::channel::<Option<String>>(1);
         drop(steer_tx);
         tokio::task::spawn_local(async move {
             let outcome =

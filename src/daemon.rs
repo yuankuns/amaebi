@@ -13,8 +13,40 @@ use crate::ipc::{write_frame, Request, Response};
 use crate::memory_db;
 use crate::tools::{self, ToolExecutor};
 
-/// Tokens reserved for model output — matches `max_tokens` in the request body (4096).
-const RESPONSE_RESERVE_TOKENS: usize = 4_096;
+/// Compute `max_tokens` for a request to `model`: capped at half the model's context window
+/// so it never exceeds what the model supports (e.g. gpt-4's 8,192-token limit).
+fn max_output_tokens_for_model(model: &str) -> usize {
+    // Ordered longest-prefix-first so that e.g. "gpt-4-turbo" beats "gpt-4".
+    const TABLE: &[(&str, usize)] = &[
+        ("gpt-4.1", 32_768),
+        ("gpt-4o", 16_384),
+        ("gpt-4-turbo", 4_096),
+        ("gpt-4", 8_192),
+        ("gpt-3.5-turbo", 4_096),
+        ("o1", 100_000),
+        ("o3", 100_000),
+        ("claude", 16_384),
+    ];
+    TABLE
+        .iter()
+        .find(|(prefix, _)| model.starts_with(prefix))
+        .map(|(_, limit)| *limit)
+        .unwrap_or(16_384) // conservative default for unknown models
+}
+
+fn response_max_tokens(model: &str) -> usize {
+    let model_max = max_output_tokens_for_model(model);
+    let context_budget = context_limit_for_model(model) / 2;
+    let result = model_max.min(context_budget);
+    tracing::debug!(
+        model,
+        model_max,
+        context_budget,
+        max_tokens = result,
+        "resolved max output tokens"
+    );
+    result
+}
 /// Compact session history when prompt tokens exceed this fraction of available input.
 const COMPACTION_THRESHOLD: f64 = 0.85;
 /// Minimum recent user/assistant *pairs* to keep in the hot tail after a token-budget trim.
@@ -139,6 +171,7 @@ fn context_limit_for_model(model: &str) -> usize {
     // Ordered longest-prefix-first so that e.g. "gpt-4-turbo" beats "gpt-4".
     const TABLE: &[(&str, usize)] = &[
         ("gpt-4o", 128_000),
+        ("gpt-4.1", 1_047_576),
         ("gpt-4-turbo", 128_000),
         ("gpt-4", 8_192),
         ("gpt-3.5-turbo", 16_385),
@@ -156,7 +189,7 @@ fn context_limit_for_model(model: &str) -> usize {
 /// Token threshold above which compaction should be triggered for `model`.
 ///
 /// Returns `usize::MAX` for models whose context window is too small to
-/// accommodate `RESPONSE_RESERVE_TOKENS`, disabling compaction/trimming for
+/// produce a non-zero compaction threshold, disabling compaction/trimming for
 /// those models rather than triggering it on every turn.
 fn compaction_threshold_tokens(model: &str) -> usize {
     // Allow manual override for debugging: AMAEBI_COMPACTION_THRESHOLD=<tokens>
@@ -165,11 +198,12 @@ fn compaction_threshold_tokens(model: &str) -> usize {
             return n;
         }
     }
-    let available = context_limit_for_model(model).saturating_sub(RESPONSE_RESERVE_TOKENS);
-    if available == 0 {
+    let available = context_limit_for_model(model).saturating_sub(response_max_tokens(model));
+    let threshold = (available as f64 * COMPACTION_THRESHOLD) as usize;
+    if threshold == 0 {
         return usize::MAX;
     }
-    (available as f64 * COMPACTION_THRESHOLD) as usize
+    threshold
 }
 
 // ---------------------------------------------------------------------------
@@ -290,6 +324,12 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
             .await?;
         }
 
+        Request::Interrupt { .. } => {
+            // An Interrupt arriving on a fresh connection is silently ignored —
+            // there is no active loop to interrupt.
+            tracing::debug!("ignoring Interrupt on fresh connection (no active loop)");
+        }
+
         Request::SubmitDetach {
             prompt,
             tmux_pane,
@@ -371,7 +411,7 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                 // agentic loop returns None at once instead of timing out if
                 // the model ends with '?'.
                 let mut sink = tokio::io::sink();
-                let (_, mut steer_rx) = tokio::sync::mpsc::channel::<String>(1);
+                let (_, mut steer_rx) = tokio::sync::mpsc::channel::<Option<String>>(1);
 
                 match run_agentic_loop(&state, &model, messages, &mut sink, &mut steer_rx).await {
                     Ok((final_text, _)) => {
@@ -436,7 +476,7 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                 return Ok(());
             }
 
-            let (steer_tx, mut steer_rx) = tokio::sync::mpsc::channel::<String>(16);
+            let (steer_tx, mut steer_rx) = tokio::sync::mpsc::channel::<Option<String>>(16);
             let expected_resume_sid = session_id.clone();
             tokio::spawn(async move {
                 while let Ok(Some(frame)) = lines.next_line().await {
@@ -453,7 +493,22 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                                 );
                                 continue;
                             }
-                            if steer_tx.send(message).await.is_err() {
+                            if steer_tx.send(Some(message)).await.is_err() {
+                                break;
+                            }
+                        }
+                        Ok(Request::Interrupt {
+                            session_id: steer_sid,
+                        }) => {
+                            if steer_sid != expected_resume_sid {
+                                tracing::debug!(
+                                    expected = %expected_resume_sid,
+                                    got = %steer_sid,
+                                    "ignoring interrupt frame with mismatched session_id on resume"
+                                );
+                                continue;
+                            }
+                            if steer_tx.send(None).await.is_err() {
                                 break;
                             }
                         }
@@ -573,7 +628,7 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
 
             // Steering channel: the spawned reader task sends user corrections
             // here; the agentic loop drains them between model turns.
-            let (steer_tx, mut steer_rx) = tokio::sync::mpsc::channel::<String>(16);
+            let (steer_tx, mut steer_rx) = tokio::sync::mpsc::channel::<Option<String>>(16);
 
             // Spawn a task that reads subsequent frames from the client on
             // this connection.  Any Steer frames are forwarded to steer_tx so
@@ -596,8 +651,24 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                                 );
                                 continue;
                             }
-                            if steer_tx.send(message).await.is_err() {
+                            if steer_tx.send(Some(message)).await.is_err() {
                                 break; // agentic loop has finished; channel closed
+                            }
+                        }
+                        Ok(Request::Interrupt {
+                            session_id: steer_sid,
+                        }) => {
+                            if steer_sid != expected_chat_sid {
+                                tracing::debug!(
+                                    expected = %expected_chat_sid,
+                                    got = %steer_sid,
+                                    "ignoring interrupt frame with mismatched session_id on chat"
+                                );
+                                continue;
+                            }
+                            // None = interrupt-only; no steer text to inject.
+                            if steer_tx.send(None).await.is_err() {
+                                break;
                             }
                         }
                         Ok(_) | Err(_) => {
@@ -971,8 +1042,16 @@ async fn compact_session(
             .await
             .context("compact_session: refreshing token")?;
         let mut sink = tokio::io::sink();
-        let resp =
-            copilot::stream_chat(&state.http, &token, &model, &messages, &[], &mut sink).await?;
+        let resp = copilot::stream_chat(
+            &state.http,
+            &token,
+            &model,
+            &messages,
+            &[],
+            response_max_tokens(&model),
+            &mut sink,
+        )
+        .await?;
         Ok(resp.text)
     }
     .await;
@@ -1039,7 +1118,7 @@ pub(crate) async fn run_agentic_loop<W>(
     model: &str,
     mut messages: Vec<Message>,
     writer: &mut W,
-    steer_rx: &mut tokio::sync::mpsc::Receiver<String>,
+    steer_rx: &mut tokio::sync::mpsc::Receiver<Option<String>>,
 ) -> Result<(String, usize)>
 where
     W: AsyncWriteExt + Unpin,
@@ -1055,8 +1134,12 @@ where
         // call (covers non-tool turns and the time between tool completion
         // and the next iteration).
         while let Ok(steer_msg) = steer_rx.try_recv() {
-            messages.push(Message::user(steer_msg));
-            write_frame(writer, &Response::SteerAck).await?;
+            if let Some(msg) = steer_msg {
+                messages.push(Message::user(msg));
+                write_frame(writer, &Response::SteerAck).await?;
+            }
+            // None = interrupt-only (no user message to inject; loop already
+            // skipped the tool chain at execution time).  No SteerAck is sent.
         }
 
         // Re-fetch the token on every iteration so long-running agentic loops
@@ -1074,40 +1157,48 @@ where
         // for auth-adjacent ones (400/401/403) we evict the cache and retry once
         // with a fresh token. Any other error (exhausted retries, context overflow,
         // etc.) propagates.
-        let resp =
-            match copilot::stream_chat(&state.http, &token, model, &messages, &schemas, writer)
-                .await
-            {
-                Ok(r) => r,
-                Err(e) => {
-                    let is_auth_err = e
-                        .downcast_ref::<copilot::CopilotHttpError>()
-                        .is_some_and(|he| matches!(he.status.as_u16(), 400 | 401 | 403));
-                    if is_auth_err {
-                        tracing::warn!(
-                            error = %e,
-                            "Copilot auth error; evicting token cache and retrying once"
-                        );
-                        state.tokens.invalidate().await;
-                        let fresh_token = state
-                            .tokens
-                            .get(&state.http)
-                            .await
-                            .context("fetching fresh token after auth error")?;
-                        copilot::stream_chat(
-                            &state.http,
-                            &fresh_token,
-                            model,
-                            &messages,
-                            &schemas,
-                            writer,
-                        )
-                        .await?
-                    } else {
-                        return Err(e);
-                    }
+        let resp = match copilot::stream_chat(
+            &state.http,
+            &token,
+            model,
+            &messages,
+            &schemas,
+            response_max_tokens(model),
+            writer,
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                let is_auth_err = e
+                    .downcast_ref::<copilot::CopilotHttpError>()
+                    .is_some_and(|he| matches!(he.status.as_u16(), 400 | 401 | 403));
+                if is_auth_err {
+                    tracing::warn!(
+                        error = %e,
+                        "Copilot auth error; evicting token cache and retrying once"
+                    );
+                    state.tokens.invalidate().await;
+                    let fresh_token = state
+                        .tokens
+                        .get(&state.http)
+                        .await
+                        .context("fetching fresh token after auth error")?;
+                    copilot::stream_chat(
+                        &state.http,
+                        &fresh_token,
+                        model,
+                        &messages,
+                        &schemas,
+                        response_max_tokens(model),
+                        writer,
+                    )
+                    .await?
+                } else {
+                    return Err(e);
                 }
-            };
+            }
+        };
 
         last_prompt_tokens = resp.prompt_tokens;
 
@@ -1165,9 +1256,28 @@ where
 
                     // Block until the user replies via the steering channel.
                     // Timeout after 5 minutes to avoid infinite hangs.
-                    match tokio::time::timeout(std::time::Duration::from_secs(300), steer_rx.recv())
+                    // A bare interrupt (Ctrl-C / None) is ignored while the
+                    // session is already waiting for input — keep waiting.
+                    let steer_result = 'wait_input: loop {
+                        match tokio::time::timeout(
+                            std::time::Duration::from_secs(300),
+                            steer_rx.recv(),
+                        )
                         .await
-                    {
+                        {
+                            Ok(Some(Some(reply))) => break 'wait_input Ok(Some(reply)),
+                            Ok(Some(None)) => {
+                                tracing::debug!(
+                                    context = "waiting_for_input_reply",
+                                    "interrupt ignored while waiting for input"
+                                );
+                                continue 'wait_input;
+                            }
+                            Ok(None) => break 'wait_input Ok(None),
+                            Err(e) => break 'wait_input Err(e),
+                        }
+                    };
+                    match steer_result {
                         Ok(Some(user_reply)) => {
                             messages.push(Message::user(user_reply));
                             write_frame(writer, &Response::SteerAck).await?;
@@ -1225,9 +1335,28 @@ where
                     // Use the trimmed question (no marker contamination) in history.
                     messages.push(Message::assistant(Some(question.clone()), vec![]));
 
-                    match tokio::time::timeout(std::time::Duration::from_secs(300), steer_rx.recv())
+                    // A bare interrupt (Ctrl-C / None) is ignored while the
+                    // session is already waiting for a question reply — keep waiting.
+                    let steer_result = 'wait_question: loop {
+                        match tokio::time::timeout(
+                            std::time::Duration::from_secs(300),
+                            steer_rx.recv(),
+                        )
                         .await
-                    {
+                        {
+                            Ok(Some(Some(reply))) => break 'wait_question Ok(Some(reply)),
+                            Ok(Some(None)) => {
+                                tracing::debug!(
+                                    context = "waiting_for_question_reply",
+                                    "interrupt ignored while waiting for question reply"
+                                );
+                                continue 'wait_question;
+                            }
+                            Ok(None) => break 'wait_question Ok(None),
+                            Err(e) => break 'wait_question Err(e),
+                        }
+                    };
+                    match steer_result {
                         Ok(Some(user_reply)) => {
                             messages.push(Message::user(user_reply));
                             write_frame(writer, &Response::SteerAck).await?;
@@ -1309,8 +1438,11 @@ where
 
             FinishReason::ToolCalls => {
                 tools_were_used = true;
-                let api_calls: Vec<ApiToolCall> = resp
-                    .tool_calls
+                // Destructure resp up front to avoid a partial move: consuming
+                // resp.text while still needing to borrow resp.tool_calls.
+                let resp_text = resp.text;
+                let tool_calls = resp.tool_calls;
+                let api_calls: Vec<ApiToolCall> = tool_calls
                     .iter()
                     .map(|tc| ApiToolCall {
                         id: tc.id.clone(),
@@ -1322,14 +1454,38 @@ where
                     })
                     .collect();
 
-                let assistant_text = if resp.text.is_empty() {
+                let assistant_text = if resp_text.is_empty() {
                     None
                 } else {
-                    Some(resp.text)
+                    Some(resp_text)
                 };
                 messages.push(Message::assistant(assistant_text, api_calls));
 
-                for tc in &resp.tool_calls {
+                let tool_calls_snapshot = &tool_calls;
+                let mut interrupted_at: Option<usize> = None;
+                let mut steer_text: Option<String> = None;
+
+                for (i, tc) in tool_calls_snapshot.iter().enumerate() {
+                    // Check for a mid-execution steer before running this tool.
+                    // If the user pressed Ctrl-C and typed a correction, honour
+                    // it immediately: skip this and all remaining tools.
+                    if let Ok(msg) = steer_rx.try_recv() {
+                        tracing::debug!(
+                            "mid-execution steer received; interrupting tool chain at index {i}"
+                        );
+                        // Stash the steer text — we must emit placeholder tool_result
+                        // entries for ALL skipped calls before appending the user message,
+                        // because the API requires assistant(tool_calls) →
+                        // tool(tool_result…) → user/assistant ordering.
+                        // msg is None for interrupt-only (no text to inject).
+                        steer_text = msg;
+                        if steer_text.is_some() {
+                            write_frame(writer, &Response::SteerAck).await?;
+                        }
+                        interrupted_at = Some(i);
+                        break;
+                    }
+
                     tracing::debug!(tool = %tc.name, "executing tool");
 
                     let tool_detail = {
@@ -1407,6 +1563,41 @@ where
                     };
 
                     messages.push(Message::tool_result(&tc.id, result));
+                }
+
+                // If the user injected a steer mid-chain, push placeholder
+                // tool results for the tools that were never executed.  The
+                // OpenAI API requires a tool_result for every tool_call in the
+                // assistant message, even if we didn't actually run them.
+                if let Some(skip_from) = interrupted_at {
+                    for tc in &tool_calls_snapshot[skip_from..] {
+                        messages.push(Message::tool_result(
+                            &tc.id,
+                            "[interrupted by user before execution]",
+                        ));
+                    }
+                    // When the interrupt carried steer text, use it directly.
+                    // When it was interrupt-only (None), block until the user
+                    // sends a correction before starting the next model turn —
+                    // proceeding immediately would race against incoming steer
+                    // text and re-enter the model without user guidance.
+                    let effective_steer = if let Some(text) = steer_text {
+                        Some(text)
+                    } else {
+                        loop {
+                            match steer_rx.recv().await {
+                                Some(Some(t)) => {
+                                    write_frame(writer, &Response::SteerAck).await?;
+                                    break Some(t);
+                                }
+                                Some(None) => continue, // another bare interrupt; keep waiting
+                                None => break None,     // channel closed; proceed without steer
+                            }
+                        }
+                    };
+                    if let Some(text) = effective_steer {
+                        messages.push(Message::user(text));
+                    }
                 }
 
                 // Steers that arrived during tool execution are drained at
@@ -1612,7 +1803,7 @@ async fn run_cron_job(state: Arc<DaemonState>, job: &cron::CronJob) {
     // Cron jobs are non-interactive: drop the sender immediately so steer_rx.recv()
     // returns None at once if the model ends with '?', rather than timing out.
     let mut sink = tokio::io::sink();
-    let (_, mut steer_rx) = tokio::sync::mpsc::channel::<String>(1);
+    let (_, mut steer_rx) = tokio::sync::mpsc::channel::<Option<String>>(1);
 
     let result = run_agentic_loop(&state, &model, messages, &mut sink, &mut steer_rx).await;
 
@@ -1859,7 +2050,21 @@ mod tests {
         std::env::remove_var("AMAEBI_COMPACTION_THRESHOLD");
         for model in &["gpt-4o", "gpt-4", "gpt-3.5-turbo", "o1", "unknown-model"] {
             let t = compaction_threshold_tokens(model);
-            let available = context_limit_for_model(model).saturating_sub(RESPONSE_RESERVE_TOKENS);
+            let available =
+                context_limit_for_model(model).saturating_sub(response_max_tokens(model));
+            // When context_limit minus response_max_tokens(model) leaves ≤1
+            // token, (available as f64 * COMPACTION_THRESHOLD) truncates to 0,
+            // so compaction_threshold_tokens returns usize::MAX to disable
+            // compaction rather than triggering it on every turn.
+            // Skip the < available / > 0 assertions for those.
+            if available <= 1 {
+                assert_eq!(
+                    t,
+                    usize::MAX,
+                    "model={model}: tiny-context model should return usize::MAX to disable compaction"
+                );
+                continue;
+            }
             assert!(
                 t < available,
                 "model={model}: threshold must be below available input budget"
@@ -1917,5 +2122,207 @@ mod tests {
             .as_deref()
             .unwrap_or("")
             .contains("soul only"));
+    }
+
+    #[test]
+    fn max_output_tokens_for_known_models() {
+        assert_eq!(max_output_tokens_for_model("gpt-4.1"), 32_768);
+        assert_eq!(max_output_tokens_for_model("gpt-4.1-mini"), 32_768);
+        assert_eq!(max_output_tokens_for_model("gpt-4o"), 16_384);
+        assert_eq!(max_output_tokens_for_model("gpt-4o-mini"), 16_384);
+        assert_eq!(max_output_tokens_for_model("gpt-4-turbo"), 4_096);
+        assert_eq!(max_output_tokens_for_model("gpt-4"), 8_192);
+        assert_eq!(max_output_tokens_for_model("gpt-3.5-turbo"), 4_096);
+        assert_eq!(max_output_tokens_for_model("o1"), 100_000);
+        assert_eq!(max_output_tokens_for_model("o1-preview"), 100_000);
+        assert_eq!(max_output_tokens_for_model("o3"), 100_000);
+        assert_eq!(max_output_tokens_for_model("o3-mini"), 100_000);
+        assert_eq!(max_output_tokens_for_model("claude-3-5-sonnet"), 16_384);
+        assert_eq!(max_output_tokens_for_model("claude-opus-4-6"), 16_384);
+    }
+
+    #[test]
+    fn max_output_tokens_unknown_model_is_conservative() {
+        assert_eq!(max_output_tokens_for_model("some-future-model-xyz"), 16_384);
+    }
+
+    #[test]
+    fn response_max_tokens_is_min_of_model_max_and_half_context() {
+        // For each model, response_max_tokens must equal min(model_max, context_limit/2).
+        for model in &[
+            "gpt-4.1",
+            "gpt-4o",
+            "gpt-4-turbo",
+            "gpt-4",
+            "gpt-3.5-turbo",
+            "o1",
+            "o3",
+            "claude-3-5-sonnet",
+            "unknown-model",
+        ] {
+            let model_max = max_output_tokens_for_model(model);
+            let context_half = context_limit_for_model(model) / 2;
+            let expected = model_max.min(context_half);
+            assert_eq!(
+                response_max_tokens(model),
+                expected,
+                "model={model}: expected min({model_max}, {context_half}) = {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn response_max_tokens_context_half_wins_for_small_context_model() {
+        // gpt-4 has context=8192, so context/2=4096 < model_max=8192 → capped at 4096.
+        assert_eq!(response_max_tokens("gpt-4"), 4_096);
+    }
+
+    #[test]
+    fn response_max_tokens_model_max_wins_when_context_is_large() {
+        // gpt-4o has model_max=16384 < context/2=64000 → capped at model_max.
+        assert_eq!(response_max_tokens("gpt-4o"), 16_384);
+    }
+
+    // ---- mid-execution steer / interrupt tests ----------------------------
+
+    /// Build an assistant `Message` carrying `n` synthetic tool calls with IDs
+    /// "id0", "id1", … and a parallel `Vec<copilot::ToolCall>` for execution.
+    fn make_tool_calls(
+        n: usize,
+    ) -> (
+        Vec<crate::copilot::ToolCall>,
+        Vec<crate::copilot::ApiToolCall>,
+    ) {
+        let tool_calls: Vec<crate::copilot::ToolCall> = (0..n)
+            .map(|i| crate::copilot::ToolCall {
+                id: format!("id{i}"),
+                name: format!("tool_{i}"),
+                arguments: "{}".into(),
+            })
+            .collect();
+        let api_calls: Vec<crate::copilot::ApiToolCall> = tool_calls
+            .iter()
+            .map(|tc| crate::copilot::ApiToolCall {
+                id: tc.id.clone(),
+                kind: "function".into(),
+                function: crate::copilot::ApiToolCallFunction {
+                    name: tc.name.clone(),
+                    arguments: tc.arguments.clone(),
+                },
+            })
+            .collect();
+        (tool_calls, api_calls)
+    }
+
+    /// Simulate the steer-mid-chain path and return the resulting messages.
+    ///
+    /// `n_calls`: total number of tool calls in the assistant turn.
+    /// `interrupt_at`: index at which the steer is received (no tool at this
+    ///   index or beyond is "executed").
+    /// `steer`: optional user-injected text appended after the placeholders.
+    fn simulate_mid_steer(
+        n_calls: usize,
+        interrupt_at: usize,
+        steer: Option<&str>,
+    ) -> Vec<Message> {
+        let (tool_calls, api_calls) = make_tool_calls(n_calls);
+        let mut messages: Vec<Message> = Vec::new();
+
+        // Push the assistant turn with all tool_calls, just like daemon.rs does.
+        messages.push(Message::assistant(None, api_calls));
+
+        // Simulate executing tools up to the interrupt point.
+        for tc in &tool_calls[..interrupt_at] {
+            messages.push(Message::tool_result(&tc.id, "ok"));
+        }
+
+        // Push placeholder tool_results for skipped tools — mirrors daemon.rs:1569.
+        for tc in &tool_calls[interrupt_at..] {
+            messages.push(Message::tool_result(
+                &tc.id,
+                "[interrupted by user before execution]",
+            ));
+        }
+
+        // Append the steer as a user turn — mirrors daemon.rs:1578.
+        if let Some(text) = steer {
+            messages.push(Message::user(text));
+        }
+
+        messages
+    }
+
+    #[test]
+    fn steer_mid_chain_placeholder_count_correct() {
+        // 3 tools, interrupt after executing 1 → 2 placeholders.
+        let msgs = simulate_mid_steer(3, 1, None);
+        let tool_results: Vec<_> = msgs.iter().filter(|m| m.role == "tool").collect();
+        assert_eq!(
+            tool_results.len(),
+            3,
+            "must have one tool_result per tool_call"
+        );
+    }
+
+    #[test]
+    fn steer_mid_chain_every_tool_call_has_matching_result() {
+        let msgs = simulate_mid_steer(4, 2, Some("go left instead"));
+        let assistant = &msgs[0];
+        assert_eq!(assistant.role, "assistant");
+
+        for tc in &assistant.tool_calls {
+            let found = msgs
+                .iter()
+                .any(|m| m.role == "tool" && m.tool_call_id.as_deref() == Some(tc.id.as_str()));
+            assert!(found, "tool_call id={} has no matching tool_result", tc.id);
+        }
+    }
+
+    #[test]
+    fn steer_mid_chain_message_ordering() {
+        // Ordering: assistant → tool… → user (steer)
+        let msgs = simulate_mid_steer(3, 1, Some("new direction"));
+
+        assert_eq!(msgs[0].role, "assistant", "first message must be assistant");
+        for i in 1..=3 {
+            assert_eq!(msgs[i].role, "tool", "messages[{i}] must be role=tool");
+        }
+        assert_eq!(
+            msgs.last().unwrap().role,
+            "user",
+            "last message must be user (steer)"
+        );
+    }
+
+    #[test]
+    fn steer_at_first_tool_all_placeholders() {
+        // Interrupt before any tool runs → all 3 results are placeholders.
+        let msgs = simulate_mid_steer(3, 0, None);
+        let placeholders: Vec<_> = msgs
+            .iter()
+            .filter(|m| {
+                m.role == "tool"
+                    && m.content
+                        .as_deref()
+                        .unwrap_or("")
+                        .contains("[interrupted by user before execution]")
+            })
+            .collect();
+        assert_eq!(
+            placeholders.len(),
+            3,
+            "all tool_results must be placeholders"
+        );
+    }
+
+    #[test]
+    fn interrupt_no_steer_text_no_trailing_user_message() {
+        // Interrupt with no steer text → no user message appended.
+        let msgs = simulate_mid_steer(2, 1, None);
+        assert_ne!(
+            msgs.last().unwrap().role,
+            "user",
+            "without steer text there must be no trailing user message"
+        );
     }
 }

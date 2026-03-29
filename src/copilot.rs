@@ -393,13 +393,14 @@ async fn send_with_retry(
     model: &str,
     messages: &[Message],
     tools: &[serde_json::Value],
+    max_tokens: usize,
 ) -> Result<reqwest::Response> {
     let body = serde_json::json!({
         "model": model,
         "messages": messages,
         "tools": tools,
         "stream": true,
-        "max_tokens": 4096,
+        "max_tokens": max_tokens,
         "stream_options": { "include_usage": true },
     });
 
@@ -527,13 +528,14 @@ pub async fn stream_chat<W>(
     model: &str,
     messages: &[Message],
     tools: &[serde_json::Value],
+    max_tokens: usize,
     writer: &mut W,
 ) -> Result<CopilotResponse>
 where
     W: AsyncWriteExt + Unpin,
 {
     tracing::debug!(messages = messages.len(), "sending chat request to Copilot");
-    let resp = send_with_retry(http, token, model, messages, tools).await?;
+    let resp = send_with_retry(http, token, model, messages, tools, max_tokens).await?;
     parse_sse_stream(resp, writer).await
 }
 

@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use std::collections::VecDeque;
 use std::io::IsTerminal as _;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -11,6 +12,11 @@ use crate::session;
 
 /// How long the user has to press Ctrl-C a second time to exit.
 const DOUBLE_CTRLC_WINDOW: Duration = Duration::from_secs(2);
+
+/// Maximum number of frames buffered during a steer interaction.
+/// If exceeded, the oldest frames are dropped and a truncation notice is shown
+/// when the buffer is flushed.
+const STEER_BUFFER_MAX_FRAMES: usize = 1000;
 
 /// Returned when the user presses Ctrl-C twice within [`DOUBLE_CTRLC_WINDOW`].
 ///
@@ -76,6 +82,13 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
     let mut stdout = tokio::io::stdout();
     // Timestamp of the first Ctrl-C press; None means no pending first press.
     let mut last_ctrl_c: Option<Instant> = None;
+    // Set to true on first Ctrl-C to immediately buffer daemon output while
+    // the user types a steering correction (prevents output/input overlap).
+    let mut steer_pending = false;
+    // Frames received while steer_pending — flushed to the terminal on SteerAck.
+    let mut steer_buffer: VecDeque<Response> = VecDeque::new();
+    // Set to true when eviction occurs so flush_steer_buffer can print a truncation notice.
+    let mut buffer_truncated = false;
 
     // Stdin reader — only created when stdin is a TTY (interactive terminal).
     // Piped invocations (`echo "fix" | amaebi ask "..."`) have stdin as a
@@ -90,7 +103,6 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
     loop {
         tokio::select! {
             biased;
-
             // Handle Ctrl-C (SIGINT).
             result = sigint.recv() => {
                 // recv() returns None when the signal stream is closed; treat
@@ -108,11 +120,26 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
                     let _ = tokio::io::stderr().flush().await;
                     return Err(anyhow::Error::new(Interrupted));
                 }
-                // First press (or expired window): remind the user and record time.
-                eprintln!(
-                    "\nPress Ctrl-C again within {}s to exit",
-                    DOUBLE_CTRLC_WINDOW.as_secs()
-                );
+                // First press (or expired window): interrupt the agent and
+                // immediately start buffering output to prevent overlap with
+                // the user's correction text.  Double Ctrl-C (handled above) exits.
+                steer_pending = true;
+                if use_stdin {
+                    eprintln!("\n^C interrupted. Enter correction (empty line to cancel): ");
+                    eprint!(">");
+                } else {
+                    eprintln!("\n[interrupted — press Ctrl-C again quickly to exit]");
+                }
+                let _ = tokio::io::stderr().flush().await;
+                // Notify the daemon to abort/skip remaining tool calls immediately.
+                let interrupt_req = Request::Interrupt {
+                    session_id: session_id_copy.clone(),
+                };
+                if let Ok(mut frame) = serde_json::to_string(&interrupt_req) {
+                    frame.push('\n');
+                    let _ = writer.write_all(frame.as_bytes()).await;
+                    let _ = writer.flush().await;
+                }
                 last_ctrl_c = Some(now);
             }
 
@@ -127,30 +154,50 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
                     serde_json::from_str(&line).context("parsing response frame")?;
                 match resp {
                     Response::Text { chunk } => {
-                        stdout
-                            .write_all(chunk.as_bytes())
-                            .await
-                            .context("writing to stdout")?;
-                        stdout.flush().await.context("flushing stdout")?;
+                        // Buffer output while the user is typing a steering correction
+                        // to prevent mixing daemon output with the user's input.
+                        if steer_pending {
+                            push_steer_buffer(&mut steer_buffer, &mut buffer_truncated, Response::Text { chunk });
+                        } else {
+                            stdout
+                                .write_all(chunk.as_bytes())
+                                .await
+                                .context("writing to stdout")?;
+                            stdout.flush().await.context("flushing stdout")?;
+                        }
                     }
-                    Response::Done => break,
+                    Response::Done => {
+                        // Flush any buffered frames before exiting.
+                        flush_steer_buffer(&mut steer_buffer, &mut buffer_truncated, &mut stdout).await?;
+                        break;
+                    }
                     Response::Error { message } => {
+                        // Flush any buffered frames before surfacing the error
+                        // so the user can see what happened before it failed.
+                        flush_steer_buffer(&mut steer_buffer, &mut buffer_truncated, &mut stdout).await?;
                         anyhow::bail!("{message}");
                     }
                     Response::ToolUse { name, detail } => {
-                        // Tool notifications go to stderr so stdout stays clean for the AI response.
-                        eprintln!();
-                        match name.as_str() {
-                            "shell_command" => eprintln!("```bash\n$ {detail}\n```"),
-                            "read_file" => eprintln!("📄 {detail}"),
-                            "edit_file" => eprintln!("✏️  {detail}"),
-                            "tmux_send_keys" => eprintln!("⌨️  send-keys: {detail}"),
-                            "tmux_capture_pane" => eprintln!("🖥️  capture: {detail}"),
-                            _ => eprintln!("🔧 {name}: {detail}"),
+                        // Buffer tool notifications while steering is pending.
+                        if steer_pending {
+                            push_steer_buffer(&mut steer_buffer, &mut buffer_truncated, Response::ToolUse { name, detail });
+                        } else {
+                            // Tool notifications go to stderr so stdout stays clean for the AI response.
+                            eprintln!();
+                            match name.as_str() {
+                                "shell_command" => eprintln!("```bash\n$ {detail}\n```"),
+                                "read_file" => eprintln!("📄 {detail}"),
+                                "edit_file" => eprintln!("✏️  {detail}"),
+                                "tmux_send_keys" => eprintln!("⌨️  send-keys: {detail}"),
+                                "tmux_capture_pane" => eprintln!("🖥️  capture: {detail}"),
+                                _ => eprintln!("🔧 {name}: {detail}"),
+                            }
                         }
                     }
                     Response::Compacting => {
-                        if std::io::stderr().is_terminal() {
+                        if steer_pending {
+                            push_steer_buffer(&mut steer_buffer, &mut buffer_truncated, Response::Compacting);
+                        } else if std::io::stderr().is_terminal() {
                             eprintln!("\n\x1b[1;5;34m[compacting conversation history…]\x1b[0m");
                         } else {
                             eprintln!("\n[compacting conversation history…]");
@@ -158,7 +205,11 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
                     }
                     Response::SteerAck => {
                         // The daemon has acknowledged our steering message.
-                        // No visible output — the next model turn will incorporate it.
+                        // Flush buffered frames so the user can see what happened
+                        // before their correction took effect, then resume output.
+                        steer_pending = false;
+                        last_ctrl_c = None;
+                        flush_steer_buffer(&mut steer_buffer, &mut buffer_truncated, &mut stdout).await?;
                         tracing::debug!("steer acknowledged by daemon");
                     }
                     Response::DetachAccepted { .. } => {
@@ -173,13 +224,17 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
                         // empty the question was already on screen via Text
                         // chunks; just show the cursor.  When non-empty, print
                         // the extra context first, then the cursor line.
-                        if prompt.is_empty() {
+                        // Buffer while steer is pending (user is typing).
+                        if steer_pending {
+                            push_steer_buffer(&mut steer_buffer, &mut buffer_truncated, Response::WaitingForInput { prompt });
+                        } else if prompt.is_empty() {
                             eprint!("\n>");
+                            let _ = tokio::io::stderr().flush().await;
                         } else {
                             eprintln!("\n{prompt}");
                             eprint!(">");
+                            let _ = tokio::io::stderr().flush().await;
                         }
-                        let _ = tokio::io::stderr().flush().await;
                     }
                 }
             }
@@ -189,6 +244,7 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
             steer_line = next_stdin_line(&mut stdin_lines) => {
                 match steer_line {
                     Some(text) if !text.trim().is_empty() => {
+                        // steer_pending is already true (set on Ctrl-C); just send the request.
                         let steer_req = Request::Steer {
                             session_id: session_id_copy.clone(),
                             message: text,
@@ -203,11 +259,25 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
                         let _ = writer.flush().await;
                     }
                     Some(_) => {
-                        // Empty or whitespace-only line (e.g. bare Enter) — discard silently.
+                        // Empty or whitespace-only line (e.g. bare Enter) — if a steer
+                        // is pending, cancel it and resume normal output.
+                        if steer_pending {
+                            steer_pending = false;
+                            last_ctrl_c = None;
+                            flush_steer_buffer(&mut steer_buffer, &mut buffer_truncated, &mut stdout).await?;
+                            buffer_truncated = false;
+                        }
+                        // Otherwise discard silently.
                     }
                     None => {
-                        // Ctrl+D on stdin — detach gracefully (task continues
-                        // on the daemon side; we stop reading stdin).
+                        // Ctrl+D on stdin — if a steer is pending, cancel it
+                        // and resume normal output; then stop reading stdin.
+                        if steer_pending {
+                            steer_pending = false;
+                            last_ctrl_c = None;
+                            flush_steer_buffer(&mut steer_buffer, &mut buffer_truncated, &mut stdout).await?;
+                            buffer_truncated = false;
+                        }
                         stdin_lines = None;
                     }
                 }
@@ -327,6 +397,13 @@ pub async fn run_resume(
     let mut lines = BufReader::new(reader).lines();
     let mut stdout = tokio::io::stdout();
     let mut last_ctrl_c: Option<Instant> = None;
+    // Set to true when the user submits steer text, to buffer daemon output
+    // until SteerAck arrives (prevents mixing with the next model turn).
+    let mut steer_pending = false;
+    // Frames received while steer_pending — flushed to the terminal on SteerAck.
+    let mut steer_buffer: VecDeque<Response> = VecDeque::new();
+    // Set to true when eviction occurs so flush_steer_buffer can print a truncation notice.
+    let mut buffer_truncated = false;
 
     let use_stdin = std::io::stdin().is_terminal();
     let mut stdin_lines: Option<BufReader<tokio::io::Stdin>> = if use_stdin {
@@ -338,7 +415,6 @@ pub async fn run_resume(
     loop {
         tokio::select! {
             biased;
-
             result = sigint.recv() => {
                 let Some(_) = result else { break; };
                 let now = Instant::now();
@@ -348,10 +424,23 @@ pub async fn run_resume(
                     let _ = tokio::io::stderr().flush().await;
                     return Err(anyhow::Error::new(Interrupted));
                 }
-                eprintln!(
-                    "\nPress Ctrl-C again within {}s to exit",
-                    DOUBLE_CTRLC_WINDOW.as_secs()
-                );
+                // Start buffering immediately so output doesn't overlap with user input.
+                steer_pending = true;
+                if use_stdin {
+                    eprintln!("\n^C interrupted. Enter correction (empty line to cancel): ");
+                } else {
+                    eprintln!("\n[interrupted — press Ctrl-C again soon to exit]");
+                }
+                let _ = tokio::io::stderr().flush().await;
+                // Notify the daemon to abort/skip remaining tool calls immediately.
+                let interrupt_req = Request::Interrupt {
+                    session_id: session_uuid.clone(),
+                };
+                if let Ok(mut frame) = serde_json::to_string(&interrupt_req) {
+                    frame.push('\n');
+                    let _ = writer.write_all(frame.as_bytes()).await;
+                    let _ = writer.flush().await;
+                }
                 last_ctrl_c = Some(now);
             }
 
@@ -361,30 +450,55 @@ pub async fn run_resume(
                 let resp: Response = serde_json::from_str(&line).context("parsing response")?;
                 match resp {
                     Response::Text { chunk } => {
-                        stdout.write_all(chunk.as_bytes()).await.context("writing to stdout")?;
-                        stdout.flush().await.context("flushing stdout")?;
+                        // Buffer output while the user is typing a steering correction.
+                        if steer_pending {
+                            push_steer_buffer(&mut steer_buffer, &mut buffer_truncated, Response::Text { chunk });
+                        } else {
+                            stdout.write_all(chunk.as_bytes()).await.context("writing to stdout")?;
+                            stdout.flush().await.context("flushing stdout")?;
+                        }
                     }
-                    Response::Done => break,
-                    Response::Error { message } => anyhow::bail!("{message}"),
+                    Response::Done => {
+                        // Flush any buffered frames before exiting.
+                        flush_steer_buffer(&mut steer_buffer, &mut buffer_truncated, &mut stdout).await?;
+                        break;
+                    }
+                    Response::Error { message } => {
+                        flush_steer_buffer(&mut steer_buffer, &mut buffer_truncated, &mut stdout).await?;
+                        anyhow::bail!("{message}")
+                    }
                     Response::ToolUse { name, detail } => {
-                        eprintln!();
-                        match name.as_str() {
-                            "shell_command" => eprintln!("```bash\n$ {detail}\n```"),
-                            "read_file" => eprintln!("📄 {detail}"),
-                            "edit_file" => eprintln!("✏️  {detail}"),
-                            "tmux_send_keys" => eprintln!("⌨️  send-keys: {detail}"),
-                            "tmux_capture_pane" => eprintln!("🖥️  capture: {detail}"),
-                            _ => eprintln!("🔧 {name}: {detail}"),
+                        // Buffer tool notifications while steering is pending.
+                        if steer_pending {
+                            push_steer_buffer(&mut steer_buffer, &mut buffer_truncated, Response::ToolUse { name, detail });
+                        } else {
+                            eprintln!();
+                            match name.as_str() {
+                                "shell_command" => eprintln!("```bash\n$ {detail}\n```"),
+                                "read_file" => eprintln!("📄 {detail}"),
+                                "edit_file" => eprintln!("✏️  {detail}"),
+                                "tmux_send_keys" => eprintln!("⌨️  send-keys: {detail}"),
+                                "tmux_capture_pane" => eprintln!("🖥️  capture: {detail}"),
+                                _ => eprintln!("🔧 {name}: {detail}"),
+                            }
                         }
                     }
                     Response::Compacting => {
-                        if std::io::stderr().is_terminal() {
+                        if steer_pending {
+                            push_steer_buffer(&mut steer_buffer, &mut buffer_truncated, Response::Compacting);
+                        } else if std::io::stderr().is_terminal() {
                             eprintln!("\n\x1b[1;5;34m[compacting conversation history…]\x1b[0m");
                         } else {
                             eprintln!("\n[compacting conversation history…]");
                         }
                     }
                     Response::SteerAck => {
+                        // Resume output rendering for the next model turn.
+                        // Flush buffered frames so the user can see what happened
+                        // before their correction took effect.
+                        steer_pending = false;
+                        last_ctrl_c = None;
+                        flush_steer_buffer(&mut steer_buffer, &mut buffer_truncated, &mut stdout).await?;
                         tracing::debug!("steer acknowledged by daemon");
                     }
                     Response::DetachAccepted { .. } => {
@@ -394,13 +508,17 @@ pub async fn run_resume(
                         // Not sent to the CLI client — daemon-internal only.
                     }
                     Response::WaitingForInput { prompt } => {
-                        if prompt.is_empty() {
+                        // Buffer while steer is pending (user is typing).
+                        if steer_pending {
+                            push_steer_buffer(&mut steer_buffer, &mut buffer_truncated, Response::WaitingForInput { prompt });
+                        } else if prompt.is_empty() {
                             eprint!("\n>");
+                            let _ = tokio::io::stderr().flush().await;
                         } else {
                             eprintln!("\n{prompt}");
                             eprint!(">");
+                            let _ = tokio::io::stderr().flush().await;
                         }
-                        let _ = tokio::io::stderr().flush().await;
                     }
                 }
             }
@@ -408,6 +526,7 @@ pub async fn run_resume(
             steer_line = next_stdin_line(&mut stdin_lines) => {
                 match steer_line {
                     Some(text) if !text.trim().is_empty() => {
+                        // steer_pending already set on Ctrl-C; just send the request.
                         let steer_req = Request::Steer {
                             session_id: session_uuid.clone(),
                             message: text,
@@ -419,9 +538,24 @@ pub async fn run_resume(
                         let _ = writer.flush().await;
                     }
                     Some(_) => {
-                        // Empty or whitespace-only line — discard silently.
+                        // Empty or whitespace-only line — if a steer is pending,
+                        // cancel it and resume normal output.
+                        if steer_pending {
+                            steer_pending = false;
+                            last_ctrl_c = None;
+                            flush_steer_buffer(&mut steer_buffer, &mut buffer_truncated, &mut stdout).await?;
+                            buffer_truncated = false;
+                        }
                     }
                     None => {
+                        // EOF (Ctrl+D) — if a steer is pending, cancel it and
+                        // resume normal output; then stop reading stdin.
+                        if steer_pending {
+                            steer_pending = false;
+                            last_ctrl_c = None;
+                            flush_steer_buffer(&mut steer_buffer, &mut buffer_truncated, &mut stdout).await?;
+                            buffer_truncated = false;
+                        }
                         stdin_lines = None;
                     }
                 }
@@ -469,6 +603,93 @@ async fn next_stdin_line(lines: &mut Option<BufReader<tokio::io::Stdin>>) -> Opt
         }
         None => std::future::pending().await,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Steer buffer helper
+// ---------------------------------------------------------------------------
+
+/// Push a response frame onto the steer buffer, enforcing the cap.
+///
+/// If the buffer has reached [`STEER_BUFFER_MAX_FRAMES`], the oldest entry is
+/// evicted and `truncated` is set to `true`.  `flush_steer_buffer` checks
+/// that flag to print a truncation notice without comparing frame content.
+/// This keeps memory bounded regardless of how long the user takes to type
+/// their correction.
+fn push_steer_buffer(buffer: &mut VecDeque<Response>, truncated: &mut bool, frame: Response) {
+    if buffer.len() >= STEER_BUFFER_MAX_FRAMES {
+        // Evict the oldest frame and record that truncation has occurred.
+        buffer.pop_front();
+        *truncated = true;
+        // buffer.len() == STEER_BUFFER_MAX_FRAMES - 1 here.
+    }
+    buffer.push_back(frame);
+}
+
+/// Flush buffered response frames that were held while a steer was pending.
+///
+/// Each frame is rendered to the terminal exactly as it would have been on
+/// first receipt.  A dim header is printed before the buffered frames so the
+/// user knows they're seeing suppressed output.  If `truncated` is `true`, a
+/// notice is printed first to indicate that some frames were dropped.
+async fn flush_steer_buffer(
+    buffer: &mut VecDeque<Response>,
+    truncated: &mut bool,
+    stdout: &mut tokio::io::Stdout,
+) -> Result<()> {
+    if buffer.is_empty() && !*truncated {
+        return Ok(());
+    }
+    if std::io::stderr().is_terminal() {
+        eprintln!("\n\x1b[2m[output before steer took effect:]\x1b[0m");
+    } else {
+        eprintln!("\n[output before steer took effect:]");
+    }
+    if *truncated {
+        eprintln!("\n[some output was truncated]");
+        *truncated = false;
+    }
+    for resp in buffer.drain(..) {
+        match resp {
+            Response::Text { chunk } => {
+                stdout
+                    .write_all(chunk.as_bytes())
+                    .await
+                    .context("writing buffered text to stdout")?;
+                stdout.flush().await.context("flushing stdout")?;
+            }
+            Response::ToolUse { name, detail } => {
+                eprintln!();
+                match name.as_str() {
+                    "shell_command" => eprintln!("```bash\n$ {detail}\n```"),
+                    "read_file" => eprintln!("📄 {detail}"),
+                    "edit_file" => eprintln!("✏️  {detail}"),
+                    "tmux_send_keys" => eprintln!("⌨️  send-keys: {detail}"),
+                    "tmux_capture_pane" => eprintln!("🖥️  capture: {detail}"),
+                    _ => eprintln!("🔧 {name}: {detail}"),
+                }
+            }
+            Response::Compacting => {
+                if std::io::stderr().is_terminal() {
+                    eprintln!("\n\x1b[1;5;34m[compacting conversation history…]\x1b[0m");
+                } else {
+                    eprintln!("\n[compacting conversation history…]");
+                }
+            }
+            Response::WaitingForInput { prompt } => {
+                if prompt.is_empty() {
+                    eprint!("\n>");
+                } else {
+                    eprintln!("\n{prompt}");
+                    eprint!(">");
+                }
+                let _ = tokio::io::stderr().flush().await;
+            }
+            // Other variants are not buffered; ignore defensively.
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -578,5 +799,89 @@ mod tests {
             now,
             Duration::from_secs(2)
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // push_steer_buffer / flush_steer_buffer
+    // -----------------------------------------------------------------------
+
+    fn text(s: &str) -> Response {
+        Response::Text {
+            chunk: s.to_string(),
+        }
+    }
+
+    #[test]
+    fn push_steer_buffer_evicts_at_max_frames() {
+        let mut buf: VecDeque<Response> = VecDeque::new();
+        let mut truncated = false;
+        // Fill up to the cap.
+        for i in 0..STEER_BUFFER_MAX_FRAMES {
+            push_steer_buffer(&mut buf, &mut truncated, text(&format!("frame-{i}")));
+        }
+        assert_eq!(buf.len(), STEER_BUFFER_MAX_FRAMES);
+        assert!(!truncated, "no eviction yet");
+        // One more push should evict the oldest.
+        push_steer_buffer(&mut buf, &mut truncated, text("extra"));
+        assert_eq!(buf.len(), STEER_BUFFER_MAX_FRAMES, "len stays at cap");
+        assert!(truncated, "eviction sets truncated flag");
+        // The oldest frame ("frame-0") should be gone; "extra" should be last.
+        assert!(
+            !matches!(buf.front(), Some(Response::Text { chunk }) if chunk == "frame-0"),
+            "oldest frame was evicted"
+        );
+        assert!(
+            matches!(buf.back(), Some(Response::Text { chunk }) if chunk == "extra"),
+            "new frame is at the back"
+        );
+    }
+
+    #[test]
+    fn push_steer_buffer_sentinel_set_only_once() {
+        let mut buf: VecDeque<Response> = VecDeque::new();
+        let mut truncated = false;
+        // Fill to the cap.
+        for i in 0..STEER_BUFFER_MAX_FRAMES {
+            push_steer_buffer(&mut buf, &mut truncated, text(&format!("{i}")));
+        }
+        // Cause eviction multiple times.
+        for _ in 0..5 {
+            push_steer_buffer(&mut buf, &mut truncated, text("x"));
+        }
+        // truncated is a bool flag — just one bit, not a counter.  Verify it
+        // stayed true after the first eviction and didn't flip back.
+        assert!(truncated);
+        assert_eq!(buf.len(), STEER_BUFFER_MAX_FRAMES);
+    }
+
+    #[test]
+    fn push_steer_buffer_frame_ordering_after_eviction() {
+        let mut buf: VecDeque<Response> = VecDeque::new();
+        let mut truncated = false;
+        // Fill to cap with labelled frames.
+        for i in 0..STEER_BUFFER_MAX_FRAMES {
+            push_steer_buffer(&mut buf, &mut truncated, text(&format!("old-{i}")));
+        }
+        // Evict 3 oldest, add 3 new.
+        for i in 0..3 {
+            push_steer_buffer(&mut buf, &mut truncated, text(&format!("new-{i}")));
+        }
+        // The first 3 "old-*" frames should be gone; "new-0..2" at the back.
+        let frames: Vec<&str> = buf
+            .iter()
+            .filter_map(|r| {
+                if let Response::Text { chunk } = r {
+                    Some(chunk.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert!(!frames.contains(&"old-0"));
+        assert!(!frames.contains(&"old-1"));
+        assert!(!frames.contains(&"old-2"));
+        assert_eq!(frames[frames.len() - 3], "new-0");
+        assert_eq!(frames[frames.len() - 2], "new-1");
+        assert_eq!(frames[frames.len() - 1], "new-2");
     }
 }
