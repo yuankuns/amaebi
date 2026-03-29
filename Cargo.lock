@@ -54,6 +54,7 @@ dependencies = [
  "fs2",
  "futures-util",
  "landlock",
+ "libc",
  "reqwest",
  "rusqlite",
  "serde",

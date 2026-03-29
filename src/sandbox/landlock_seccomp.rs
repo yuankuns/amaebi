@@ -1,9 +1,10 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use landlock::{
     Access as _, AccessFs, PathBeneath, PathFd, RulesetAttr as _, RulesetCreatedAttr as _,
     RulesetStatus, ABI as LandlockABI,
 };
 use std::os::unix::process::CommandExt;
+use std::path::PathBuf;
 use std::process::Command;
 
 use super::{Access, Sandbox, SandboxConfig, SandboxOutput};
@@ -53,24 +54,24 @@ impl Sandbox for LandlockSandbox {
         let workspace_access = self.config.workspace_access.clone();
         let allowed_paths = self.config.allowed_paths.clone();
 
-        // Build the list of (path, rw_flag) to allow, evaluated in the parent.
+        // Build the list of (PathBuf, rw_flag) to allow, evaluated in the parent.
         // We collect into a Vec so the pre_exec closure is 'static-compatible.
-        let mut rules: Vec<(String, bool)> = Vec::new();
+        let mut rules: Vec<(PathBuf, bool)> = Vec::new();
 
         // Standard read-only paths needed by virtually every shell command.
         for ro in &[
             "/usr", "/lib", "/lib64", "/bin", "/sbin", "/etc", "/proc", "/dev",
         ] {
-            if std::path::Path::new(ro).exists() {
-                rules.push((ro.to_string(), false));
+            let p = PathBuf::from(ro);
+            if p.exists() {
+                rules.push((p, false));
             }
         }
 
         // Workspace
-        let ws_str = workspace.to_string_lossy().into_owned();
         match workspace_access {
-            Access::Rw => rules.push((ws_str, true)),
-            Access::Ro => rules.push((ws_str, false)),
+            Access::Rw => rules.push((workspace, true)),
+            Access::Ro => rules.push((workspace, false)),
             Access::None => {} // no access to workspace
         }
 
@@ -80,12 +81,12 @@ impl Sandbox for LandlockSandbox {
                 Access::None => {} // skip — don't grant any access
                 Access::Ro => {
                     if p.exists() {
-                        rules.push((p.to_string_lossy().into_owned(), false));
+                        rules.push((p.clone(), false));
                     }
                 }
                 Access::Rw => {
                     if p.exists() {
-                        rules.push((p.to_string_lossy().into_owned(), true));
+                        rules.push((p.clone(), true));
                     }
                 }
             }
@@ -95,23 +96,27 @@ impl Sandbox for LandlockSandbox {
         command.arg("-c").arg(cmd).current_dir(cwd);
 
         // Safety: pre_exec runs in the child after fork, before exec.
-        // All values captured here are cloned plain data (Vec<(String, bool)>),
+        // All values captured here are cloned plain data (Vec<(PathBuf, bool)>),
         // so no async resources or Mutexes are shared.
         // IMPORTANT: Do not call tracing/logging macros inside pre_exec —
         // they are not async-signal-safe and can deadlock after fork.
         unsafe {
             command.pre_exec(move || {
-                if let Err(e) = apply_landlock_rules(&rules) {
-                    // Write to stderr directly (async-signal-safe write).
-                    eprintln!("[sandbox/landlock] restriction failed (degraded): {e}");
+                if let Err(_e) = apply_landlock_rules(&rules) {
+                    // Write to stderr using a raw libc::write — async-signal-safe.
+                    let msg = b"[sandbox/landlock] restriction failed (degraded)\n";
+                    libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len());
                 }
                 Ok(())
             });
         }
 
-        let output = command
-            .output()
-            .with_context(|| format!("landlock sandbox: spawning shell command: {cmd}"))?;
+        let output = command.output().map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!("landlock sandbox: spawning shell command: {cmd}: {e}"),
+            )
+        })?;
 
         Ok(SandboxOutput {
             status: output.status,
@@ -129,20 +134,17 @@ impl Sandbox for LandlockSandbox {
 /// IMPORTANT: This function must not call tracing macros or any code that
 /// acquires locks held by other threads — it runs after `fork()` in a
 /// single-threaded child and such calls can deadlock.
-fn apply_landlock_rules(rules: &[(String, bool)]) -> Result<()> {
+fn apply_landlock_rules(rules: &[(PathBuf, bool)]) -> std::io::Result<()> {
     // Compose the full set of filesystem accesses we handle.
     let handled = AccessFs::from_all(LandlockABI::V1);
 
     let ruleset = landlock::Ruleset::default()
         .handle_access(handled)
-        .context("landlock: creating ruleset")?;
+        .map_err(std::io::Error::other)?;
 
-    let mut ruleset_created = ruleset
-        .create()
-        .context("landlock: creating ruleset (create)")?;
+    let mut ruleset_created = ruleset.create().map_err(std::io::Error::other)?;
 
-    for (path_str, rw) in rules {
-        let path = std::path::Path::new(path_str);
+    for (path, rw) in rules {
         if !path.exists() {
             continue;
         }
@@ -157,26 +159,30 @@ fn apply_landlock_rules(rules: &[(String, bool)]) -> Result<()> {
             AccessFs::from_read(LandlockABI::V1)
         };
 
-        // add_rule consumes self and returns Result<Self, _>.
-        // Propagate errors — the caller (pre_exec) handles them gracefully.
         ruleset_created = ruleset_created
             .add_rule(PathBeneath::new(fd, access))
-            .with_context(|| format!("landlock: add_rule for {path_str}"))?;
+            .map_err(std::io::Error::other)?;
     }
 
     let status = ruleset_created
         .restrict_self()
-        .context("landlock: restrict_self")?;
+        .map_err(std::io::Error::other)?;
 
     // Do NOT use tracing here — we are inside pre_exec (post-fork child).
-    // Use stderr directly if you need to report enforcement status.
+    // Use raw libc::write for any stderr output.
     match status.ruleset {
         RulesetStatus::FullyEnforced => {}
         RulesetStatus::PartiallyEnforced => {
-            eprintln!("[sandbox/landlock] partially enforced (older kernel ABI)");
+            let msg = b"[sandbox/landlock] partially enforced (older kernel ABI)\n";
+            unsafe {
+                libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len());
+            }
         }
         RulesetStatus::NotEnforced => {
-            eprintln!("[sandbox/landlock] not enforced (kernel lacks support)");
+            let msg = b"[sandbox/landlock] not enforced (kernel lacks support)\n";
+            unsafe {
+                libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len());
+            }
         }
     }
 
@@ -261,6 +267,58 @@ mod tests {
 
         if !sb.available() {
             eprintln!("landlock not available — skipping denial test");
+            return;
+        }
+
+        // Verify Landlock fully enforced before trusting the test result.
+        // If restriction is only partial or not enforced, skip rather than
+        // risk a flaky failure.
+        let enforcement_check = {
+            use landlock::{Access as _, AccessFs, ABI as LandlockABI};
+            let rules: Vec<(PathBuf, bool)> = vec![];
+            // Probe restrict_self on a throwaway ruleset in a temp child.
+            // We do this by spawning a child that just exits so we can check
+            // stdout for enforcement level.
+            let mut probe = std::process::Command::new("sh");
+            probe.arg("-c").arg("exit 0");
+            // We can't easily call restrict_self without forking, so we use a
+            // best-effort check: if available() is true the kernel handle_access
+            // call succeeded, but restrict_self may yield less-than-full
+            // enforcement. We use a separate spawned probe via pre_exec.
+            let enforced = std::sync::Arc::new(std::sync::Mutex::new(None::<RulesetStatus>));
+            let enforced_clone = enforced.clone();
+            unsafe {
+                probe.pre_exec(move || {
+                    let handled = AccessFs::from_all(LandlockABI::V1);
+                    if let Ok(rs) = landlock::Ruleset::default().handle_access(handled) {
+                        if let Ok(rc) = rs.create() {
+                            if let Ok(status) = rc.restrict_self() {
+                                // Store status then exit child immediately.
+                                let level = match status.ruleset {
+                                    RulesetStatus::FullyEnforced => 2,
+                                    RulesetStatus::PartiallyEnforced => 1,
+                                    RulesetStatus::NotEnforced => 0,
+                                };
+                                // Encode in exit code: 2=full, 1=partial, 0=none
+                                unsafe { libc::_exit(level) };
+                            }
+                        }
+                    }
+                    unsafe { libc::_exit(99) };
+                    #[allow(unreachable_code)]
+                    Ok(())
+                });
+            }
+            let status = probe
+                .status()
+                .unwrap_or_else(|_| std::process::Command::new("false").status().unwrap());
+            status.code().unwrap_or(0)
+        };
+
+        if enforcement_check < 2 {
+            eprintln!(
+                "landlock denial test: restrict_self not fully enforced (code={enforcement_check}) — skipping"
+            );
             return;
         }
 

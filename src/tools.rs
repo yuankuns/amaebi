@@ -393,7 +393,7 @@ mod tests {
 
     // ---- execute_with_sandbox dispatch -----------------------------------
 
-    use crate::sandbox::{Access, Sandbox, SandboxConfig, SandboxOutput};
+    use crate::sandbox::{Sandbox, SandboxOutput};
     use std::sync::{Arc, Mutex};
 
     /// A fake sandbox that records every command passed to `spawn`.

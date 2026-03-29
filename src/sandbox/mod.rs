@@ -88,17 +88,26 @@ pub fn create_backend(config: &SandboxConfig) -> Box<dyn Sandbox> {
     if !config.enabled {
         return Box::new(noop::NoopSandbox);
     }
-    // Warn if denied_paths is set — Landlock does not enforce explicit denials.
+    // Warn if denied_paths is set — the Landlock backend uses allowlist-only
+    // enforcement and will not actively block these paths.
     if !config.denied_paths.is_empty() {
         tracing::warn!(
             count = config.denied_paths.len(),
-            "sandbox: denied_paths is set but the Landlock backend uses allowlist-only \
+            "sandbox: denied_paths is set but the current backend uses allowlist-only \
              enforcement; denied_paths will NOT be actively blocked"
         );
     }
     match config.backend.as_str() {
         #[cfg(target_os = "linux")]
         "landlock" => Box::new(landlock_seccomp::LandlockSandbox::new(config.clone())),
+        #[cfg(not(target_os = "linux"))]
+        "landlock" => {
+            tracing::warn!(
+                "sandbox: backend=\"landlock\" requested but Landlock is only available on Linux; \
+                 falling back to noop"
+            );
+            Box::new(noop::NoopSandbox)
+        }
         _ => Box::new(noop::NoopSandbox),
     }
 }
@@ -146,5 +155,17 @@ mod tests {
         };
         let backend = create_backend(&cfg);
         assert_eq!(backend.name(), "landlock");
+    }
+
+    #[test]
+    #[cfg(not(target_os = "linux"))]
+    fn create_backend_landlock_falls_back_to_noop_on_non_linux() {
+        let cfg = SandboxConfig {
+            enabled: true,
+            backend: "landlock".into(),
+            ..SandboxConfig::default()
+        };
+        let backend = create_backend(&cfg);
+        assert_eq!(backend.name(), "noop");
     }
 }
