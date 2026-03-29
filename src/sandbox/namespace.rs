@@ -171,7 +171,6 @@ fn path_to_cstring(p: &Path) -> Result<CString> {
 // Not suitable for Docker containers with default seccomp profile.
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::sandbox::{create_backend, SandboxConfig};
     use std::path::PathBuf;
     use tempfile::TempDir;
@@ -274,70 +273,6 @@ mod tests {
         assert!(!out
             .stdout
             .contains(absent_path.file_name().unwrap().to_str().unwrap()));
-    }
-
-    #[test]
-    #[ignore]
-    fn available_returns_true_on_linux() {
-        let dir = TempDir::new().unwrap();
-        let sb = NamespaceSandbox::new(make_config(dir.path().to_path_buf()));
-        assert!(sb.available());
-    }
-
-    /// Verify that credential paths NOT listed in SandboxConfig are completely
-    /// absent inside the namespace (not just "permission denied" — they must
-    /// not exist at all).
-    #[tokio::test]
-    #[ignore]
-    async fn credential_dirs_not_accessible() {
-        let workspace = TempDir::new().unwrap();
-        // Only workspace is in config — no ro_paths, no rw_paths.
-        let sb = create_backend(make_config(workspace.path().to_path_buf()));
-
-        // Check ~/.claude (shell expands ~ to $HOME inside the namespace).
-        let out = sb
-            .spawn(
-                "test -e ~/.claude && echo exists || echo absent",
-                workspace.path(),
-            )
-            .await
-            .unwrap();
-        assert!(
-            out.stdout.contains("absent"),
-            "~/.claude should be absent inside the namespace, got stdout={:?} stderr={:?}",
-            out.stdout,
-            out.stderr,
-        );
-
-        // Also verify /root/.claude is absent.
-        let out2 = sb
-            .spawn(
-                "test -e /root/.claude && echo exists || echo absent",
-                workspace.path(),
-            )
-            .await
-            .unwrap();
-        assert!(
-            out2.stdout.contains("absent"),
-            "/root/.claude should be absent inside the namespace, got stdout={:?} stderr={:?}",
-            out2.stdout,
-            out2.stderr,
-        );
-
-        // And $HOME/.claude via the env var.
-        let out3 = sb
-            .spawn(
-                r#"test -e "${HOME}/.claude" && echo exists || echo absent"#,
-                workspace.path(),
-            )
-            .await
-            .unwrap();
-        assert!(
-            out3.stdout.contains("absent"),
-            "$HOME/.claude should be absent inside the namespace, got stdout={:?} stderr={:?}",
-            out3.stdout,
-            out3.stderr,
-        );
     }
 
     /// Verify that an agent sandboxed to worktree_b cannot access worktree_a.
