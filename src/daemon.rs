@@ -177,6 +177,12 @@ fn context_limit_for_model(model: &str) -> usize {
         ("gpt-3.5-turbo", 16_385),
         ("o1", 200_000),
         ("o3", 200_000),
+        // Claude 4.x series (Opus/Sonnet/Haiku): 200k context window.
+        // Must appear before the "claude" catch-all (longest-prefix-first).
+        ("claude-opus-4", 200_000),
+        ("claude-sonnet-4", 200_000),
+        ("claude-haiku-4", 200_000),
+        // Claude 3.x and older: 1M context window.
         ("claude", 1_000_000),
     ];
     TABLE
