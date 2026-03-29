@@ -166,6 +166,9 @@ fn path_to_cstring(p: &Path) -> Result<CString> {
     CString::new(p.as_os_str().as_bytes()).context("path contains null byte")
 }
 
+// These tests require Linux user namespaces (CLONE_NEWUSER).
+// Run with: cargo test -- --ignored
+// Not suitable for Docker containers with default seccomp profile.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -184,11 +187,8 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore]
     async fn namespace_backend_spawns_and_returns_output() {
-        if !namespace_available() {
-            eprintln!("user namespaces not available — skipping namespace_backend_spawns_and_returns_output");
-            return;
-        }
         let dir = TempDir::new().unwrap();
         let sb = create_backend(make_config(dir.path().to_path_buf()));
         let out = sb.spawn("echo hello", dir.path()).await.unwrap();
@@ -197,11 +197,8 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore]
     async fn workspace_is_writable() {
-        if !namespace_available() {
-            eprintln!("user namespaces not available — skipping workspace_is_writable");
-            return;
-        }
         let dir = TempDir::new().unwrap();
         let sb = create_backend(make_config(dir.path().to_path_buf()));
         let file = dir.path().join("canary.txt");
@@ -211,11 +208,8 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore]
     async fn tmp_is_isolated_between_spawns() {
-        if !namespace_available() {
-            eprintln!("user namespaces not available — skipping tmp_is_isolated_between_spawns");
-            return;
-        }
         let dir = TempDir::new().unwrap();
         let sb = create_backend(make_config(dir.path().to_path_buf()));
 
@@ -238,11 +232,8 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore]
     async fn ro_path_is_not_writable() {
-        if !namespace_available() {
-            eprintln!("user namespaces not available — skipping ro_path_is_not_writable");
-            return;
-        }
         let ro_dir = TempDir::new().unwrap();
         // Create a file in ro_dir so it's a valid existing directory.
         std::fs::write(ro_dir.path().join("existing.txt"), b"data").unwrap();
@@ -266,11 +257,8 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore]
     async fn path_not_in_config_does_not_exist() {
-        if !namespace_available() {
-            eprintln!("user namespaces not available — skipping path_not_in_config_does_not_exist");
-            return;
-        }
         let workspace = TempDir::new().unwrap();
         let absent_dir = TempDir::new().unwrap();
         let absent_path = absent_dir.path().to_path_buf();
@@ -289,11 +277,8 @@ mod tests {
     }
 
     #[test]
+    #[ignore]
     fn available_returns_true_on_linux() {
-        if !namespace_available() {
-            eprintln!("user namespaces not available — skipping available_returns_true_on_linux");
-            return;
-        }
         let dir = TempDir::new().unwrap();
         let sb = NamespaceSandbox::new(make_config(dir.path().to_path_buf()));
         assert!(sb.available());
