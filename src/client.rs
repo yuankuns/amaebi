@@ -82,8 +82,8 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
     let mut stdout = tokio::io::stdout();
     // Timestamp of the first Ctrl-C press; None means no pending first press.
     let mut last_ctrl_c: Option<Instant> = None;
-    // Set to true when the user submits steer text, to buffer daemon output
-    // until SteerAck arrives (prevents mixing with the next model turn).
+    // Set to true on first Ctrl-C to immediately buffer daemon output while
+    // the user types a steering correction (prevents output/input overlap).
     let mut steer_pending = false;
     // Frames received while steer_pending — flushed to the terminal on SteerAck.
     let mut steer_buffer: VecDeque<Response> = VecDeque::new();
@@ -120,12 +120,12 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
                     let _ = tokio::io::stderr().flush().await;
                     return Err(anyhow::Error::new(Interrupted));
                 }
-                // First press (or expired window): interrupt the agent.
-                // Do NOT start buffering yet — output continues normally until
-                // the user actually submits correction text (second step).
-                // Double Ctrl-C (handled above) exits.
+                // First press (or expired window): interrupt the agent and
+                // immediately start buffering output to prevent overlap with
+                // the user's correction text.  Double Ctrl-C (handled above) exits.
+                steer_pending = true;
                 if use_stdin {
-                    eprintln!("\n[interrupted — type a correction and press Enter, or Ctrl-C again to exit]");
+                    eprintln!("\n^C interrupted. Enter correction (empty line to cancel): ");
                     eprint!(">");
                 } else {
                     eprintln!("\n[interrupted — press Ctrl-C again quickly to exit]");
@@ -244,9 +244,7 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
             steer_line = next_stdin_line(&mut stdin_lines) => {
                 match steer_line {
                     Some(text) if !text.trim().is_empty() => {
-                        // Start buffering now that the user has submitted text;
-                        // prevents daemon output from mixing with the ack/next turn.
-                        steer_pending = true;
+                        // steer_pending is already true (set on Ctrl-C); just send the request.
                         let steer_req = Request::Steer {
                             session_id: session_id_copy.clone(),
                             message: text,
@@ -426,11 +424,10 @@ pub async fn run_resume(
                     let _ = tokio::io::stderr().flush().await;
                     return Err(anyhow::Error::new(Interrupted));
                 }
-                // Do NOT start buffering yet — output continues normally until
-                // the user actually submits correction text (second step).
+                // Start buffering immediately so output doesn't overlap with user input.
+                steer_pending = true;
                 if use_stdin {
-                    eprintln!("\n[interrupted — type a correction and press Enter, or Ctrl-C again to exit]");
-                    eprint!(">");
+                    eprintln!("\n^C interrupted. Enter correction (empty line to cancel): ");
                 } else {
                     eprintln!("\n[interrupted — press Ctrl-C again soon to exit]");
                 }
@@ -529,8 +526,7 @@ pub async fn run_resume(
             steer_line = next_stdin_line(&mut stdin_lines) => {
                 match steer_line {
                     Some(text) if !text.trim().is_empty() => {
-                        // Start buffering now that the user has submitted text.
-                        steer_pending = true;
+                        // steer_pending already set on Ctrl-C; just send the request.
                         let steer_req = Request::Steer {
                             session_id: session_uuid.clone(),
                             message: text,
