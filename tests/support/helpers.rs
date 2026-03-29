@@ -144,11 +144,8 @@ pub async fn start_daemon_with_env(
         let mut stderr_text = String::new();
         if let Some(ref mut stderr) = stderr_capture {
             let mut buf = Vec::new();
-            let _ = tokio::time::timeout(
-                Duration::from_millis(500),
-                stderr.read_to_end(&mut buf),
-            )
-            .await;
+            let _ = tokio::time::timeout(Duration::from_millis(500), stderr.read_to_end(&mut buf))
+                .await;
             stderr_text = String::from_utf8_lossy(&buf).into_owned();
         }
         let stderr_display = if stderr_text.is_empty() {

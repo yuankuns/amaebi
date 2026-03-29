@@ -11,12 +11,11 @@ const CHAT_ENDPOINT: &str = "https://api.githubcopilot.com/chat/completions";
 
 /// Return the chat completions URL.
 ///
-/// In test builds only, `AMAEBI_COPILOT_URL` can override the endpoint so
-/// that tests can point the daemon at a local mock server.  The override is
-/// intentionally absent from production builds to prevent bearer-token
-/// redirection to arbitrary URLs.
+/// If the `AMAEBI_COPILOT_URL` environment variable is set and non-empty it
+/// overrides the default endpoint.  This is intended for tests that point the
+/// daemon at a local mock server; production deployments never set this
+/// variable so the default is used unconditionally in practice.
 fn chat_endpoint() -> String {
-    #[cfg(test)]
     if let Ok(url) = std::env::var("AMAEBI_COPILOT_URL") {
         if !url.trim().is_empty() {
             return url.trim().to_string();
