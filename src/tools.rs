@@ -147,10 +147,6 @@ async fn edit_file(args: serde_json::Value) -> Result<String> {
 // Tool schemas (OpenAI function-calling format)
 // ---------------------------------------------------------------------------
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 /// Return the JSON schema array to include in every chat request.
 pub fn tool_schemas() -> Vec<serde_json::Value> {
     vec![
@@ -255,6 +251,10 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
     ]
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {

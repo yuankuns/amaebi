@@ -149,7 +149,7 @@ impl TokenCache {
         // full OAuth flow (which requires real GitHub credentials).
         if let Ok(tok) = std::env::var("AMAEBI_COPILOT_TOKEN") {
             if !tok.trim().is_empty() {
-                return Ok(tok);
+                return Ok(tok.trim().to_string());
             }
         }
 

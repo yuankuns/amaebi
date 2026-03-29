@@ -13,7 +13,7 @@ const CHAT_ENDPOINT: &str = "https://api.githubcopilot.com/chat/completions";
 fn chat_endpoint() -> String {
     if let Ok(url) = std::env::var("AMAEBI_COPILOT_URL") {
         if !url.trim().is_empty() {
-            return url;
+            return url.trim().to_string();
         }
     }
     CHAT_ENDPOINT.to_string()
@@ -333,9 +333,7 @@ impl SseAccumulator {
 }
 
 // ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
+// Retry helpers
 // ---------------------------------------------------------------------------
 
 /// Exponential back-off delay for `attempt` (0-indexed).
