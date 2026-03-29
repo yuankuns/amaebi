@@ -1422,8 +1422,11 @@ where
 
             FinishReason::ToolCalls => {
                 tools_were_used = true;
-                let api_calls: Vec<ApiToolCall> = resp
-                    .tool_calls
+                // Destructure resp up front to avoid a partial move: consuming
+                // resp.text while still needing to borrow resp.tool_calls.
+                let resp_text = resp.text;
+                let tool_calls = resp.tool_calls;
+                let api_calls: Vec<ApiToolCall> = tool_calls
                     .iter()
                     .map(|tc| ApiToolCall {
                         id: tc.id.clone(),
@@ -1435,14 +1438,14 @@ where
                     })
                     .collect();
 
-                let assistant_text = if resp.text.is_empty() {
+                let assistant_text = if resp_text.is_empty() {
                     None
                 } else {
-                    Some(resp.text)
+                    Some(resp_text)
                 };
                 messages.push(Message::assistant(assistant_text, api_calls));
 
-                let tool_calls_snapshot = &resp.tool_calls;
+                let tool_calls_snapshot = &tool_calls;
                 let mut interrupted_at: Option<usize> = None;
                 let mut steer_text: Option<String> = None;
 
@@ -2145,5 +2148,148 @@ mod tests {
     fn response_max_tokens_model_max_wins_when_context_is_large() {
         // gpt-4o has model_max=16384 < context/2=64000 → capped at model_max.
         assert_eq!(response_max_tokens("gpt-4o"), 16_384);
+    }
+
+    // ---- mid-execution steer / interrupt tests ----------------------------
+
+    /// Build an assistant `Message` carrying `n` synthetic tool calls with IDs
+    /// "id0", "id1", … and a parallel `Vec<copilot::ToolCall>` for execution.
+    fn make_tool_calls(
+        n: usize,
+    ) -> (
+        Vec<crate::copilot::ToolCall>,
+        Vec<crate::copilot::ApiToolCall>,
+    ) {
+        let tool_calls: Vec<crate::copilot::ToolCall> = (0..n)
+            .map(|i| crate::copilot::ToolCall {
+                id: format!("id{i}"),
+                name: format!("tool_{i}"),
+                arguments: "{}".into(),
+            })
+            .collect();
+        let api_calls: Vec<crate::copilot::ApiToolCall> = tool_calls
+            .iter()
+            .map(|tc| crate::copilot::ApiToolCall {
+                id: tc.id.clone(),
+                kind: "function".into(),
+                function: crate::copilot::ApiToolCallFunction {
+                    name: tc.name.clone(),
+                    arguments: tc.arguments.clone(),
+                },
+            })
+            .collect();
+        (tool_calls, api_calls)
+    }
+
+    /// Simulate the steer-mid-chain path and return the resulting messages.
+    ///
+    /// `n_calls`: total number of tool calls in the assistant turn.
+    /// `interrupt_at`: index at which the steer is received (no tool at this
+    ///   index or beyond is "executed").
+    /// `steer`: optional user-injected text appended after the placeholders.
+    fn simulate_mid_steer(
+        n_calls: usize,
+        interrupt_at: usize,
+        steer: Option<&str>,
+    ) -> Vec<Message> {
+        let (tool_calls, api_calls) = make_tool_calls(n_calls);
+        let mut messages: Vec<Message> = Vec::new();
+
+        // Push the assistant turn with all tool_calls, just like daemon.rs does.
+        messages.push(Message::assistant(None, api_calls));
+
+        // Simulate executing tools up to the interrupt point.
+        for tc in &tool_calls[..interrupt_at] {
+            messages.push(Message::tool_result(&tc.id, "ok"));
+        }
+
+        // Push placeholder tool_results for skipped tools — mirrors daemon.rs:1569.
+        for tc in &tool_calls[interrupt_at..] {
+            messages.push(Message::tool_result(
+                &tc.id,
+                "[interrupted by user before execution]",
+            ));
+        }
+
+        // Append the steer as a user turn — mirrors daemon.rs:1578.
+        if let Some(text) = steer {
+            messages.push(Message::user(text));
+        }
+
+        messages
+    }
+
+    #[test]
+    fn steer_mid_chain_placeholder_count_correct() {
+        // 3 tools, interrupt after executing 1 → 2 placeholders.
+        let msgs = simulate_mid_steer(3, 1, None);
+        let tool_results: Vec<_> = msgs.iter().filter(|m| m.role == "tool").collect();
+        assert_eq!(
+            tool_results.len(),
+            3,
+            "must have one tool_result per tool_call"
+        );
+    }
+
+    #[test]
+    fn steer_mid_chain_every_tool_call_has_matching_result() {
+        let msgs = simulate_mid_steer(4, 2, Some("go left instead"));
+        let assistant = &msgs[0];
+        assert_eq!(assistant.role, "assistant");
+
+        for tc in &assistant.tool_calls {
+            let found = msgs
+                .iter()
+                .any(|m| m.role == "tool" && m.tool_call_id.as_deref() == Some(tc.id.as_str()));
+            assert!(found, "tool_call id={} has no matching tool_result", tc.id);
+        }
+    }
+
+    #[test]
+    fn steer_mid_chain_message_ordering() {
+        // Ordering: assistant → tool… → user (steer)
+        let msgs = simulate_mid_steer(3, 1, Some("new direction"));
+
+        assert_eq!(msgs[0].role, "assistant", "first message must be assistant");
+        for i in 1..=3 {
+            assert_eq!(msgs[i].role, "tool", "messages[{i}] must be role=tool");
+        }
+        assert_eq!(
+            msgs.last().unwrap().role,
+            "user",
+            "last message must be user (steer)"
+        );
+    }
+
+    #[test]
+    fn steer_at_first_tool_all_placeholders() {
+        // Interrupt before any tool runs → all 3 results are placeholders.
+        let msgs = simulate_mid_steer(3, 0, None);
+        let placeholders: Vec<_> = msgs
+            .iter()
+            .filter(|m| {
+                m.role == "tool"
+                    && m.content
+                        .as_deref()
+                        .unwrap_or("")
+                        .contains("[interrupted by user before execution]")
+            })
+            .collect();
+        assert_eq!(
+            placeholders.len(),
+            3,
+            "all tool_results must be placeholders"
+        );
+    }
+
+    #[test]
+    fn interrupt_no_steer_text_no_trailing_user_message() {
+        // Interrupt with no steer text → no user message appended.
+        let msgs = simulate_mid_steer(2, 1, None);
+        assert_ne!(
+            msgs.last().unwrap().role,
+            "user",
+            "without steer text there must be no trailing user message"
+        );
     }
 }
