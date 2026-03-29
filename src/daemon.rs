@@ -91,7 +91,7 @@ impl DaemonState {
         Ok(Self {
             http,
             tokens: TokenCache::new(),
-            executor: Box::new(tools::LocalExecutor),
+            executor: Box::new(tools::LocalExecutor { sandbox: None }),
             db: Arc::new(Mutex::new(conn)),
             compacting_sessions: Arc::new(Mutex::new(HashSet::new())),
         })

@@ -16,14 +16,24 @@ pub trait ToolExecutor: Send + Sync {
 // Local (host) executor
 // ---------------------------------------------------------------------------
 
-pub struct LocalExecutor;
+pub struct LocalExecutor {
+    /// Optional sandbox backend.  When `Some`, `shell_command` is routed
+    /// through the sandbox instead of spawning `sh` directly.
+    pub sandbox: Option<Box<dyn crate::sandbox::Sandbox>>,
+}
+
+impl Default for LocalExecutor {
+    fn default() -> Self {
+        Self { sandbox: None }
+    }
+}
 
 #[async_trait::async_trait]
 impl ToolExecutor for LocalExecutor {
     async fn execute(&self, name: &str, args: serde_json::Value) -> Result<String> {
         tracing::debug!(tool = %name, "executing tool");
         match name {
-            "shell_command" => shell_command(args).await,
+            "shell_command" => shell_command(args, self.sandbox.as_deref()).await,
             "tmux_capture_pane" => tmux_capture_pane(args).await,
             "tmux_send_keys" => tmux_send_keys(args).await,
             "read_file" => read_file(args).await,
@@ -38,12 +48,43 @@ impl ToolExecutor for LocalExecutor {
 // ---------------------------------------------------------------------------
 
 /// Run an arbitrary shell command in the background, capturing stdout+stderr.
-async fn shell_command(args: serde_json::Value) -> Result<String> {
+///
+/// When `sandbox` is `Some`, the command is executed inside the sandbox via
+/// `Sandbox::spawn`.  Otherwise the existing `sh -c` behaviour is used.
+async fn shell_command(
+    args: serde_json::Value,
+    sandbox: Option<&dyn crate::sandbox::Sandbox>,
+) -> Result<String> {
     let command = args["command"]
         .as_str()
         .context("shell_command: missing string argument 'command'")?;
 
     tracing::debug!(command = %command, "running shell command");
+
+    if let Some(sb) = sandbox {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let out = sb
+            .spawn(command, &cwd)
+            .await
+            .with_context(|| format!("sandbox spawn: {command}"))?;
+
+        let mut result = String::new();
+        if !out.stdout.is_empty() {
+            result.push_str(out.stdout.trim_end());
+        }
+        if !out.stderr.is_empty() {
+            if !result.is_empty() {
+                result.push_str("\n[stderr]\n");
+            }
+            result.push_str(out.stderr.trim_end());
+        }
+        if result.is_empty() {
+            result = format!("[exit {}]", out.status);
+        } else if out.status != 0 {
+            result.push_str(&format!("\n[exit {}]", out.status));
+        }
+        return Ok(result);
+    }
 
     let output = Command::new("sh")
         .arg("-c")
@@ -308,7 +349,7 @@ mod tests {
 
     #[tokio::test]
     async fn shell_command_captures_stdout() {
-        let exec = LocalExecutor;
+        let exec = LocalExecutor::default();
         let out = exec
             .execute(
                 "shell_command",
@@ -321,7 +362,7 @@ mod tests {
 
     #[tokio::test]
     async fn shell_command_appends_exit_code_on_failure() {
-        let exec = LocalExecutor;
+        let exec = LocalExecutor::default();
         let out = exec
             .execute(
                 "shell_command",
@@ -335,7 +376,7 @@ mod tests {
 
     #[tokio::test]
     async fn shell_command_empty_output_shows_exit_zero() {
-        let exec = LocalExecutor;
+        let exec = LocalExecutor::default();
         let out = exec
             .execute("shell_command", serde_json::json!({"command": "true"}))
             .await
@@ -345,7 +386,7 @@ mod tests {
 
     #[tokio::test]
     async fn shell_command_missing_arg_returns_err() {
-        let exec = LocalExecutor;
+        let exec = LocalExecutor::default();
         let result = exec.execute("shell_command", serde_json::json!({})).await;
         assert!(result.is_err());
         let msg = format!("{}", result.unwrap_err());
@@ -363,7 +404,7 @@ mod tests {
         let path = tmp.path().join("test.txt");
         std::fs::write(&path, "file contents").unwrap();
 
-        let exec = LocalExecutor;
+        let exec = LocalExecutor::default();
         let out = exec
             .execute(
                 "read_file",
@@ -378,7 +419,7 @@ mod tests {
     async fn read_file_nonexistent_returns_err() {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("does_not_exist.txt");
-        let exec = LocalExecutor;
+        let exec = LocalExecutor::default();
         let result = exec
             .execute(
                 "read_file",
@@ -390,7 +431,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_file_missing_path_arg_returns_err() {
-        let exec = LocalExecutor;
+        let exec = LocalExecutor::default();
         let result = exec.execute("read_file", serde_json::json!({})).await;
         assert!(result.is_err());
     }
@@ -402,7 +443,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("new.txt");
 
-        let exec = LocalExecutor;
+        let exec = LocalExecutor::default();
         let out = exec
             .execute(
                 "edit_file",
@@ -423,7 +464,7 @@ mod tests {
         let path = tmp.path().join("existing.txt");
         std::fs::write(&path, "old").unwrap();
 
-        let exec = LocalExecutor;
+        let exec = LocalExecutor::default();
         exec.execute(
             "edit_file",
             serde_json::json!({"path": path.to_str().unwrap(), "content": "new"}),
@@ -437,7 +478,7 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_tool_returns_descriptive_error() {
-        let exec = LocalExecutor;
+        let exec = LocalExecutor::default();
         let result = exec
             .execute("nonexistent_tool", serde_json::json!({}))
             .await;
