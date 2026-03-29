@@ -280,11 +280,11 @@ mod tests {
                                 RulesetStatus::PartiallyEnforced => 1,
                                 RulesetStatus::NotEnforced => 0,
                             };
-                            unsafe { libc::_exit(code) };
+                            libc::_exit(code);
                         }
                     }
                 }
-                unsafe { libc::_exit(99) };
+                libc::_exit(99);
                 #[allow(unreachable_code)]
                 Ok(())
             });
