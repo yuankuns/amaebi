@@ -2087,4 +2087,63 @@ mod tests {
             .unwrap_or("")
             .contains("soul only"));
     }
+
+    #[test]
+    fn max_output_tokens_for_known_models() {
+        assert_eq!(max_output_tokens_for_model("gpt-4.1"), 32_768);
+        assert_eq!(max_output_tokens_for_model("gpt-4.1-mini"), 32_768);
+        assert_eq!(max_output_tokens_for_model("gpt-4o"), 16_384);
+        assert_eq!(max_output_tokens_for_model("gpt-4o-mini"), 16_384);
+        assert_eq!(max_output_tokens_for_model("gpt-4-turbo"), 4_096);
+        assert_eq!(max_output_tokens_for_model("gpt-4"), 8_192);
+        assert_eq!(max_output_tokens_for_model("gpt-3.5-turbo"), 4_096);
+        assert_eq!(max_output_tokens_for_model("o1"), 100_000);
+        assert_eq!(max_output_tokens_for_model("o1-preview"), 100_000);
+        assert_eq!(max_output_tokens_for_model("o3"), 100_000);
+        assert_eq!(max_output_tokens_for_model("o3-mini"), 100_000);
+        assert_eq!(max_output_tokens_for_model("claude-3-5-sonnet"), 16_384);
+        assert_eq!(max_output_tokens_for_model("claude-opus-4-6"), 16_384);
+    }
+
+    #[test]
+    fn max_output_tokens_unknown_model_is_conservative() {
+        assert_eq!(max_output_tokens_for_model("some-future-model-xyz"), 16_384);
+    }
+
+    #[test]
+    fn response_max_tokens_is_min_of_model_max_and_half_context() {
+        // For each model, response_max_tokens must equal min(model_max, context_limit/2).
+        for model in &[
+            "gpt-4.1",
+            "gpt-4o",
+            "gpt-4-turbo",
+            "gpt-4",
+            "gpt-3.5-turbo",
+            "o1",
+            "o3",
+            "claude-3-5-sonnet",
+            "unknown-model",
+        ] {
+            let model_max = max_output_tokens_for_model(model);
+            let context_half = context_limit_for_model(model) / 2;
+            let expected = model_max.min(context_half);
+            assert_eq!(
+                response_max_tokens(model),
+                expected,
+                "model={model}: expected min({model_max}, {context_half}) = {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn response_max_tokens_context_half_wins_for_small_context_model() {
+        // gpt-4 has context=8192, so context/2=4096 < model_max=8192 → capped at 4096.
+        assert_eq!(response_max_tokens("gpt-4"), 4_096);
+    }
+
+    #[test]
+    fn response_max_tokens_model_max_wins_when_context_is_large() {
+        // gpt-4o has model_max=16384 < context/2=64000 → capped at model_max.
+        assert_eq!(response_max_tokens("gpt-4o"), 16_384);
+    }
 }
