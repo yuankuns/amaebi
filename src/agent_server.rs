@@ -488,7 +488,7 @@ mod tests {
     #[test]
     fn text_extraction_joins_text_blocks() {
         // Verify the prompt extraction logic used in AmaebiAgent::prompt.
-        let blocks = vec![
+        let blocks = [
             acp::ContentBlock::Text(acp::TextContent::new("hello")),
             acp::ContentBlock::Text(acp::TextContent::new("world")),
         ];
@@ -505,7 +505,7 @@ mod tests {
 
     #[test]
     fn text_extraction_skips_non_text_blocks() {
-        let blocks = vec![acp::ContentBlock::Text(acp::TextContent::new("keep"))];
+        let blocks = [acp::ContentBlock::Text(acp::TextContent::new("keep"))];
         let text: String = blocks
             .iter()
             .filter_map(|b| match b {

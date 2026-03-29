@@ -9,6 +9,21 @@ use crate::ipc::{write_frame, Response};
 
 const CHAT_ENDPOINT: &str = "https://api.githubcopilot.com/chat/completions";
 
+/// Return the chat completions URL.
+///
+/// If the `AMAEBI_COPILOT_URL` environment variable is set and non-empty it
+/// overrides the default endpoint.  This is intended for tests that point the
+/// daemon at a local mock server; production deployments never set this
+/// variable so the default is used unconditionally in practice.
+fn chat_endpoint() -> String {
+    if let Ok(url) = std::env::var("AMAEBI_COPILOT_URL") {
+        if !url.trim().is_empty() {
+            return url.trim().to_string();
+        }
+    }
+    CHAT_ENDPOINT.to_string()
+}
+
 // ---------------------------------------------------------------------------
 // Retry policy constants
 // ---------------------------------------------------------------------------
@@ -323,189 +338,6 @@ impl SseAccumulator {
 }
 
 // ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
-
-    // ---- parse_retry_after_header ---------------------------------------
-
-    #[test]
-    fn parse_retry_after_header_missing() {
-        let headers = HeaderMap::new();
-        assert_eq!(parse_retry_after_header(&headers), None);
-    }
-
-    #[test]
-    fn parse_retry_after_header_invalid_value() {
-        let mut headers = HeaderMap::new();
-        headers.insert(RETRY_AFTER, HeaderValue::from_static("not-a-number"));
-        assert_eq!(parse_retry_after_header(&headers), None);
-    }
-
-    #[test]
-    fn parse_retry_after_header_valid_value() {
-        let mut headers = HeaderMap::new();
-        headers.insert(RETRY_AFTER, HeaderValue::from_static("10"));
-        let dur = parse_retry_after_header(&headers).expect("expected Some(Duration)");
-        assert_eq!(dur, Duration::from_secs(10));
-    }
-
-    #[test]
-    fn parse_retry_after_header_caps_large_values() {
-        let mut headers = HeaderMap::new();
-        let large = (MAX_RETRY_AFTER_SECS.saturating_add(10)).to_string();
-        headers.insert(
-            RETRY_AFTER,
-            HeaderValue::from_str(&large).expect("valid header value"),
-        );
-        let dur = parse_retry_after_header(&headers).expect("expected Some(Duration)");
-        assert_eq!(dur, Duration::from_secs(MAX_RETRY_AFTER_SECS));
-    }
-
-    // ---- Message constructors -------------------------------------------
-
-    #[test]
-    fn message_system_fields() {
-        let m = Message::system("be helpful");
-        assert_eq!(m.role, "system");
-        assert_eq!(m.content.as_deref(), Some("be helpful"));
-        assert!(m.tool_calls.is_empty());
-        assert!(m.tool_call_id.is_none());
-    }
-
-    #[test]
-    fn message_user_fields() {
-        let m = Message::user("what is Rust?");
-        assert_eq!(m.role, "user");
-        assert_eq!(m.content.as_deref(), Some("what is Rust?"));
-        assert!(m.tool_calls.is_empty());
-        assert!(m.tool_call_id.is_none());
-    }
-
-    #[test]
-    fn message_assistant_text_only() {
-        let m = Message::assistant(Some("42".into()), vec![]);
-        assert_eq!(m.role, "assistant");
-        assert_eq!(m.content.as_deref(), Some("42"));
-        assert!(m.tool_calls.is_empty());
-        assert!(m.tool_call_id.is_none());
-    }
-
-    #[test]
-    fn message_assistant_with_tool_calls() {
-        let call = ApiToolCall {
-            id: "call_001".into(),
-            kind: "function".into(),
-            function: ApiToolCallFunction {
-                name: "shell_command".into(),
-                arguments: r#"{"command":"ls"}"#.into(),
-            },
-        };
-        let m = Message::assistant(None, vec![call]);
-        assert_eq!(m.role, "assistant");
-        assert!(m.content.is_none());
-        assert_eq!(m.tool_calls.len(), 1);
-        assert_eq!(m.tool_calls[0].id, "call_001");
-        assert_eq!(m.tool_calls[0].function.name, "shell_command");
-    }
-
-    #[test]
-    fn message_tool_result_fields() {
-        let m = Message::tool_result("cid_42", "stdout output");
-        assert_eq!(m.role, "tool");
-        assert_eq!(m.content.as_deref(), Some("stdout output"));
-        assert_eq!(m.tool_call_id.as_deref(), Some("cid_42"));
-        assert!(m.tool_calls.is_empty());
-    }
-
-    // ---- Message serialization ------------------------------------------
-
-    #[test]
-    fn system_message_skips_empty_fields() {
-        let m = Message::system("prompt");
-        let v: serde_json::Value = serde_json::to_value(&m).unwrap();
-        assert_eq!(v["role"], "system");
-        assert_eq!(v["content"], "prompt");
-        // tool_calls and tool_call_id are skipped when empty/absent
-        assert!(
-            v.get("tool_calls").is_none(),
-            "tool_calls should be omitted"
-        );
-        assert!(
-            v.get("tool_call_id").is_none(),
-            "tool_call_id should be omitted"
-        );
-    }
-
-    #[test]
-    fn tool_result_message_serializes_tool_call_id() {
-        let m = Message::tool_result("cid", "result");
-        let v: serde_json::Value = serde_json::to_value(&m).unwrap();
-        assert_eq!(v["role"], "tool");
-        assert_eq!(v["content"], "result");
-        assert_eq!(v["tool_call_id"], "cid");
-    }
-
-    // ---- Retry helpers --------------------------------------------------
-
-    #[test]
-    fn backoff_delay_increases_exponentially() {
-        assert_eq!(backoff_delay(0), Duration::from_millis(1_000));
-        assert_eq!(backoff_delay(1), Duration::from_millis(2_000));
-        assert_eq!(backoff_delay(2), Duration::from_millis(4_000));
-    }
-
-    #[test]
-    fn backoff_delay_saturates_at_high_attempt() {
-        // Must not panic on large attempt numbers.
-        let _ = backoff_delay(30);
-        let _ = backoff_delay(u32::MAX);
-    }
-
-    // ---- ToolCall::parse_args -------------------------------------------
-
-    #[test]
-    fn parse_args_valid_object() {
-        let tc = ToolCall {
-            id: "t1".into(),
-            name: "shell_command".into(),
-            arguments: r#"{"command":"echo hi"}"#.into(),
-        };
-        let args = tc.parse_args().unwrap();
-        assert_eq!(args["command"], "echo hi");
-    }
-
-    #[test]
-    fn parse_args_empty_object() {
-        let tc = ToolCall {
-            id: "t2".into(),
-            name: "tmux_capture_pane".into(),
-            arguments: "{}".into(),
-        };
-        assert!(tc.parse_args().unwrap().is_object());
-    }
-
-    #[test]
-    fn parse_args_invalid_json_returns_err_with_name() {
-        let tc = ToolCall {
-            id: "t3".into(),
-            name: "bad_tool".into(),
-            arguments: "{not: valid".into(),
-        };
-        let err = tc.parse_args().unwrap_err();
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("bad_tool"),
-            "error should mention tool name: {msg}"
-        );
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Retry helpers
 // ---------------------------------------------------------------------------
 
@@ -574,7 +406,7 @@ async fn send_with_retry(
     let mut attempt = 0u32;
     loop {
         let result = http
-            .post(CHAT_ENDPOINT)
+            .post(chat_endpoint())
             .header("Authorization", format!("Bearer {token}"))
             .header("Content-Type", "application/json")
             .header("Accept", "application/json")
@@ -762,3 +594,185 @@ where
     tracing::debug!("SSE stream closed without [DONE]");
     Ok(acc.finalize())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
+
+    // ---- parse_retry_after_header ---------------------------------------
+
+    #[test]
+    fn parse_retry_after_header_missing() {
+        let headers = HeaderMap::new();
+        assert_eq!(parse_retry_after_header(&headers), None);
+    }
+
+    #[test]
+    fn parse_retry_after_header_invalid_value() {
+        let mut headers = HeaderMap::new();
+        headers.insert(RETRY_AFTER, HeaderValue::from_static("not-a-number"));
+        assert_eq!(parse_retry_after_header(&headers), None);
+    }
+
+    #[test]
+    fn parse_retry_after_header_valid_value() {
+        let mut headers = HeaderMap::new();
+        headers.insert(RETRY_AFTER, HeaderValue::from_static("10"));
+        let dur = parse_retry_after_header(&headers).expect("expected Some(Duration)");
+        assert_eq!(dur, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn parse_retry_after_header_caps_large_values() {
+        let mut headers = HeaderMap::new();
+        let large = (MAX_RETRY_AFTER_SECS.saturating_add(10)).to_string();
+        headers.insert(
+            RETRY_AFTER,
+            HeaderValue::from_str(&large).expect("valid header value"),
+        );
+        let dur = parse_retry_after_header(&headers).expect("expected Some(Duration)");
+        assert_eq!(dur, Duration::from_secs(MAX_RETRY_AFTER_SECS));
+    }
+
+    // ---- Message constructors -------------------------------------------
+
+    #[test]
+    fn message_system_fields() {
+        let m = Message::system("be helpful");
+        assert_eq!(m.role, "system");
+        assert_eq!(m.content.as_deref(), Some("be helpful"));
+        assert!(m.tool_calls.is_empty());
+        assert!(m.tool_call_id.is_none());
+    }
+
+    #[test]
+    fn message_user_fields() {
+        let m = Message::user("what is Rust?");
+        assert_eq!(m.role, "user");
+        assert_eq!(m.content.as_deref(), Some("what is Rust?"));
+        assert!(m.tool_calls.is_empty());
+        assert!(m.tool_call_id.is_none());
+    }
+
+    #[test]
+    fn message_assistant_text_only() {
+        let m = Message::assistant(Some("42".into()), vec![]);
+        assert_eq!(m.role, "assistant");
+        assert_eq!(m.content.as_deref(), Some("42"));
+        assert!(m.tool_calls.is_empty());
+        assert!(m.tool_call_id.is_none());
+    }
+
+    #[test]
+    fn message_assistant_with_tool_calls() {
+        let call = ApiToolCall {
+            id: "call_001".into(),
+            kind: "function".into(),
+            function: ApiToolCallFunction {
+                name: "shell_command".into(),
+                arguments: r#"{"command":"ls"}"#.into(),
+            },
+        };
+        let m = Message::assistant(None, vec![call]);
+        assert_eq!(m.role, "assistant");
+        assert!(m.content.is_none());
+        assert_eq!(m.tool_calls.len(), 1);
+        assert_eq!(m.tool_calls[0].id, "call_001");
+        assert_eq!(m.tool_calls[0].function.name, "shell_command");
+    }
+
+    #[test]
+    fn message_tool_result_fields() {
+        let m = Message::tool_result("cid_42", "stdout output");
+        assert_eq!(m.role, "tool");
+        assert_eq!(m.content.as_deref(), Some("stdout output"));
+        assert_eq!(m.tool_call_id.as_deref(), Some("cid_42"));
+        assert!(m.tool_calls.is_empty());
+    }
+
+    // ---- Message serialization ------------------------------------------
+
+    #[test]
+    fn system_message_skips_empty_fields() {
+        let m = Message::system("prompt");
+        let v: serde_json::Value = serde_json::to_value(&m).unwrap();
+        assert_eq!(v["role"], "system");
+        assert_eq!(v["content"], "prompt");
+        // tool_calls and tool_call_id are skipped when empty/absent
+        assert!(
+            v.get("tool_calls").is_none(),
+            "tool_calls should be omitted"
+        );
+        assert!(
+            v.get("tool_call_id").is_none(),
+            "tool_call_id should be omitted"
+        );
+    }
+
+    #[test]
+    fn tool_result_message_serializes_tool_call_id() {
+        let m = Message::tool_result("cid", "result");
+        let v: serde_json::Value = serde_json::to_value(&m).unwrap();
+        assert_eq!(v["role"], "tool");
+        assert_eq!(v["content"], "result");
+        assert_eq!(v["tool_call_id"], "cid");
+    }
+
+    // ---- Retry helpers --------------------------------------------------
+
+    #[test]
+    fn backoff_delay_increases_exponentially() {
+        assert_eq!(backoff_delay(0), Duration::from_millis(1_000));
+        assert_eq!(backoff_delay(1), Duration::from_millis(2_000));
+        assert_eq!(backoff_delay(2), Duration::from_millis(4_000));
+    }
+
+    #[test]
+    fn backoff_delay_saturates_at_high_attempt() {
+        // Must not panic on large attempt numbers.
+        let _ = backoff_delay(30);
+        let _ = backoff_delay(u32::MAX);
+    }
+
+    // ---- ToolCall::parse_args -------------------------------------------
+
+    #[test]
+    fn parse_args_valid_object() {
+        let tc = ToolCall {
+            id: "t1".into(),
+            name: "shell_command".into(),
+            arguments: r#"{"command":"echo hi"}"#.into(),
+        };
+        let args = tc.parse_args().unwrap();
+        assert_eq!(args["command"], "echo hi");
+    }
+
+    #[test]
+    fn parse_args_empty_object() {
+        let tc = ToolCall {
+            id: "t2".into(),
+            name: "tmux_capture_pane".into(),
+            arguments: "{}".into(),
+        };
+        assert!(tc.parse_args().unwrap().is_object());
+    }
+
+    #[test]
+    fn parse_args_invalid_json_returns_err_with_name() {
+        let tc = ToolCall {
+            id: "t3".into(),
+            name: "bad_tool".into(),
+            arguments: "{not: valid".into(),
+        };
+        let err = tc.parse_args().unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("bad_tool"),
+            "error should mention tool name: {msg}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Retry helpers

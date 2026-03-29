@@ -517,8 +517,10 @@ mod tests {
 
         let handles: Vec<_> = paths
             .iter()
-            .cloned()
-            .map(|p| std::thread::spawn(move || get_or_create(&p).unwrap()))
+            .map(|p| {
+                let p = p.clone();
+                std::thread::spawn(move || get_or_create(&p).unwrap())
+            })
             .collect();
 
         let ids: Vec<String> = handles.into_iter().map(|h| h.join().unwrap()).collect();
@@ -798,7 +800,8 @@ mod tests {
         let mut handles: Vec<std::thread::JoinHandle<()>> = Vec::new();
 
         // Reader threads.
-        for p in paths.iter().cloned() {
+        for p in paths.iter() {
+            let p = p.clone();
             handles.push(std::thread::spawn(move || {
                 for _ in 0..5 {
                     let _ = get_or_create(&p);
