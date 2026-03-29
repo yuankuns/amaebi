@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use std::collections::VecDeque;
 use std::io::IsTerminal as _;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -85,7 +86,9 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
     // while the user is typing a steering correction.  Cleared on SteerAck.
     let mut steer_pending = false;
     // Frames received while steer_pending — flushed to the terminal on SteerAck.
-    let mut steer_buffer: Vec<Response> = Vec::new();
+    let mut steer_buffer: VecDeque<Response> = VecDeque::new();
+    // Set to true when eviction occurs so flush_steer_buffer can print a truncation notice.
+    let mut buffer_truncated = false;
 
     // Stdin reader — only created when stdin is a TTY (interactive terminal).
     // Piped invocations (`echo "fix" | amaebi ask "..."`) have stdin as a
@@ -145,7 +148,7 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
                         // Buffer output while the user is typing a steering correction
                         // to prevent mixing daemon output with the user's input.
                         if steer_pending {
-                            push_steer_buffer(&mut steer_buffer, Response::Text { chunk });
+                            push_steer_buffer(&mut steer_buffer, &mut buffer_truncated, Response::Text { chunk });
                         } else {
                             stdout
                                 .write_all(chunk.as_bytes())
@@ -156,19 +159,19 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
                     }
                     Response::Done => {
                         // Flush any buffered frames before exiting.
-                        flush_steer_buffer(&mut steer_buffer, &mut stdout).await?;
+                        flush_steer_buffer(&mut steer_buffer, &mut buffer_truncated, &mut stdout).await?;
                         break;
                     }
                     Response::Error { message } => {
                         // Flush any buffered frames before surfacing the error
                         // so the user can see what happened before it failed.
-                        flush_steer_buffer(&mut steer_buffer, &mut stdout).await?;
+                        flush_steer_buffer(&mut steer_buffer, &mut buffer_truncated, &mut stdout).await?;
                         anyhow::bail!("{message}");
                     }
                     Response::ToolUse { name, detail } => {
                         // Buffer tool notifications while steering is pending.
                         if steer_pending {
-                            push_steer_buffer(&mut steer_buffer, Response::ToolUse { name, detail });
+                            push_steer_buffer(&mut steer_buffer, &mut buffer_truncated, Response::ToolUse { name, detail });
                         } else {
                             // Tool notifications go to stderr so stdout stays clean for the AI response.
                             eprintln!();
@@ -184,7 +187,7 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
                     }
                     Response::Compacting => {
                         if steer_pending {
-                            push_steer_buffer(&mut steer_buffer, Response::Compacting);
+                            push_steer_buffer(&mut steer_buffer, &mut buffer_truncated, Response::Compacting);
                         } else if std::io::stderr().is_terminal() {
                             eprintln!("\n\x1b[1;5;34m[compacting conversation history…]\x1b[0m");
                         } else {
@@ -197,7 +200,7 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
                         // before their correction took effect, then resume output.
                         steer_pending = false;
                         last_ctrl_c = None;
-                        flush_steer_buffer(&mut steer_buffer, &mut stdout).await?;
+                        flush_steer_buffer(&mut steer_buffer, &mut buffer_truncated, &mut stdout).await?;
                         tracing::debug!("steer acknowledged by daemon");
                     }
                     Response::DetachAccepted { .. } => {
@@ -214,7 +217,7 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
                         // the extra context first, then the cursor line.
                         // Buffer while steer is pending (user is typing).
                         if steer_pending {
-                            push_steer_buffer(&mut steer_buffer, Response::WaitingForInput { prompt });
+                            push_steer_buffer(&mut steer_buffer, &mut buffer_truncated, Response::WaitingForInput { prompt });
                         } else if prompt.is_empty() {
                             eprint!("\n>");
                             let _ = tokio::io::stderr().flush().await;
@@ -246,11 +249,23 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
                         let _ = writer.flush().await;
                     }
                     Some(_) => {
-                        // Empty or whitespace-only line (e.g. bare Enter) — discard silently.
+                        // Empty or whitespace-only line (e.g. bare Enter) — if a steer
+                        // is pending, cancel it and resume normal output.
+                        if steer_pending {
+                            steer_pending = false;
+                            buffer_truncated = false;
+                            flush_steer_buffer(&mut steer_buffer, &mut buffer_truncated, &mut stdout).await?;
+                        }
+                        // Otherwise discard silently.
                     }
                     None => {
-                        // Ctrl+D on stdin — detach gracefully (task continues
-                        // on the daemon side; we stop reading stdin).
+                        // Ctrl+D on stdin — if a steer is pending, cancel it
+                        // and resume normal output; then stop reading stdin.
+                        if steer_pending {
+                            steer_pending = false;
+                            buffer_truncated = false;
+                            flush_steer_buffer(&mut steer_buffer, &mut buffer_truncated, &mut stdout).await?;
+                        }
                         stdin_lines = None;
                     }
                 }
@@ -374,7 +389,9 @@ pub async fn run_resume(
     // while the user is typing a steering correction.  Cleared on SteerAck.
     let mut steer_pending = false;
     // Frames received while steer_pending — flushed to the terminal on SteerAck.
-    let mut steer_buffer: Vec<Response> = Vec::new();
+    let mut steer_buffer: VecDeque<Response> = VecDeque::new();
+    // Set to true when eviction occurs so flush_steer_buffer can print a truncation notice.
+    let mut buffer_truncated = false;
 
     let use_stdin = std::io::stdin().is_terminal();
     let mut stdin_lines: Option<BufReader<tokio::io::Stdin>> = if use_stdin {
@@ -413,7 +430,7 @@ pub async fn run_resume(
                     Response::Text { chunk } => {
                         // Buffer output while the user is typing a steering correction.
                         if steer_pending {
-                            push_steer_buffer(&mut steer_buffer, Response::Text { chunk });
+                            push_steer_buffer(&mut steer_buffer, &mut buffer_truncated, Response::Text { chunk });
                         } else {
                             stdout.write_all(chunk.as_bytes()).await.context("writing to stdout")?;
                             stdout.flush().await.context("flushing stdout")?;
@@ -421,17 +438,17 @@ pub async fn run_resume(
                     }
                     Response::Done => {
                         // Flush any buffered frames before exiting.
-                        flush_steer_buffer(&mut steer_buffer, &mut stdout).await?;
+                        flush_steer_buffer(&mut steer_buffer, &mut buffer_truncated, &mut stdout).await?;
                         break;
                     }
                     Response::Error { message } => {
-                        flush_steer_buffer(&mut steer_buffer, &mut stdout).await?;
+                        flush_steer_buffer(&mut steer_buffer, &mut buffer_truncated, &mut stdout).await?;
                         anyhow::bail!("{message}")
                     }
                     Response::ToolUse { name, detail } => {
                         // Buffer tool notifications while steering is pending.
                         if steer_pending {
-                            push_steer_buffer(&mut steer_buffer, Response::ToolUse { name, detail });
+                            push_steer_buffer(&mut steer_buffer, &mut buffer_truncated, Response::ToolUse { name, detail });
                         } else {
                             eprintln!();
                             match name.as_str() {
@@ -446,7 +463,7 @@ pub async fn run_resume(
                     }
                     Response::Compacting => {
                         if steer_pending {
-                            push_steer_buffer(&mut steer_buffer, Response::Compacting);
+                            push_steer_buffer(&mut steer_buffer, &mut buffer_truncated, Response::Compacting);
                         } else if std::io::stderr().is_terminal() {
                             eprintln!("\n\x1b[1;5;34m[compacting conversation history…]\x1b[0m");
                         } else {
@@ -459,7 +476,7 @@ pub async fn run_resume(
                         // before their correction took effect.
                         steer_pending = false;
                         last_ctrl_c = None;
-                        flush_steer_buffer(&mut steer_buffer, &mut stdout).await?;
+                        flush_steer_buffer(&mut steer_buffer, &mut buffer_truncated, &mut stdout).await?;
                         tracing::debug!("steer acknowledged by daemon");
                     }
                     Response::DetachAccepted { .. } => {
@@ -471,7 +488,7 @@ pub async fn run_resume(
                     Response::WaitingForInput { prompt } => {
                         // Buffer while steer is pending (user is typing).
                         if steer_pending {
-                            push_steer_buffer(&mut steer_buffer, Response::WaitingForInput { prompt });
+                            push_steer_buffer(&mut steer_buffer, &mut buffer_truncated, Response::WaitingForInput { prompt });
                         } else if prompt.is_empty() {
                             eprint!("\n>");
                             let _ = tokio::io::stderr().flush().await;
@@ -498,9 +515,22 @@ pub async fn run_resume(
                         let _ = writer.flush().await;
                     }
                     Some(_) => {
-                        // Empty or whitespace-only line — discard silently.
+                        // Empty or whitespace-only line — if a steer is pending,
+                        // cancel it and resume normal output.
+                        if steer_pending {
+                            steer_pending = false;
+                            buffer_truncated = false;
+                            flush_steer_buffer(&mut steer_buffer, &mut buffer_truncated, &mut stdout).await?;
+                        }
                     }
                     None => {
+                        // EOF (Ctrl+D) — if a steer is pending, cancel it and
+                        // resume normal output; then stop reading stdin.
+                        if steer_pending {
+                            steer_pending = false;
+                            buffer_truncated = false;
+                            flush_steer_buffer(&mut steer_buffer, &mut buffer_truncated, &mut stdout).await?;
+                        }
                         stdin_lines = None;
                     }
                 }
@@ -557,59 +587,42 @@ async fn next_stdin_line(lines: &mut Option<BufReader<tokio::io::Stdin>>) -> Opt
 /// Push a response frame onto the steer buffer, enforcing the cap.
 ///
 /// If the buffer has reached [`STEER_BUFFER_MAX_FRAMES`], the oldest entry is
-/// dropped.  A synthetic truncation marker is inserted at position 0 only
-/// once (when it is not already there) so `flush_steer_buffer` can print a
-/// notice.  This keeps memory bounded regardless of how long the user takes
-/// to type their correction.
-fn push_steer_buffer(buffer: &mut Vec<Response>, frame: Response) {
+/// evicted and `truncated` is set to `true`.  `flush_steer_buffer` checks
+/// that flag to print a truncation notice without comparing frame content.
+/// This keeps memory bounded regardless of how long the user takes to type
+/// their correction.
+fn push_steer_buffer(buffer: &mut VecDeque<Response>, truncated: &mut bool, frame: Response) {
     if buffer.len() >= STEER_BUFFER_MAX_FRAMES {
-        // Evict the oldest *real* frame.  If a truncation sentinel is sitting
-        // at index 0, keep it and remove the frame at index 1 instead so the
-        // user always sees the "output was truncated" notice.
-        let has_sentinel = matches!(
-            buffer.first(),
-            Some(Response::Text { chunk }) if chunk == "\n[some output was truncated]\n"
-        );
-        if has_sentinel && buffer.len() > 1 {
-            buffer.remove(1);
-        } else {
-            buffer.remove(0);
-            // The sentinel was not present; insert it now so the user knows
-            // buffered output was dropped.
-            buffer.insert(
-                0,
-                Response::Text {
-                    chunk: "\n[some output was truncated]\n".to_string(),
-                },
-            );
-            // Inserting grew the buffer back to MAX_FRAMES; remove the entry
-            // now at index 1 (oldest real frame) to keep len == MAX_FRAMES - 1
-            // before the final push below.
-            if buffer.len() >= STEER_BUFFER_MAX_FRAMES {
-                buffer.remove(1);
-            }
-        }
+        // Evict the oldest frame and record that truncation has occurred.
+        buffer.pop_front();
+        *truncated = true;
         // buffer.len() == STEER_BUFFER_MAX_FRAMES - 1 here.
     }
-    buffer.push(frame);
+    buffer.push_back(frame);
 }
 
 /// Flush buffered response frames that were held while a steer was pending.
 ///
 /// Each frame is rendered to the terminal exactly as it would have been on
 /// first receipt.  A dim header is printed before the buffered frames so the
-/// user knows they're seeing suppressed output.
+/// user knows they're seeing suppressed output.  If `truncated` is `true`, a
+/// notice is printed first to indicate that some frames were dropped.
 async fn flush_steer_buffer(
-    buffer: &mut Vec<Response>,
+    buffer: &mut VecDeque<Response>,
+    truncated: &mut bool,
     stdout: &mut tokio::io::Stdout,
 ) -> Result<()> {
-    if buffer.is_empty() {
+    if buffer.is_empty() && !*truncated {
         return Ok(());
     }
     if std::io::stderr().is_terminal() {
         eprintln!("\n\x1b[2m[output before steer took effect:]\x1b[0m");
     } else {
         eprintln!("\n[output before steer took effect:]");
+    }
+    if *truncated {
+        eprintln!("\n[some output was truncated]");
+        *truncated = false;
     }
     for resp in buffer.drain(..) {
         match resp {
@@ -761,5 +774,89 @@ mod tests {
             now,
             Duration::from_secs(2)
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // push_steer_buffer / flush_steer_buffer
+    // -----------------------------------------------------------------------
+
+    fn text(s: &str) -> Response {
+        Response::Text {
+            chunk: s.to_string(),
+        }
+    }
+
+    #[test]
+    fn push_steer_buffer_evicts_at_max_frames() {
+        let mut buf: VecDeque<Response> = VecDeque::new();
+        let mut truncated = false;
+        // Fill up to the cap.
+        for i in 0..STEER_BUFFER_MAX_FRAMES {
+            push_steer_buffer(&mut buf, &mut truncated, text(&format!("frame-{i}")));
+        }
+        assert_eq!(buf.len(), STEER_BUFFER_MAX_FRAMES);
+        assert!(!truncated, "no eviction yet");
+        // One more push should evict the oldest.
+        push_steer_buffer(&mut buf, &mut truncated, text("extra"));
+        assert_eq!(buf.len(), STEER_BUFFER_MAX_FRAMES, "len stays at cap");
+        assert!(truncated, "eviction sets truncated flag");
+        // The oldest frame ("frame-0") should be gone; "extra" should be last.
+        assert!(
+            !matches!(buf.front(), Some(Response::Text { chunk }) if chunk == "frame-0"),
+            "oldest frame was evicted"
+        );
+        assert!(
+            matches!(buf.back(), Some(Response::Text { chunk }) if chunk == "extra"),
+            "new frame is at the back"
+        );
+    }
+
+    #[test]
+    fn push_steer_buffer_sentinel_set_only_once() {
+        let mut buf: VecDeque<Response> = VecDeque::new();
+        let mut truncated = false;
+        // Fill to the cap.
+        for i in 0..STEER_BUFFER_MAX_FRAMES {
+            push_steer_buffer(&mut buf, &mut truncated, text(&format!("{i}")));
+        }
+        // Cause eviction multiple times.
+        for _ in 0..5 {
+            push_steer_buffer(&mut buf, &mut truncated, text("x"));
+        }
+        // truncated is a bool flag — just one bit, not a counter.  Verify it
+        // stayed true after the first eviction and didn't flip back.
+        assert!(truncated);
+        assert_eq!(buf.len(), STEER_BUFFER_MAX_FRAMES);
+    }
+
+    #[test]
+    fn push_steer_buffer_frame_ordering_after_eviction() {
+        let mut buf: VecDeque<Response> = VecDeque::new();
+        let mut truncated = false;
+        // Fill to cap with labelled frames.
+        for i in 0..STEER_BUFFER_MAX_FRAMES {
+            push_steer_buffer(&mut buf, &mut truncated, text(&format!("old-{i}")));
+        }
+        // Evict 3 oldest, add 3 new.
+        for i in 0..3 {
+            push_steer_buffer(&mut buf, &mut truncated, text(&format!("new-{i}")));
+        }
+        // The first 3 "old-*" frames should be gone; "new-0..2" at the back.
+        let frames: Vec<&str> = buf
+            .iter()
+            .filter_map(|r| {
+                if let Response::Text { chunk } = r {
+                    Some(chunk.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert!(!frames.contains(&"old-0"));
+        assert!(!frames.contains(&"old-1"));
+        assert!(!frames.contains(&"old-2"));
+        assert_eq!(frames[frames.len() - 3], "new-0");
+        assert_eq!(frames[frames.len() - 2], "new-1");
+        assert_eq!(frames[frames.len() - 1], "new-2");
     }
 }

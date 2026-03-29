@@ -171,6 +171,7 @@ fn context_limit_for_model(model: &str) -> usize {
     // Ordered longest-prefix-first so that e.g. "gpt-4-turbo" beats "gpt-4".
     const TABLE: &[(&str, usize)] = &[
         ("gpt-4o", 128_000),
+        ("gpt-4.1", 1_047_576),
         ("gpt-4-turbo", 128_000),
         ("gpt-4", 8_192),
         ("gpt-3.5-turbo", 16_385),
@@ -1949,7 +1950,7 @@ mod tests {
             let t = compaction_threshold_tokens(model);
             let available =
                 context_limit_for_model(model).saturating_sub(response_max_tokens(model));
-            // When context_limit minus RESPONSE_RESERVE_TOKENS leaves ≤1
+            // When context_limit minus response_max_tokens(model) leaves ≤1
             // token, (available as f64 * COMPACTION_THRESHOLD) truncates to 0,
             // so compaction_threshold_tokens returns usize::MAX to disable
             // compaction rather than triggering it on every turn.
