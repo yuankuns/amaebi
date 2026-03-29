@@ -283,4 +283,88 @@ mod tests {
         let sb = NamespaceSandbox::new(make_config(dir.path().to_path_buf()));
         assert!(sb.available());
     }
+
+    /// Verify that credential paths NOT listed in SandboxConfig are completely
+    /// absent inside the namespace (not just "permission denied" — they must
+    /// not exist at all).
+    #[tokio::test]
+    #[ignore]
+    async fn credential_dirs_not_accessible() {
+        let workspace = TempDir::new().unwrap();
+        // Only workspace is in config — no ro_paths, no rw_paths.
+        let sb = create_backend(make_config(workspace.path().to_path_buf()));
+
+        // Check ~/.claude (shell expands ~ to $HOME inside the namespace).
+        let out = sb
+            .spawn(
+                "test -e ~/.claude && echo exists || echo absent",
+                workspace.path(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            out.stdout.contains("absent"),
+            "~/.claude should be absent inside the namespace, got stdout={:?} stderr={:?}",
+            out.stdout,
+            out.stderr,
+        );
+
+        // Also verify /root/.claude is absent.
+        let out2 = sb
+            .spawn(
+                "test -e /root/.claude && echo exists || echo absent",
+                workspace.path(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            out2.stdout.contains("absent"),
+            "/root/.claude should be absent inside the namespace, got stdout={:?} stderr={:?}",
+            out2.stdout,
+            out2.stderr,
+        );
+
+        // And $HOME/.claude via the env var.
+        let out3 = sb
+            .spawn(
+                r#"test -e "${HOME}/.claude" && echo exists || echo absent"#,
+                workspace.path(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            out3.stdout.contains("absent"),
+            "$HOME/.claude should be absent inside the namespace, got stdout={:?} stderr={:?}",
+            out3.stdout,
+            out3.stderr,
+        );
+    }
+
+    /// Verify that an agent sandboxed to worktree_b cannot access worktree_a.
+    /// The file written into worktree_a must be completely invisible — not just
+    /// unreadable — inside the namespace configured only for worktree_b.
+    #[tokio::test]
+    #[ignore]
+    async fn agent_cannot_read_other_agent_worktree() {
+        let worktree_a = TempDir::new().unwrap();
+        let worktree_b = TempDir::new().unwrap();
+
+        // Write a secret into agent A's worktree.
+        let secret_path = worktree_a.path().join("secret.txt");
+        std::fs::write(&secret_path, b"agent_a_secret").unwrap();
+
+        // Sandbox configured only for worktree_b — worktree_a is not listed.
+        let sb = create_backend(make_config(worktree_b.path().to_path_buf()));
+
+        let cmd = format!("cat {} 2>&1 || echo no_access", secret_path.display());
+        let out = sb.spawn(&cmd, worktree_b.path()).await.unwrap();
+
+        assert!(
+            out.stdout.contains("no_access"),
+            "agent B should not be able to read agent A's worktree; \
+             got stdout={:?} stderr={:?}",
+            out.stdout,
+            out.stderr,
+        );
+    }
 }
