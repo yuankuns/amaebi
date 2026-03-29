@@ -66,6 +66,7 @@ pub struct SandboxOutput {
 // Sandbox trait
 // ---------------------------------------------------------------------------
 
+#[async_trait::async_trait]
 pub trait Sandbox: Send + Sync {
     #[allow(dead_code)]
     fn name(&self) -> &str;
@@ -73,7 +74,7 @@ pub trait Sandbox: Send + Sync {
     /// Return `true` when this backend is usable on the current kernel/OS.
     fn available(&self) -> bool;
     /// Run `sh -c <cmd>` in `cwd`, applying the configured isolation policy.
-    fn spawn(&self, cmd: &str, cwd: &std::path::Path) -> Result<SandboxOutput>;
+    async fn spawn(&self, cmd: &str, cwd: &std::path::Path) -> Result<SandboxOutput>;
 }
 
 // ---------------------------------------------------------------------------
@@ -175,9 +176,9 @@ mod tests {
     // New regression tests for PR #21
     // ------------------------------------------------------------------
 
-    #[test]
+    #[tokio::test]
     #[cfg(target_os = "linux")]
-    fn enabled_config_creates_correct_backend() {
+    async fn enabled_config_creates_correct_backend() {
         use tempfile::TempDir;
         let tmp = TempDir::new().unwrap();
         let cfg = SandboxConfig {
@@ -192,13 +193,13 @@ mod tests {
         let backend = create_backend(&cfg);
         assert_eq!(backend.name(), "landlock");
         // Verify spawn works end-to-end through the config flow
-        let out = backend.spawn("echo cfg-ok", tmp.path()).unwrap();
+        let out = backend.spawn("echo cfg-ok", tmp.path()).await.unwrap();
         assert!(out.status.success());
         assert_eq!(out.stdout.trim(), "cfg-ok");
     }
 
-    #[test]
-    fn noop_backend_allows_everything() {
+    #[tokio::test]
+    async fn noop_backend_allows_everything() {
         use tempfile::TempDir;
         let tmp = TempDir::new().unwrap();
         let secret = tmp.path().join("secret.txt");
@@ -216,6 +217,7 @@ mod tests {
 
         let out = backend
             .spawn(&format!("cat '{}'", secret.display()), tmp.path())
+            .await
             .unwrap();
         assert!(
             out.status.success(),
@@ -230,6 +232,7 @@ mod tests {
                 &format!("echo noop-write > '{}'", write_file.display()),
                 tmp.path(),
             )
+            .await
             .unwrap();
         assert!(
             out.status.success(),

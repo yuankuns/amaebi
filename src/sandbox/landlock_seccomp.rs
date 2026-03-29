@@ -1,18 +1,18 @@
 use anyhow::Result;
+use async_trait::async_trait;
 use landlock::{
     Access as _, AccessFs, PathBeneath, PathFd, RulesetAttr as _, RulesetCreatedAttr as _,
     RulesetStatus, ABI as LandlockABI,
 };
-use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
-use std::process::Command;
+use tokio::process::Command;
 
 use super::{Access, Sandbox, SandboxConfig, SandboxOutput};
 
 /// Landlock-backed sandbox: applies filesystem access rules before executing
 /// the child command.
 ///
-/// Uses `std::process::Command::pre_exec` (an unsafe hook that runs in the
+/// Uses `tokio::process::Command::pre_exec` (an unsafe hook that runs in the
 /// child process after `fork()` but before `exec()`) to install Landlock
 /// rules in the child only, so the parent daemon is unaffected.
 ///
@@ -39,6 +39,7 @@ impl LandlockSandbox {
     }
 }
 
+#[async_trait]
 impl Sandbox for LandlockSandbox {
     fn name(&self) -> &str {
         "landlock"
@@ -48,7 +49,7 @@ impl Sandbox for LandlockSandbox {
         Self::kernel_supports_landlock()
     }
 
-    fn spawn(&self, cmd: &str, cwd: &std::path::Path) -> Result<SandboxOutput> {
+    async fn spawn(&self, cmd: &str, cwd: &std::path::Path) -> Result<SandboxOutput> {
         // Clone config data we need inside the child closure.
         let workspace = self.config.workspace.clone();
         let workspace_access = self.config.workspace_access.clone();
@@ -108,18 +109,23 @@ impl Sandbox for LandlockSandbox {
         // plain data with no Mutexes or async resources shared with the parent.
         // IMPORTANT: Do not call tracing/logging macros inside pre_exec —
         // they are not async-signal-safe and can deadlock after fork.
+        //
+        // The closure is defined *outside* the unsafe block so that `libc::write`
+        // inside it is not covered by the outer unsafe scope — requiring its own
+        // explicit unsafe block as a visible signal that it is async-signal-safe.
+        let pre_exec_fn = move || {
+            if let Err(_e) = apply_landlock_rules(&precomputed) {
+                // Write to stderr using a raw libc::write — async-signal-safe.
+                let msg = b"[sandbox/landlock] restriction failed (degraded)\n";
+                let _ = unsafe { libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len()) };
+            }
+            Ok(())
+        };
         unsafe {
-            command.pre_exec(move || {
-                if let Err(_e) = apply_landlock_rules(&precomputed) {
-                    // Write to stderr using a raw libc::write — async-signal-safe.
-                    let msg = b"[sandbox/landlock] restriction failed (degraded)\n";
-                    libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len());
-                }
-                Ok(())
-            });
+            command.pre_exec(pre_exec_fn);
         }
 
-        let output = command.output().map_err(|e| {
+        let output = command.output().await.map_err(|e| {
             std::io::Error::new(
                 e.kind(),
                 format!("landlock sandbox: spawning shell command: {cmd}: {e}"),
@@ -198,6 +204,7 @@ fn apply_landlock_rules(rules: &[(PathFd, bool)]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::process::CommandExt;
     use std::path::PathBuf;
     use tempfile::TempDir;
 
@@ -216,8 +223,8 @@ mod tests {
         let _ = default_sandbox().available();
     }
 
-    #[test]
-    fn runs_basic_command() {
+    #[tokio::test]
+    async fn runs_basic_command() {
         let tmp = TempDir::new().unwrap();
         let cfg = SandboxConfig {
             enabled: true,
@@ -227,7 +234,7 @@ mod tests {
             ..SandboxConfig::default()
         };
         let sb = LandlockSandbox::new(cfg);
-        let out = sb.spawn("echo hello", tmp.path()).unwrap();
+        let out = sb.spawn("echo hello", tmp.path()).await.unwrap();
         assert_eq!(out.stdout.trim(), "hello");
         assert!(out.status.success());
     }
@@ -288,8 +295,8 @@ mod tests {
         status.code().unwrap_or(0) == 2
     }
 
-    #[test]
-    fn allowed_path_ro_permits_read() {
+    #[tokio::test]
+    async fn allowed_path_ro_permits_read() {
         let tmp = TempDir::new().unwrap();
         let file = tmp.path().join("data.txt");
         std::fs::write(&file, "read-me").unwrap();
@@ -299,13 +306,14 @@ mod tests {
 
         let out = sb
             .spawn(&format!("cat '{}'", file.display()), work.path())
+            .await
             .unwrap();
         assert!(out.status.success(), "ro read failed: {:?}", out.stderr);
         assert_eq!(out.stdout.trim(), "read-me");
     }
 
-    #[test]
-    fn allowed_path_ro_denies_write() {
+    #[tokio::test]
+    async fn allowed_path_ro_denies_write() {
         if !landlock_fully_enforced() {
             eprintln!("landlock not fully enforced — skipping allowed_path_ro_denies_write");
             return;
@@ -334,6 +342,7 @@ mod tests {
                 &format!("echo overwrite > '{}'", file.display()),
                 work.path(),
             )
+            .await
             .unwrap();
         assert!(
             !out.status.success(),
@@ -342,8 +351,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn allowed_path_rw_permits_write() {
+    #[tokio::test]
+    async fn allowed_path_rw_permits_write() {
         let rw_dir = TempDir::new().unwrap();
         let file = rw_dir.path().join("out.txt");
 
@@ -352,13 +361,14 @@ mod tests {
 
         let out = sb
             .spawn(&format!("echo written > '{}'", file.display()), work.path())
+            .await
             .unwrap();
         assert!(out.status.success(), "rw write failed: {:?}", out.stderr);
         assert_eq!(std::fs::read_to_string(&file).unwrap().trim(), "written");
     }
 
-    #[test]
-    fn access_none_skips_rule() {
+    #[tokio::test]
+    async fn access_none_skips_rule() {
         if !landlock_fully_enforced() {
             eprintln!("landlock not fully enforced — skipping access_none_skips_rule");
             return;
@@ -387,6 +397,7 @@ mod tests {
 
         let out = sb
             .spawn(&format!("cat '{}'", file.display()), work.path())
+            .await
             .unwrap();
         assert!(
             !out.status.success(),
@@ -395,8 +406,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn workspace_auto_added_to_allowed_paths() {
+    #[tokio::test]
+    async fn workspace_auto_added_to_allowed_paths() {
         let workspace = TempDir::new().unwrap();
         let file = workspace.path().join("ws_file.txt");
         std::fs::write(&file, "workspace-data").unwrap();
@@ -413,6 +424,7 @@ mod tests {
 
         let out = sb
             .spawn(&format!("cat '{}'", file.display()), workspace.path())
+            .await
             .unwrap();
         assert!(
             out.status.success(),
@@ -422,8 +434,8 @@ mod tests {
         assert_eq!(out.stdout.trim(), "workspace-data");
     }
 
-    #[test]
-    fn multiple_allowed_paths() {
+    #[tokio::test]
+    async fn multiple_allowed_paths() {
         let ro_dir = TempDir::new().unwrap();
         let rw_dir = TempDir::new().unwrap();
         let ro_file = ro_dir.path().join("ro.txt");
@@ -446,6 +458,7 @@ mod tests {
         // Read from ro_dir
         let out = sb
             .spawn(&format!("cat '{}'", ro_file.display()), work.path())
+            .await
             .unwrap();
         assert!(
             out.status.success(),
@@ -461,6 +474,7 @@ mod tests {
                 &format!("echo multi > '{}'", rw_file.display()),
                 work.path(),
             )
+            .await
             .unwrap();
         assert!(
             out.status.success(),
@@ -470,8 +484,8 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&rw_file).unwrap().trim(), "multi");
     }
 
-    #[test]
-    fn command_inherits_env() {
+    #[tokio::test]
+    async fn command_inherits_env() {
         let work = TempDir::new().unwrap();
         let cfg = SandboxConfig {
             enabled: true,
@@ -485,7 +499,10 @@ mod tests {
         // Save and restore the env var to avoid cross-test interference.
         let prev_val = std::env::var("SANDBOX_TEST_VAR").ok();
         std::env::set_var("SANDBOX_TEST_VAR", "hello_sandbox");
-        let out = sb.spawn("echo $SANDBOX_TEST_VAR", work.path()).unwrap();
+        let out = sb
+            .spawn("echo $SANDBOX_TEST_VAR", work.path())
+            .await
+            .unwrap();
         match prev_val {
             Some(v) => std::env::set_var("SANDBOX_TEST_VAR", v),
             None => std::env::remove_var("SANDBOX_TEST_VAR"),
@@ -506,8 +523,8 @@ mod tests {
     /// is implicitly denied.  This test verifies that a path omitted from the
     /// allowlist is inaccessible — it does NOT test `denied_paths` enforcement
     /// (which the Landlock backend does not implement).
-    #[test]
-    fn path_not_in_allowlist_is_implicitly_denied() {
+    #[tokio::test]
+    async fn path_not_in_allowlist_is_implicitly_denied() {
         // Create a "secret" directory under /var/tmp so it's not covered by
         // the default /tmp allowed path.
         let secret_base = std::path::Path::new("/var/tmp");
@@ -557,6 +574,7 @@ mod tests {
                 &format!("cat '{}'", secret.join("file.txt").display()),
                 &work,
             )
+            .await
             .unwrap();
         // Under Landlock the cat should fail (non-zero exit).
         assert!(

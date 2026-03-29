@@ -67,9 +67,7 @@ pub async fn execute_with_sandbox(
         // Resolve cwd using std::env::current_dir(); falls back to "." on error.
         let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
 
-        let output = tokio::task::spawn_blocking(move || sandbox.spawn(&command, &cwd))
-            .await
-            .context("shell_command: spawn_blocking panicked")??;
+        let output = sandbox.spawn(&command, &cwd).await?;
 
         let stdout = output.stdout;
         let stderr = output.stderr;
@@ -401,6 +399,7 @@ mod tests {
         commands: Arc<Mutex<Vec<String>>>,
     }
 
+    #[async_trait::async_trait]
     impl Sandbox for RecordingSandbox {
         fn name(&self) -> &str {
             "recording"
@@ -408,7 +407,7 @@ mod tests {
         fn available(&self) -> bool {
             true
         }
-        fn spawn(&self, cmd: &str, _cwd: &std::path::Path) -> anyhow::Result<SandboxOutput> {
+        async fn spawn(&self, cmd: &str, _cwd: &std::path::Path) -> anyhow::Result<SandboxOutput> {
             self.commands.lock().unwrap().push(cmd.to_string());
             Ok(SandboxOutput {
                 status: std::process::Command::new("true").status().unwrap(),
@@ -472,7 +471,7 @@ mod tests {
     // ---- execute_with_sandbox --------------------------------------------
 
     #[tokio::test]
-    async fn sandbox_captures_config_during_spawn() {
+    async fn sandbox_backend_stores_config() {
         use crate::sandbox::{Access, SandboxConfig};
 
         let tmp = TempDir::new().unwrap();
@@ -485,6 +484,7 @@ mod tests {
             config: SandboxConfig,
         }
 
+        #[async_trait::async_trait]
         impl Sandbox for ConfigCaptureSandbox {
             fn name(&self) -> &str {
                 "config-capture"
@@ -492,7 +492,11 @@ mod tests {
             fn available(&self) -> bool {
                 true
             }
-            fn spawn(&self, _cmd: &str, _cwd: &std::path::Path) -> anyhow::Result<SandboxOutput> {
+            async fn spawn(
+                &self,
+                _cmd: &str,
+                _cwd: &std::path::Path,
+            ) -> anyhow::Result<SandboxOutput> {
                 *self.workspace.lock().unwrap() = Some(self.config.workspace.clone());
                 *self.allowed.lock().unwrap() = self.config.allowed_paths.clone();
                 Ok(SandboxOutput {
