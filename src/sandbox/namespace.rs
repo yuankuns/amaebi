@@ -3,7 +3,6 @@
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use std::ffi::{CStr, CString};
 use std::path::Path;
 use tokio::process::Command;
 
@@ -30,130 +29,46 @@ impl Sandbox for NamespaceSandbox {
     }
 
     async fn spawn(&self, cmd: &str, cwd: &Path) -> Result<SandboxOutput> {
-        let workspace = self.config.workspace.clone();
-        let ro_paths = self.config.ro_paths.clone();
-        let rw_paths = self.config.rw_paths.clone();
+        let mut args: Vec<String> = vec![
+            "--user".to_string(),
+            "--map-root-user".to_string(),
+            "--mount".to_string(),
+        ];
 
-        // Convert paths to CStrings before entering pre_exec (no allocation
-        // is safe inside the async-signal-safe section).
-        let workspace_c = path_to_cstring(&workspace)?;
+        // Bind mount workspace as read-write.
+        let ws = self
+            .config
+            .workspace
+            .to_str()
+            .context("workspace path is not valid UTF-8")?;
+        args.push(format!("--bind={}:{}", ws, ws));
 
-        let mut ro_c: Vec<(CString, CString)> = Vec::with_capacity(ro_paths.len());
-        for p in &ro_paths {
-            ro_c.push((path_to_cstring(p)?, path_to_cstring(p)?));
+        // Bind mount additional rw_paths.
+        for p in &self.config.rw_paths {
+            let s = p.to_str().context("rw_path is not valid UTF-8")?;
+            args.push(format!("--bind={}:{}", s, s));
         }
 
-        let mut rw_c: Vec<(CString, CString)> = Vec::with_capacity(rw_paths.len());
-        for p in &rw_paths {
-            rw_c.push((path_to_cstring(p)?, path_to_cstring(p)?));
+        // Bind mount ro_paths as read-only.
+        for p in &self.config.ro_paths {
+            let s = p.to_str().context("ro_path is not valid UTF-8")?;
+            args.push(format!("--bind-ro={}:{}", s, s));
         }
 
-        let tmpfs_target = CString::new("/tmp").unwrap();
-        let tmpfs_fstype = CString::new("tmpfs").unwrap();
-        let empty = CString::new("").unwrap();
+        // Mount a fresh tmpfs at /tmp for per-invocation isolation.
+        args.push("--tmpfs=/tmp".to_string());
 
-        let mut cmd_builder = Command::new("sh");
-        cmd_builder.arg("-c").arg(cmd).current_dir(cwd);
+        args.push("--".to_string());
+        args.push("sh".to_string());
+        args.push("-c".to_string());
+        args.push(cmd.to_string());
 
-        // Capture uid/gid before fork — getuid/getgid are not async-signal-safe
-        // in all libc implementations, and allocation is forbidden inside pre_exec.
-        let outer_uid = unsafe { libc::getuid() };
-        let outer_gid = unsafe { libc::getgid() };
-        let uid_map_str = CString::new(format!("0 {} 1\n", outer_uid)).unwrap();
-        let gid_map_str = CString::new(format!("0 {} 1\n", outer_gid)).unwrap();
-        let setgroups_deny = CString::new("deny\n").unwrap();
-        let uid_map_path = CString::new("/proc/self/uid_map").unwrap();
-        let setgroups_path = CString::new("/proc/self/setgroups").unwrap();
-        let gid_map_path = CString::new("/proc/self/gid_map").unwrap();
-
-        // Safety: pre_exec closure runs in the child after fork(), before exec().
-        // Must only call async-signal-safe functions (libc syscalls).
-        unsafe {
-            cmd_builder.pre_exec(move || {
-                // 1. Create independent mount + user namespace (unprivileged).
-                let ret = libc::unshare(libc::CLONE_NEWNS | libc::CLONE_NEWUSER);
-                if ret != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-
-                // 1b. Map outer uid/gid → root (0) inside the new user namespace.
-                //     Order is mandatory: setgroups must be written before gid_map.
-                write_proc_file(&uid_map_path, &uid_map_str)?;
-                write_proc_file(&setgroups_path, &setgroups_deny)?;
-                write_proc_file(&gid_map_path, &gid_map_str)?;
-
-                // 2. Mount tmpfs at /tmp — isolated per-agent.
-                let ret = libc::mount(
-                    empty.as_ptr(),
-                    tmpfs_target.as_ptr(),
-                    tmpfs_fstype.as_ptr(),
-                    0,
-                    std::ptr::null(),
-                );
-                if ret != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-
-                // 3. Bind mount workspace as rw.
-                let ret = libc::mount(
-                    workspace_c.as_ptr(),
-                    workspace_c.as_ptr(),
-                    std::ptr::null(),
-                    libc::MS_BIND | libc::MS_REC,
-                    std::ptr::null(),
-                );
-                if ret != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-
-                // 4. Bind mount ro_paths as read-only (two-step).
-                for (src, dst) in &ro_c {
-                    // Step 1: bind mount.
-                    let ret = libc::mount(
-                        src.as_ptr(),
-                        dst.as_ptr(),
-                        std::ptr::null(),
-                        libc::MS_BIND | libc::MS_REC,
-                        std::ptr::null(),
-                    );
-                    if ret != 0 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                    // Step 2: remount read-only.
-                    let ret = libc::mount(
-                        src.as_ptr(),
-                        dst.as_ptr(),
-                        std::ptr::null(),
-                        libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY | libc::MS_REC,
-                        std::ptr::null(),
-                    );
-                    if ret != 0 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                }
-
-                // 5. Bind mount rw_paths as read-write.
-                for (src, dst) in &rw_c {
-                    let ret = libc::mount(
-                        src.as_ptr(),
-                        dst.as_ptr(),
-                        std::ptr::null(),
-                        libc::MS_BIND | libc::MS_REC,
-                        std::ptr::null(),
-                    );
-                    if ret != 0 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                }
-
-                Ok(())
-            });
-        }
-
-        let output = cmd_builder
+        let output = Command::new("unshare")
+            .args(&args)
+            .current_dir(cwd)
             .output()
             .await
-            .context("failed to spawn sandboxed command")?;
+            .context("failed to spawn sandboxed command via unshare")?;
 
         Ok(SandboxOutput {
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -163,14 +78,14 @@ impl Sandbox for NamespaceSandbox {
     }
 }
 
-/// Probe whether unprivileged user namespaces are available by actually
-/// attempting `unshare --user --mount` in a subprocess.  Checking
-/// `/proc/self/ns/mnt` only verifies kernel support, not whether the running
-/// process has permission (e.g. container environments often set
+/// Probe whether unprivileged user namespaces are available by attempting
+/// `unshare --user --map-root-user --mount /bin/true`.  This confirms both
+/// that the `unshare` binary is present and that the kernel permits
+/// unprivileged user namespaces (some container environments set
 /// `kernel.unprivileged_userns_clone=0`).
 fn namespace_available() -> bool {
     std::process::Command::new("unshare")
-        .args(["--user", "--mount", "/bin/true"])
+        .args(["--user", "--map-root-user", "--mount", "/bin/true"])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
@@ -178,28 +93,7 @@ fn namespace_available() -> bool {
         .unwrap_or(false)
 }
 
-fn path_to_cstring(p: &Path) -> Result<CString> {
-    use std::os::unix::ffi::OsStrExt;
-    CString::new(p.as_os_str().as_bytes()).context("path contains null byte")
-}
-
-/// Write `content` to a `/proc/self/…` file using only raw syscalls.
-/// Safe to call from a `pre_exec` hook: no heap allocation, no Rust runtime.
-unsafe fn write_proc_file(path: &CStr, content: &CStr) -> std::io::Result<()> {
-    let fd = libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC);
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    let bytes = content.to_bytes(); // excludes the NUL terminator
-    let ret = libc::write(fd, bytes.as_ptr() as *const libc::c_void, bytes.len());
-    libc::close(fd);
-    if ret < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-// These tests require Linux user namespaces (CLONE_NEWUSER).
+// These tests require Linux user namespaces and the `unshare` binary.
 // Run with: cargo test -- --ignored
 // Not suitable for Docker containers with default seccomp profile.
 #[cfg(test)]
