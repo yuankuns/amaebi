@@ -324,6 +324,12 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
             .await?;
         }
 
+        Request::Interrupt { .. } => {
+            // An Interrupt arriving on a fresh connection is silently ignored —
+            // there is no active loop to interrupt.
+            tracing::debug!("ignoring Interrupt on fresh connection (no active loop)");
+        }
+
         Request::SubmitDetach {
             prompt,
             tmux_pane,
@@ -405,7 +411,7 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                 // agentic loop returns None at once instead of timing out if
                 // the model ends with '?'.
                 let mut sink = tokio::io::sink();
-                let (_, mut steer_rx) = tokio::sync::mpsc::channel::<String>(1);
+                let (_, mut steer_rx) = tokio::sync::mpsc::channel::<Option<String>>(1);
 
                 match run_agentic_loop(&state, &model, messages, &mut sink, &mut steer_rx).await {
                     Ok((final_text, _)) => {
@@ -470,7 +476,7 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                 return Ok(());
             }
 
-            let (steer_tx, mut steer_rx) = tokio::sync::mpsc::channel::<String>(16);
+            let (steer_tx, mut steer_rx) = tokio::sync::mpsc::channel::<Option<String>>(16);
             let expected_resume_sid = session_id.clone();
             tokio::spawn(async move {
                 while let Ok(Some(frame)) = lines.next_line().await {
@@ -487,7 +493,22 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                                 );
                                 continue;
                             }
-                            if steer_tx.send(message).await.is_err() {
+                            if steer_tx.send(Some(message)).await.is_err() {
+                                break;
+                            }
+                        }
+                        Ok(Request::Interrupt {
+                            session_id: steer_sid,
+                        }) => {
+                            if steer_sid != expected_resume_sid {
+                                tracing::debug!(
+                                    expected = %expected_resume_sid,
+                                    got = %steer_sid,
+                                    "ignoring interrupt frame with mismatched session_id on resume"
+                                );
+                                continue;
+                            }
+                            if steer_tx.send(None).await.is_err() {
                                 break;
                             }
                         }
@@ -607,7 +628,7 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
 
             // Steering channel: the spawned reader task sends user corrections
             // here; the agentic loop drains them between model turns.
-            let (steer_tx, mut steer_rx) = tokio::sync::mpsc::channel::<String>(16);
+            let (steer_tx, mut steer_rx) = tokio::sync::mpsc::channel::<Option<String>>(16);
 
             // Spawn a task that reads subsequent frames from the client on
             // this connection.  Any Steer frames are forwarded to steer_tx so
@@ -630,8 +651,24 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                                 );
                                 continue;
                             }
-                            if steer_tx.send(message).await.is_err() {
+                            if steer_tx.send(Some(message)).await.is_err() {
                                 break; // agentic loop has finished; channel closed
+                            }
+                        }
+                        Ok(Request::Interrupt {
+                            session_id: steer_sid,
+                        }) => {
+                            if steer_sid != expected_chat_sid {
+                                tracing::debug!(
+                                    expected = %expected_chat_sid,
+                                    got = %steer_sid,
+                                    "ignoring interrupt frame with mismatched session_id on chat"
+                                );
+                                continue;
+                            }
+                            // None = interrupt-only; no steer text to inject.
+                            if steer_tx.send(None).await.is_err() {
+                                break;
                             }
                         }
                         Ok(_) | Err(_) => {
@@ -1081,7 +1118,7 @@ pub(crate) async fn run_agentic_loop<W>(
     model: &str,
     mut messages: Vec<Message>,
     writer: &mut W,
-    steer_rx: &mut tokio::sync::mpsc::Receiver<String>,
+    steer_rx: &mut tokio::sync::mpsc::Receiver<Option<String>>,
 ) -> Result<(String, usize)>
 where
     W: AsyncWriteExt + Unpin,
@@ -1097,8 +1134,12 @@ where
         // call (covers non-tool turns and the time between tool completion
         // and the next iteration).
         while let Ok(steer_msg) = steer_rx.try_recv() {
-            messages.push(Message::user(steer_msg));
-            write_frame(writer, &Response::SteerAck).await?;
+            if let Some(msg) = steer_msg {
+                messages.push(Message::user(msg));
+                write_frame(writer, &Response::SteerAck).await?;
+            }
+            // None = interrupt-only (no user message to inject; loop already
+            // skipped the tool chain at execution time).
         }
 
         // Re-fetch the token on every iteration so long-running agentic loops
@@ -1218,10 +1259,21 @@ where
                     match tokio::time::timeout(std::time::Duration::from_secs(300), steer_rx.recv())
                         .await
                     {
-                        Ok(Some(user_reply)) => {
+                        Ok(Some(Some(user_reply))) => {
                             messages.push(Message::user(user_reply));
                             write_frame(writer, &Response::SteerAck).await?;
                             continue;
+                        }
+                        Ok(Some(None)) => {
+                            // Interrupt-only: cancel waiting for input.
+                            tracing::debug!(
+                                reason = "interrupt",
+                                context = "waiting_for_input_reply",
+                                tools_were_used,
+                                "session end"
+                            );
+                            final_text = clarification_prompt;
+                            break;
                         }
                         Ok(None) => {
                             // Channel closed — client disconnected.
@@ -1278,10 +1330,21 @@ where
                     match tokio::time::timeout(std::time::Duration::from_secs(300), steer_rx.recv())
                         .await
                     {
-                        Ok(Some(user_reply)) => {
+                        Ok(Some(Some(user_reply))) => {
                             messages.push(Message::user(user_reply));
                             write_frame(writer, &Response::SteerAck).await?;
                             continue;
+                        }
+                        Ok(Some(None)) => {
+                            // Interrupt-only: cancel waiting for input.
+                            tracing::debug!(
+                                reason = "interrupt",
+                                context = "waiting_for_question_reply",
+                                tools_were_used,
+                                "session end"
+                            );
+                            final_text = question;
+                            break;
                         }
                         Ok(None) => {
                             tracing::debug!(
@@ -1395,8 +1458,11 @@ where
                         // entries for ALL skipped calls before appending the user message,
                         // because the API requires assistant(tool_calls) →
                         // tool(tool_result…) → user/assistant ordering.
-                        steer_text = Some(msg);
-                        write_frame(writer, &Response::SteerAck).await?;
+                        // msg is None for interrupt-only (no text to inject).
+                        steer_text = msg;
+                        if steer_text.is_some() {
+                            write_frame(writer, &Response::SteerAck).await?;
+                        }
                         interrupted_at = Some(i);
                         break;
                     }
@@ -1701,7 +1767,7 @@ async fn run_cron_job(state: Arc<DaemonState>, job: &cron::CronJob) {
     // Cron jobs are non-interactive: drop the sender immediately so steer_rx.recv()
     // returns None at once if the model ends with '?', rather than timing out.
     let mut sink = tokio::io::sink();
-    let (_, mut steer_rx) = tokio::sync::mpsc::channel::<String>(1);
+    let (_, mut steer_rx) = tokio::sync::mpsc::channel::<Option<String>>(1);
 
     let result = run_agentic_loop(&state, &model, messages, &mut sink, &mut steer_rx).await;
 

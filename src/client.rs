@@ -102,6 +102,7 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
 
     loop {
         tokio::select! {
+            biased;
             // Handle Ctrl-C (SIGINT).
             result = sigint.recv() => {
                 // recv() returns None when the signal stream is closed; treat
@@ -131,6 +132,15 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
                     eprintln!("\n[interrupted — press Ctrl-C again quickly to exit]");
                 }
                 let _ = tokio::io::stderr().flush().await;
+                // Notify the daemon to abort/skip remaining tool calls immediately.
+                let interrupt_req = Request::Interrupt {
+                    session_id: session_id_copy.clone(),
+                };
+                if let Ok(mut frame) = serde_json::to_string(&interrupt_req) {
+                    frame.push('\n');
+                    let _ = writer.write_all(frame.as_bytes()).await;
+                    let _ = writer.flush().await;
+                }
                 last_ctrl_c = Some(now);
             }
 
@@ -253,8 +263,9 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
                         // is pending, cancel it and resume normal output.
                         if steer_pending {
                             steer_pending = false;
-                            buffer_truncated = false;
+                            last_ctrl_c = None;
                             flush_steer_buffer(&mut steer_buffer, &mut buffer_truncated, &mut stdout).await?;
+                            buffer_truncated = false;
                         }
                         // Otherwise discard silently.
                     }
@@ -263,8 +274,9 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
                         // and resume normal output; then stop reading stdin.
                         if steer_pending {
                             steer_pending = false;
-                            buffer_truncated = false;
+                            last_ctrl_c = None;
                             flush_steer_buffer(&mut steer_buffer, &mut buffer_truncated, &mut stdout).await?;
+                            buffer_truncated = false;
                         }
                         stdin_lines = None;
                     }
@@ -402,6 +414,7 @@ pub async fn run_resume(
 
     loop {
         tokio::select! {
+            biased;
             result = sigint.recv() => {
                 let Some(_) = result else { break; };
                 let now = Instant::now();
@@ -419,6 +432,15 @@ pub async fn run_resume(
                     eprintln!("\n[interrupted — press Ctrl-C again soon to exit]");
                 }
                 let _ = tokio::io::stderr().flush().await;
+                // Notify the daemon to abort/skip remaining tool calls immediately.
+                let interrupt_req = Request::Interrupt {
+                    session_id: session_uuid.clone(),
+                };
+                if let Ok(mut frame) = serde_json::to_string(&interrupt_req) {
+                    frame.push('\n');
+                    let _ = writer.write_all(frame.as_bytes()).await;
+                    let _ = writer.flush().await;
+                }
                 last_ctrl_c = Some(now);
             }
 
@@ -519,8 +541,9 @@ pub async fn run_resume(
                         // cancel it and resume normal output.
                         if steer_pending {
                             steer_pending = false;
-                            buffer_truncated = false;
+                            last_ctrl_c = None;
                             flush_steer_buffer(&mut steer_buffer, &mut buffer_truncated, &mut stdout).await?;
+                            buffer_truncated = false;
                         }
                     }
                     None => {
@@ -528,8 +551,9 @@ pub async fn run_resume(
                         // resume normal output; then stop reading stdin.
                         if steer_pending {
                             steer_pending = false;
-                            buffer_truncated = false;
+                            last_ctrl_c = None;
                             flush_steer_buffer(&mut steer_buffer, &mut buffer_truncated, &mut stdout).await?;
+                            buffer_truncated = false;
                         }
                         stdin_lines = None;
                     }

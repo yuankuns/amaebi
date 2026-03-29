@@ -59,6 +59,17 @@ pub enum Request {
         /// Chat model to use (e.g. "gpt-4o").
         model: String,
     },
+    /// Ask the daemon to abort the current tool execution and skip remaining
+    /// tool calls in the active agentic loop for the given session.
+    ///
+    /// Sent by the client immediately on the first Ctrl-C so the daemon can
+    /// stop mid-chain without waiting for the user to type a correction.
+    /// A [`Response::SteerAck`] is NOT sent in response; the loop simply
+    /// drains any pending steer messages at the start of the next iteration.
+    Interrupt {
+        /// Session UUID of the loop to interrupt.
+        session_id: String,
+    },
     /// Ask the daemon to clear its persisted SQLite memory database.
     ///
     /// Sent after `amaebi memory clear` so the running daemon also clears its
