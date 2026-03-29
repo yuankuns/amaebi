@@ -273,6 +273,23 @@ mod tests {
         assert!(!out
             .stdout
             .contains(absent_path.file_name().unwrap().to_str().unwrap()));
+
+        // Verify that credential directories are inaccessible inside the namespace.
+        for cred_dir in &["~/.claude", "~/.config", "~/.ssh"] {
+            let cmd = format!(
+                "test -e {dir} && echo exists || echo absent",
+                dir = cred_dir
+            );
+            let out = sb.spawn(&cmd, workspace.path()).await.unwrap();
+            assert!(
+                out.stdout.contains("absent"),
+                "Expected {dir} to be absent inside the namespace; \
+                 got stdout={:?} stderr={:?}",
+                out.stdout,
+                out.stderr,
+                dir = cred_dir,
+            );
+        }
     }
 
     /// Verify that an agent sandboxed to worktree_b cannot access worktree_a.
