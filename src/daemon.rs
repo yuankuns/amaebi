@@ -177,7 +177,8 @@ fn context_limit_for_model(model: &str) -> usize {
         ("gpt-3.5-turbo", 16_385),
         ("o1", 200_000),
         ("o3", 200_000),
-        ("claude", 1_000_000),
+        // Claude models: 200k context window.
+        ("claude", 200_000),
     ];
     TABLE
         .iter()
@@ -2033,7 +2034,7 @@ mod tests {
         assert_eq!(context_limit_for_model("gpt-3.5-turbo"), 16_385);
         assert_eq!(context_limit_for_model("o1-preview"), 200_000);
         assert_eq!(context_limit_for_model("o3-mini"), 200_000);
-        assert_eq!(context_limit_for_model("claude-3-5-sonnet"), 1_000_000);
+        assert_eq!(context_limit_for_model("claude-3-5-sonnet"), 200_000);
     }
 
     #[test]
