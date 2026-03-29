@@ -533,7 +533,15 @@ mod tests {
             return;
         }
 
-        let tmp = TempDir::new_in(secret_base).unwrap();
+        let tmp = match TempDir::new_in(secret_base) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!(
+                    "landlock denial test: cannot create temp dir in /var/tmp ({e}) — skipping"
+                );
+                return;
+            }
+        };
         let secret = tmp.path().join("secret");
         std::fs::create_dir_all(&secret).unwrap();
         std::fs::write(secret.join("file.txt"), "secret data").unwrap();

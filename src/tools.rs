@@ -64,8 +64,8 @@ pub async fn execute_with_sandbox(
 
         tracing::debug!(command = %command, "running shell command via sandbox");
 
-        // Resolve cwd using std::env::current_dir(); falls back to "." on error.
-        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let cwd = std::env::current_dir()
+            .context("shell_command: failed to determine current working directory")?;
 
         let output = sandbox.spawn(&command, &cwd).await?;
 
