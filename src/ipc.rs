@@ -140,6 +140,19 @@ pub enum Response {
 // Tests
 // ---------------------------------------------------------------------------
 
+/// Write one `Response` frame as a JSON line to `writer`.
+pub async fn write_frame<W>(writer: &mut W, frame: &Response) -> anyhow::Result<()>
+where
+    W: tokio::io::AsyncWriteExt + Unpin,
+{
+    let mut line = serde_json::to_string(frame)?;
+    line.push('\n');
+    writer
+        .write_all(line.as_bytes())
+        .await
+        .map_err(anyhow::Error::from)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -444,17 +457,4 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(s.trim_end()).unwrap();
         assert_eq!(v["chunk"], "streamed");
     }
-}
-
-/// Write one `Response` frame as a JSON line to `writer`.
-pub async fn write_frame<W>(writer: &mut W, frame: &Response) -> anyhow::Result<()>
-where
-    W: tokio::io::AsyncWriteExt + Unpin,
-{
-    let mut line = serde_json::to_string(frame)?;
-    line.push('\n');
-    writer
-        .write_all(line.as_bytes())
-        .await
-        .map_err(anyhow::Error::from)
 }

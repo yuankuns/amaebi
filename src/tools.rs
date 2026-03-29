@@ -151,6 +151,111 @@ async fn edit_file(args: serde_json::Value) -> Result<String> {
 // Tests
 // ---------------------------------------------------------------------------
 
+/// Return the JSON schema array to include in every chat request.
+pub fn tool_schemas() -> Vec<serde_json::Value> {
+    vec![
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "shell_command",
+                "description": "Run a shell command (via sh -c) in the background and \
+                                return its stdout and stderr. Use this for grep, find, git, \
+                                cargo, systemctl, etc. Does NOT interact with the user's \
+                                tmux pane.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": {
+                            "type": "string",
+                            "description": "The shell command to execute."
+                        }
+                    },
+                    "required": ["command"]
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "tmux_capture_pane",
+                "description": "Capture and return the current visible text of a tmux pane.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "target": {
+                            "type": "string",
+                            "description": "tmux target pane (e.g. '%0', '0:1.0'). \
+                                            Defaults to %0."
+                        }
+                    },
+                    "required": []
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "tmux_send_keys",
+                "description": "Send keystrokes to a tmux pane. Use for interactive \
+                                programs (e.g. pressing Enter, Ctrl-C). For background \
+                                tasks prefer shell_command.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "keys": {
+                            "type": "string",
+                            "description": "Keys to send, e.g. 'q', 'Enter', 'C-c'."
+                        },
+                        "target": {
+                            "type": "string",
+                            "description": "tmux target pane. Defaults to %0."
+                        }
+                    },
+                    "required": ["keys"]
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "Read the full contents of a file on disk.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Absolute or relative path to the file."
+                        }
+                    },
+                    "required": ["path"]
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "edit_file",
+                "description": "Overwrite a file with new content.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Path of the file to write."
+                        },
+                        "content": {
+                            "type": "string",
+                            "description": "New full content for the file."
+                        }
+                    },
+                    "required": ["path", "content"]
+                }
+            }
+        }),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -340,109 +445,4 @@ mod tests {
         let msg = format!("{}", result.unwrap_err());
         assert!(msg.contains("unknown tool"), "got: {msg}");
     }
-}
-
-/// Return the JSON schema array to include in every chat request.
-pub fn tool_schemas() -> Vec<serde_json::Value> {
-    vec![
-        serde_json::json!({
-            "type": "function",
-            "function": {
-                "name": "shell_command",
-                "description": "Run a shell command (via sh -c) in the background and \
-                                return its stdout and stderr. Use this for grep, find, git, \
-                                cargo, systemctl, etc. Does NOT interact with the user's \
-                                tmux pane.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "command": {
-                            "type": "string",
-                            "description": "The shell command to execute."
-                        }
-                    },
-                    "required": ["command"]
-                }
-            }
-        }),
-        serde_json::json!({
-            "type": "function",
-            "function": {
-                "name": "tmux_capture_pane",
-                "description": "Capture and return the current visible text of a tmux pane.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "target": {
-                            "type": "string",
-                            "description": "tmux target pane (e.g. '%0', '0:1.0'). \
-                                            Defaults to %0."
-                        }
-                    },
-                    "required": []
-                }
-            }
-        }),
-        serde_json::json!({
-            "type": "function",
-            "function": {
-                "name": "tmux_send_keys",
-                "description": "Send keystrokes to a tmux pane. Use for interactive \
-                                programs (e.g. pressing Enter, Ctrl-C). For background \
-                                tasks prefer shell_command.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "keys": {
-                            "type": "string",
-                            "description": "Keys to send, e.g. 'q', 'Enter', 'C-c'."
-                        },
-                        "target": {
-                            "type": "string",
-                            "description": "tmux target pane. Defaults to %0."
-                        }
-                    },
-                    "required": ["keys"]
-                }
-            }
-        }),
-        serde_json::json!({
-            "type": "function",
-            "function": {
-                "name": "read_file",
-                "description": "Read the full contents of a file on disk.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "path": {
-                            "type": "string",
-                            "description": "Absolute or relative path to the file."
-                        }
-                    },
-                    "required": ["path"]
-                }
-            }
-        }),
-        serde_json::json!({
-            "type": "function",
-            "function": {
-                "name": "edit_file",
-                "description": "Overwrite a file with new content.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "path": {
-                            "type": "string",
-                            "description": "Path of the file to write."
-                        },
-                        "content": {
-                            "type": "string",
-                            "description": "New full content for the file."
-                        }
-                    },
-                    "required": ["path", "content"]
-                }
-            }
-        }),
-    ]
 }
