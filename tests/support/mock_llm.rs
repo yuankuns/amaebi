@@ -164,7 +164,7 @@ struct ServerState {
     responses: Arc<Mutex<VecDeque<ScriptedResponse>>>,
     /// Log of all captured requests.
     captured: Arc<Mutex<Vec<CapturedRequest>>>,
-    /// Whether to validate incoming requests (default: true).
+    /// Whether to validate incoming requests.
     validate: bool,
 }
 

@@ -9,8 +9,14 @@ use crate::ipc::{write_frame, Response};
 
 const CHAT_ENDPOINT: &str = "https://api.githubcopilot.com/chat/completions";
 
-/// Return the chat completions URL, allowing tests to override via env var.
+/// Return the chat completions URL.
+///
+/// In test builds only, `AMAEBI_COPILOT_URL` can override the endpoint so
+/// that tests can point the daemon at a local mock server.  The override is
+/// intentionally absent from production builds to prevent bearer-token
+/// redirection to arbitrary URLs.
 fn chat_endpoint() -> String {
+    #[cfg(test)]
     if let Ok(url) = std::env::var("AMAEBI_COPILOT_URL") {
         if !url.trim().is_empty() {
             return url.trim().to_string();

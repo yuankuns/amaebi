@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tempfile::TempDir;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::process::{Child, Command};
 
@@ -119,15 +119,19 @@ pub async fn start_daemon_with_env(
         .env("RUST_LOG", "error")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+        .stderr(std::process::Stdio::piped());
 
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
 
-    let child = cmd
+    let mut child = cmd
         .spawn()
         .with_context(|| format!("spawning daemon: {}", exe.display()))?;
+
+    // Take stderr *before* moving `child` into `DaemonHandle` so we can
+    // drain it in the startup-timeout error path.
+    let mut stderr_capture = child.stderr.take();
 
     for _ in 0..50 {
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -135,11 +139,29 @@ pub async fn start_daemon_with_env(
             break;
         }
     }
-    anyhow::ensure!(
-        socket.exists(),
-        "daemon socket did not appear within 5 s: {}",
-        socket.display()
-    );
+
+    if !socket.exists() {
+        let mut stderr_text = String::new();
+        if let Some(ref mut stderr) = stderr_capture {
+            let mut buf = Vec::new();
+            let _ = tokio::time::timeout(
+                Duration::from_millis(500),
+                stderr.read_to_end(&mut buf),
+            )
+            .await;
+            stderr_text = String::from_utf8_lossy(&buf).into_owned();
+        }
+        let stderr_display = if stderr_text.is_empty() {
+            "(empty)".to_string()
+        } else {
+            stderr_text
+        };
+        anyhow::bail!(
+            "daemon socket did not appear within 5 s: {}\ndaemon stderr:\n{}",
+            socket.display(),
+            stderr_display
+        );
+    }
 
     Ok(DaemonHandle {
         socket,
@@ -384,18 +406,23 @@ pub async fn send_request(client: &ClientHandle, req: &Request) -> Result<Vec<Re
 
     let mut responses = Vec::new();
     let mut lines = BufReader::new(reader).lines();
-    while let Some(l) = lines.next_line().await.context("reading response line")? {
-        if l.is_empty() {
-            continue;
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while let Some(l) = lines.next_line().await.context("reading response line")? {
+            if l.is_empty() {
+                continue;
+            }
+            let frame: Response =
+                serde_json::from_str(&l).with_context(|| format!("parsing response: {l:?}"))?;
+            let done = matches!(frame, Response::Done | Response::Error { .. });
+            responses.push(frame);
+            if done {
+                break;
+            }
         }
-        let frame: Response =
-            serde_json::from_str(&l).with_context(|| format!("parsing response: {l:?}"))?;
-        let done = matches!(frame, Response::Done | Response::Error { .. });
-        responses.push(frame);
-        if done {
-            break;
-        }
-    }
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .context("send_request timed out after 30 s waiting for Done/Error frame")??;
     Ok(responses)
 }
 
