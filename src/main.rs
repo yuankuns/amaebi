@@ -14,6 +14,7 @@ mod inbox;
 mod ipc;
 mod memory_db;
 mod models;
+mod sandbox;
 mod session;
 #[cfg(test)]
 mod test_utils;
