@@ -279,6 +279,23 @@ mod tests {
     }
 
     #[test]
+    fn request_interrupt_round_trip() {
+        let req = Request::Interrupt {
+            session_id: "sess-xyz".into(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["type"], "interrupt");
+        assert_eq!(v["session_id"], "sess-xyz");
+
+        let back: Request = serde_json::from_str(&json).unwrap();
+        let Request::Interrupt { session_id } = back else {
+            panic!("expected Interrupt variant");
+        };
+        assert_eq!(session_id, "sess-xyz");
+    }
+
+    #[test]
     fn response_detach_accepted_round_trip() {
         let r = Response::DetachAccepted {
             session_id: "task-uuid".into(),

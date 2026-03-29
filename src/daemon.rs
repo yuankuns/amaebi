@@ -14,7 +14,7 @@ use crate::memory_db;
 use crate::tools::{self, ToolExecutor};
 
 /// Compute `max_tokens` for a request to `model`: capped at half the model's context window
-/// so it never exceeds what the model supports (e.g. gpt-4's 8 192-token limit).
+/// so it never exceeds what the model supports (e.g. gpt-4's 8,192-token limit).
 fn max_output_tokens_for_model(model: &str) -> usize {
     // Ordered longest-prefix-first so that e.g. "gpt-4-turbo" beats "gpt-4".
     const TABLE: &[(&str, usize)] = &[
@@ -1139,7 +1139,7 @@ where
                 write_frame(writer, &Response::SteerAck).await?;
             }
             // None = interrupt-only (no user message to inject; loop already
-            // skipped the tool chain at execution time).
+            // skipped the tool chain at execution time).  No SteerAck is sent.
         }
 
         // Re-fetch the token on every iteration so long-running agentic loops
@@ -1256,24 +1256,32 @@ where
 
                     // Block until the user replies via the steering channel.
                     // Timeout after 5 minutes to avoid infinite hangs.
-                    match tokio::time::timeout(std::time::Duration::from_secs(300), steer_rx.recv())
+                    // A bare interrupt (Ctrl-C / None) is ignored while the
+                    // session is already waiting for input — keep waiting.
+                    let steer_result = 'wait_input: loop {
+                        match tokio::time::timeout(
+                            std::time::Duration::from_secs(300),
+                            steer_rx.recv(),
+                        )
                         .await
-                    {
-                        Ok(Some(Some(user_reply))) => {
+                        {
+                            Ok(Some(Some(reply))) => break 'wait_input Ok(Some(reply)),
+                            Ok(Some(None)) => {
+                                tracing::debug!(
+                                    context = "waiting_for_input_reply",
+                                    "interrupt ignored while waiting for input"
+                                );
+                                continue 'wait_input;
+                            }
+                            Ok(None) => break 'wait_input Ok(None),
+                            Err(e) => break 'wait_input Err(e),
+                        }
+                    };
+                    match steer_result {
+                        Ok(Some(user_reply)) => {
                             messages.push(Message::user(user_reply));
                             write_frame(writer, &Response::SteerAck).await?;
                             continue;
-                        }
-                        Ok(Some(None)) => {
-                            // Interrupt-only: cancel waiting for input.
-                            tracing::debug!(
-                                reason = "interrupt",
-                                context = "waiting_for_input_reply",
-                                tools_were_used,
-                                "session end"
-                            );
-                            final_text = clarification_prompt;
-                            break;
                         }
                         Ok(None) => {
                             // Channel closed — client disconnected.
@@ -1327,24 +1335,32 @@ where
                     // Use the trimmed question (no marker contamination) in history.
                     messages.push(Message::assistant(Some(question.clone()), vec![]));
 
-                    match tokio::time::timeout(std::time::Duration::from_secs(300), steer_rx.recv())
+                    // A bare interrupt (Ctrl-C / None) is ignored while the
+                    // session is already waiting for a question reply — keep waiting.
+                    let steer_result = 'wait_question: loop {
+                        match tokio::time::timeout(
+                            std::time::Duration::from_secs(300),
+                            steer_rx.recv(),
+                        )
                         .await
-                    {
-                        Ok(Some(Some(user_reply))) => {
+                        {
+                            Ok(Some(Some(reply))) => break 'wait_question Ok(Some(reply)),
+                            Ok(Some(None)) => {
+                                tracing::debug!(
+                                    context = "waiting_for_question_reply",
+                                    "interrupt ignored while waiting for question reply"
+                                );
+                                continue 'wait_question;
+                            }
+                            Ok(None) => break 'wait_question Ok(None),
+                            Err(e) => break 'wait_question Err(e),
+                        }
+                    };
+                    match steer_result {
+                        Ok(Some(user_reply)) => {
                             messages.push(Message::user(user_reply));
                             write_frame(writer, &Response::SteerAck).await?;
                             continue;
-                        }
-                        Ok(Some(None)) => {
-                            // Interrupt-only: cancel waiting for input.
-                            tracing::debug!(
-                                reason = "interrupt",
-                                context = "waiting_for_question_reply",
-                                tools_were_used,
-                                "session end"
-                            );
-                            final_text = question;
-                            break;
                         }
                         Ok(None) => {
                             tracing::debug!(
