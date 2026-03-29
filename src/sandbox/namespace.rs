@@ -3,7 +3,7 @@
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::path::Path;
 use tokio::process::Command;
 
@@ -55,6 +55,17 @@ impl Sandbox for NamespaceSandbox {
         let mut cmd_builder = Command::new("sh");
         cmd_builder.arg("-c").arg(cmd).current_dir(cwd);
 
+        // Capture uid/gid before fork — getuid/getgid are not async-signal-safe
+        // in all libc implementations, and allocation is forbidden inside pre_exec.
+        let outer_uid = unsafe { libc::getuid() };
+        let outer_gid = unsafe { libc::getgid() };
+        let uid_map_str = CString::new(format!("0 {} 1\n", outer_uid)).unwrap();
+        let gid_map_str = CString::new(format!("0 {} 1\n", outer_gid)).unwrap();
+        let setgroups_deny = CString::new("deny\n").unwrap();
+        let uid_map_path = CString::new("/proc/self/uid_map").unwrap();
+        let setgroups_path = CString::new("/proc/self/setgroups").unwrap();
+        let gid_map_path = CString::new("/proc/self/gid_map").unwrap();
+
         // Safety: pre_exec closure runs in the child after fork(), before exec().
         // Must only call async-signal-safe functions (libc syscalls).
         unsafe {
@@ -64,6 +75,12 @@ impl Sandbox for NamespaceSandbox {
                 if ret != 0 {
                     return Err(std::io::Error::last_os_error());
                 }
+
+                // 1b. Map outer uid/gid → root (0) inside the new user namespace.
+                //     Order is mandatory: setgroups must be written before gid_map.
+                write_proc_file(&uid_map_path, &uid_map_str)?;
+                write_proc_file(&setgroups_path, &setgroups_deny)?;
+                write_proc_file(&gid_map_path, &gid_map_str)?;
 
                 // 2. Mount tmpfs at /tmp — isolated per-agent.
                 let ret = libc::mount(
@@ -164,6 +181,22 @@ fn namespace_available() -> bool {
 fn path_to_cstring(p: &Path) -> Result<CString> {
     use std::os::unix::ffi::OsStrExt;
     CString::new(p.as_os_str().as_bytes()).context("path contains null byte")
+}
+
+/// Write `content` to a `/proc/self/…` file using only raw syscalls.
+/// Safe to call from a `pre_exec` hook: no heap allocation, no Rust runtime.
+unsafe fn write_proc_file(path: &CStr, content: &CStr) -> std::io::Result<()> {
+    let fd = libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC);
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let bytes = content.to_bytes(); // excludes the NUL terminator
+    let ret = libc::write(fd, bytes.as_ptr() as *const libc::c_void, bytes.len());
+    libc::close(fd);
+    if ret < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 // These tests require Linux user namespaces (CLONE_NEWUSER).
@@ -315,6 +348,27 @@ mod tests {
             out.stdout.contains("no_access"),
             "agent B should not be able to read agent A's worktree; \
              got stdout={:?} stderr={:?}",
+            out.stdout,
+            out.stderr,
+        );
+    }
+
+    /// Verify that a sandboxed process cannot signal processes outside the PID
+    /// namespace.  `kill -0` just checks accessibility — it does not actually
+    /// deliver a signal — so this test is safe to run against the real parent.
+    #[tokio::test]
+    #[ignore]
+    async fn cannot_kill_external_process() {
+        let dir = TempDir::new().unwrap();
+        let sb = create_backend(make_config(dir.path().to_path_buf()));
+        let pid = std::process::id();
+        let cmd = format!("kill -0 {} 2>&1 || echo kill_denied", pid);
+        let out = sb.spawn(&cmd, dir.path()).await.unwrap();
+        assert!(
+            out.stdout.contains("kill_denied"),
+            "Expected sandbox to deny signaling external PID {}; \
+             got stdout={:?} stderr={:?}",
+            pid,
             out.stdout,
             out.stderr,
         );
