@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -11,6 +9,7 @@ use super::{Sandbox, SandboxOutput};
 // DockerSandboxConfig
 // ---------------------------------------------------------------------------
 
+#[allow(dead_code)]
 pub struct DockerSandboxConfig {
     pub image: String,
     /// Mounted read-write at the same path inside the container.
@@ -25,11 +24,13 @@ pub struct DockerSandboxConfig {
 // DockerSandbox
 // ---------------------------------------------------------------------------
 
+#[allow(dead_code)]
 pub struct DockerSandbox {
     config: DockerSandboxConfig,
 }
 
 impl DockerSandbox {
+    #[allow(dead_code)]
     pub fn new(config: DockerSandboxConfig) -> Self {
         Self { config }
     }
@@ -38,6 +39,14 @@ impl DockerSandbox {
 #[async_trait::async_trait]
 impl Sandbox for DockerSandbox {
     async fn spawn(&self, cmd: &str, cwd: &Path) -> Result<SandboxOutput> {
+        if !cwd.starts_with(&self.config.workspace) {
+            anyhow::bail!(
+                "cwd '{}' is not under workspace '{}'",
+                cwd.display(),
+                self.config.workspace.display()
+            );
+        }
+
         let cwd_str = cwd
             .to_str()
             .ok_or_else(|| anyhow::anyhow!("cwd is not valid UTF-8"))?;
@@ -79,13 +88,15 @@ impl Sandbox for DockerSandbox {
     }
 
     fn available(&self) -> bool {
-        std::process::Command::new("docker")
-            .arg("info")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
+        tokio::task::block_in_place(|| {
+            std::process::Command::new("docker")
+                .arg("info")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        })
     }
 
     fn name(&self) -> &str {
@@ -131,12 +142,12 @@ mod tests {
     }
 
     // ---- DockerSandbox tests (require Docker) ------------------------------
-    // Requires: amaebi-sandbox:latest Docker image
+    // Requires: amaebi-sandbox:bookworm-slim Docker image
     // Build with: ./scripts/build-sandbox-image.sh
 
     fn test_sandbox(workspace: &TempDir) -> DockerSandbox {
         DockerSandbox::new(DockerSandboxConfig {
-            image: "amaebi-sandbox:latest".to_string(),
+            image: "amaebi-sandbox:bookworm-slim".to_string(),
             workspace: workspace.path().to_path_buf(),
             ro_paths: vec![],
             rw_paths: vec![],
@@ -214,7 +225,7 @@ mod tests {
 
         // Sandbox only mounts `workspace`, not `other_workspace`.
         let sandbox = DockerSandbox::new(DockerSandboxConfig {
-            image: "amaebi-sandbox:latest".to_string(),
+            image: "amaebi-sandbox:bookworm-slim".to_string(),
             workspace: workspace.path().to_path_buf(),
             ro_paths: vec![],
             rw_paths: vec![],

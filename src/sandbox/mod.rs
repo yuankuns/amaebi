@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -26,7 +24,9 @@ pub trait Sandbox: Send + Sync {
     /// Spawn a shell command inside the sandbox.
     async fn spawn(&self, cmd: &str, cwd: &Path) -> Result<SandboxOutput>;
     /// Returns true if this backend is available on the current system.
+    #[allow(dead_code)]
     fn available(&self) -> bool;
+    #[allow(dead_code)]
     fn name(&self) -> &str;
 }
 
@@ -36,6 +36,7 @@ pub trait Sandbox: Send + Sync {
 
 /// No-op sandbox: runs commands directly via sh -c. Used in tests and when
 /// sandbox is disabled.
+#[allow(dead_code)]
 pub struct NoopSandbox;
 
 #[async_trait::async_trait]
