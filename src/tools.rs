@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use tokio::process::Command;
 
-use crate::sandbox::Sandbox;
+use crate::sandbox::{docker::DockerSandboxConfig, DockerSandbox, Sandbox};
 
 // ---------------------------------------------------------------------------
 // ToolExecutor trait
@@ -18,6 +18,17 @@ pub trait ToolExecutor: Send + Sync {
 // Local (host) executor
 // ---------------------------------------------------------------------------
 
+/// A local tool executor that optionally routes `shell_command` calls through
+/// a sandbox backend.
+///
+/// # Environment variables
+///
+/// - `AMAEBI_SANDBOX=docker` — enable the Docker sandbox backend.
+/// - `AMAEBI_SANDBOX_IMAGE` — override the Docker image used by the sandbox
+///   (default: `"amaebi-sandbox:bookworm-slim"`).
+///
+/// When `AMAEBI_SANDBOX` is unset or set to any value other than `"docker"`,
+/// commands run directly on the host via `sh -c`.
 #[derive(Default)]
 pub struct LocalExecutor {
     /// Optional sandbox backend. When `Some`, `shell_command` runs inside the
@@ -27,7 +38,21 @@ pub struct LocalExecutor {
 
 impl LocalExecutor {
     pub fn new() -> Self {
-        Self::default()
+        let sandbox: Option<Box<dyn Sandbox>> = match std::env::var("AMAEBI_SANDBOX").as_deref() {
+            Ok("docker") => {
+                let image = std::env::var("AMAEBI_SANDBOX_IMAGE")
+                    .unwrap_or_else(|_| "amaebi-sandbox:bookworm-slim".to_string());
+                let workspace = std::env::current_dir().unwrap_or_default();
+                Some(Box::new(DockerSandbox::new(DockerSandboxConfig {
+                    image,
+                    workspace,
+                    ro_paths: vec![],
+                    rw_paths: vec![],
+                })))
+            }
+            _ => None,
+        };
+        Self { sandbox }
     }
 }
 
@@ -457,6 +482,32 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
+    }
+
+    // ---- LocalExecutor::new env-var wiring ----------------------------------
+
+    #[test]
+    fn new_without_env_var_has_no_sandbox() {
+        std::env::remove_var("AMAEBI_SANDBOX");
+        let exec = LocalExecutor::new();
+        assert!(exec.sandbox.is_none());
+    }
+
+    #[test]
+    fn new_with_docker_env_var_creates_docker_sandbox() {
+        std::env::set_var("AMAEBI_SANDBOX", "docker");
+        let exec = LocalExecutor::new();
+        std::env::remove_var("AMAEBI_SANDBOX");
+        assert!(exec.sandbox.is_some());
+        assert_eq!(exec.sandbox.as_deref().map(|s| s.name()), Some("docker"));
+    }
+
+    #[test]
+    fn new_with_unknown_env_var_value_has_no_sandbox() {
+        std::env::set_var("AMAEBI_SANDBOX", "unknown");
+        let exec = LocalExecutor::new();
+        std::env::remove_var("AMAEBI_SANDBOX");
+        assert!(exec.sandbox.is_none());
     }
 
     // ---- unknown tool ---------------------------------------------------
