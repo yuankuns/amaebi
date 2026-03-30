@@ -36,7 +36,7 @@ step() { echo ""; echo "==> Step $1: $2"; }
 ok()   { echo "    ✓ passed"; pass=$((pass + 1)); }
 fail() { echo "    ✗ failed"; exit 1; }
 
-# Steps 1-3: run all in a single container
+# Step 1: run inside container
 step 1 "cargo check + test + clippy (in $DEV_IMAGE)"
 # Note: --user 0:0 (root) is intentional. The image's Cargo/Rustup toolchains
 # live under /home/user/.cargo and /home/user/.rustup, owned by the container's
