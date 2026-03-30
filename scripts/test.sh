@@ -17,7 +17,10 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 WORKDIR="$REPO_ROOT"
 
-DEV_IMAGE="openclaw-sandbox-dev:bookworm-slim"
+# This image is provided by OpenClaw. Set AMAEBI_DEV_IMAGE to use a custom image.
+# The default openclaw-sandbox-dev:bookworm-slim ships Rust/Cargo pre-installed
+# and is not publicly distributed — contact the OpenClaw team or build your own.
+DEV_IMAGE="${AMAEBI_DEV_IMAGE:-openclaw-sandbox-dev:bookworm-slim}"
 HOST_CARGO="${CARGO:-$HOME/.cargo/bin/cargo}"
 RUN_DOCKER=0
 FILTER=""
@@ -53,6 +56,13 @@ fail() { echo "    ✗ failed"; exit 1; }
 
 # Step 1: run inside container
 step 1 "cargo check + test + clippy (in $DEV_IMAGE)"
+if ! docker image inspect "$DEV_IMAGE" &>/dev/null; then
+    echo ""
+    echo "    ✗ Dev image '$DEV_IMAGE' not found."
+    echo "      Set AMAEBI_DEV_IMAGE to point to a local image, or contact the OpenClaw"
+    echo "      team for access to openclaw-sandbox-dev:bookworm-slim."
+    exit 1
+fi
 # Note: --user 0:0 (root) is intentional. The image's Cargo/Rustup toolchains
 # live under /home/user/.cargo and /home/user/.rustup, owned by the container's
 # 'user' account. Root can write there; a host-mapped UID (id -u):(id -g) cannot,

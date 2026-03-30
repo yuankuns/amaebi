@@ -39,9 +39,18 @@ impl DockerSandbox {
 #[async_trait::async_trait]
 impl Sandbox for DockerSandbox {
     async fn spawn(&self, cmd: &str, cwd: &Path) -> Result<SandboxOutput> {
-        if !cwd.starts_with(&self.config.workspace) {
+        let cwd_canon = cwd
+            .canonicalize()
+            .with_context(|| format!("canonicalizing cwd: {}", cwd.display()))?;
+        let workspace_canon = self.config.workspace.canonicalize().with_context(|| {
+            format!(
+                "canonicalizing workspace: {}",
+                self.config.workspace.display()
+            )
+        })?;
+        if cwd_canon.strip_prefix(&workspace_canon).is_err() {
             anyhow::bail!(
-                "cwd '{}' is not under workspace '{}'",
+                "cwd {} is not under workspace {}",
                 cwd.display(),
                 self.config.workspace.display()
             );

@@ -510,6 +510,18 @@ mod tests {
         assert!(exec.sandbox.is_none());
     }
 
+    // ---- shell_command with NoopSandbox ----------------------------------
+
+    #[tokio::test]
+    async fn shell_command_with_noop_sandbox() {
+        let exec = LocalExecutor {
+            sandbox: Some(Box::new(crate::sandbox::NoopSandbox)),
+        };
+        let args = serde_json::json!({"command": "echo hello"});
+        let result = exec.execute("shell_command", args).await.unwrap();
+        assert!(result.contains("hello"));
+    }
+
     // ---- unknown tool ---------------------------------------------------
 
     #[tokio::test]
