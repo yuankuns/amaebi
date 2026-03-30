@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use tokio::process::Command;
+use tokio::sync::Mutex;
 
 use super::{Sandbox, SandboxOutput};
 
@@ -24,41 +25,27 @@ pub struct DockerSandboxConfig {
 // DockerSandbox
 // ---------------------------------------------------------------------------
 
-#[allow(dead_code)]
 pub struct DockerSandbox {
     config: DockerSandboxConfig,
+    container_id: Mutex<Option<String>>,
 }
 
 impl DockerSandbox {
     #[allow(dead_code)]
     pub fn new(config: DockerSandboxConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            container_id: Mutex::new(None),
+        }
     }
-}
 
-#[async_trait::async_trait]
-impl Sandbox for DockerSandbox {
-    async fn spawn(&self, cmd: &str, cwd: &Path) -> Result<SandboxOutput> {
-        let cwd_canon = cwd
-            .canonicalize()
-            .with_context(|| format!("canonicalizing cwd: {}", cwd.display()))?;
-        let workspace_canon = self.config.workspace.canonicalize().with_context(|| {
-            format!(
-                "canonicalizing workspace: {}",
-                self.config.workspace.display()
-            )
-        })?;
-        if cwd_canon.strip_prefix(&workspace_canon).is_err() {
-            anyhow::bail!(
-                "cwd {} is not under workspace {}",
-                cwd.display(),
-                self.config.workspace.display()
-            );
+    /// Ensure the long-running container is started, returning its ID.
+    async fn ensure_container(&self) -> Result<String> {
+        let mut guard = self.container_id.lock().await;
+        if let Some(id) = guard.as_ref() {
+            return Ok(id.clone());
         }
 
-        let cwd_str = cwd
-            .to_str()
-            .ok_or_else(|| anyhow::anyhow!("cwd is not valid UTF-8"))?;
         let workspace_str = self
             .config
             .workspace
@@ -66,8 +53,7 @@ impl Sandbox for DockerSandbox {
             .ok_or_else(|| anyhow::anyhow!("workspace path is not valid UTF-8"))?;
 
         let mut docker = Command::new("docker");
-        docker.args(["run", "--rm", "--network", "none"]);
-        docker.args(["-w", cwd_str]);
+        docker.args(["run", "-d", "--rm", "--network", "none"]);
         docker.args(["-v", &format!("{workspace_str}:{workspace_str}:rw")]);
 
         for rw_path in &self.config.rw_paths {
@@ -85,9 +71,60 @@ impl Sandbox for DockerSandbox {
         }
 
         docker.arg(&self.config.image);
-        docker.args(["sh", "-c", cmd]);
+        docker.args(["sleep", "infinity"]);
 
-        let output = docker.output().await.context("spawning docker run")?;
+        let output = docker
+            .output()
+            .await
+            .context("starting persistent docker container")?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("docker run -d failed: {}", stderr.trim());
+        }
+
+        let id = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if id.is_empty() {
+            anyhow::bail!("docker run -d returned an empty container ID");
+        }
+
+        *guard = Some(id.clone());
+        Ok(id)
+    }
+}
+
+#[async_trait::async_trait]
+impl Sandbox for DockerSandbox {
+    async fn spawn(&self, cmd: &str, cwd: &Path) -> Result<SandboxOutput> {
+        // Validate cwd is inside the workspace.
+        let cwd_canon = cwd
+            .canonicalize()
+            .with_context(|| format!("canonicalizing cwd: {}", cwd.display()))?;
+        let workspace_canon = self.config.workspace.canonicalize().with_context(|| {
+            format!(
+                "canonicalizing workspace: {}",
+                self.config.workspace.display()
+            )
+        })?;
+        if cwd_canon.strip_prefix(&workspace_canon).is_err() {
+            anyhow::bail!(
+                "cwd {} is not under workspace {}",
+                cwd.display(),
+                self.config.workspace.display()
+            );
+        }
+
+        let cwd_str = cwd_canon
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("cwd is not valid UTF-8"))?;
+
+        let container_id = self.ensure_container().await?;
+
+        let output = Command::new("docker")
+            .args(["exec", "-w", cwd_str, &container_id, "sh", "-c", cmd])
+            .output()
+            .await
+            .context("spawning docker exec")?;
 
         Ok(SandboxOutput {
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -108,6 +145,18 @@ impl Sandbox for DockerSandbox {
 
     fn name(&self) -> &str {
         "docker"
+    }
+}
+
+impl Drop for DockerSandbox {
+    fn drop(&mut self) {
+        if let Ok(guard) = self.container_id.try_lock() {
+            if let Some(id) = guard.as_ref() {
+                let _ = std::process::Command::new("docker")
+                    .args(["rm", "-f", id])
+                    .output();
+            }
+        }
     }
 }
 
@@ -174,20 +223,45 @@ mod tests {
         );
     }
 
+    /// Two spawn() calls on the *same* sandbox share /tmp state.
+    #[tokio::test]
+    #[ignore]
+    async fn docker_sandbox_shares_state_within_session() {
+        let dir = TempDir::new().unwrap();
+        let sandbox = test_sandbox(&dir);
+
+        sandbox
+            .spawn("echo session_data > /tmp/shared_file", dir.path())
+            .await
+            .unwrap();
+
+        let out = sandbox
+            .spawn("cat /tmp/shared_file", dir.path())
+            .await
+            .unwrap();
+        assert!(
+            out.stdout.contains("session_data"),
+            "second spawn should see file written by first spawn, got: {:?}",
+            out.stdout
+        );
+    }
+
+    /// Two *separate* DockerSandbox instances have isolated /tmp.
     #[tokio::test]
     #[ignore]
     async fn docker_sandbox_isolates_tmp() {
         let dir = TempDir::new().unwrap();
-        let sandbox = test_sandbox(&dir);
+        let sandbox1 = test_sandbox(&dir);
+        let sandbox2 = test_sandbox(&dir);
 
-        // First container writes a marker to /tmp.
-        sandbox
+        // First sandbox writes a marker to /tmp.
+        sandbox1
             .spawn("echo run1 > /tmp/isolation_marker", dir.path())
             .await
             .unwrap();
 
-        // Second container should have a fresh /tmp — no marker.
-        let out = sandbox
+        // Second sandbox (separate container) should have a fresh /tmp — no marker.
+        let out = sandbox2
             .spawn(
                 "test -e /tmp/isolation_marker && echo exists || echo absent",
                 dir.path(),
@@ -196,7 +270,7 @@ mod tests {
             .unwrap();
         assert!(
             out.stdout.contains("absent"),
-            "containers should have isolated /tmp, got: {:?}",
+            "separate sandbox instances should have isolated /tmp, got: {:?}",
             out.stdout
         );
     }
