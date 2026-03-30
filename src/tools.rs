@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use anyhow::{Context, Result};
 use tokio::process::Command;
 
@@ -29,6 +31,9 @@ pub trait ToolExecutor: Send + Sync {
 ///
 /// When `AMAEBI_SANDBOX` is unset or set to any value other than `"docker"`,
 /// commands run directly on the host via `sh -c`.
+///
+/// Set `AMAEBI_SANDBOX_WORKSPACE` to mount a specific directory (e.g. a git
+/// worktree) as the workspace. Defaults to the current working directory.
 #[derive(Default)]
 pub struct LocalExecutor {
     /// Optional sandbox backend. When `Some`, `shell_command` runs inside the
@@ -42,7 +47,9 @@ impl LocalExecutor {
             Ok("docker") => {
                 let image = std::env::var("AMAEBI_SANDBOX_IMAGE")
                     .unwrap_or_else(|_| "amaebi-sandbox:bookworm-slim".to_string());
-                let workspace = std::env::current_dir().unwrap_or_default();
+                let workspace = std::env::var("AMAEBI_SANDBOX_WORKSPACE")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|_| std::env::current_dir().unwrap_or_default());
                 Some(Box::new(DockerSandbox::new(DockerSandboxConfig {
                     image,
                     workspace,
@@ -500,6 +507,16 @@ mod tests {
         std::env::remove_var("AMAEBI_SANDBOX");
         assert!(exec.sandbox.is_some());
         assert_eq!(exec.sandbox.as_deref().map(|s| s.name()), Some("docker"));
+    }
+
+    #[test]
+    fn new_with_sandbox_workspace_env_var_uses_that_path() {
+        std::env::set_var("AMAEBI_SANDBOX", "docker");
+        std::env::set_var("AMAEBI_SANDBOX_WORKSPACE", "/tmp/my-worktree");
+        let exec = LocalExecutor::new();
+        std::env::remove_var("AMAEBI_SANDBOX");
+        std::env::remove_var("AMAEBI_SANDBOX_WORKSPACE");
+        assert!(exec.sandbox.is_some());
     }
 
     #[test]
