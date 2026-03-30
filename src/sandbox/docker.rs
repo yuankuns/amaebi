@@ -66,9 +66,8 @@ impl Sandbox for DockerSandbox {
             docker.args(["-v", &format!("{s}:{s}:ro")]);
         }
 
-        docker.args(["-e", &format!("AMAEBI_CMD={cmd}")]);
         docker.arg(&self.config.image);
-        docker.args(["sh", "-c", "$AMAEBI_CMD"]);
+        docker.args(["sh", "-c", cmd]);
 
         let output = docker.output().await.context("spawning docker run")?;
 
