@@ -1,5 +1,9 @@
+use std::path::PathBuf;
+
 use anyhow::{Context, Result};
 use tokio::process::Command;
+
+use crate::sandbox::{docker::DockerSandboxConfig, DockerSandbox, Sandbox};
 
 // ---------------------------------------------------------------------------
 // ToolExecutor trait
@@ -16,14 +20,55 @@ pub trait ToolExecutor: Send + Sync {
 // Local (host) executor
 // ---------------------------------------------------------------------------
 
-pub struct LocalExecutor;
+/// A local tool executor that optionally routes `shell_command` calls through
+/// a sandbox backend.
+///
+/// # Environment variables
+///
+/// - `AMAEBI_SANDBOX=docker` — enable the Docker sandbox backend.
+/// - `AMAEBI_SANDBOX_IMAGE` — override the Docker image used by the sandbox
+///   (default: `"amaebi-sandbox:bookworm-slim"`).
+///
+/// When `AMAEBI_SANDBOX` is unset or set to any value other than `"docker"`,
+/// commands run directly on the host via `sh -c`.
+///
+/// Set `AMAEBI_SANDBOX_WORKSPACE` to mount a specific directory (e.g. a git
+/// worktree) as the workspace. Defaults to the current working directory.
+#[derive(Default)]
+pub struct LocalExecutor {
+    /// Optional sandbox backend. When `Some`, `shell_command` runs inside the
+    /// sandbox instead of directly on the host.
+    pub sandbox: Option<Box<dyn Sandbox>>,
+}
+
+impl LocalExecutor {
+    pub fn new() -> Self {
+        let sandbox: Option<Box<dyn Sandbox>> = match std::env::var("AMAEBI_SANDBOX").as_deref() {
+            Ok("docker") => {
+                let image = std::env::var("AMAEBI_SANDBOX_IMAGE")
+                    .unwrap_or_else(|_| "amaebi-sandbox:bookworm-slim".to_string());
+                let workspace = std::env::var("AMAEBI_SANDBOX_WORKSPACE")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|_| std::env::current_dir().unwrap_or_default());
+                Some(Box::new(DockerSandbox::new(DockerSandboxConfig {
+                    image,
+                    workspace,
+                    ro_paths: vec![],
+                    rw_paths: vec![],
+                })))
+            }
+            _ => None,
+        };
+        Self { sandbox }
+    }
+}
 
 #[async_trait::async_trait]
 impl ToolExecutor for LocalExecutor {
     async fn execute(&self, name: &str, args: serde_json::Value) -> Result<String> {
         tracing::debug!(tool = %name, "executing tool");
         match name {
-            "shell_command" => shell_command(args).await,
+            "shell_command" => shell_command(args, self.sandbox.as_deref()).await,
             "tmux_capture_pane" => tmux_capture_pane(args).await,
             "tmux_send_keys" => tmux_send_keys(args).await,
             "read_file" => read_file(args).await,
@@ -37,24 +82,37 @@ impl ToolExecutor for LocalExecutor {
 // Tool implementations
 // ---------------------------------------------------------------------------
 
-/// Run an arbitrary shell command in the background, capturing stdout+stderr.
-async fn shell_command(args: serde_json::Value) -> Result<String> {
+/// Run an arbitrary shell command, capturing stdout+stderr.
+/// If a sandbox is provided the command runs inside it; otherwise it runs
+/// directly on the host via `sh -c`.
+async fn shell_command(args: serde_json::Value, sandbox: Option<&dyn Sandbox>) -> Result<String> {
     let command = args["command"]
         .as_str()
         .context("shell_command: missing string argument 'command'")?;
 
     tracing::debug!(command = %command, "running shell command");
 
-    let output = Command::new("sh")
-        .arg("-c")
-        .arg(command)
-        .output()
-        .await
-        .with_context(|| format!("spawning shell command: {command}"))?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let exit_code = output.status.code().unwrap_or(-1);
+    let (stdout, stderr, exit_code, success) = if let Some(sb) = sandbox {
+        let cwd = std::env::current_dir().context("shell_command: getting current directory")?;
+        let out = sb.spawn(command, &cwd).await?;
+        let success = out.exit_code == 0;
+        (out.stdout, out.stderr, out.exit_code, success)
+    } else {
+        let output = Command::new("sh")
+            .arg("-c")
+            .arg(command)
+            .output()
+            .await
+            .with_context(|| format!("spawning shell command: {command}"))?;
+        let exit_code = output.status.code().unwrap_or(-1);
+        let success = output.status.success();
+        (
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+            exit_code,
+            success,
+        )
+    };
 
     let mut result = String::new();
 
@@ -69,7 +127,7 @@ async fn shell_command(args: serde_json::Value) -> Result<String> {
     }
     if result.is_empty() {
         result = format!("[exit {exit_code}]");
-    } else if !output.status.success() {
+    } else if !success {
         result.push_str(&format!("\n[exit {exit_code}]"));
     }
 
@@ -308,7 +366,7 @@ mod tests {
 
     #[tokio::test]
     async fn shell_command_captures_stdout() {
-        let exec = LocalExecutor;
+        let exec = LocalExecutor::new();
         let out = exec
             .execute(
                 "shell_command",
@@ -321,7 +379,7 @@ mod tests {
 
     #[tokio::test]
     async fn shell_command_appends_exit_code_on_failure() {
-        let exec = LocalExecutor;
+        let exec = LocalExecutor::new();
         let out = exec
             .execute(
                 "shell_command",
@@ -335,7 +393,7 @@ mod tests {
 
     #[tokio::test]
     async fn shell_command_empty_output_shows_exit_zero() {
-        let exec = LocalExecutor;
+        let exec = LocalExecutor::new();
         let out = exec
             .execute("shell_command", serde_json::json!({"command": "true"}))
             .await
@@ -345,7 +403,7 @@ mod tests {
 
     #[tokio::test]
     async fn shell_command_missing_arg_returns_err() {
-        let exec = LocalExecutor;
+        let exec = LocalExecutor::new();
         let result = exec.execute("shell_command", serde_json::json!({})).await;
         assert!(result.is_err());
         let msg = format!("{}", result.unwrap_err());
@@ -363,7 +421,7 @@ mod tests {
         let path = tmp.path().join("test.txt");
         std::fs::write(&path, "file contents").unwrap();
 
-        let exec = LocalExecutor;
+        let exec = LocalExecutor::new();
         let out = exec
             .execute(
                 "read_file",
@@ -378,7 +436,7 @@ mod tests {
     async fn read_file_nonexistent_returns_err() {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("does_not_exist.txt");
-        let exec = LocalExecutor;
+        let exec = LocalExecutor::new();
         let result = exec
             .execute(
                 "read_file",
@@ -390,7 +448,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_file_missing_path_arg_returns_err() {
-        let exec = LocalExecutor;
+        let exec = LocalExecutor::new();
         let result = exec.execute("read_file", serde_json::json!({})).await;
         assert!(result.is_err());
     }
@@ -402,7 +460,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("new.txt");
 
-        let exec = LocalExecutor;
+        let exec = LocalExecutor::new();
         let out = exec
             .execute(
                 "edit_file",
@@ -423,7 +481,7 @@ mod tests {
         let path = tmp.path().join("existing.txt");
         std::fs::write(&path, "old").unwrap();
 
-        let exec = LocalExecutor;
+        let exec = LocalExecutor::new();
         exec.execute(
             "edit_file",
             serde_json::json!({"path": path.to_str().unwrap(), "content": "new"}),
@@ -433,11 +491,59 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
     }
 
+    // ---- LocalExecutor::new env-var wiring ----------------------------------
+
+    #[test]
+    fn new_without_env_var_has_no_sandbox() {
+        std::env::remove_var("AMAEBI_SANDBOX");
+        let exec = LocalExecutor::new();
+        assert!(exec.sandbox.is_none());
+    }
+
+    #[test]
+    fn new_with_docker_env_var_creates_docker_sandbox() {
+        std::env::set_var("AMAEBI_SANDBOX", "docker");
+        let exec = LocalExecutor::new();
+        std::env::remove_var("AMAEBI_SANDBOX");
+        assert!(exec.sandbox.is_some());
+        assert_eq!(exec.sandbox.as_deref().map(|s| s.name()), Some("docker"));
+    }
+
+    #[test]
+    fn new_with_sandbox_workspace_env_var_uses_that_path() {
+        std::env::set_var("AMAEBI_SANDBOX", "docker");
+        std::env::set_var("AMAEBI_SANDBOX_WORKSPACE", "/tmp/my-worktree");
+        let exec = LocalExecutor::new();
+        std::env::remove_var("AMAEBI_SANDBOX");
+        std::env::remove_var("AMAEBI_SANDBOX_WORKSPACE");
+        assert!(exec.sandbox.is_some());
+    }
+
+    #[test]
+    fn new_with_unknown_env_var_value_has_no_sandbox() {
+        std::env::set_var("AMAEBI_SANDBOX", "unknown");
+        let exec = LocalExecutor::new();
+        std::env::remove_var("AMAEBI_SANDBOX");
+        assert!(exec.sandbox.is_none());
+    }
+
+    // ---- shell_command with NoopSandbox ----------------------------------
+
+    #[tokio::test]
+    async fn shell_command_with_noop_sandbox() {
+        let exec = LocalExecutor {
+            sandbox: Some(Box::new(crate::sandbox::NoopSandbox)),
+        };
+        let args = serde_json::json!({"command": "echo hello"});
+        let result = exec.execute("shell_command", args).await.unwrap();
+        assert!(result.contains("hello"));
+    }
+
     // ---- unknown tool ---------------------------------------------------
 
     #[tokio::test]
     async fn unknown_tool_returns_descriptive_error() {
-        let exec = LocalExecutor;
+        let exec = LocalExecutor::new();
         let result = exec
             .execute("nonexistent_tool", serde_json::json!({}))
             .await;
