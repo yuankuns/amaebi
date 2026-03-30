@@ -78,12 +78,39 @@ impl Sandbox for NamespaceSandbox {
     }
 }
 
-/// Probe whether unprivileged user namespaces are available by attempting
-/// `unshare --user --map-root-user --mount /bin/true`.  This confirms both
-/// that the `unshare` binary is present and that the kernel permits
-/// unprivileged user namespaces (some container environments set
-/// `kernel.unprivileged_userns_clone=0`).
+/// Probe whether unprivileged user namespaces are available.
+///
+/// Two checks are performed in order:
+///
+/// 1. **AppArmor restriction (Ubuntu 24.04+):** reads
+///    `/proc/sys/kernel/apparmor_restrict_unprivileged_userns`.  When that
+///    sysctl is `1` the kernel silently refuses `unshare --user` for
+///    unprivileged processes, so the probe below would return a misleading
+///    non-zero exit even if namespaces are otherwise compiled in.  If the
+///    file reads `"1"`, this function returns `false` immediately.
+///    To enable user namespaces on such a system:
+///    `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`
+///
+/// 2. **Live probe:** attempts `unshare --user --map-root-user --mount
+///    /bin/true`.  This confirms both that the `unshare` binary is present
+///    and that the kernel permits unprivileged user namespaces (some
+///    container environments set `kernel.unprivileged_userns_clone=0`).
 fn namespace_available() -> bool {
+    const APPARMOR_SYSCTL: &str =
+        "/proc/sys/kernel/apparmor_restrict_unprivileged_userns";
+
+    if let Ok(val) = std::fs::read_to_string(APPARMOR_SYSCTL) {
+        if val.trim() == "1" {
+            tracing::info!(
+                "namespace sandbox unavailable: \
+                 AppArmor restricts unprivileged user namespaces \
+                 (kernel.apparmor_restrict_unprivileged_userns=1). \
+                 Run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0"
+            );
+            return false;
+        }
+    }
+
     std::process::Command::new("unshare")
         .args(["--user", "--map-root-user", "--mount", "/bin/true"])
         .stdout(std::process::Stdio::null())
@@ -96,6 +123,8 @@ fn namespace_available() -> bool {
 // These tests require Linux user namespaces and the `unshare` binary.
 // Run with: cargo test -- --ignored
 // Not suitable for Docker containers with default seccomp profile.
+// Requires: kernel.apparmor_restrict_unprivileged_userns=0
+// On Ubuntu 24.04+: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 #[cfg(test)]
 mod tests {
     use crate::sandbox::{create_backend, SandboxConfig};
