@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # scripts/test.sh — standardized test runner for amaebi
 #
-# Step 1 runs inside openclaw-sandbox-dev:bookworm-slim (per DEV_WORKFLOW.md).
+# Step 1 runs inside the openclaw-sandbox-dev:bookworm-slim Docker image.
 # Step 2 (--docker) runs on the host since it needs access to the Docker daemon.
 #
 # Usage (from repo root or any subdirectory):
@@ -22,11 +22,26 @@ HOST_CARGO="${CARGO:-$HOME/.cargo/bin/cargo}"
 RUN_DOCKER=0
 FILTER=""
 
+usage() {
+    echo "Usage:"
+    echo "  ./scripts/test.sh              # cargo check + test + clippy (in container)"
+    echo "  ./scripts/test.sh --docker     # also run Docker integration tests on host"
+    echo "  ./scripts/test.sh --filter <p> # filter test by pattern"
+}
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --docker)  RUN_DOCKER=1; shift ;;
-        --filter)  FILTER="$2"; shift 2 ;;
-        *) echo "Unknown option: $1"; exit 1 ;;
+        --filter)
+            if [[ $# -lt 2 ]]; then
+                echo "Missing value for --filter"
+                usage
+                exit 1
+            fi
+            FILTER="$2"
+            shift 2
+            ;;
+        *) echo "Unknown option: $1"; usage; exit 1 ;;
     esac
 done
 

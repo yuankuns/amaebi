@@ -88,15 +88,13 @@ impl Sandbox for DockerSandbox {
     }
 
     fn available(&self) -> bool {
-        tokio::task::block_in_place(|| {
-            std::process::Command::new("docker")
-                .arg("info")
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false)
-        })
+        std::process::Command::new("docker")
+            .arg("info")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
     }
 
     fn name(&self) -> &str {

@@ -18,10 +18,17 @@ pub trait ToolExecutor: Send + Sync {
 // Local (host) executor
 // ---------------------------------------------------------------------------
 
+#[derive(Default)]
 pub struct LocalExecutor {
     /// Optional sandbox backend. When `Some`, `shell_command` runs inside the
     /// sandbox instead of directly on the host.
     pub sandbox: Option<Box<dyn Sandbox>>,
+}
+
+impl LocalExecutor {
+    pub fn new() -> Self {
+        Self::default()
+    }
 }
 
 #[async_trait::async_trait]
@@ -327,7 +334,7 @@ mod tests {
 
     #[tokio::test]
     async fn shell_command_captures_stdout() {
-        let exec = LocalExecutor { sandbox: None };
+        let exec = LocalExecutor::new();
         let out = exec
             .execute(
                 "shell_command",
@@ -340,7 +347,7 @@ mod tests {
 
     #[tokio::test]
     async fn shell_command_appends_exit_code_on_failure() {
-        let exec = LocalExecutor { sandbox: None };
+        let exec = LocalExecutor::new();
         let out = exec
             .execute(
                 "shell_command",
@@ -354,7 +361,7 @@ mod tests {
 
     #[tokio::test]
     async fn shell_command_empty_output_shows_exit_zero() {
-        let exec = LocalExecutor { sandbox: None };
+        let exec = LocalExecutor::new();
         let out = exec
             .execute("shell_command", serde_json::json!({"command": "true"}))
             .await
@@ -364,7 +371,7 @@ mod tests {
 
     #[tokio::test]
     async fn shell_command_missing_arg_returns_err() {
-        let exec = LocalExecutor { sandbox: None };
+        let exec = LocalExecutor::new();
         let result = exec.execute("shell_command", serde_json::json!({})).await;
         assert!(result.is_err());
         let msg = format!("{}", result.unwrap_err());
@@ -382,7 +389,7 @@ mod tests {
         let path = tmp.path().join("test.txt");
         std::fs::write(&path, "file contents").unwrap();
 
-        let exec = LocalExecutor { sandbox: None };
+        let exec = LocalExecutor::new();
         let out = exec
             .execute(
                 "read_file",
@@ -397,7 +404,7 @@ mod tests {
     async fn read_file_nonexistent_returns_err() {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("does_not_exist.txt");
-        let exec = LocalExecutor { sandbox: None };
+        let exec = LocalExecutor::new();
         let result = exec
             .execute(
                 "read_file",
@@ -409,7 +416,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_file_missing_path_arg_returns_err() {
-        let exec = LocalExecutor { sandbox: None };
+        let exec = LocalExecutor::new();
         let result = exec.execute("read_file", serde_json::json!({})).await;
         assert!(result.is_err());
     }
@@ -421,7 +428,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("new.txt");
 
-        let exec = LocalExecutor { sandbox: None };
+        let exec = LocalExecutor::new();
         let out = exec
             .execute(
                 "edit_file",
@@ -442,7 +449,7 @@ mod tests {
         let path = tmp.path().join("existing.txt");
         std::fs::write(&path, "old").unwrap();
 
-        let exec = LocalExecutor { sandbox: None };
+        let exec = LocalExecutor::new();
         exec.execute(
             "edit_file",
             serde_json::json!({"path": path.to_str().unwrap(), "content": "new"}),
@@ -456,7 +463,7 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_tool_returns_descriptive_error() {
-        let exec = LocalExecutor { sandbox: None };
+        let exec = LocalExecutor::new();
         let result = exec
             .execute("nonexistent_tool", serde_json::json!({}))
             .await;
