@@ -131,10 +131,12 @@ mod tests {
     }
 
     // ---- DockerSandbox tests (require Docker) ------------------------------
+    // Requires: amaebi-sandbox:latest Docker image
+    // Build with: ./scripts/build-sandbox-image.sh
 
-    fn alpine_sandbox(workspace: &TempDir) -> DockerSandbox {
+    fn test_sandbox(workspace: &TempDir) -> DockerSandbox {
         DockerSandbox::new(DockerSandboxConfig {
-            image: "alpine".to_string(),
+            image: "amaebi-sandbox:latest".to_string(),
             workspace: workspace.path().to_path_buf(),
             ro_paths: vec![],
             rw_paths: vec![],
@@ -145,7 +147,7 @@ mod tests {
     #[ignore]
     async fn docker_sandbox_runs_command() {
         let dir = TempDir::new().unwrap();
-        let sandbox = alpine_sandbox(&dir);
+        let sandbox = test_sandbox(&dir);
         let out = sandbox.spawn("echo hello", dir.path()).await.unwrap();
         assert!(
             out.stdout.contains("hello"),
@@ -158,7 +160,7 @@ mod tests {
     #[ignore]
     async fn docker_sandbox_isolates_tmp() {
         let dir = TempDir::new().unwrap();
-        let sandbox = alpine_sandbox(&dir);
+        let sandbox = test_sandbox(&dir);
 
         // First container writes a marker to /tmp.
         sandbox
@@ -185,7 +187,7 @@ mod tests {
     #[ignore]
     async fn docker_sandbox_credential_dirs_absent() {
         let dir = TempDir::new().unwrap();
-        let sandbox = alpine_sandbox(&dir);
+        let sandbox = test_sandbox(&dir);
         let out = sandbox
             .spawn(
                 "test -e /root/.claude && echo exists || echo absent",
@@ -212,7 +214,7 @@ mod tests {
 
         // Sandbox only mounts `workspace`, not `other_workspace`.
         let sandbox = DockerSandbox::new(DockerSandboxConfig {
-            image: "alpine".to_string(),
+            image: "amaebi-sandbox:latest".to_string(),
             workspace: workspace.path().to_path_buf(),
             ro_paths: vec![],
             rw_paths: vec![],
