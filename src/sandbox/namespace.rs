@@ -29,43 +29,58 @@ impl Sandbox for NamespaceSandbox {
     }
 
     async fn spawn(&self, cmd: &str, cwd: &Path) -> Result<SandboxOutput> {
-        let mut args: Vec<String> = vec![
-            "--user".to_string(),
-            "--map-root-user".to_string(),
-            "--mount".to_string(),
-        ];
-
-        // Bind mount workspace as read-write.
         let ws = self
             .config
             .workspace
             .to_str()
             .context("workspace path is not valid UTF-8")?;
-        args.push(format!("--bind={}:{}", ws, ws));
+        let cwd_str = cwd.to_str().context("cwd is not valid UTF-8")?;
+
+        // Build a shell script that runs inside the new mount namespace.
+        // The user command is passed via AMAEBI_CMD to avoid quoting issues.
+        let mut script = String::new();
+
+        // Prevent mount event propagation back to the parent namespace.
+        script.push_str("mount --make-rprivate / && ");
+
+        // Bind mount workspace as read-write.
+        let ws_q = shell_quote(ws);
+        script.push_str(&format!("mount --bind {ws_q} {ws_q} && "));
 
         // Bind mount additional rw_paths.
         for p in &self.config.rw_paths {
             let s = p.to_str().context("rw_path is not valid UTF-8")?;
-            args.push(format!("--bind={}:{}", s, s));
+            let sq = shell_quote(s);
+            script.push_str(&format!("mount --bind {sq} {sq} && "));
         }
 
-        // Bind mount ro_paths as read-only.
+        // Bind mount ro_paths: two steps (bind, then remount read-only).
         for p in &self.config.ro_paths {
             let s = p.to_str().context("ro_path is not valid UTF-8")?;
-            args.push(format!("--bind-ro={}:{}", s, s));
+            let sq = shell_quote(s);
+            script.push_str(&format!(
+                "mount --bind {sq} {sq} && mount -o remount,ro,bind {sq} && "
+            ));
         }
 
         // Mount a fresh tmpfs at /tmp for per-invocation isolation.
-        args.push("--tmpfs=/tmp".to_string());
+        script.push_str("mount -t tmpfs tmpfs /tmp && ");
 
-        args.push("--".to_string());
-        args.push("sh".to_string());
-        args.push("-c".to_string());
-        args.push(cmd.to_string());
+        // Change to cwd then exec the user command via the env var.
+        let cwd_q = shell_quote(cwd_str);
+        script.push_str(&format!("cd {cwd_q} && exec sh -c \"$AMAEBI_CMD\""));
 
         let output = Command::new("unshare")
-            .args(&args)
-            .current_dir(cwd)
+            .args([
+                "--user",
+                "--map-root-user",
+                "--mount",
+                "--",
+                "sh",
+                "-c",
+                &script,
+            ])
+            .env("AMAEBI_CMD", cmd)
             .output()
             .await
             .context("failed to spawn sandboxed command via unshare")?;
@@ -76,6 +91,11 @@ impl Sandbox for NamespaceSandbox {
             status: output.status.code().unwrap_or(-1),
         })
     }
+}
+
+/// Single-quote a string for safe embedding in a POSIX shell script.
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 /// Probe whether unprivileged user namespaces are available.
@@ -96,8 +116,7 @@ impl Sandbox for NamespaceSandbox {
 ///    and that the kernel permits unprivileged user namespaces (some
 ///    container environments set `kernel.unprivileged_userns_clone=0`).
 fn namespace_available() -> bool {
-    const APPARMOR_SYSCTL: &str =
-        "/proc/sys/kernel/apparmor_restrict_unprivileged_userns";
+    const APPARMOR_SYSCTL: &str = "/proc/sys/kernel/apparmor_restrict_unprivileged_userns";
 
     if let Ok(val) = std::fs::read_to_string(APPARMOR_SYSCTL) {
         if val.trim() == "1" {
