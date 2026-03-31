@@ -451,13 +451,16 @@ async fn send_with_retry(
     loop {
         let mut req = http
             .post(&endpoint_url)
-            .header("Authorization", format!("Bearer {token}"))
             .header("Content-Type", "application/json")
             .header("Accept", "application/json")
             .header("User-Agent", concat!("amaebi/", env!("CARGO_PKG_VERSION")));
 
         if use_copilot_headers {
+            // Only send the Copilot bearer token when targeting the Copilot
+            // endpoint.  Forwarding it to AMAEBI_URL would leak credentials
+            // to a third-party host.
             req = req
+                .header("Authorization", format!("Bearer {token}"))
                 .header("Copilot-Integration-Id", "vscode-chat")
                 .header("Editor-Version", "vscode/1.90.0");
         }
@@ -485,7 +488,8 @@ async fn send_with_retry(
                 tracing::warn!(
                     attempt,
                     delay_ms = delay.as_millis(),
-                    "Copilot rate-limited (429); backing off before retry"
+                    endpoint = %endpoint_url,
+                    "API rate-limited (429); backing off before retry"
                 );
                 // Drain the body so the underlying connection can be returned
                 // to the pool for reuse, then sleep before retrying.
@@ -513,7 +517,8 @@ async fn send_with_retry(
                     attempt,
                     status = %status,
                     delay_ms = delay.as_millis(),
-                    "Copilot server error; retrying with exponential backoff"
+                    endpoint = %endpoint_url,
+                    "API server error; retrying with exponential backoff"
                 );
                 // Drain the body so the underlying connection can be returned
                 // to the pool for reuse, then sleep before retrying.
@@ -540,14 +545,16 @@ async fn send_with_retry(
             // ── Transport / network error ──────────────────────────────────
             Err(e) => {
                 if attempt >= MAX_RETRIES {
-                    return Err(anyhow::Error::from(e).context("sending chat request to Copilot"));
+                    return Err(anyhow::Error::from(e)
+                        .context(format!("sending chat request to {endpoint_url}")));
                 }
                 let delay = backoff_delay(attempt);
                 tracing::warn!(
                     attempt,
                     error = %e,
                     delay_ms = delay.as_millis(),
-                    "Copilot request failed (transport error); retrying"
+                    endpoint = %endpoint_url,
+                    "API request failed (transport error); retrying"
                 );
                 tokio::time::sleep(delay).await;
                 attempt += 1;

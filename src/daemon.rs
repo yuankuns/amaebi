@@ -26,7 +26,7 @@ fn max_output_tokens_for_model(model: &str) -> usize {
         ("o1", 100_000),
         ("o3", 100_000),
         ("claude", 16_384),
-        // Gemini models routed via AMAEBI_URL: all variants cap at 8 k output.
+        // Gemini models routed via AMAEBI_URL: all variants cap at 8k output.
         ("gemini", 8_192),
     ];
     TABLE
