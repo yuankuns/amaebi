@@ -86,6 +86,7 @@ async fn main() -> Result<()> {
         cli::Command::Cache { action } => run_cache(action),
         cli::Command::Inbox { action } => run_inbox(action),
         cli::Command::Cron { action } => run_cron(action),
+        cli::Command::Heartbeat { action, socket } => run_heartbeat(action, socket).await,
     }
 }
 
@@ -498,6 +499,105 @@ fn run_cron(action: cli::CronAction) -> Result<()> {
             } else {
                 anyhow::bail!("no cron job with id {id:?}");
             }
+        }
+    }
+    Ok(())
+}
+
+async fn run_heartbeat(action: cli::HeartbeatAction, socket: std::path::PathBuf) -> Result<()> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::UnixStream;
+
+    let cwd = std::env::current_dir().context("getting current directory")?;
+    let session_id = session::get_or_create(&cwd)?;
+
+    match action {
+        cli::HeartbeatAction::Add { description } => {
+            let stream = UnixStream::connect(&socket)
+                .await
+                .context("connecting to daemon — is it running?")?;
+            let (reader, mut writer) = tokio::io::split(stream);
+            let req = ipc::Request::HeartbeatAdd {
+                session_id: session_id.clone(),
+                description: description.clone(),
+            };
+            let mut line = serde_json::to_string(&req)?;
+            line.push('\n');
+            writer.write_all(line.as_bytes()).await?;
+            // Drain Done.
+            let mut lines = BufReader::new(reader).lines();
+            let _ = lines.next_line().await;
+            println!("Heartbeat item added for session {session_id}.");
+        }
+        cli::HeartbeatAction::List { all } => {
+            let stream = UnixStream::connect(&socket)
+                .await
+                .context("connecting to daemon — is it running?")?;
+            let (reader, mut writer) = tokio::io::split(stream);
+            let req = ipc::Request::HeartbeatList {
+                session_id: session_id.clone(),
+                all,
+            };
+            let mut line = serde_json::to_string(&req)?;
+            line.push('\n');
+            writer.write_all(line.as_bytes()).await?;
+
+            let mut lines = BufReader::new(reader).lines();
+            let mut count = 0;
+            while let Some(frame) = lines.next_line().await? {
+                let resp: ipc::Response = serde_json::from_str(&frame)?;
+                match resp {
+                    ipc::Response::HeartbeatEntry {
+                        id,
+                        description,
+                        status,
+                        created_at,
+                    } => {
+                        count += 1;
+                        println!(
+                            "[{status}] #{id} — {created_at}\n  {}\n",
+                            sanitize(&description)
+                        );
+                    }
+                    ipc::Response::Done => break,
+                    ipc::Response::Error { message } => anyhow::bail!("{message}"),
+                    _ => {}
+                }
+            }
+            if count == 0 {
+                let scope = if all {
+                    "heartbeat items"
+                } else {
+                    "pending heartbeat items"
+                };
+                println!("No {scope} for this session.");
+            }
+        }
+        cli::HeartbeatAction::Dismiss { id } => {
+            let stream = UnixStream::connect(&socket)
+                .await
+                .context("connecting to daemon — is it running?")?;
+            let (reader, mut writer) = tokio::io::split(stream);
+            let req = ipc::Request::HeartbeatDismiss { id };
+            let mut line = serde_json::to_string(&req)?;
+            line.push('\n');
+            writer.write_all(line.as_bytes()).await?;
+            let mut lines = BufReader::new(reader).lines();
+            let _ = lines.next_line().await;
+            println!("Heartbeat item #{id} dismissed.");
+        }
+        cli::HeartbeatAction::Trigger => {
+            let stream = UnixStream::connect(&socket)
+                .await
+                .context("connecting to daemon — is it running?")?;
+            let (reader, mut writer) = tokio::io::split(stream);
+            let req = ipc::Request::HeartbeatTrigger;
+            let mut line = serde_json::to_string(&req)?;
+            line.push('\n');
+            writer.write_all(line.as_bytes()).await?;
+            let mut lines = BufReader::new(reader).lines();
+            let _ = lines.next_line().await;
+            println!("Heartbeat check triggered.");
         }
     }
     Ok(())

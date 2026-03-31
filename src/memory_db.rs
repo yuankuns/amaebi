@@ -125,6 +125,22 @@ CREATE TABLE IF NOT EXISTS session_turns (
 
 CREATE INDEX IF NOT EXISTS idx_session_turns_session
     ON session_turns(session_id, id);
+
+-- Heartbeat items: pending follow-up tasks the agent records during conversations.
+-- A background heartbeat scheduler periodically reviews pending items and surfaces
+-- actionable ones via the inbox.
+CREATE TABLE IF NOT EXISTS heartbeat_items (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id  TEXT    NOT NULL,
+    description TEXT    NOT NULL,
+    status      TEXT    NOT NULL DEFAULT 'pending',
+    created_at  TEXT    NOT NULL,
+    resolved_at TEXT,
+    source      TEXT    NOT NULL DEFAULT 'agent'
+);
+
+CREATE INDEX IF NOT EXISTS idx_heartbeat_session_status
+    ON heartbeat_items (session_id, status);
 ";
 
 // ---------------------------------------------------------------------------
@@ -540,6 +556,156 @@ pub fn delete_session_turns(conn: &Connection, session_id: &str) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// Heartbeat items
+// ---------------------------------------------------------------------------
+
+/// A pending follow-up item recorded by the agent or user during a conversation.
+#[derive(Debug, Clone)]
+pub struct HeartbeatItem {
+    pub id: i64,
+    #[allow(dead_code)]
+    pub session_id: String,
+    pub description: String,
+    pub status: String,
+    pub created_at: String,
+    #[allow(dead_code)]
+    pub resolved_at: Option<String>,
+    #[allow(dead_code)]
+    pub source: String,
+}
+
+/// Insert a new heartbeat item. Returns the row id.
+pub fn add_heartbeat_item(
+    conn: &Connection,
+    session_id: &str,
+    description: &str,
+    source: &str,
+) -> Result<i64> {
+    let timestamp = chrono::Utc::now().to_rfc3339();
+    conn.execute(
+        "INSERT INTO heartbeat_items (session_id, description, source, created_at)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![session_id, description, source, timestamp],
+    )
+    .context("inserting heartbeat item")?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// Return all pending heartbeat items for a session.
+pub fn get_pending_heartbeat_items(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<Vec<HeartbeatItem>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, session_id, description, status, created_at, resolved_at, source
+             FROM heartbeat_items
+             WHERE session_id = ?1 AND status = 'pending'
+             ORDER BY id ASC",
+        )
+        .context("preparing get_pending_heartbeat_items")?;
+
+    let items = stmt
+        .query_map(params![session_id], row_to_heartbeat_item)
+        .context("executing get_pending_heartbeat_items")?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .context("collecting pending heartbeat items")?;
+    Ok(items)
+}
+
+/// Return all session IDs that have at least one pending heartbeat item.
+#[allow(dead_code)]
+pub fn get_sessions_with_pending_heartbeats(conn: &Connection) -> Result<Vec<String>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT DISTINCT session_id FROM heartbeat_items
+             WHERE status = 'pending'
+             ORDER BY session_id",
+        )
+        .context("preparing get_sessions_with_pending_heartbeats")?;
+
+    let sessions = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .context("executing get_sessions_with_pending_heartbeats")?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .context("collecting sessions with pending heartbeats")?;
+    Ok(sessions)
+}
+
+/// Mark a heartbeat item as resolved.
+#[allow(dead_code)]
+pub fn resolve_heartbeat_item(conn: &Connection, id: i64, timestamp: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE heartbeat_items SET status = 'resolved', resolved_at = ?1 WHERE id = ?2",
+        params![timestamp, id],
+    )
+    .context("resolving heartbeat item")?;
+    Ok(())
+}
+
+/// Mark a heartbeat item as dismissed (cancelled).
+pub fn dismiss_heartbeat_item(conn: &Connection, id: i64) -> Result<()> {
+    conn.execute(
+        "UPDATE heartbeat_items SET status = 'dismissed' WHERE id = ?1",
+        params![id],
+    )
+    .context("dismissing heartbeat item")?;
+    Ok(())
+}
+
+/// Delete all heartbeat items for a session.
+#[allow(dead_code)]
+pub fn clear_heartbeat_items(conn: &Connection, session_id: &str) -> Result<()> {
+    conn.execute(
+        "DELETE FROM heartbeat_items WHERE session_id = ?1",
+        params![session_id],
+    )
+    .context("clearing heartbeat items")?;
+    Ok(())
+}
+
+/// Return all heartbeat items for a session (any status), ordered by creation.
+pub fn list_heartbeat_items(
+    conn: &Connection,
+    session_id: &str,
+    all: bool,
+) -> Result<Vec<HeartbeatItem>> {
+    let sql = if all {
+        "SELECT id, session_id, description, status, created_at, resolved_at, source
+         FROM heartbeat_items
+         WHERE session_id = ?1
+         ORDER BY id ASC"
+    } else {
+        "SELECT id, session_id, description, status, created_at, resolved_at, source
+         FROM heartbeat_items
+         WHERE session_id = ?1 AND status = 'pending'
+         ORDER BY id ASC"
+    };
+    let mut stmt = conn
+        .prepare(sql)
+        .context("preparing list_heartbeat_items")?;
+
+    let items = stmt
+        .query_map(params![session_id], row_to_heartbeat_item)
+        .context("executing list_heartbeat_items")?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .context("collecting heartbeat items")?;
+    Ok(items)
+}
+
+fn row_to_heartbeat_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<HeartbeatItem> {
+    Ok(HeartbeatItem {
+        id: row.get(0)?,
+        session_id: row.get(1)?,
+        description: row.get(2)?,
+        status: row.get(3)?,
+        created_at: row.get(4)?,
+        resolved_at: row.get(5)?,
+        source: row.get(6)?,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Retrieval helper used by build_messages
 // ---------------------------------------------------------------------------
 
@@ -920,5 +1086,89 @@ mod tests {
 
         assert!(get_session_turns_json(&conn, "s1").unwrap().is_empty());
         assert_eq!(get_session_turns_json(&conn, "s2").unwrap().len(), 1);
+    }
+
+    // ---- heartbeat items ---------------------------------------------------
+
+    #[test]
+    fn heartbeat_add_and_list_pending() {
+        let (conn, _dir) = open_test_db();
+        let id1 = add_heartbeat_item(&conn, "s1", "check deploy", "agent").unwrap();
+        let id2 = add_heartbeat_item(&conn, "s1", "re-run tests", "user").unwrap();
+        add_heartbeat_item(&conn, "s2", "other session", "agent").unwrap();
+
+        assert!(id1 > 0);
+        assert!(id2 > id1);
+
+        let pending = get_pending_heartbeat_items(&conn, "s1").unwrap();
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending[0].description, "check deploy");
+        assert_eq!(pending[0].source, "agent");
+        assert_eq!(pending[1].description, "re-run tests");
+        assert_eq!(pending[1].source, "user");
+    }
+
+    #[test]
+    fn heartbeat_resolve_and_dismiss() {
+        let (conn, _dir) = open_test_db();
+        let id1 = add_heartbeat_item(&conn, "s1", "item A", "agent").unwrap();
+        let id2 = add_heartbeat_item(&conn, "s1", "item B", "agent").unwrap();
+        let id3 = add_heartbeat_item(&conn, "s1", "item C", "agent").unwrap();
+
+        resolve_heartbeat_item(&conn, id1, "2026-01-01T01:00:00Z").unwrap();
+        dismiss_heartbeat_item(&conn, id2).unwrap();
+
+        let pending = get_pending_heartbeat_items(&conn, "s1").unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, id3);
+
+        let all = list_heartbeat_items(&conn, "s1", true).unwrap();
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[0].status, "resolved");
+        assert!(all[0].resolved_at.is_some());
+        assert_eq!(all[1].status, "dismissed");
+        assert_eq!(all[2].status, "pending");
+    }
+
+    #[test]
+    fn heartbeat_sessions_with_pending() {
+        let (conn, _dir) = open_test_db();
+        add_heartbeat_item(&conn, "s1", "item", "agent").unwrap();
+        add_heartbeat_item(&conn, "s2", "item", "agent").unwrap();
+        let id3 = add_heartbeat_item(&conn, "s3", "item", "agent").unwrap();
+
+        // Resolve s3's only item — it should not appear.
+        resolve_heartbeat_item(&conn, id3, "2026-01-01T01:00:00Z").unwrap();
+
+        let sessions = get_sessions_with_pending_heartbeats(&conn).unwrap();
+        assert_eq!(sessions, vec!["s1", "s2"]);
+    }
+
+    #[test]
+    fn heartbeat_clear_items() {
+        let (conn, _dir) = open_test_db();
+        add_heartbeat_item(&conn, "s1", "A", "agent").unwrap();
+        add_heartbeat_item(&conn, "s1", "B", "agent").unwrap();
+        add_heartbeat_item(&conn, "s2", "C", "agent").unwrap();
+
+        clear_heartbeat_items(&conn, "s1").unwrap();
+
+        assert!(get_pending_heartbeat_items(&conn, "s1").unwrap().is_empty());
+        assert_eq!(get_pending_heartbeat_items(&conn, "s2").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn heartbeat_list_filters_by_status() {
+        let (conn, _dir) = open_test_db();
+        add_heartbeat_item(&conn, "s1", "pending item", "agent").unwrap();
+        let id2 = add_heartbeat_item(&conn, "s1", "resolved item", "agent").unwrap();
+        resolve_heartbeat_item(&conn, id2, "2026-01-01T01:00:00Z").unwrap();
+
+        let pending_only = list_heartbeat_items(&conn, "s1", false).unwrap();
+        assert_eq!(pending_only.len(), 1);
+        assert_eq!(pending_only[0].description, "pending item");
+
+        let all = list_heartbeat_items(&conn, "s1", true).unwrap();
+        assert_eq!(all.len(), 2);
     }
 }

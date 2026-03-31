@@ -26,9 +26,10 @@ use std::time::Duration;
 
 use support::{
     helpers::{
-        collect_text, connect_client, seed_cron_job, send_message, send_message_with_session,
-        send_resume, setup_home, start_daemon, start_daemon_at_home_with_env,
-        start_daemon_with_env, Request, Response,
+        collect_text, connect_client, seed_cron_job, send_heartbeat_add, send_heartbeat_list,
+        send_heartbeat_trigger, send_message, send_message_with_session, send_resume, setup_home,
+        start_daemon, start_daemon_at_home_with_env, start_daemon_with_env, write_heartbeat_config,
+        Request, Response,
     },
     mock_llm::{MockLlmServer, ScriptedResponse},
 };
@@ -2210,6 +2211,217 @@ async fn consistent_chat_tool_call_context() {
     assert!(
         has_tool_result,
         "turn 2 must include the tool-result message from turn 1; messages: {messages:#?}"
+    );
+
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+}
+
+// ---------------------------------------------------------------------------
+// 21. Heartbeat — session-scoped, injected into running conversation
+// ---------------------------------------------------------------------------
+
+/// Heartbeat fires only for active (open) sessions and injects the follow-up
+/// report directly into the running agentic loop via the steer channel.
+///
+/// Strategy:
+/// 1. Open a Chat session with a slow tool call so the session stays alive.
+/// 2. While the tool is executing, add a heartbeat item and trigger a check
+///    on a separate connection.
+/// 3. Heartbeat LLM returns an actionable report; it is injected as a steer.
+/// 4. The agentic loop receives it and produces a final text reply.
+/// 5. Assert the heartbeat LLM call contained the item description and that
+///    the injected report appears in the third LLM turn's context.
+#[tokio::test]
+async fn heartbeat_injects_into_active_session() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::UnixStream;
+
+    let server = MockLlmServer::start().await;
+
+    // Turn 1: tool call with a short sleep so the session stays alive long
+    // enough for the heartbeat to fire.
+    server.enqueue(ScriptedResponse::tool_call(
+        "hb-tool-1",
+        "shell_command",
+        r#"{"command":"sleep 0.3"}"#,
+    ));
+    // Heartbeat LLM call (2nd request): actionable report.
+    server.enqueue(ScriptedResponse::text_chunks(vec![
+        "Build finished: all tests passed.",
+    ]));
+    // Turn 2 (3rd request): agent responds after heartbeat injection.
+    server.enqueue(ScriptedResponse::text_chunks(vec![
+        "Got the heartbeat update.",
+    ]));
+
+    let home = setup_home().expect("setup_home");
+    write_heartbeat_config(home.path()).expect("write_heartbeat_config");
+
+    let (socket, mut child, _socket_dir) =
+        start_daemon_at_home_with_env(home.path(), &server.url(), &[])
+            .await
+            .expect("start_daemon");
+
+    let session_id = uuid::Uuid::new_v4().to_string();
+
+    // Open a raw bidirectional Chat connection.
+    let stream = UnixStream::connect(&socket).await.expect("connect");
+    let (read_half, mut write_half) = stream.into_split();
+    let chat_req = Request::Chat {
+        prompt: "run slow tool".to_string(),
+        tmux_pane: None,
+        session_id: Some(session_id.clone()),
+        model: "gpt-4o".to_string(),
+    };
+    let mut line = serde_json::to_string(&chat_req).unwrap();
+    line.push('\n');
+    write_half.write_all(line.as_bytes()).await.unwrap();
+
+    let mut lines = BufReader::new(read_half).lines();
+    let mut responses: Vec<Response> = Vec::new();
+    let mut heartbeat_triggered = false;
+
+    let result = tokio::time::timeout(Duration::from_secs(15), async {
+        while let Some(raw) = lines.next_line().await.expect("reading line") {
+            if raw.is_empty() {
+                continue;
+            }
+            let frame: Response = serde_json::from_str(&raw).expect("parse frame");
+            let done = matches!(frame, Response::Done | Response::Error { .. });
+
+            // When tool starts executing, add heartbeat item and trigger.
+            if !heartbeat_triggered {
+                if let Response::ToolUse { .. } = &frame {
+                    let client = connect_client(&socket);
+                    send_heartbeat_add(&client, &session_id, "check build status")
+                        .await
+                        .expect("heartbeat add");
+                    send_heartbeat_trigger(&client).await.expect("trigger");
+                    heartbeat_triggered = true;
+                }
+            }
+
+            responses.push(frame);
+            if done {
+                break;
+            }
+        }
+    })
+    .await;
+
+    result.expect("test timed out");
+    assert!(heartbeat_triggered, "ToolUse never arrived");
+    assert!(
+        responses.iter().any(|r| matches!(r, Response::Done)),
+        "expected Done: {responses:?}"
+    );
+
+    // 3 LLM calls: chat turn 1, heartbeat check, chat turn 2.
+    let reqs = server.take_requests();
+    assert!(
+        reqs.len() >= 2,
+        "expected ≥2 LLM requests, got {}",
+        reqs.len()
+    );
+
+    // The heartbeat LLM request must contain the item description.
+    let hb_req = &reqs[1];
+    let hb_messages = hb_req.messages().expect("messages in heartbeat request");
+    let hb_content: String = hb_messages
+        .iter()
+        .filter_map(|m| m.get("content").and_then(|c| c.as_str()))
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        hb_content.contains("check build status"),
+        "heartbeat LLM request must contain item description; got:\n{hb_content}"
+    );
+
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+}
+
+/// When the LLM responds HEARTBEAT_OK, nothing is injected into the session.
+#[tokio::test]
+async fn heartbeat_ok_does_not_inject() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::UnixStream;
+
+    let server = MockLlmServer::start().await;
+
+    // Turn 1: slow tool to keep session alive.
+    server.enqueue(ScriptedResponse::tool_call(
+        "hb-ok-tool-1",
+        "shell_command",
+        r#"{"command":"sleep 0.3"}"#,
+    ));
+    // Heartbeat LLM call: HEARTBEAT_OK — nothing to inject.
+    server.enqueue(ScriptedResponse::text_chunks(vec!["HEARTBEAT_OK"]));
+    // Turn 2: normal reply after tool (no steer injected).
+    server.enqueue(ScriptedResponse::text_chunks(vec!["Done."]));
+
+    let home = setup_home().expect("setup_home");
+    write_heartbeat_config(home.path()).expect("write_heartbeat_config");
+
+    let (socket, mut child, _socket_dir) =
+        start_daemon_at_home_with_env(home.path(), &server.url(), &[])
+            .await
+            .expect("start_daemon");
+
+    let session_id = uuid::Uuid::new_v4().to_string();
+
+    let stream = UnixStream::connect(&socket).await.expect("connect");
+    let (read_half, mut write_half) = stream.into_split();
+    let chat_req = Request::Chat {
+        prompt: "run slow tool".to_string(),
+        tmux_pane: None,
+        session_id: Some(session_id.clone()),
+        model: "gpt-4o".to_string(),
+    };
+    let mut line = serde_json::to_string(&chat_req).unwrap();
+    line.push('\n');
+    write_half.write_all(line.as_bytes()).await.unwrap();
+
+    let mut lines = BufReader::new(read_half).lines();
+    let mut responses: Vec<Response> = Vec::new();
+    let mut triggered = false;
+
+    let result = tokio::time::timeout(Duration::from_secs(15), async {
+        while let Some(raw) = lines.next_line().await.expect("reading line") {
+            if raw.is_empty() {
+                continue;
+            }
+            let frame: Response = serde_json::from_str(&raw).expect("parse frame");
+            let done = matches!(frame, Response::Done | Response::Error { .. });
+            if !triggered {
+                if let Response::ToolUse { .. } = &frame {
+                    let client = connect_client(&socket);
+                    send_heartbeat_add(&client, &session_id, "check status")
+                        .await
+                        .expect("add");
+                    send_heartbeat_trigger(&client).await.expect("trigger");
+                    triggered = true;
+                }
+            }
+            responses.push(frame);
+            if done {
+                break;
+            }
+        }
+    })
+    .await;
+
+    result.expect("test timed out");
+
+    // No SteerAck should appear — HEARTBEAT_OK means nothing was injected.
+    assert!(
+        !responses.iter().any(|r| matches!(r, Response::SteerAck)),
+        "unexpected SteerAck — HEARTBEAT_OK should not inject anything: {responses:?}"
+    );
+    assert!(
+        responses.iter().any(|r| matches!(r, Response::Done)),
+        "expected Done: {responses:?}"
     );
 
     let _ = child.kill().await;

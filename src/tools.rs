@@ -117,6 +117,10 @@ impl ToolExecutor for LocalExecutor {
                      (child agents cannot spawn further agents)"
                 ),
             },
+            "heartbeat_note" => match &self.spawn_ctx {
+                Some(ctx) => heartbeat_note(args, &ctx.db).await,
+                None => anyhow::bail!("heartbeat_note is not available in this context"),
+            },
             other => anyhow::bail!("unknown tool: {other}"),
         }
     }
@@ -246,6 +250,31 @@ async fn read_file(args: serde_json::Value) -> Result<String> {
 /// - Otherwise a [`DockerSandbox`] is created with `--network none`.
 ///   If Docker is not available, an error is returned.
 ///
+/// Record a heartbeat item for the given session.
+async fn heartbeat_note(
+    args: serde_json::Value,
+    db: &Arc<Mutex<rusqlite::Connection>>,
+) -> Result<String> {
+    let description = args["description"]
+        .as_str()
+        .context("heartbeat_note: missing string argument 'description'")?;
+    let session_id = args["session_id"]
+        .as_str()
+        .context("heartbeat_note: missing string argument 'session_id'")?;
+
+    let db = Arc::clone(db);
+    let desc = description.to_owned();
+    let sid = session_id.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let conn = db.lock().unwrap_or_else(|p| p.into_inner());
+        crate::memory_db::add_heartbeat_item(&conn, &sid, &desc, "agent")
+    })
+    .await
+    .unwrap_or_else(|e| Err(anyhow::anyhow!("heartbeat write panicked: {e}")))?;
+
+    Ok(format!("Heartbeat item recorded: {description}"))
+}
+
 /// # Recursion prevention
 ///
 /// The child executor is created with `spawn_ctx: None` so it cannot
@@ -413,6 +442,8 @@ async fn spawn_agent(args: serde_json::Value, ctx: &SpawnContext) -> Result<Stri
         executor: Box::new(child_executor),
         db: Arc::clone(&ctx.db),
         compacting_sessions: Arc::clone(&ctx.compacting_sessions),
+        heartbeat_notify: Arc::new(tokio::sync::Notify::new()),
+        active_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
     };
 
     let messages = vec![
@@ -572,6 +603,31 @@ pub fn tool_schemas(include_spawn_agent: bool) -> Vec<serde_json::Value> {
         }),
     ];
     if include_spawn_agent {
+        schemas.push(serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "heartbeat_note",
+                "description": "Record a pending follow-up item for the heartbeat checker \
+                                to review later. Use this when you identify something that \
+                                should be checked after this conversation ends (e.g. a test \
+                                to re-run, a deployment to verify, a file to check after a \
+                                cron job completes).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "description": {
+                            "type": "string",
+                            "description": "What should be checked or done later."
+                        },
+                        "session_id": {
+                            "type": "string",
+                            "description": "The session UUID (provided in the system prompt)."
+                        }
+                    },
+                    "required": ["description", "session_id"]
+                }
+            }
+        }));
         schemas.push(serde_json::json!({
             "type": "function",
             "function": {

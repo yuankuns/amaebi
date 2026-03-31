@@ -82,6 +82,16 @@ pub struct DaemonState {
     /// insert the session ID.  The task removes itself on completion.  If the
     /// ID is already present, skip the spawn to prevent overlapping compactions.
     pub compacting_sessions: Arc<Mutex<HashSet<String>>>,
+    /// Notify handle to trigger an immediate heartbeat check.
+    pub heartbeat_notify: Arc<tokio::sync::Notify>,
+    /// Currently active interactive sessions mapped to their steer channel.
+    ///
+    /// Registered when a Chat/Resume connection opens; removed when it closes.
+    /// The heartbeat scheduler uses this to inject follow-up messages directly
+    /// into the running agentic loop.  Heartbeat items are only considered
+    /// pending while the session is open; they are auto-dismissed on close.
+    pub active_sessions:
+        Arc<Mutex<std::collections::HashMap<String, tokio::sync::mpsc::Sender<Option<String>>>>>,
 }
 
 impl DaemonState {
@@ -118,7 +128,51 @@ impl DaemonState {
             executor: Box::new(executor),
             db,
             compacting_sessions,
+            heartbeat_notify: Arc::new(tokio::sync::Notify::new()),
+            active_sessions: Arc::new(Mutex::new(std::collections::HashMap::new())),
         })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Active session helpers
+// ---------------------------------------------------------------------------
+
+/// Register a session as active, storing the steer sender so the heartbeat
+/// scheduler can inject follow-up messages into the running agentic loop.
+fn register_active_session(
+    state: &DaemonState,
+    session_id: &str,
+    steer_tx: tokio::sync::mpsc::Sender<Option<String>>,
+) {
+    state
+        .active_sessions
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(session_id.to_owned(), steer_tx);
+}
+
+/// Deregister a session and auto-dismiss its pending heartbeat items.
+///
+/// Called when a Chat/Resume connection closes (both success and error paths).
+async fn deregister_active_session(state: &DaemonState, session_id: &str) {
+    state
+        .active_sessions
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(session_id);
+
+    let db = Arc::clone(&state.db);
+    let sid = session_id.to_owned();
+    let result = tokio::task::spawn_blocking(move || {
+        let conn = db.lock().unwrap_or_else(|p| p.into_inner());
+        memory_db::clear_heartbeat_items(&conn, &sid)
+    })
+    .await
+    .unwrap_or_else(|e| Err(anyhow::anyhow!("heartbeat dismiss panicked: {e}")));
+
+    if let Err(e) = result {
+        tracing::warn!(error = %e, session_id, "failed to dismiss heartbeat items on session close");
     }
 }
 
@@ -261,6 +315,14 @@ pub async fn run(socket: PathBuf) -> Result<()> {
         let state = Arc::clone(&state);
         tokio::spawn(async move {
             run_cron_scheduler(state).await;
+        });
+    }
+
+    // Spawn the heartbeat scheduler (if configured).
+    {
+        let state = Arc::clone(&state);
+        tokio::spawn(async move {
+            run_heartbeat_scheduler(state).await;
         });
     }
 
@@ -423,6 +485,7 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
 
                 let mut messages =
                     build_messages(&prompt, tmux_pane.as_deref(), &history, &[], None);
+                inject_session_id(&mut messages, &sid);
                 inject_skill_files(&mut messages).await;
 
                 // Pre-flight token check: trim to hot tail if over budget.
@@ -435,6 +498,7 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                         &history[..]
                     };
                     messages = build_messages(&prompt, tmux_pane.as_deref(), trimmed, &[], None);
+                    inject_session_id(&mut messages, &sid);
                     inject_skill_files(&mut messages).await;
                 }
 
@@ -512,6 +576,10 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
             }
 
             let (steer_tx, mut steer_rx) = tokio::sync::mpsc::channel::<Option<String>>(16);
+
+            // Register as active for heartbeat injection.
+            register_active_session(&state, &session_id, steer_tx.clone());
+
             let expected_resume_sid = session_id.clone();
             tokio::spawn(async move {
                 while let Ok(Some(frame)) = lines.next_line().await {
@@ -586,6 +654,7 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                 &summaries,
                 own_summary.as_deref(),
             );
+            inject_session_id(&mut messages, &session_id);
             inject_skill_files(&mut messages).await;
 
             // Pre-flight token check.
@@ -604,6 +673,7 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                     &summaries,
                     own_summary.as_deref(),
                 );
+                inject_session_id(&mut messages, &session_id);
                 inject_skill_files(&mut messages).await;
             }
 
@@ -614,9 +684,11 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                     let assistant_text = truncate_chars(response_text.clone(), MAX_RESPONSE_CHARS);
 
                     store_conversation(&state, &session_id, &user_text, &assistant_text).await;
+                    deregister_active_session(&state, &session_id).await;
                     write_frame(&mut writer, &Response::Done).await?;
                 }
                 Err(e) => {
+                    deregister_active_session(&state, &session_id).await;
                     tracing::error!(error = %e, "resume agentic loop error");
                     let _ = write_frame(
                         &mut writer,
@@ -665,6 +737,10 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
             // Steering channel: the spawned reader task sends user corrections
             // here; the agentic loop drains them between model turns.
             let (steer_tx, mut steer_rx) = tokio::sync::mpsc::channel::<Option<String>>(16);
+
+            // Register as active so the heartbeat scheduler can inject into
+            // this session's agentic loop while it's alive.
+            register_active_session(&state, &sid, steer_tx.clone());
 
             // Spawn a task that reads subsequent frames from the client on
             // this connection.  Any Steer frames are forwarded to steer_tx so
@@ -795,6 +871,7 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                     )
                 })
             };
+            inject_session_id(&mut messages, &sid);
             // Record where the current user prompt sits BEFORE inject_skill_files,
             // which may append extra system messages after the user turn.
             // Capturing here ensures the stored turn delta starts at the user
@@ -823,6 +900,7 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                     &past_summaries,
                     own_summary.as_deref(),
                 );
+                inject_session_id(&mut messages, &sid);
                 // Update before inject so the index stays correct after inject.
                 user_prompt_idx = messages.len() - 1;
                 inject_skill_files(&mut messages).await;
@@ -923,9 +1001,11 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                             ));
                         }
                     }
+                    deregister_active_session(&state, &sid).await;
                     write_frame(&mut writer, &Response::Done).await?;
                 }
                 Err(e) => {
+                    deregister_active_session(&state, &sid).await;
                     tracing::error!(error = %e, "agentic loop error");
                     let _ = write_frame(
                         &mut writer,
@@ -936,6 +1016,74 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                     .await;
                 }
             }
+        }
+
+        Request::HeartbeatAdd {
+            session_id,
+            description,
+        } => {
+            let db = Arc::clone(&state.db);
+            let result = tokio::task::spawn_blocking(move || {
+                let conn = db.lock().unwrap_or_else(|p| p.into_inner());
+                memory_db::add_heartbeat_item(&conn, &session_id, &description, "user")
+            })
+            .await
+            .unwrap_or_else(|e| Err(anyhow::anyhow!("heartbeat add panicked: {e}")));
+            match result {
+                Ok(id) => {
+                    tracing::debug!(id, "heartbeat item added");
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to add heartbeat item");
+                }
+            }
+            write_frame(&mut writer, &Response::Done).await?;
+        }
+
+        Request::HeartbeatList { session_id, all } => {
+            let db = Arc::clone(&state.db);
+            let items = tokio::task::spawn_blocking(move || {
+                let conn = db.lock().unwrap_or_else(|p| p.into_inner());
+                memory_db::list_heartbeat_items(&conn, &session_id, all)
+            })
+            .await
+            .unwrap_or_else(|e| Err(anyhow::anyhow!("heartbeat list panicked: {e}")))
+            .unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "failed to list heartbeat items");
+                vec![]
+            });
+            for item in items {
+                write_frame(
+                    &mut writer,
+                    &Response::HeartbeatEntry {
+                        id: item.id,
+                        description: item.description,
+                        status: item.status,
+                        created_at: item.created_at,
+                    },
+                )
+                .await?;
+            }
+            write_frame(&mut writer, &Response::Done).await?;
+        }
+
+        Request::HeartbeatDismiss { id } => {
+            let db = Arc::clone(&state.db);
+            let result = tokio::task::spawn_blocking(move || {
+                let conn = db.lock().unwrap_or_else(|p| p.into_inner());
+                memory_db::dismiss_heartbeat_item(&conn, id)
+            })
+            .await
+            .unwrap_or_else(|e| Err(anyhow::anyhow!("heartbeat dismiss panicked: {e}")));
+            if let Err(e) = result {
+                tracing::warn!(error = %e, "failed to dismiss heartbeat item");
+            }
+            write_frame(&mut writer, &Response::Done).await?;
+        }
+
+        Request::HeartbeatTrigger => {
+            state.heartbeat_notify.notify_one();
+            write_frame(&mut writer, &Response::Done).await?;
         }
     }
 
@@ -2016,6 +2164,18 @@ async fn inject_skill_files_from(messages: &mut Vec<Message>, amaebi_home: &std:
 /// All `history` rows are included without a sliding-window cap.  Callers are
 /// responsible for trimming the history slice to a token budget before calling
 /// (see the pre-flight check in `Request::Chat` / `Request::Resume` handlers).
+/// Append the session UUID to the system message so the agent can reference it
+/// in tool calls (e.g. `heartbeat_note`).
+fn inject_session_id(messages: &mut [Message], session_id: &str) {
+    if let Some(sys) = messages.first_mut() {
+        if sys.role == "system" {
+            if let Some(ref mut content) = sys.content {
+                content.push_str(&format!(" Your session ID is {session_id}."));
+            }
+        }
+    }
+}
+
 pub(crate) fn build_messages(
     prompt: &str,
     tmux_pane: Option<&str>,
@@ -2240,6 +2400,214 @@ async fn run_cron_job(state: Arc<DaemonState>, job: &cron::CronJob) {
     }
 
     tracing::info!(id = %job.id, "cron: job complete");
+}
+
+// ---------------------------------------------------------------------------
+// Heartbeat scheduler
+// ---------------------------------------------------------------------------
+
+/// Background task: checks pending heartbeat items on a configurable interval.
+///
+/// Reads `config.json` on every tick so interval/active-hours changes take
+/// effect without a daemon restart.  Only sessions that are currently open
+/// (registered in `active_sessions`) are considered — heartbeat items are
+/// session-scoped and meaningless after the chat closes.
+///
+/// A manual trigger via [`Request::HeartbeatTrigger`] is supported through the
+/// `heartbeat_notify` handle on `DaemonState`.
+async fn run_heartbeat_scheduler(state: Arc<DaemonState>) {
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    let mut last_run = tokio::time::Instant::now()
+        .checked_sub(std::time::Duration::from_secs(3600))
+        .unwrap_or_else(tokio::time::Instant::now);
+
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {}
+            _ = state.heartbeat_notify.notified() => {
+                tracing::info!("heartbeat: manual trigger received");
+            }
+        }
+
+        let config = crate::config::Config::load();
+        let hb_config = match config.heartbeat {
+            Some(ref hb) => hb.clone(),
+            None => continue, // heartbeat disabled
+        };
+
+        // Interval guard — skip unless enough time has elapsed or this was a
+        // manual trigger (heuristic: elapsed < 2 s → manual).
+        let interval_dur = std::time::Duration::from_secs(hb_config.interval_minutes * 60);
+        if last_run.elapsed() < interval_dur
+            && last_run.elapsed() > std::time::Duration::from_secs(2)
+        {
+            continue;
+        }
+
+        // Active hours check.
+        if !hb_config.is_active_now() {
+            tracing::debug!("heartbeat: outside active hours, skipping");
+            continue;
+        }
+
+        // Snapshot active sessions — clone the steer senders so we can release
+        // the lock before doing any async work.
+        let active: Vec<(String, tokio::sync::mpsc::Sender<Option<String>>)> = state
+            .active_sessions
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+
+        if active.is_empty() {
+            tracing::debug!("heartbeat: no active sessions");
+            last_run = tokio::time::Instant::now();
+            continue;
+        }
+
+        let model = hb_config.model.unwrap_or_else(|| {
+            std::env::var("AMAEBI_MODEL").unwrap_or_else(|_| "gpt-4o".to_string())
+        });
+
+        for (session_id, steer_tx) in &active {
+            run_heartbeat_for_session(&state, session_id, &model, steer_tx).await;
+        }
+
+        last_run = tokio::time::Instant::now();
+    }
+}
+
+/// Run a single heartbeat check for one active session.
+///
+/// Queries pending items from SQLite, asks the LLM whether anything is
+/// actionable, and if so injects the report as a user message into the
+/// running agentic loop via `steer_tx`.  The message is also logged at
+/// debug level for diagnostics.
+///
+/// Items are auto-resolved after being surfaced so they are not re-checked
+/// on the next tick.
+async fn run_heartbeat_for_session(
+    state: &DaemonState,
+    session_id: &str,
+    model: &str,
+    steer_tx: &tokio::sync::mpsc::Sender<Option<String>>,
+) {
+    // Load pending items from SQLite.
+    let db = Arc::clone(&state.db);
+    let sid = session_id.to_owned();
+    let loaded = tokio::task::spawn_blocking(move || {
+        let conn = db.lock().unwrap_or_else(|p| p.into_inner());
+        let items = memory_db::get_pending_heartbeat_items(&conn, &sid)?;
+        let summary = memory_db::get_session_own_summary(&conn, &sid)?;
+        Ok::<_, anyhow::Error>((items, summary))
+    })
+    .await
+    .unwrap_or_else(|e| Err(anyhow::anyhow!("heartbeat DB read panicked: {e}")));
+
+    let (items, summary) = match loaded {
+        Ok((items, _)) if items.is_empty() => return, // nothing to check
+        Ok(pair) => pair,
+        Err(e) => {
+            tracing::warn!(error = %e, session_id, "heartbeat: failed to load items");
+            return;
+        }
+    };
+
+    // Build lightweight prompt.
+    let mut item_list = String::new();
+    for (i, item) in items.iter().enumerate() {
+        item_list.push_str(&format!("{}. {}\n", i + 1, item.description));
+    }
+
+    let system =
+        "You are a heartbeat checker reviewing pending follow-up items for an AI agent session. \
+        For each item, determine if it needs attention or action right now. \
+        If nothing needs attention, reply with exactly HEARTBEAT_OK and nothing else. \
+        If any item needs attention, provide a concise plain-text report of what should be done.";
+
+    let mut user_prompt = format!("Pending items:\n{item_list}");
+    if let Some(ref s) = summary {
+        user_prompt.push_str(&format!("\nSession context:\n{s}"));
+    }
+
+    let messages = vec![Message::system(system), Message::user(&user_prompt)];
+
+    tracing::info!(
+        session_id,
+        items = items.len(),
+        "heartbeat: checking session"
+    );
+
+    // Call LLM — no tools, lightweight.
+    let token = match state.tokens.get(&state.http).await {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!(error = %e, "heartbeat: failed to get Copilot token");
+            return;
+        }
+    };
+
+    let mut sink = tokio::io::sink();
+    let result = copilot::stream_chat(
+        &state.http,
+        &token.value,
+        &token.base_url,
+        model,
+        &messages,
+        &[],
+        1024,
+        &mut sink,
+    )
+    .await;
+
+    let response_text = match result {
+        Ok(resp) => resp.text,
+        Err(e) => {
+            tracing::warn!(error = %e, session_id, "heartbeat: LLM call failed");
+            return;
+        }
+    };
+
+    let report = response_text.trim();
+
+    if report == "HEARTBEAT_OK" {
+        tracing::debug!(session_id, "heartbeat: nothing actionable");
+        return;
+    }
+
+    // Actionable — inject into the running conversation as a user message.
+    tracing::debug!(
+        session_id,
+        report,
+        "heartbeat: injecting follow-up into session"
+    );
+
+    if let Err(e) = steer_tx.send(Some(report.to_string())).await {
+        // Session closed between our snapshot and now — that's fine.
+        tracing::debug!(session_id, error = %e, "heartbeat: session closed before inject");
+        return;
+    }
+
+    // Auto-resolve surfaced items so they aren't re-checked next tick.
+    let db = Arc::clone(&state.db);
+    let ids: Vec<i64> = items.iter().map(|i| i.id).collect();
+    let timestamp = chrono::Utc::now().to_rfc3339();
+    let resolve_result = tokio::task::spawn_blocking(move || {
+        let conn = db.lock().unwrap_or_else(|p| p.into_inner());
+        for id in &ids {
+            memory_db::resolve_heartbeat_item(&conn, *id, &timestamp)?;
+        }
+        Ok::<_, anyhow::Error>(())
+    })
+    .await
+    .unwrap_or_else(|e| Err(anyhow::anyhow!("heartbeat resolve panicked: {e}")));
+
+    if let Err(e) = resolve_result {
+        tracing::warn!(error = %e, session_id, "heartbeat: failed to auto-resolve items");
+    }
 }
 
 // ---------------------------------------------------------------------------

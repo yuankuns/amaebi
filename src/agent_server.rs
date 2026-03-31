@@ -316,7 +316,8 @@ impl acp::Agent for AmaebiAgent {
                 Response::ToolUse { .. }
                 | Response::MemoryEntry { .. }
                 | Response::WaitingForInput { .. }
-                | Response::Compacting => {
+                | Response::Compacting
+                | Response::HeartbeatEntry { .. } => {
                     // Not relevant on the ACP forwarding path.
                 }
                 Response::SteerAck => {

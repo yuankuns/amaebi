@@ -92,6 +92,22 @@ pub enum Request {
     /// The daemon responds with zero or more [`Response::MemoryEntry`] frames
     /// followed by a single [`Response::Done`] frame.
     RetrieveContext { prompt: String },
+
+    /// Add a heartbeat item for a session.
+    HeartbeatAdd {
+        session_id: String,
+        description: String,
+    },
+    /// List heartbeat items for a session.
+    HeartbeatList {
+        session_id: String,
+        /// Include resolved/dismissed items when `true`.
+        all: bool,
+    },
+    /// Dismiss (cancel) a heartbeat item by its ID.
+    HeartbeatDismiss { id: i64 },
+    /// Trigger an immediate heartbeat check.
+    HeartbeatTrigger,
 }
 
 /// A single frame streamed from the daemon back to the client.
@@ -128,6 +144,13 @@ pub enum Response {
     },
     /// The daemon has started a background compaction of conversation history.
     Compacting,
+    /// A single heartbeat item returned in response to [`Request::HeartbeatList`].
+    HeartbeatEntry {
+        id: i64,
+        description: String,
+        status: String,
+        created_at: String,
+    },
     /// The daemon is waiting for interactive user input before proceeding.
     ///
     /// Sent when the model asks a clarifying question or ends its response
@@ -434,6 +457,7 @@ mod tests {
             r#"{"type":"memory_entry","role":"user","content":"hi"}"#,
             r#"{"type":"waiting_for_input","prompt":"Which language?"}"#,
             r#"{"type":"compacting"}"#,
+            r#"{"type":"heartbeat_entry","id":1,"description":"check deploy","status":"pending","created_at":"2026-01-01T00:00:00Z"}"#,
         ];
         for frame in frames {
             let r: Response = serde_json::from_str(frame).unwrap();
@@ -448,8 +472,75 @@ mod tests {
                     | Response::MemoryEntry { .. }
                     | Response::WaitingForInput { .. }
                     | Response::Compacting
+                    | Response::HeartbeatEntry { .. }
             ));
         }
+    }
+
+    // ---- Heartbeat IPC round-trips ----------------------------------------
+
+    #[test]
+    fn request_heartbeat_add_round_trip() {
+        let req = Request::HeartbeatAdd {
+            session_id: "s1".into(),
+            description: "check deploy".into(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["type"], "heartbeat_add");
+        let back: Request = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, Request::HeartbeatAdd { .. }));
+    }
+
+    #[test]
+    fn request_heartbeat_list_round_trip() {
+        let req = Request::HeartbeatList {
+            session_id: "s1".into(),
+            all: true,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["type"], "heartbeat_list");
+        assert_eq!(v["all"], true);
+        let back: Request = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, Request::HeartbeatList { .. }));
+    }
+
+    #[test]
+    fn request_heartbeat_dismiss_round_trip() {
+        let req = Request::HeartbeatDismiss { id: 42 };
+        let json = serde_json::to_string(&req).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["type"], "heartbeat_dismiss");
+        assert_eq!(v["id"], 42);
+        let back: Request = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, Request::HeartbeatDismiss { .. }));
+    }
+
+    #[test]
+    fn request_heartbeat_trigger_round_trip() {
+        let req = Request::HeartbeatTrigger;
+        let json = serde_json::to_string(&req).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["type"], "heartbeat_trigger");
+        let back: Request = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, Request::HeartbeatTrigger));
+    }
+
+    #[test]
+    fn response_heartbeat_entry_round_trip() {
+        let r = Response::HeartbeatEntry {
+            id: 1,
+            description: "check deploy".into(),
+            status: "pending".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["type"], "heartbeat_entry");
+        assert_eq!(v["id"], 1);
+        let back: Response = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, Response::HeartbeatEntry { .. }));
     }
 
     // ---- write_frame -----------------------------------------------------

@@ -24,6 +24,65 @@ use crate::auth::amaebi_home;
 /// Default session TTL when no configuration is present.
 const DEFAULT_TTL_MINUTES: u64 = 30;
 
+/// Default heartbeat interval when present in config but no interval specified.
+const DEFAULT_HEARTBEAT_INTERVAL_MINUTES: u64 = 30;
+
+/// Heartbeat configuration.  When present in `config.json`, the daemon
+/// periodically reviews pending heartbeat items and surfaces actionable
+/// ones via the inbox.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HeartbeatConfig {
+    /// How often (in minutes) the heartbeat scheduler fires.
+    #[serde(default = "default_heartbeat_interval")]
+    pub interval_minutes: u64,
+
+    /// Active hours window `[start, end)` in UTC (0–23).
+    /// Heartbeat only fires when the current UTC hour is within this range.
+    /// If absent, heartbeat fires at any hour.
+    #[serde(default)]
+    pub active_hours: Option<(u8, u8)>,
+
+    /// Model override for heartbeat LLM calls.
+    /// Falls back to `AMAEBI_MODEL` / `"gpt-4o"` when absent.
+    #[serde(default)]
+    pub model: Option<String>,
+}
+
+fn default_heartbeat_interval() -> u64 {
+    DEFAULT_HEARTBEAT_INTERVAL_MINUTES
+}
+
+impl Default for HeartbeatConfig {
+    fn default() -> Self {
+        Self {
+            interval_minutes: DEFAULT_HEARTBEAT_INTERVAL_MINUTES,
+            active_hours: None,
+            model: None,
+        }
+    }
+}
+
+impl HeartbeatConfig {
+    /// Check whether the current UTC hour is within the active window.
+    pub fn is_active_now(&self) -> bool {
+        let Some((start, end)) = self.active_hours else {
+            return true;
+        };
+        let hour = chrono::Utc::now()
+            .format("%H")
+            .to_string()
+            .parse::<u8>()
+            .unwrap_or(0);
+        if start <= end {
+            // Normal range: e.g. [9, 21) means 09:00–20:59
+            hour >= start && hour < end
+        } else {
+            // Wrap-around: e.g. [22, 8) means 22:00–07:59
+            hour >= start || hour < end
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
     /// TTL overrides keyed by one of three kinds of identifier (minutes):
@@ -43,6 +102,11 @@ pub struct Config {
     /// 5. built-in 30-minute fallback
     #[serde(default)]
     pub ttl_minutes: HashMap<String, u64>,
+
+    /// Heartbeat configuration.  When absent (`null` or omitted), the
+    /// heartbeat scheduler is disabled entirely.
+    #[serde(default)]
+    pub heartbeat: Option<HeartbeatConfig>,
 }
 
 impl Config {
@@ -233,5 +297,44 @@ mod tests {
         let cfg2: Config = serde_json::from_str(&json).unwrap();
         assert_eq!(cfg2.ttl_minutes.get("default"), Some(&30));
         assert_eq!(cfg2.ttl_minutes.get("/projectX"), Some(&120));
+    }
+
+    // ---- HeartbeatConfig ---------------------------------------------------
+
+    #[test]
+    fn heartbeat_absent_means_disabled() {
+        let cfg: Config = serde_json::from_str(r#"{"ttl_minutes":{}}"#).unwrap();
+        assert!(cfg.heartbeat.is_none());
+    }
+
+    #[test]
+    fn heartbeat_empty_object_uses_defaults() {
+        let cfg: Config = serde_json::from_str(r#"{"heartbeat":{}}"#).unwrap();
+        let hb = cfg.heartbeat.unwrap();
+        assert_eq!(hb.interval_minutes, 30);
+        assert!(hb.active_hours.is_none());
+        assert!(hb.model.is_none());
+    }
+
+    #[test]
+    fn heartbeat_full_config_round_trip() {
+        let json = r#"{
+            "heartbeat": {
+                "interval_minutes": 15,
+                "active_hours": [9, 21],
+                "model": "gpt-4o-mini"
+            }
+        }"#;
+        let cfg: Config = serde_json::from_str(json).unwrap();
+        let hb = cfg.heartbeat.unwrap();
+        assert_eq!(hb.interval_minutes, 15);
+        assert_eq!(hb.active_hours, Some((9, 21)));
+        assert_eq!(hb.model.as_deref(), Some("gpt-4o-mini"));
+    }
+
+    #[test]
+    fn heartbeat_is_active_no_restriction() {
+        let hb = HeartbeatConfig::default();
+        assert!(hb.is_active_now());
     }
 }
