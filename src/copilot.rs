@@ -7,17 +7,21 @@ use tokio::io::AsyncWriteExt;
 
 use crate::ipc::{write_frame, Response};
 
+/// GitHub Copilot chat endpoint — serves Claude models.
 const CHAT_ENDPOINT: &str = "https://api.githubcopilot.com/chat/completions";
 
-/// Return the chat completions URL.
+/// GitHub Models endpoint — serves all models listed by `amaebi models`,
+/// including GPT-5, Gemini, and any model that returns
+/// `unsupported_api_for_model` from the Copilot endpoint.
 ///
-/// All models — Claude, GPT, Gemini, etc. — are served by the GitHub Copilot
-/// gateway through a single endpoint.  The model name in the request body is
-/// what determines which underlying model is used; no per-model URL routing is
-/// required.
+/// Authentication uses the raw GitHub OAuth token (no Copilot JWT exchange).
+pub(crate) const GITHUB_MODELS_ENDPOINT: &str =
+    "https://models.inference.ai.azure.com/chat/completions";
+
+/// Return the Copilot chat URL (Claude models).
 ///
-/// `AMAEBI_COPILOT_URL` is a test-only override that points the daemon at a
-/// local mock server; it is never set in production.
+/// `AMAEBI_COPILOT_URL` is a test-only override that redirects to a local
+/// mock server; it is never set in production.
 fn chat_endpoint() -> String {
     if let Ok(url) = std::env::var("AMAEBI_COPILOT_URL") {
         if !url.trim().is_empty() {
@@ -25,6 +29,19 @@ fn chat_endpoint() -> String {
         }
     }
     CHAT_ENDPOINT.to_string()
+}
+
+/// Return the GitHub Models endpoint URL (non-Claude models).
+///
+/// `AMAEBI_COPILOT_URL` test override applies here too so integration tests
+/// that point both backends at the same mock server continue to work.
+fn github_models_endpoint() -> String {
+    if let Ok(url) = std::env::var("AMAEBI_COPILOT_URL") {
+        if !url.trim().is_empty() {
+            return url.trim().to_string();
+        }
+    }
+    GITHUB_MODELS_ENDPOINT.to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -390,6 +407,7 @@ pub(crate) fn parse_retry_after_header(headers: &reqwest::header::HeaderMap) -> 
 ///   deciding whether to refresh the token and retry.
 ///
 /// On success returns the raw `reqwest::Response` (status 2xx).
+#[allow(clippy::too_many_arguments)]
 async fn send_with_retry(
     http: &reqwest::Client,
     token: &str,
@@ -397,6 +415,8 @@ async fn send_with_retry(
     messages: &[Message],
     tools: &[serde_json::Value],
     max_tokens: usize,
+    endpoint_url: &str,
+    use_copilot_headers: bool,
 ) -> Result<reqwest::Response> {
     let body = serde_json::json!({
         "model": model,
@@ -407,21 +427,20 @@ async fn send_with_retry(
         "stream_options": { "include_usage": true },
     });
 
-    let endpoint_url = chat_endpoint();
-
     let mut attempt = 0u32;
     loop {
-        let result = http
-            .post(&endpoint_url)
+        let mut req = http
+            .post(endpoint_url)
             .header("Authorization", format!("Bearer {token}"))
             .header("Content-Type", "application/json")
             .header("Accept", "application/json")
-            .header("Copilot-Integration-Id", "vscode-chat")
-            .header("Editor-Version", "vscode/1.90.0")
-            .header("User-Agent", concat!("amaebi/", env!("CARGO_PKG_VERSION")))
-            .json(&body)
-            .send()
-            .await;
+            .header("User-Agent", concat!("amaebi/", env!("CARGO_PKG_VERSION")));
+        if use_copilot_headers {
+            req = req
+                .header("Copilot-Integration-Id", "vscode-chat")
+                .header("Editor-Version", "vscode/1.90.0");
+        }
+        let result = req.json(&body).send().await;
 
         match result {
             // ── Success ────────────────────────────────────────────────────
@@ -543,8 +562,48 @@ pub async fn stream_chat<W>(
 where
     W: AsyncWriteExt + Unpin,
 {
-    tracing::debug!(messages = messages.len(), "sending chat request to Copilot");
-    let resp = send_with_retry(http, token, model, messages, tools, max_tokens).await?;
+    let endpoint = chat_endpoint();
+    tracing::debug!(messages = messages.len(), endpoint = %endpoint, "sending chat request");
+    let resp = send_with_retry(
+        http, token, model, messages, tools, max_tokens, &endpoint, true,
+    )
+    .await?;
+    parse_sse_stream(resp, writer).await
+}
+
+/// Send a streaming chat request to the **GitHub Models** endpoint.
+///
+/// Used for non-Claude models (GPT-5, Gemini, …) that are accessible via
+/// the GitHub Models API (`models.inference.ai.azure.com`) but not via the
+/// Copilot chat-completions endpoint.
+///
+/// `oauth_token` is the raw GitHub OAuth token from `auth::read_oauth_token()`,
+/// NOT the short-lived Copilot API JWT.
+pub async fn stream_chat_models<W>(
+    http: &reqwest::Client,
+    oauth_token: &str,
+    model: &str,
+    messages: &[Message],
+    tools: &[serde_json::Value],
+    max_tokens: usize,
+    writer: &mut W,
+) -> Result<CopilotResponse>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    let endpoint = github_models_endpoint();
+    tracing::debug!(messages = messages.len(), endpoint = %endpoint, model, "sending chat request");
+    let resp = send_with_retry(
+        http,
+        oauth_token,
+        model,
+        messages,
+        tools,
+        max_tokens,
+        &endpoint,
+        false,
+    )
+    .await?;
     parse_sse_stream(resp, writer).await
 }
 

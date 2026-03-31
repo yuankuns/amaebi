@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
-use crate::auth::{amaebi_home, TokenCache};
+use crate::auth::{self, amaebi_home, TokenCache};
 use crate::copilot::{self, ApiToolCall, ApiToolCallFunction, FinishReason, Message};
 use crate::cron;
 use crate::inbox::InboxStore;
@@ -1066,22 +1066,17 @@ async fn compact_session(
     // Use a direct API call with no tools so the model cannot execute shell
     // commands during background summarisation.
     let compact_result: Result<String> = async {
-        let token = state
-            .tokens
-            .get(&state.http)
-            .await
-            .context("compact_session: refreshing token")?;
         let mut sink = tokio::io::sink();
-        let resp = copilot::stream_chat(
-            &state.http,
-            &token,
+        let resp = invoke_model(
+            &state,
             &model,
             &messages,
             &[],
             response_max_tokens(&model),
             &mut sink,
         )
-        .await?;
+        .await
+        .context("compact_session: model call failed")?;
         Ok(resp.text)
     }
     .await;
@@ -1115,6 +1110,94 @@ async fn compact_session(
         Err(ref e) => tracing::warn!(error = %e, "compact_session: API error"),
     }
     // _guard is dropped here (and on any earlier return), releasing the slot.
+}
+
+// ---------------------------------------------------------------------------
+// Model dispatch
+// ---------------------------------------------------------------------------
+
+/// Send one model turn, automatically selecting the correct backend and token.
+///
+/// * `claude-*` models → GitHub Copilot endpoint, short-lived Copilot API token
+///   (from `TokenCache`). Retries once on 400/401/403 with a fresh token.
+/// * All other models → GitHub Models endpoint (`models.inference.ai.azure.com`),
+///   raw GitHub OAuth token.  This covers GPT-5, Gemini, and anything else
+///   that returns `unsupported_api_for_model` from the Copilot endpoint.
+///
+/// The `AMAEBI_COPILOT_URL` test override routes both endpoints to the mock
+/// server so integration tests remain model-agnostic.
+async fn invoke_model<W>(
+    state: &DaemonState,
+    model: &str,
+    messages: &[Message],
+    tools: &[serde_json::Value],
+    max_tokens: usize,
+    writer: &mut W,
+) -> Result<copilot::CopilotResponse>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    if model.starts_with("claude") {
+        let token = state
+            .tokens
+            .get(&state.http)
+            .await
+            .context("refreshing Copilot API token")?;
+
+        return match copilot::stream_chat(
+            &state.http,
+            &token,
+            model,
+            messages,
+            tools,
+            max_tokens,
+            writer,
+        )
+        .await
+        {
+            Ok(r) => Ok(r),
+            Err(e) => {
+                let is_auth_err = e
+                    .downcast_ref::<copilot::CopilotHttpError>()
+                    .is_some_and(|he| matches!(he.status.as_u16(), 400 | 401 | 403));
+                if is_auth_err {
+                    tracing::warn!(error = %e, "Copilot auth error; evicting token and retrying");
+                    state.tokens.invalidate().await;
+                    let fresh = state
+                        .tokens
+                        .get(&state.http)
+                        .await
+                        .context("fetching fresh Copilot token after auth error")?;
+                    copilot::stream_chat(
+                        &state.http,
+                        &fresh,
+                        model,
+                        messages,
+                        tools,
+                        max_tokens,
+                        writer,
+                    )
+                    .await
+                } else {
+                    Err(e)
+                }
+            }
+        };
+    }
+
+    // Non-Claude: use the GitHub Models endpoint with the raw OAuth token.
+    let oauth_token = auth::read_oauth_token()
+        .context("reading GitHub OAuth token for GitHub Models endpoint")?;
+    copilot::stream_chat_models(
+        &state.http,
+        &oauth_token,
+        model,
+        messages,
+        tools,
+        max_tokens,
+        writer,
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -1173,63 +1256,18 @@ where
             // skipped the tool chain at execution time).  No SteerAck is sent.
         }
 
-        // Re-fetch the token on every iteration so long-running agentic loops
-        // survive token expiration.
-        let token = state
-            .tokens
-            .get(&state.http)
-            .await
-            .context("refreshing Copilot API token inside agentic loop")?;
-
-        // stream_chat retries 5xx, 429, and transport errors internally up to
-        // its MAX_RETRIES, but those errors can still surface here if retries
-        // are exhausted, or if parsing/IO errors occur while streaming.
-        // 4xx responses (except 429) are surfaced immediately as CopilotHttpError;
-        // for auth-adjacent ones (400/401/403) we evict the cache and retry once
-        // with a fresh token. Any other error (exhausted retries, context overflow,
-        // etc.) propagates.
-        let resp = match copilot::stream_chat(
-            &state.http,
-            &token,
+        // Dispatch to the correct backend (Copilot for Claude, GitHub Models
+        // for everything else).  Token management and auth-error retry are
+        // handled inside invoke_model.
+        let resp = invoke_model(
+            state,
             model,
             &messages,
             &schemas,
             response_max_tokens(model),
             writer,
         )
-        .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                let is_auth_err = e
-                    .downcast_ref::<copilot::CopilotHttpError>()
-                    .is_some_and(|he| matches!(he.status.as_u16(), 400 | 401 | 403));
-                if is_auth_err {
-                    tracing::warn!(
-                        error = %e,
-                        "Copilot auth error; evicting token cache and retrying once"
-                    );
-                    state.tokens.invalidate().await;
-                    let fresh_token = state
-                        .tokens
-                        .get(&state.http)
-                        .await
-                        .context("fetching fresh token after auth error")?;
-                    copilot::stream_chat(
-                        &state.http,
-                        &fresh_token,
-                        model,
-                        &messages,
-                        &schemas,
-                        response_max_tokens(model),
-                        writer,
-                    )
-                    .await?
-                } else {
-                    return Err(e);
-                }
-            }
-        };
+        .await?;
 
         last_prompt_tokens = resp.prompt_tokens;
 
