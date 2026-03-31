@@ -1181,7 +1181,7 @@ where
                 model,
                 "model not accessible via /chat/completions; retrying via Responses API"
             );
-            crate::responses::stream_chat(
+            let r = crate::responses::stream_chat(
                 &state.http,
                 &tok.value,
                 &tok.base_url,
@@ -1191,7 +1191,42 @@ where
                 max_tokens,
                 writer,
             )
-            .await
+            .await;
+            // The Responses API can also return 401/403 on token expiry.
+            // Evict the cache and retry once with a fresh token.
+            match r {
+                Ok(r) => Ok(r),
+                Err(e2) => {
+                    let is_auth = e2
+                        .downcast_ref::<copilot::CopilotHttpError>()
+                        .is_some_and(|he| matches!(he.status.as_u16(), 401 | 403));
+                    if is_auth {
+                        tracing::warn!(
+                            error = %e2,
+                            "Responses API auth error; evicting token and retrying"
+                        );
+                        state.tokens.invalidate().await;
+                        let fresh = state
+                            .tokens
+                            .get(&state.http)
+                            .await
+                            .context("fetching fresh token after Responses API auth error")?;
+                        crate::responses::stream_chat(
+                            &state.http,
+                            &fresh.value,
+                            &fresh.base_url,
+                            model,
+                            messages,
+                            tools,
+                            max_tokens,
+                            writer,
+                        )
+                        .await
+                    } else {
+                        Err(e2)
+                    }
+                }
+            }
         }
 
         // Auth error — evict the token cache and retry once with a fresh token.

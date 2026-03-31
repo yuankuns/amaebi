@@ -170,9 +170,15 @@ impl CapturedRequest {
         self.body.get("model").and_then(|v| v.as_str())
     }
 
-    /// Return the `max_tokens` field.
+    /// Return the output-token limit.
+    ///
+    /// Checks `max_tokens` (Chat Completions) and `max_output_tokens`
+    /// (Responses API) so helpers work for both request formats.
     pub fn max_tokens(&self) -> Option<u64> {
-        self.body.get("max_tokens").and_then(|v| v.as_u64())
+        self.body
+            .get("max_tokens")
+            .or_else(|| self.body.get("max_output_tokens"))
+            .and_then(|v| v.as_u64())
     }
 
     /// Return `true` if `stream` is `true`.
@@ -183,9 +189,15 @@ impl CapturedRequest {
             .unwrap_or(false)
     }
 
-    /// Return the messages array.
+    /// Return the messages / input array.
+    ///
+    /// Checks `messages` (Chat Completions) and `input` (Responses API)
+    /// so helpers work for both request formats.
     pub fn messages(&self) -> Option<&Vec<Value>> {
-        self.body.get("messages").and_then(|v| v.as_array())
+        self.body
+            .get("messages")
+            .or_else(|| self.body.get("input"))
+            .and_then(|v| v.as_array())
     }
 }
 

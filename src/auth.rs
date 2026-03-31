@@ -197,14 +197,15 @@ impl TokenCache {
     /// Return a valid API token and its base URL, fetching a fresh one if the
     /// cache is empty or the cached token is about to expire.
     pub async fn get(&self, http: &reqwest::Client) -> Result<CopilotToken> {
-        // Allow tests to inject a pre-baked token via env var, bypassing the
-        // full OAuth flow (which requires real GitHub credentials).
+        // Allow callers to inject a pre-baked token via env var, bypassing
+        // the full OAuth flow.  Still parse proxy-ep from the token so that
+        // a real Copilot JWT passed this way gets the correct per-account
+        // base URL rather than always falling back to the default.
         if let Ok(tok) = std::env::var("AMAEBI_COPILOT_TOKEN") {
             if !tok.trim().is_empty() {
-                return Ok(CopilotToken {
-                    value: tok.trim().to_string(),
-                    base_url: DEFAULT_COPILOT_BASE_URL.to_string(),
-                });
+                let value = tok.trim().to_string();
+                let base_url = base_url_from_token(&value);
+                return Ok(CopilotToken { value, base_url });
             }
         }
 
