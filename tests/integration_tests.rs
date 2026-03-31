@@ -18,6 +18,7 @@
 //! - sandbox credential exposure regression checks
 //! - sub-agent chain/session resilience
 //! - non-retryable LLM error-path recovery
+//! - consistent chat (full tool-call context preserved across turns)
 
 mod support;
 
@@ -2042,3 +2043,180 @@ async fn gemini_models_route_via_copilot_and_succeed() {
 // Verifies that when /chat/completions returns 400 unsupported_api_for_model
 // the daemon automatically retries via /v1/responses and delivers the
 // response to the client.
+
+// 19. Consistent chat — plain-text turns
+// ---------------------------------------------------------------------------
+
+/// Two sequential plain-text turns on the same session.
+/// The second turn's LLM request must contain the user message and assistant
+/// reply from turn 1 — verifying that consistent chat context is preserved
+/// across separate `amaebi ask` invocations.
+#[tokio::test]
+async fn consistent_chat_plain_turns() {
+    let server = MockLlmServer::start().await;
+    // Turn 1: simple text reply.
+    server.enqueue(ScriptedResponse::text_chunks(vec!["The answer is 42."]));
+    // Turn 2: another text reply (content doesn't matter here).
+    server.enqueue(ScriptedResponse::text_chunks(vec!["That is 84."]));
+
+    let home = setup_home().expect("setup_home");
+    let (socket, mut child, _socket_dir) =
+        start_daemon_at_home_with_env(home.path(), &server.url(), &[])
+            .await
+            .expect("start_daemon");
+
+    let session_id = "test-consistent-plain-001";
+
+    // Turn 1.
+    let client1 = connect_client(&socket);
+    let r1 = send_message_with_session(&client1, "what is 6 times 7?", session_id, "gpt-4o")
+        .await
+        .expect("turn 1");
+    assert!(
+        collect_text(&r1).contains("42"),
+        "turn 1 response unexpected: {:?}",
+        collect_text(&r1)
+    );
+
+    // Turn 2 on a new connection (simulates a second `amaebi ask` invocation).
+    let client2 = connect_client(&socket);
+    let r2 = send_message_with_session(&client2, "double that", session_id, "gpt-4o")
+        .await
+        .expect("turn 2");
+    assert!(
+        collect_text(&r2).contains("84"),
+        "turn 2 response unexpected: {:?}",
+        collect_text(&r2)
+    );
+
+    // Inspect what the daemon sent to the LLM on turn 2.
+    let reqs = server.take_requests();
+    assert_eq!(reqs.len(), 2, "expected 2 LLM requests, got {}", reqs.len());
+
+    let turn2_req = &reqs[1];
+    let messages = turn2_req
+        .body
+        .get("messages")
+        .and_then(|m| m.as_array())
+        .expect("messages array missing in turn 2 request");
+
+    // Turn 2 must include the user message from turn 1.
+    let has_turn1_user = messages.iter().any(|m| {
+        m.get("role").and_then(|r| r.as_str()) == Some("user")
+            && m.get("content")
+                .and_then(|c| c.as_str())
+                .map(|c| c.contains("6 times 7"))
+                .unwrap_or(false)
+    });
+    assert!(
+        has_turn1_user,
+        "turn 2 LLM request must include turn 1 user message; messages: {messages:#?}"
+    );
+
+    // Turn 2 must include the assistant reply from turn 1.
+    let has_turn1_assistant = messages.iter().any(|m| {
+        m.get("role").and_then(|r| r.as_str()) == Some("assistant")
+            && m.get("content")
+                .and_then(|c| c.as_str())
+                .map(|c| c.contains("42"))
+                .unwrap_or(false)
+    });
+    assert!(
+        has_turn1_assistant,
+        "turn 2 LLM request must include turn 1 assistant reply; messages: {messages:#?}"
+    );
+
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+}
+
+// ---------------------------------------------------------------------------
+// 20. Consistent chat — tool-call context preserved across turns
+// ---------------------------------------------------------------------------
+
+/// Turn 1 involves a tool call; turn 2 must receive the full tool exchange
+/// (the assistant tool-call message AND the tool-result message), not just
+/// the final plain-text assistant reply.
+///
+/// This is the key difference from the old text-only approach: openclaw/pi
+/// stores the complete reasoning chain so subsequent turns have richer context.
+#[tokio::test]
+async fn consistent_chat_tool_call_context() {
+    let server = MockLlmServer::start().await;
+
+    // Turn 1, step 1: model calls shell_command.
+    server.enqueue(ScriptedResponse::tool_call(
+        "call-ls-001",
+        "shell_command",
+        r#"{"command":"echo hello-from-tool"}"#,
+    ));
+    // Turn 1, step 2: model receives tool result, returns final text.
+    server.enqueue(ScriptedResponse::text_chunks(vec![
+        "The tool returned hello-from-tool.",
+    ]));
+    // Turn 2: model replies (content doesn't matter for this assertion).
+    server.enqueue(ScriptedResponse::text_chunks(vec!["Got it."]));
+
+    let home = setup_home().expect("setup_home");
+    let (socket, mut child, _socket_dir) =
+        start_daemon_at_home_with_env(home.path(), &server.url(), &[])
+            .await
+            .expect("start_daemon");
+
+    let session_id = "test-consistent-tool-001";
+
+    // Turn 1: triggers a tool call internally.
+    let client1 = connect_client(&socket);
+    let r1 = send_message_with_session(&client1, "run echo hello-from-tool", session_id, "gpt-4o")
+        .await
+        .expect("turn 1");
+    let text1 = collect_text(&r1);
+    assert!(
+        text1.contains("hello-from-tool"),
+        "turn 1 response unexpected: {text1:?}"
+    );
+
+    // Turn 2: a follow-up question.
+    let client2 = connect_client(&socket);
+    let _r2 =
+        send_message_with_session(&client2, "what did the tool return?", session_id, "gpt-4o")
+            .await
+            .expect("turn 2");
+
+    // Inspect the turn-2 LLM request.
+    let reqs = server.take_requests();
+    // 3 requests: turn1-step1, turn1-step2, turn2
+    assert_eq!(reqs.len(), 3, "expected 3 LLM requests, got {}", reqs.len());
+
+    let turn2_req = &reqs[2];
+    let messages = turn2_req
+        .body
+        .get("messages")
+        .and_then(|m| m.as_array())
+        .expect("messages array missing in turn 2 request");
+
+    // The turn-2 request must include the assistant tool-call message from turn 1.
+    let has_tool_call_msg = messages.iter().any(|m| {
+        m.get("role").and_then(|r| r.as_str()) == Some("assistant")
+            && m.get("tool_calls")
+                .and_then(|tc| tc.as_array())
+                .map(|arr| !arr.is_empty())
+                .unwrap_or(false)
+    });
+    assert!(
+        has_tool_call_msg,
+        "turn 2 must include the assistant tool-call message from turn 1; messages: {messages:#?}"
+    );
+
+    // The turn-2 request must include the tool-result message.
+    let has_tool_result = messages
+        .iter()
+        .any(|m| m.get("role").and_then(|r| r.as_str()) == Some("tool"));
+    assert!(
+        has_tool_result,
+        "turn 2 must include the tool-result message from turn 1; messages: {messages:#?}"
+    );
+
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+}

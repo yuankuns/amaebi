@@ -449,7 +449,7 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                 match run_agentic_loop(&state, &model, messages, &mut sink, &mut steer_rx, true)
                     .await
                 {
-                    Ok((final_text, _)) => {
+                    Ok((final_text, _, _)) => {
                         let user_text = truncate_chars(prompt.clone(), MAX_PROMPT_CHARS);
                         let assistant_text = truncate_chars(final_text.clone(), MAX_RESPONSE_CHARS);
 
@@ -609,7 +609,7 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
 
             match run_agentic_loop(&state, &model, messages, &mut writer, &mut steer_rx, true).await
             {
-                Ok((response_text, _)) => {
+                Ok((response_text, _, _)) => {
                     let user_text = truncate_chars(prompt.clone(), MAX_PROMPT_CHARS);
                     let assistant_text = truncate_chars(response_text.clone(), MAX_RESPONSE_CHARS);
 
@@ -715,32 +715,34 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                 }
             });
 
-            // Load full session history, past-session summaries, and the session's own
-            // running summary (if any) for token-budget-driven compaction decisions.
+            // Load full-turn JSON history (openclaw/pi approach) AND text-only
+            // history.  The JSON turns provide richer context (tool calls
+            // included); the text-only rows drive compaction and FTS search.
             let db = Arc::clone(&state.db);
             let sid_clone = sid.clone();
-            let (history, past_summaries, own_summary) =
+            let (turns_json, history, past_summaries, own_summary) =
                 tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
                     let conn = db.lock().unwrap_or_else(|p| p.into_inner());
+                    let turns_json = memory_db::get_session_turns_json(&conn, &sid_clone)?;
                     let history = memory_db::get_session_history(&conn, &sid_clone)?;
                     let past_summaries =
                         memory_db::get_recent_summaries(&conn, &sid_clone, MAX_SUMMARIES)?;
                     let own_summary = memory_db::get_session_own_summary(&conn, &sid_clone)?;
-                    Ok((history, past_summaries, own_summary))
+                    Ok((turns_json, history, past_summaries, own_summary))
                 })
                 .await
                 .unwrap_or_else(|e| {
                     tracing::warn!(error = %e, "session history load panicked");
-                    Ok((vec![], vec![], None))
+                    Ok((vec![], vec![], vec![], None))
                 })
                 .unwrap_or_else(|e| {
                     tracing::warn!(error = %e, "failed to load session history");
-                    (vec![], vec![], None)
+                    (vec![], vec![], vec![], None)
                 });
 
             // Cross-session: if this is the first turn of a new session, compact any
             // old sessions that have never been summarised.
-            if history.is_empty() {
+            if history.is_empty() && turns_json.is_empty() {
                 let db = Arc::clone(&state.db);
                 let sid_clone = sid.clone();
                 let old_sessions = tokio::task::spawn_blocking(move || {
@@ -762,13 +764,37 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                 }
             }
 
-            let mut messages = build_messages(
-                &prompt,
-                tmux_pane.as_deref(),
-                &history,
-                &past_summaries,
-                own_summary.as_deref(),
-            );
+            // Build the initial messages array.  When full JSON turns are
+            // available, use them to include complete tool-call context from
+            // prior turns (the openclaw/pi approach).  Fall back to text-only
+            // history for older sessions that pre-date this feature.
+            let mut messages = if turns_json.is_empty() {
+                build_messages(
+                    &prompt,
+                    tmux_pane.as_deref(),
+                    &history,
+                    &past_summaries,
+                    own_summary.as_deref(),
+                )
+            } else {
+                build_messages_from_turns(
+                    &prompt,
+                    tmux_pane.as_deref(),
+                    &turns_json,
+                    &past_summaries,
+                    own_summary.as_deref(),
+                )
+                .unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "failed to build messages from turns; falling back to text-only history");
+                    build_messages(
+                        &prompt,
+                        tmux_pane.as_deref(),
+                        &history,
+                        &past_summaries,
+                        own_summary.as_deref(),
+                    )
+                })
+            };
             inject_skill_files(&mut messages).await;
 
             // Pre-flight token check: if over the compaction threshold, trim to hot tail.
@@ -776,6 +802,8 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
             // compaction even if the API does not return usage data.
             let threshold = compaction_threshold_tokens(&model);
             let pre_flight_trimmed = if count_message_tokens(&messages) > threshold {
+                // When trimming, always fall back to the text-only hot tail to
+                // guarantee the messages fit — JSON turns may be much larger.
                 let hot = HOT_TAIL_PAIRS * 2;
                 let trimmed = if history.len() > hot {
                     &history[history.len() - hot..]
@@ -799,17 +827,45 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                 false
             };
 
+            // Record where the current user prompt sits in the message array.
+            // After the agentic loop, everything from this index onward is the
+            // delta (user + tool exchanges + assistant reply) to persist.
+            let user_prompt_idx = messages.len() - 1;
+
             // Snapshot the token count before messages is moved into the loop.
             // Used as a fallback when the API returns prompt_tokens = 0.
             let pre_send_tokens = count_message_tokens(&messages);
 
             match run_agentic_loop(&state, &model, messages, &mut writer, &mut steer_rx, true).await
             {
-                Ok((response_text, prompt_tokens)) => {
+                Ok((response_text, prompt_tokens, final_messages)) => {
+                    // Persist the full turn delta as JSON (openclaw/pi approach).
+                    // This includes the user prompt, every tool call/result pair,
+                    // and the final assistant reply — giving subsequent turns
+                    // the complete reasoning context, not just the final text.
+                    let turn_delta = &final_messages[user_prompt_idx..];
+                    match serde_json::to_string(turn_delta) {
+                        Ok(turn_json) => {
+                            let db_t = Arc::clone(&state.db);
+                            let sid_t = sid.clone();
+                            let ts_t = chrono::Utc::now().to_rfc3339();
+                            let _ = tokio::task::spawn_blocking(move || {
+                                let conn = db_t.lock().unwrap_or_else(|p| p.into_inner());
+                                memory_db::store_session_turn(&conn, &sid_t, &ts_t, &turn_json)
+                            })
+                            .await
+                            .unwrap_or_else(|e| {
+                                Err(anyhow::anyhow!("store_session_turn panicked: {e}"))
+                            });
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "failed to serialize session turn delta");
+                        }
+                    }
+
+                    // Also persist text-only summary for FTS search and compaction.
                     let user_text = truncate_chars(prompt.clone(), MAX_PROMPT_CHARS);
                     let assistant_text = truncate_chars(response_text.clone(), MAX_RESPONSE_CHARS);
-
-                    // Persist to SQLite memory store.
                     store_conversation(&state, &sid, &user_text, &assistant_text).await;
 
                     // Within-session compaction: trigger when the context is large enough.
@@ -1101,6 +1157,11 @@ async fn compact_session(
                     .context("compact_session: begin transaction")?;
                 memory_db::store_session_summary(&conn, &sid, &summary, &ts)?;
                 memory_db::archive_session_turns(&conn, &ids_to_archive)?;
+                // Clear full-turn JSON history: the compacted turns are now
+                // captured in the session summary.  New turns accumulate fresh
+                // after this point; old turns would otherwise inflate context
+                // beyond the compaction threshold again on the very next request.
+                memory_db::delete_session_turns(&conn, &sid)?;
                 tx.commit().context("compact_session: commit transaction")
             })
             .await
@@ -1312,7 +1373,7 @@ pub(crate) async fn run_agentic_loop<W>(
     writer: &mut W,
     steer_rx: &mut tokio::sync::mpsc::Receiver<Option<String>>,
     include_spawn_agent: bool,
-) -> Result<(String, usize)>
+) -> Result<(String, usize, Vec<Message>)>
 where
     W: AsyncWriteExt + Unpin,
 {
@@ -1581,6 +1642,12 @@ where
                 }
 
                 final_text = resp.text;
+                // Push the final assistant turn into messages so that
+                // run_agentic_loop returns a complete history — the caller
+                // uses this to persist the full turn delta (consistent chat).
+                if !final_text.is_empty() {
+                    messages.push(Message::assistant(Some(final_text.clone()), vec![]));
+                }
                 break;
             }
 
@@ -1829,12 +1896,15 @@ where
                 let warning = format!("\n[stopped: unexpected finish reason '{reason}']");
                 write_frame(writer, &Response::Text { chunk: warning }).await?;
                 final_text = resp.text;
+                if !final_text.is_empty() {
+                    messages.push(Message::assistant(Some(final_text.clone()), vec![]));
+                }
                 break;
             }
         }
     }
 
-    Ok((final_text, last_prompt_tokens))
+    Ok((final_text, last_prompt_tokens, messages))
 }
 
 // ---------------------------------------------------------------------------
@@ -1995,6 +2065,62 @@ pub(crate) fn build_messages(
     messages
 }
 
+/// Build the messages array from full JSON turn history (consistent-chat path).
+///
+/// Each element of `turns_json` is a serialized `Vec<Message>` representing one
+/// complete agentic-loop turn: [user, (tool_call, tool_result)*, assistant].
+/// Concatenating all turns gives the full conversation context including every
+/// tool-call exchange — the same approach used by openclaw/pi's `SessionManager`.
+///
+/// Falls back to logging a warning (and returning `Err`) if any turn cannot be
+/// deserialized; the caller should fall back to `build_messages` in that case.
+pub(crate) fn build_messages_from_turns(
+    prompt: &str,
+    tmux_pane: Option<&str>,
+    turns_json: &[String],
+    past_summaries: &[String],
+    own_summary: Option<&str>,
+) -> anyhow::Result<Vec<Message>> {
+    let mut system = "You are a helpful, concise AI assistant embedded in a tmux terminal. \
+                      Answer in plain text; avoid markdown unless the user asks for it. \
+                      You have tools available to inspect the terminal, run commands, \
+                      and read or edit files — use them when they help you answer accurately. \
+                      After using any tool, you MUST always follow up with a text response \
+                      summarising what you did and the outcome — never end silently after a tool call."
+        .to_owned();
+
+    if let Some(pane) = tmux_pane {
+        system.push_str(&format!(" The user's active tmux pane is {pane}."));
+    }
+
+    if !past_summaries.is_empty() {
+        system.push_str("\n\nSummaries from past sessions (oldest first):\n");
+        for s in past_summaries {
+            system.push_str(&truncate_chars(s.clone(), MAX_SUMMARY_CHARS));
+            system.push('\n');
+        }
+    }
+
+    let mut messages = vec![Message::system(system)];
+
+    if let Some(summary) = own_summary {
+        let summary = truncate_chars(summary.to_owned(), MAX_SUMMARY_CHARS * 2);
+        messages.push(Message::user(
+            "[Summary of earlier in this session]".to_owned(),
+        ));
+        messages.push(Message::assistant(Some(summary), vec![]));
+    }
+
+    for (i, blob) in turns_json.iter().enumerate() {
+        let turn: Vec<Message> = serde_json::from_str(blob)
+            .with_context(|| format!("deserializing session turn {i}"))?;
+        messages.extend(turn);
+    }
+
+    messages.push(Message::user(prompt.to_owned()));
+    Ok(messages)
+}
+
 // ---------------------------------------------------------------------------
 // Cron scheduler
 // ---------------------------------------------------------------------------
@@ -2080,7 +2206,7 @@ async fn run_cron_job(state: Arc<DaemonState>, job: &cron::CronJob) {
     let result = run_agentic_loop(&state, &model, messages, &mut sink, &mut steer_rx, true).await;
 
     let (output, run_ok) = match result {
-        Ok((final_text, _)) => {
+        Ok((final_text, _, _)) => {
             store_conversation(&state, &session_id, &job.description, &final_text).await;
             (final_text, true)
         }
@@ -2120,6 +2246,7 @@ async fn run_cron_job(state: Arc<DaemonState>, job: &cron::CronJob) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::copilot;
 
     fn make_db_entry(id: i64, role: &str, content: &str) -> memory_db::DbMemoryEntry {
         memory_db::DbMemoryEntry {
@@ -2276,6 +2403,87 @@ mod tests {
             summary_placeholder.contains("Summary of earlier"),
             "summary label must appear before history"
         );
+    }
+
+    // ---- build_messages_from_turns tests --------------------------------
+
+    #[test]
+    fn build_messages_from_turns_empty_produces_system_and_user() {
+        let msgs = build_messages_from_turns("hello", None, &[], &[], None).unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].role, "system");
+        assert_eq!(msgs[1].role, "user");
+        assert_eq!(msgs[1].content.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn build_messages_from_turns_single_turn_injects_all_messages() {
+        // A turn with user + tool-call assistant + tool result + final assistant.
+        let turn: Vec<Message> = vec![
+            Message::user("what files?"),
+            Message::assistant(
+                None,
+                vec![copilot::ApiToolCall {
+                    id: "c1".into(),
+                    kind: "function".into(),
+                    function: copilot::ApiToolCallFunction {
+                        name: "shell_command".into(),
+                        arguments: r#"{"command":"ls"}"#.into(),
+                    },
+                }],
+            ),
+            Message::tool_result("c1", "file1.txt\nfile2.txt"),
+            Message::assistant(Some("There are two files.".into()), vec![]),
+        ];
+        let turn_json = serde_json::to_string(&turn).unwrap();
+
+        let msgs = build_messages_from_turns("follow-up", None, &[turn_json], &[], None).unwrap();
+        // system + 4 turn messages + new user prompt
+        assert_eq!(msgs.len(), 6);
+        assert_eq!(msgs[0].role, "system");
+        assert_eq!(msgs[1].role, "user");
+        assert_eq!(msgs[1].content.as_deref(), Some("what files?"));
+        assert_eq!(msgs[2].role, "assistant");
+        assert_eq!(msgs[3].role, "tool");
+        assert_eq!(msgs[4].role, "assistant");
+        assert_eq!(msgs[5].role, "user");
+        assert_eq!(msgs[5].content.as_deref(), Some("follow-up"));
+    }
+
+    #[test]
+    fn build_messages_from_turns_two_turns_concatenated() {
+        let turn1 = serde_json::to_string(&vec![
+            Message::user("q1"),
+            Message::assistant(Some("a1".into()), vec![]),
+        ])
+        .unwrap();
+        let turn2 = serde_json::to_string(&vec![
+            Message::user("q2"),
+            Message::assistant(Some("a2".into()), vec![]),
+        ])
+        .unwrap();
+
+        let msgs = build_messages_from_turns("q3", None, &[turn1, turn2], &[], None).unwrap();
+        // system + q1 + a1 + q2 + a2 + q3
+        assert_eq!(msgs.len(), 6);
+        assert_eq!(msgs[1].content.as_deref(), Some("q1"));
+        assert_eq!(msgs[4].content.as_deref(), Some("a2"));
+        assert_eq!(msgs[5].content.as_deref(), Some("q3"));
+    }
+
+    #[test]
+    fn build_messages_from_turns_injects_own_summary() {
+        let msgs = build_messages_from_turns("hi", None, &[], &[], Some("- did X")).unwrap();
+        // system + summary user label + summary assistant + user
+        assert_eq!(msgs.len(), 4);
+        assert!(msgs[1].content.as_deref().unwrap_or("").contains("Summary"));
+        assert!(msgs[2].content.as_deref().unwrap_or("").contains("did X"));
+    }
+
+    #[test]
+    fn build_messages_from_turns_invalid_json_returns_err() {
+        let result = build_messages_from_turns("hi", None, &["not-json".to_string()], &[], None);
+        assert!(result.is_err(), "invalid JSON should return Err");
     }
 
     // ---- token budget tests -----
