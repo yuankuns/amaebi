@@ -6,7 +6,7 @@
 //! 3. Connects a client to the daemon socket.
 //! 4. Exercises the daemon and asserts on the responses / captured requests.
 //!
-//! ## Current tests (18 total)
+//! ## Current tests (24 total)
 //!
 //! 1. `test_basic_chat_roundtrip` — basic chat round-trip
 //! 2. `test_tool_call_roundtrip` — tool-call round-trip (shell echo)
@@ -26,6 +26,12 @@
 //! 16. `cron_job_triggers_llm_call` — scheduled cron job fires and calls the LLM with the task prompt
 //! 17. `cron_job_result_not_sent_to_chat` — cron output goes to inbox only, never to the chat stream
 //! 18. `cron_job_with_spawn_agent` — cron job can call spawn_agent; child runs and returns result
+//! 19. `steer_e2e_delivers_ack_and_injects_message` — steer is acked and injected into next loop turn
+//! 20. `sandbox_noop_child_does_not_expose_credentials` — child context must not leak host credential paths
+//! 21. `subagent_chain_session_remains_usable_after_recursion_block` — recursion block does not poison session
+//! 22. `llm_error_path_surfaces_error_frame_and_daemon_stays_alive` — non-retryable LLM error surfaces cleanly and recovers
+//! 23. `support::mock_llm::tests::mock_server_captures_request` — mock server captures request payloads
+//! 24. `support::mock_llm::tests::mock_server_returns_text` — mock server streams scripted text chunks
 
 mod support;
 
