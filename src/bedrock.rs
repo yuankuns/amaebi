@@ -134,6 +134,36 @@ fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// SigV4 URI-encode a single path segment.
+///
+/// Per the AWS SigV4 spec, every byte except the unreserved set
+/// (`A-Z a-z 0-9 - . _ ~`) must be percent-encoded.  This matters for
+/// Bedrock model IDs that contain `:` (e.g. `…-v2:0`).
+fn sigv4_encode_segment(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for byte in s.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(byte as char);
+            }
+            _ => {
+                out.push('%');
+                out.push(
+                    char::from_digit((byte >> 4) as u32, 16)
+                        .unwrap()
+                        .to_ascii_uppercase(),
+                );
+                out.push(
+                    char::from_digit((byte & 0xf) as u32, 16)
+                        .unwrap()
+                        .to_ascii_uppercase(),
+                );
+            }
+        }
+    }
+    out
+}
+
 /// Build AWS SigV4 `Authorization` and related headers for a Bedrock POST.
 ///
 /// Returns a `Vec<(name, value)>` of headers to add to the request.
@@ -161,6 +191,14 @@ fn sigv4_headers(
         signed_headers.push_str(";x-amz-security-token");
     }
 
+    // AWS SigV4 canonical request format (each section separated by \n):
+    //   HTTPMethod \n CanonicalURI \n CanonicalQueryString \n
+    //   CanonicalHeaders \n SignedHeaders \n HexPayloadHash
+    //
+    // `canonical_headers` already ends with \n (each "name:value\n" entry has
+    // a trailing newline).  The spec then requires one more \n as the separator
+    // before SignedHeaders, resulting in the blank line visible in AWS test
+    // vectors — see aws4_testsuite/get-vanilla.creq.
     let canonical_request =
         format!("POST\n{path}\n\n{canonical_headers}\n{signed_headers}\n{payload_hash}");
 
@@ -200,8 +238,9 @@ fn sigv4_headers(
 /// Convert an OpenAI-format messages list into the Bedrock Converse format.
 ///
 /// Returns `(system_text, converse_messages)` where `system_text` is the
-/// content of the first system message (if any) and `converse_messages` is
-/// the converted array.
+/// content of the **first** system message found (if any) and
+/// `converse_messages` is the converted array.  Subsequent system messages
+/// are ignored because Bedrock's `system` field accepts a single block.
 pub(crate) fn to_converse_messages(
     messages: &[Message],
 ) -> (Option<String>, Vec<serde_json::Value>) {
@@ -211,8 +250,12 @@ pub(crate) fn to_converse_messages(
     for msg in messages {
         match msg.role.as_str() {
             "system" => {
-                if let Some(ref text) = msg.content {
-                    system = Some(text.clone());
+                // Only capture the first system message; ignore any subsequent
+                // ones (Bedrock only accepts a single system block).
+                if system.is_none() {
+                    if let Some(ref text) = msg.content {
+                        system = Some(text.clone());
+                    }
                 }
             }
             "user" => {
@@ -363,6 +406,12 @@ pub(crate) fn to_converse_tools(tools: &[serde_json::Value]) -> Vec<serde_json::
 //   [M]  payload         – raw JSON payload
 //   [4]  message_crc32   – CRC32 of everything except this field (not validated)
 
+/// Reject any frame whose declared size exceeds this limit.
+///
+/// An oversized `total_length` field in a corrupted or malicious stream
+/// would cause unbounded buffer growth if not capped here.
+const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024; // 16 MiB
+
 #[derive(Debug)]
 struct EventFrame {
     event_type: String,
@@ -374,7 +423,13 @@ fn parse_event_frame(data: &[u8]) -> Option<(EventFrame, usize)> {
         return None;
     }
     let total_len = u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as usize;
-    if data.len() < total_len || total_len < 12 {
+    // Reject oversized or structurally invalid frames immediately so the
+    // caller never buffers more than MAX_FRAME_SIZE bytes waiting for data
+    // that may never arrive.
+    if !(12..=MAX_FRAME_SIZE).contains(&total_len) {
+        return None;
+    }
+    if data.len() < total_len {
         return None;
     }
     let headers_len = u32::from_be_bytes([data[4], data[5], data[6], data[7]]) as usize;
@@ -455,7 +510,11 @@ struct PartialToolUse {
 // Public streaming entry point
 // ---------------------------------------------------------------------------
 
-/// Send a streaming chat request to the Bedrock Converse Stream API.
+/// How many times to retry transient Bedrock errors before surfacing them.
+const BEDROCK_MAX_RETRIES: u32 = 3;
+
+/// Send a streaming chat request to the Bedrock Converse Stream API with
+/// built-in retry for 429 / 5xx / transport errors.
 ///
 /// Signature matches `copilot::stream_chat` so the daemon can dispatch to
 /// either backend without duplicating call-site logic.
@@ -492,38 +551,87 @@ where
 
     let body_bytes = serde_json::to_vec(&body).context("serializing Bedrock request")?;
 
-    let path = format!("/model/{model}/converse-stream");
+    // URI-encode the model ID so that version suffixes like `:0` in
+    // `anthropic.claude-3-5-sonnet-20241022-v2:0` are represented as `%3A0`
+    // in both the HTTP request URL and the SigV4 canonical URI.
+    let model_encoded = sigv4_encode_segment(model);
+    let path = format!("/model/{model_encoded}/converse-stream");
     let url = format!(
         "https://bedrock-runtime.{}.amazonaws.com{path}",
         config.region
     );
 
-    let datetime = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
-    let auth_headers = sigv4_headers(&config, &path, &body_bytes, &datetime);
+    let mut attempt = 0u32;
+    loop {
+        // Re-sign every attempt with a fresh timestamp so signatures never
+        // expire during the backoff window.
+        let datetime = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+        let auth_headers = sigv4_headers(&config, &path, &body_bytes, &datetime);
 
-    let mut req = http
-        .post(&url)
-        .header("Content-Type", "application/json")
-        .header("Accept", "application/vnd.amazon.eventstream")
-        .header("User-Agent", concat!("amaebi/", env!("CARGO_PKG_VERSION")));
+        let mut req = http
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/vnd.amazon.eventstream")
+            .header("User-Agent", concat!("amaebi/", env!("CARGO_PKG_VERSION")));
 
-    for (k, v) in &auth_headers {
-        req = req.header(k.as_str(), v.as_str());
+        for (k, v) in &auth_headers {
+            req = req.header(k.as_str(), v.as_str());
+        }
+
+        let result = req.body(body_bytes.clone()).send().await;
+
+        match result {
+            Ok(resp) if resp.status().is_success() => {
+                return parse_eventstream_response(resp, writer).await;
+            }
+
+            // 429 or 5xx — retry with exponential backoff.
+            Ok(resp)
+                if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS
+                    || resp.status().is_server_error() =>
+            {
+                if attempt >= BEDROCK_MAX_RETRIES {
+                    let status = resp.status();
+                    let body_text = resp.text().await.unwrap_or_default();
+                    anyhow::bail!("Bedrock API returned {status}: {body_text}");
+                }
+                let delay = crate::copilot::backoff_delay(attempt);
+                tracing::warn!(
+                    attempt,
+                    status = %resp.status(),
+                    delay_ms = delay.as_millis(),
+                    "Bedrock transient error; retrying"
+                );
+                let _ = resp.bytes().await; // drain so connection can be reused
+                tokio::time::sleep(delay).await;
+                attempt += 1;
+            }
+
+            // Non-retryable 4xx — surface immediately.
+            Ok(resp) => {
+                let status = resp.status();
+                let body_text = resp.text().await.unwrap_or_default();
+                anyhow::bail!("Bedrock API returned {status}: {body_text}");
+            }
+
+            // Transport error — retry.
+            Err(e) => {
+                if attempt >= BEDROCK_MAX_RETRIES {
+                    return Err(anyhow::Error::from(e)
+                        .context(format!("sending request to Bedrock ({url})")));
+                }
+                let delay = crate::copilot::backoff_delay(attempt);
+                tracing::warn!(
+                    attempt,
+                    error = %e,
+                    delay_ms = delay.as_millis(),
+                    "Bedrock transport error; retrying"
+                );
+                tokio::time::sleep(delay).await;
+                attempt += 1;
+            }
+        }
     }
-
-    let resp = req
-        .body(body_bytes)
-        .send()
-        .await
-        .context("sending request to Bedrock")?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body_text = resp.text().await.unwrap_or_default();
-        anyhow::bail!("Bedrock API returned {status}: {body_text}");
-    }
-
-    parse_eventstream_response(resp, writer).await
 }
 
 // ---------------------------------------------------------------------------
@@ -551,9 +659,12 @@ where
         let bytes = chunk.context("reading Bedrock response chunk")?;
         buf.extend_from_slice(&bytes);
 
-        // Drain all complete frames from `buf`.
-        while let Some((frame, consumed)) = parse_event_frame(&buf) {
-            buf.drain(..consumed);
+        // Parse all complete frames using a cursor so we never shift bytes
+        // inside the Vec for every frame (which would be O(n²) across many
+        // small frames).  We drain once per HTTP chunk instead.
+        let mut cursor = 0;
+        while let Some((frame, consumed)) = parse_event_frame(&buf[cursor..]) {
+            cursor += consumed;
             process_converse_event(
                 &frame,
                 &mut text,
@@ -565,6 +676,8 @@ where
             )
             .await?;
         }
+        // Discard all bytes we have already consumed in this chunk.
+        buf.drain(..cursor);
     }
 
     // Flush any tool-use blocks that arrived without a contentBlockStop
@@ -839,6 +952,24 @@ mod tests {
     // ---- sigv4_headers structure -------------------------------------------
 
     #[test]
+    fn sigv4_encode_segment_encodes_colon() {
+        // `:` in Bedrock model version suffixes (e.g. `…-v2:0`) must be %3A.
+        assert_eq!(
+            sigv4_encode_segment("anthropic.claude-3-5-sonnet-20241022-v2:0"),
+            "anthropic.claude-3-5-sonnet-20241022-v2%3A0"
+        );
+    }
+
+    #[test]
+    fn sigv4_encode_segment_leaves_unreserved_chars_unchanged() {
+        assert_eq!(
+            sigv4_encode_segment("amazon.nova-pro-v1"),
+            "amazon.nova-pro-v1"
+        );
+        assert_eq!(sigv4_encode_segment("meta.llama3-8b"), "meta.llama3-8b");
+    }
+
+    #[test]
     fn sigv4_headers_always_includes_required_fields() {
         let config = BedrockConfig {
             region: "us-east-1".to_string(),
@@ -1016,6 +1147,18 @@ mod tests {
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0]["role"], "user");
         assert_eq!(msgs[0]["content"][0]["text"], "Hello");
+    }
+
+    #[test]
+    fn to_converse_messages_first_system_wins() {
+        // Only the first system message is captured; duplicates are ignored.
+        let messages = vec![
+            Message::system("first"),
+            Message::system("second"),
+            Message::user("hi"),
+        ];
+        let (system, _) = to_converse_messages(&messages);
+        assert_eq!(system.as_deref(), Some("first"));
     }
 
     #[test]

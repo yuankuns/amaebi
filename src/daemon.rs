@@ -13,6 +13,22 @@ use crate::ipc::{write_frame, Request, Response};
 use crate::memory_db;
 use crate::tools::{self, ToolExecutor};
 
+/// Strip the cross-region inference profile geo prefix from a Bedrock model ID.
+///
+/// Bedrock cross-region IDs like `us.anthropic.claude-3-5-sonnet-…` are
+/// identical to the base model `anthropic.claude-3-5-sonnet-…` for the
+/// purposes of token-budget estimation.  Normalising before table lookup
+/// avoids adding redundant `"us."` / `"eu."` / `"ap."` rows that would
+/// shadow more-specific provider rows (e.g. `"amazon.nova"` vs `"amazon."`).
+fn strip_cross_region_prefix(model: &str) -> &str {
+    for geo in &["us.", "eu.", "ap."] {
+        if let Some(rest) = model.strip_prefix(geo) {
+            return rest;
+        }
+    }
+    model
+}
+
 /// Compute `max_tokens` for a request to `model`: capped at half the model's context window
 /// so it never exceeds what the model supports (e.g. gpt-4's 8,192-token limit).
 fn max_output_tokens_for_model(model: &str) -> usize {
@@ -34,19 +50,21 @@ fn max_output_tokens_for_model(model: &str) -> usize {
         ("claude", 16_384),
         // Gemini models: all variants cap at 8k output.
         ("gemini", 8_192),
-        // Bedrock models (prefixed by provider or cross-region geo prefix).
-        // Claude via Bedrock: same 16 k cap as Copilot-hosted Claude.
+        // Bedrock models — matched after stripping any geo prefix (us./eu./ap.).
+        // Claude via Bedrock: same 16k cap as Copilot-hosted Claude.
         ("anthropic.", 16_384),
-        // Amazon Nova and Titan models: up to 5 k output.
+        // Amazon Nova and Titan models: up to 5k output.
         ("amazon.", 5_120),
-        // Catch-all for other Bedrock providers (Cohere, Meta, Mistral, …).
-        ("us.", 16_384),
-        ("eu.", 16_384),
-        ("ap.", 16_384),
+        // Other Bedrock providers (Cohere, Meta, Mistral, …): conservative 16k.
+        ("cohere.", 16_384),
+        ("meta.", 16_384),
+        ("mistral.", 16_384),
+        ("ai21.", 16_384),
     ];
+    let key = strip_cross_region_prefix(model);
     TABLE
         .iter()
-        .find(|(prefix, _)| model.starts_with(prefix))
+        .find(|(prefix, _)| key.starts_with(prefix))
         .map(|(_, limit)| *limit)
         .unwrap_or(16_384) // conservative default for unknown models
 }
@@ -229,21 +247,23 @@ fn context_limit_for_model(model: &str) -> usize {
         ("gemini-1.5-flash", 1_048_576), // Gemini 1.5 Flash: 1 M context
         ("gemini-1.0", 32_768),          // Gemini 1.0: 32 k context
         ("gemini", 128_000),             // conservative catch-all for other Gemini variants
-        // Bedrock models.
+        // Bedrock models — matched after stripping any geo prefix (us./eu./ap.).
         // Anthropic Claude on Bedrock: 200k context.
         ("anthropic.", 200_000),
         // Amazon Nova Pro/Lite/Micro: 300k; use conservative 200k.
         ("amazon.nova", 200_000),
         // Amazon Titan: 32k.
         ("amazon.", 32_768),
-        // Cross-region inference profiles: same as the base model family.
-        ("us.", 200_000),
-        ("eu.", 200_000),
-        ("ap.", 200_000),
+        // Other Bedrock providers: conservative 32k default.
+        ("cohere.", 128_000),
+        ("meta.", 128_000),
+        ("mistral.", 32_768),
+        ("ai21.", 256_000),
     ];
+    let key = strip_cross_region_prefix(model);
     TABLE
         .iter()
-        .find(|(prefix, _)| model.starts_with(prefix))
+        .find(|(prefix, _)| key.starts_with(prefix))
         .map(|(_, limit)| *limit)
         .unwrap_or(32_768) // conservative default for unknown models
 }
@@ -2463,6 +2483,41 @@ mod tests {
         // Catch-all for unrecognised Gemini variants.
         assert_eq!(context_limit_for_model("gemini-flash"), 128_000);
         assert_eq!(context_limit_for_model("gemini-pro"), 128_000);
+    }
+
+    #[test]
+    fn context_limit_bedrock_cross_region_normalized() {
+        // Cross-region prefixes (us./eu./ap.) must resolve to the same limit as
+        // the base provider — not a generic catch-all.
+        assert_eq!(
+            context_limit_for_model("us.anthropic.claude-3-5-sonnet-20241022-v2:0"),
+            200_000,
+            "us.anthropic.* must resolve to anthropic. (200k)"
+        );
+        assert_eq!(
+            context_limit_for_model("eu.amazon.nova-pro-v1:0"),
+            200_000,
+            "eu.amazon.nova.* must resolve to amazon.nova (200k)"
+        );
+        assert_eq!(
+            context_limit_for_model("ap.amazon.titan-text-lite-v1"),
+            32_768,
+            "ap.amazon.titan.* must resolve to amazon. (32k)"
+        );
+    }
+
+    #[test]
+    fn max_output_tokens_bedrock_cross_region_normalized() {
+        assert_eq!(
+            max_output_tokens_for_model("us.anthropic.claude-3-5-sonnet-20241022-v2:0"),
+            16_384,
+            "us.anthropic.* must resolve to anthropic. (16k)"
+        );
+        assert_eq!(
+            max_output_tokens_for_model("eu.amazon.titan-text-lite-v1"),
+            5_120,
+            "eu.amazon.* must resolve to amazon. (5k)"
+        );
     }
 
     #[test]
