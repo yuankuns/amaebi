@@ -1749,18 +1749,71 @@ async fn llm_error_path_surfaces_error_frame_and_daemon_stays_alive() {
     let client = connect_client(&daemon.socket);
 
     // Message 1: should result in an Error frame, no panic.
-    let r1 = send_message(&client, "trigger an llm error")
+    // Read directly from a live socket so we can assert no `Done` is emitted
+    // *after* the `Error` frame on the same connection.
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::UnixStream;
+
+    let stream = UnixStream::connect(&daemon.socket)
         .await
-        .expect("send_message (error case)");
+        .expect("connect socket for error-path check");
+    let (read_half, mut write_half) = tokio::io::split(stream);
+
+    let mut line = serde_json::to_string(&Request::Chat {
+        prompt: "trigger an llm error".to_string(),
+        tmux_pane: None,
+        session_id: None,
+        model: "gpt-4o".to_string(),
+    })
+    .expect("serialize chat request");
+    line.push('\n');
+    write_half
+        .write_all(line.as_bytes())
+        .await
+        .expect("write chat request");
+
+    let mut lines = BufReader::new(read_half).lines();
+    let mut saw_error = false;
+    let mut saw_done_before_error = false;
+    loop {
+        let next = tokio::time::timeout(Duration::from_secs(10), lines.next_line())
+            .await
+            .expect("timed out waiting for response frame")
+            .expect("failed reading response frame");
+        let Some(raw) = next else {
+            break;
+        };
+        if raw.is_empty() {
+            continue;
+        }
+        let frame: Response = serde_json::from_str(&raw).expect("parse response frame");
+        match frame {
+            Response::Error { .. } => {
+                saw_error = true;
+                break;
+            }
+            Response::Done => saw_done_before_error = true,
+            _ => {}
+        }
+    }
+
+    assert!(saw_error, "expected Error frame on LLM 422 failure");
     assert!(
-        r1.iter().any(|r| matches!(r, Response::Error { .. })),
-        "expected Error frame on LLM 422 failure: {r1:?}"
+        !saw_done_before_error,
+        "Done must not be emitted before Error in this flow"
     );
-    // Done is NOT sent after Error; ensure there is no Done either (clean terminal).
-    assert!(
-        !r1.iter().any(|r| matches!(r, Response::Done)),
-        "Done must not follow Error: {r1:?}"
-    );
+
+    // Ensure no trailing `Done` after `Error` on the same connection.
+    let trailing = tokio::time::timeout(Duration::from_millis(300), lines.next_line()).await;
+    if let Ok(Ok(Some(raw))) = trailing {
+        if !raw.is_empty() {
+            let frame: Response = serde_json::from_str(&raw).expect("parse trailing frame");
+            assert!(
+                !matches!(frame, Response::Done),
+                "Done must not follow Error: {frame:?}"
+            );
+        }
+    }
 
     // Message 2: daemon must still be alive and return a normal response.
     let r2 = send_message(&client, "retry after error")

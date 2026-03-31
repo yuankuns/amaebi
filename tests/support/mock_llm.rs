@@ -450,7 +450,8 @@ async fn handle_completion(
     let scripted = match item {
         QueuedItem::Response(r) => r,
         QueuedItem::Error { status, body } => {
-            let code = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            let code = StatusCode::from_u16(status)
+                .expect("invalid HTTP status code for scripted error in mock LLM server");
             return Err((code, body));
         }
     };
