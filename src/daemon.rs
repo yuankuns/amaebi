@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
-use crate::auth::{self, amaebi_home, TokenCache};
+use crate::auth::{amaebi_home, TokenCache};
 use crate::copilot::{self, ApiToolCall, ApiToolCallFunction, FinishReason, Message};
 use crate::cron;
 use crate::inbox::InboxStore;
@@ -1185,12 +1185,17 @@ where
         };
     }
 
-    // Non-Claude: use the GitHub Models endpoint with the raw OAuth token.
-    let oauth_token = auth::read_oauth_token()
-        .context("reading GitHub OAuth token for GitHub Models endpoint")?;
+    // Non-Claude: use the GitHub Models endpoint.  The Copilot JWT (from the
+    // same token cache) is the correct credential — the raw OAuth token
+    // typically lacks the `models` permission needed by this endpoint.
+    let token = state
+        .tokens
+        .get(&state.http)
+        .await
+        .context("refreshing API token for GitHub Models endpoint")?;
     copilot::stream_chat_models(
         &state.http,
-        &oauth_token,
+        &token,
         model,
         messages,
         tools,
