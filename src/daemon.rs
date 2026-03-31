@@ -18,6 +18,12 @@ use crate::tools::{self, ToolExecutor};
 fn max_output_tokens_for_model(model: &str) -> usize {
     // Ordered longest-prefix-first so that e.g. "gpt-4-turbo" beats "gpt-4".
     const TABLE: &[(&str, usize)] = &[
+        ("gpt-5.4", 32_768), // gpt-5.4 via Responses API
+        ("gpt-5.3", 32_768),
+        ("gpt-5.2", 32_768),
+        ("gpt-5.1", 32_768),
+        ("gpt-5-mini", 16_384),
+        ("gpt-5", 32_768), // catch-all for gpt-5 family
         ("gpt-4.1", 32_768),
         ("gpt-4o", 16_384),
         ("gpt-4-turbo", 4_096),
@@ -188,6 +194,8 @@ fn count_message_tokens(messages: &[Message]) -> usize {
 fn context_limit_for_model(model: &str) -> usize {
     // Ordered longest-prefix-first so that e.g. "gpt-4-turbo" beats "gpt-4".
     const TABLE: &[(&str, usize)] = &[
+        // gpt-5.x via Responses API: 128k context (conservative)
+        ("gpt-5", 128_000),
         ("gpt-4o", 128_000),
         ("gpt-4.1", 1_047_576),
         ("gpt-4-turbo", 128_000),
@@ -1116,15 +1124,25 @@ async fn compact_session(
 // Model dispatch
 // ---------------------------------------------------------------------------
 
-/// Send one model turn through the Copilot API.
+/// Returns `true` when `e` is the specific 400 indicating the model needs the
+/// Responses API (`/v1/responses`) instead of Chat Completions.
+fn is_unsupported_via_chat_completions(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<copilot::CopilotHttpError>()
+        .is_some_and(|he| {
+            he.status.as_u16() == 400 && he.body.contains("unsupported_api_for_model")
+        })
+}
+
+/// Send one model turn, with automatic endpoint selection and fallback.
 ///
-/// All models — Claude, GPT, Gemini — are sent to the same Copilot
-/// chat-completions endpoint.  The base URL is derived from the `proxy-ep`
-/// field embedded in the Copilot JWT so each user automatically reaches
-/// their account-specific gateway (individual, enterprise, etc.).
-///
-/// Token refresh and auth-error retry are handled here so call sites are
-/// simple.
+/// 1. The base URL is derived from the `proxy-ep` field in the Copilot JWT
+///    so each user reaches their account-specific gateway automatically.
+/// 2. All models try `/v1/chat/completions` first.
+/// 3. If the model returns `400 unsupported_api_for_model` (e.g. gpt-5.x),
+///    the request is transparently retried via `/v1/responses` (OpenAI
+///    Responses API), which uses a different request/response format handled
+///    by `crate::responses`.
+/// 4. Auth errors (401/403) evict the token cache and retry once.
 async fn invoke_model<W>(
     state: &DaemonState,
     model: &str,
@@ -1142,7 +1160,7 @@ where
         .await
         .context("refreshing Copilot API token")?;
 
-    match copilot::stream_chat(
+    let result = copilot::stream_chat(
         &state.http,
         &tok.value,
         &tok.base_url,
@@ -1152,13 +1170,34 @@ where
         max_tokens,
         writer,
     )
-    .await
-    {
+    .await;
+
+    match result {
         Ok(r) => Ok(r),
+
+        // Model requires Responses API — retry transparently.
+        Err(ref e) if is_unsupported_via_chat_completions(e) => {
+            tracing::debug!(
+                model,
+                "model not accessible via /chat/completions; retrying via Responses API"
+            );
+            crate::responses::stream_chat(
+                &state.http,
+                &tok.value,
+                model,
+                messages,
+                tools,
+                max_tokens,
+                writer,
+            )
+            .await
+        }
+
+        // Auth error — evict the token cache and retry once with a fresh token.
         Err(e) => {
             let is_auth_err = e
                 .downcast_ref::<copilot::CopilotHttpError>()
-                .is_some_and(|he| matches!(he.status.as_u16(), 400 | 401 | 403));
+                .is_some_and(|he| matches!(he.status.as_u16(), 401 | 403));
             if is_auth_err {
                 tracing::warn!(error = %e, "Copilot auth error; evicting token and retrying");
                 state.tokens.invalidate().await;
@@ -1167,7 +1206,9 @@ where
                     .get(&state.http)
                     .await
                     .context("fetching fresh Copilot token after auth error")?;
-                copilot::stream_chat(
+                // Use Chat Completions with fresh token; Responses API fallback
+                // applies here too if needed.
+                let r2 = copilot::stream_chat(
                     &state.http,
                     &fresh.value,
                     &fresh.base_url,
@@ -1177,7 +1218,23 @@ where
                     max_tokens,
                     writer,
                 )
-                .await
+                .await;
+                match r2 {
+                    Ok(r) => Ok(r),
+                    Err(ref e2) if is_unsupported_via_chat_completions(e2) => {
+                        crate::responses::stream_chat(
+                            &state.http,
+                            &fresh.value,
+                            model,
+                            messages,
+                            tools,
+                            max_tokens,
+                            writer,
+                        )
+                        .await
+                    }
+                    Err(e2) => Err(e2),
+                }
             } else {
                 Err(e)
             }
