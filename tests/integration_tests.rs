@@ -1465,16 +1465,11 @@ async fn steer_e2e_delivers_ack_and_injects_message() {
     let mut steer_sent = false;
 
     let read_result = tokio::time::timeout(Duration::from_secs(15), async {
-        while let Some(line) = lines
-            .next_line()
-            .await
-            .expect("reading response line")
-        {
+        while let Some(line) = lines.next_line().await.expect("reading response line") {
             if line.is_empty() {
                 continue;
             }
-            let frame: Response =
-                serde_json::from_str(&line).expect("parsing response frame");
+            let frame: Response = serde_json::from_str(&line).expect("parsing response frame");
             let done = matches!(frame, Response::Done | Response::Error { .. });
 
             // Inject Steer on the same socket the moment we see the ToolUse
@@ -1505,7 +1500,10 @@ async fn steer_e2e_delivers_ack_and_injects_message() {
     .await;
 
     read_result.expect("steer E2E test timed out after 15 s");
-    assert!(steer_sent, "ToolUse frame never appeared — steer not injected");
+    assert!(
+        steer_sent,
+        "ToolUse frame never appeared — steer not injected"
+    );
 
     // The daemon must have sent SteerAck confirming the message was consumed.
     assert!(
@@ -1615,10 +1613,7 @@ async fn sandbox_noop_child_does_not_expose_credentials() {
 
     // The daemon's HOME directory (which contains hosts.json) must not be
     // listed as a mount or otherwise mentioned in the child's context.
-    let home_str = daemon
-        .home
-        .to_str()
-        .expect("home path is valid UTF-8");
+    let home_str = daemon.home.to_str().expect("home path is valid UTF-8");
     assert!(
         !all_content.contains(home_str),
         "child context must not expose host HOME path {home_str:?}: {all_content}"
