@@ -1915,3 +1915,123 @@ async fn responses_api_fallback_on_unsupported_model() {
         reqs.len()
     );
 }
+
+/// All gpt-5.x model variants must trigger the Responses API fallback when
+/// /chat/completions returns 400 unsupported_api_for_model.
+#[tokio::test]
+async fn responses_api_fallback_all_gpt5_variants() {
+    for model in &["gpt-5.4", "gpt-5.4-mini", "gpt-5", "gpt-5-turbo"] {
+        let server = MockLlmServer::start().await;
+        server.enqueue_error(
+            400,
+            r#"{"error":{"code":"unsupported_api_for_model","message":"not via chat/completions"}}"#,
+        );
+        server.enqueue(ScriptedResponse::text_chunks(vec!["responses-ok"]));
+
+        let daemon = start_daemon(&server.url()).await.expect("start_daemon");
+        let client = connect_client(&daemon.socket);
+
+        let responses =
+            send_message_with_session(&client, "ping", &format!("sess-gpt5-{model}"), model)
+                .await
+                .expect("send_message");
+
+        let text = collect_text(&responses);
+        assert!(
+            text.contains("responses-ok"),
+            "model={model}: expected Responses API text; got: {text:?}"
+        );
+
+        let reqs = server.take_requests();
+        assert_eq!(
+            reqs.len(),
+            2,
+            "model={model}: expected 2 requests (chat/completions + /v1/responses), got {}",
+            reqs.len()
+        );
+    }
+}
+
+/// Claude and gpt-4o models must succeed via /chat/completions directly,
+/// without needing the Responses API fallback.
+#[tokio::test]
+async fn chat_completions_models_no_fallback_needed() {
+    for model in &["claude-sonnet-4.6", "claude-opus-4.6", "gpt-4o", "gpt-4.1"] {
+        let server = MockLlmServer::start().await;
+        // Enqueue exactly one response — if the daemon made a second request
+        // (fallback) the mock would error with "no scripted response queued".
+        server.enqueue(ScriptedResponse::text_chunks(vec!["direct-ok"]));
+
+        let daemon = start_daemon(&server.url()).await.expect("start_daemon");
+        let client = connect_client(&daemon.socket);
+
+        let responses =
+            send_message_with_session(&client, "ping", &format!("sess-direct-{model}"), model)
+                .await
+                .expect("send_message");
+
+        let text = collect_text(&responses);
+        assert!(
+            text.contains("direct-ok"),
+            "model={model}: expected direct response; got: {text:?}"
+        );
+
+        let reqs = server.take_requests();
+        assert_eq!(
+            reqs.len(),
+            1,
+            "model={model}: expected exactly 1 request (no fallback), got {}",
+            reqs.len()
+        );
+    }
+}
+
+/// Gemini models must route through the Copilot JWT endpoint and return
+/// a valid response via /chat/completions (no Responses API needed).
+#[tokio::test]
+async fn gemini_models_route_via_copilot_and_succeed() {
+    for model in &[
+        "gemini-2.5-pro",
+        "gemini-2.0-flash",
+        "gemini-1.5-pro",
+        "gemini-flash",
+    ] {
+        let server = MockLlmServer::start().await;
+        server.enqueue(ScriptedResponse::text_chunks(vec!["gemini-ok"]));
+
+        let daemon = start_daemon(&server.url()).await.expect("start_daemon");
+        let client = connect_client(&daemon.socket);
+
+        let responses =
+            send_message_with_session(&client, "ping", &format!("sess-gemini-{model}"), model)
+                .await
+                .expect("send_message");
+
+        let text = collect_text(&responses);
+        assert!(
+            text.contains("gemini-ok"),
+            "model={model}: expected response text; got: {text:?}"
+        );
+
+        // Exactly one request — direct /chat/completions, no fallback.
+        let reqs = server.take_requests();
+        assert_eq!(
+            reqs.len(),
+            1,
+            "model={model}: expected 1 request, got {}",
+            reqs.len()
+        );
+
+        // Copilot JWT must be present.
+        let auth = reqs[0]
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("authorization"))
+            .map(|(_, v)| v.as_str())
+            .unwrap_or("");
+        assert!(
+            auth.contains("test-api-token"),
+            "model={model}: Copilot JWT missing; got: {auth:?}"
+        );
+    }
+}
