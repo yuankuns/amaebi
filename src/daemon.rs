@@ -1743,6 +1743,17 @@ async fn inject_skill_files_from(messages: &mut Vec<Message>, amaebi_home: &std:
                 let trimmed = content.trim();
                 if !trimmed.is_empty() {
                     messages.push(Message::system(format!("{header}\n\n{trimmed}")));
+                    tracing::info!(
+                        file = %path.display(),
+                        header,
+                        bytes = trimmed.len(),
+                        "injected skill file"
+                    );
+                } else {
+                    tracing::debug!(
+                        file = %path.display(),
+                        "config file empty after trimming; skipping injection"
+                    );
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -1786,9 +1797,13 @@ async fn inject_skill_files_from(messages: &mut Vec<Message>, amaebi_home: &std:
              The following files can be loaded with read_file when the task involves \
              deployment, configuration, or troubleshooting:\n\n{list}"
         )));
+        tracing::info!(
+            files = ?available,
+            count = available.len(),
+            "injected on-demand operations docs pointer"
+        );
     }
 }
-
 // ---------------------------------------------------------------------------
 // Message construction
 // ---------------------------------------------------------------------------
