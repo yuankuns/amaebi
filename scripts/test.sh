@@ -107,6 +107,31 @@ if [[ "$RUN_DOCKER" == "1" ]]; then
         exit 1
     fi
 
+    # Preflight: ensure target/ is writable by the host user.
+    # Step 1 runs cargo as root inside Docker and can leave root-owned artifacts.
+    if [[ -d "$WORKDIR/target" ]] && ! [[ -w "$WORKDIR/target" ]]; then
+        echo "    detected non-writable target/, repairing ownership via docker..."
+        HOST_UID=$(id -u)
+        HOST_GID=$(id -g)
+        if docker run --rm \
+            --user 0:0 \
+            -v "$WORKDIR:/repo" \
+            "$DEV_IMAGE" \
+            sh -c "chown -R ${HOST_UID}:${HOST_GID} /repo/target || true"; then
+            if [[ -w "$WORKDIR/target" ]]; then
+                echo "    target ownership repaired"
+            else
+                echo "    ✗ target/ is still not writable after repair attempt."
+                echo "      Run manually: sudo chown -R ${HOST_UID}:${HOST_GID} $WORKDIR/target"
+                exit 1
+            fi
+        else
+            echo "    ✗ docker command failed while repairing target/ ownership."
+            echo "      Run manually: sudo chown -R ${HOST_UID}:${HOST_GID} $WORKDIR/target"
+            exit 1
+        fi
+    fi
+
     echo "    image:   amaebi-sandbox:bookworm-slim"
     echo "    running: cargo test -- --ignored"
     if "$HOST_CARGO" test -- --ignored; then ok; else fail; fi
