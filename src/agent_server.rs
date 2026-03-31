@@ -266,10 +266,16 @@ impl acp::Agent for AmaebiAgent {
         let (steer_tx, mut steer_rx) = tokio::sync::mpsc::channel::<Option<String>>(1);
         drop(steer_tx);
         tokio::task::spawn_local(async move {
-            let outcome =
-                run_agentic_loop(&state, &model, messages, &mut write_half, &mut steer_rx)
-                    .await
-                    .map_err(|e| format!("{e:#}"));
+            let outcome = run_agentic_loop(
+                &state,
+                &model,
+                messages,
+                &mut write_half,
+                &mut steer_rx,
+                true,
+            )
+            .await
+            .map_err(|e| format!("{e:#}"));
             let _ = result_tx.send(outcome);
             // Dropping write_half closes the pipe, signalling EOF to the reader.
         });
