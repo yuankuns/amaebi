@@ -1,9 +1,30 @@
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use tokio::process::Command;
 
-use crate::sandbox::{docker::DockerSandboxConfig, DockerSandbox, Sandbox};
+use crate::sandbox::{docker::DockerSandboxConfig, DockerSandbox, NoopSandbox, Sandbox};
+
+// ---------------------------------------------------------------------------
+// SpawnContext — shared state injected by the daemon for spawn_agent support
+// ---------------------------------------------------------------------------
+
+/// Context passed to `LocalExecutor` so the `spawn_agent` tool can launch a
+/// child agentic loop without holding a reference back to `DaemonState`
+/// (which would create a circular type dependency).
+pub struct SpawnContext {
+    /// HTTP client inherited from the parent daemon.
+    pub http: reqwest::Client,
+    /// Shared SQLite memory-DB connection.
+    pub db: Arc<Mutex<rusqlite::Connection>>,
+    /// Tracks sessions that currently have a compaction task in flight.
+    pub compacting_sessions: Arc<Mutex<HashSet<String>>>,
+    /// Shared Copilot token cache — reused by child agents to avoid redundant
+    /// token fetches.
+    pub tokens: Arc<crate::auth::TokenCache>,
+}
 
 // ---------------------------------------------------------------------------
 // ToolExecutor trait
@@ -39,10 +60,18 @@ pub struct LocalExecutor {
     /// Optional sandbox backend. When `Some`, `shell_command` runs inside the
     /// sandbox instead of directly on the host.
     pub sandbox: Option<Box<dyn Sandbox>>,
+    /// Optional context for the `spawn_agent` tool.  Injected by the daemon
+    /// at startup; `None` in child agents to prevent unbounded recursion.
+    pub spawn_ctx: Option<Arc<SpawnContext>>,
+    /// Default working directory for `shell_command` when a sandbox is active.
+    /// Set to the agent's workspace in child executors so sandbox cwd matches
+    /// the mounted workspace rather than the daemon process cwd.
+    pub default_cwd: Option<PathBuf>,
 }
 
 impl LocalExecutor {
     pub fn new() -> Self {
+        let mut default_cwd: Option<PathBuf> = None;
         let sandbox: Option<Box<dyn Sandbox>> = match std::env::var("AMAEBI_SANDBOX").as_deref() {
             Ok("docker") => {
                 let image = std::env::var("AMAEBI_SANDBOX_IMAGE")
@@ -50,16 +79,22 @@ impl LocalExecutor {
                 let workspace = std::env::var("AMAEBI_SANDBOX_WORKSPACE")
                     .map(PathBuf::from)
                     .unwrap_or_else(|_| std::env::current_dir().unwrap_or_default());
+                default_cwd = Some(workspace.clone());
                 Some(Box::new(DockerSandbox::new(DockerSandboxConfig {
                     image,
                     workspace,
                     ro_paths: vec![],
                     rw_paths: vec![],
+                    env: HashMap::new(),
                 })))
             }
             _ => None,
         };
-        Self { sandbox }
+        Self {
+            sandbox,
+            spawn_ctx: None,
+            default_cwd,
+        }
     }
 }
 
@@ -68,11 +103,20 @@ impl ToolExecutor for LocalExecutor {
     async fn execute(&self, name: &str, args: serde_json::Value) -> Result<String> {
         tracing::debug!(tool = %name, "executing tool");
         match name {
-            "shell_command" => shell_command(args, self.sandbox.as_deref()).await,
+            "shell_command" => {
+                shell_command(args, self.sandbox.as_deref(), self.default_cwd.as_deref()).await
+            }
             "tmux_capture_pane" => tmux_capture_pane(args).await,
             "tmux_send_keys" => tmux_send_keys(args).await,
             "read_file" => read_file(args).await,
             "edit_file" => edit_file(args).await,
+            "spawn_agent" => match &self.spawn_ctx {
+                Some(ctx) => spawn_agent(args, ctx).await,
+                None => anyhow::bail!(
+                    "spawn_agent is not available in this context \
+                     (child agents cannot spawn further agents)"
+                ),
+            },
             other => anyhow::bail!("unknown tool: {other}"),
         }
     }
@@ -85,7 +129,11 @@ impl ToolExecutor for LocalExecutor {
 /// Run an arbitrary shell command, capturing stdout+stderr.
 /// If a sandbox is provided the command runs inside it; otherwise it runs
 /// directly on the host via `sh -c`.
-async fn shell_command(args: serde_json::Value, sandbox: Option<&dyn Sandbox>) -> Result<String> {
+async fn shell_command(
+    args: serde_json::Value,
+    sandbox: Option<&dyn Sandbox>,
+    default_cwd: Option<&Path>,
+) -> Result<String> {
     let command = args["command"]
         .as_str()
         .context("shell_command: missing string argument 'command'")?;
@@ -93,7 +141,11 @@ async fn shell_command(args: serde_json::Value, sandbox: Option<&dyn Sandbox>) -
     tracing::debug!(command = %command, "running shell command");
 
     let (stdout, stderr, exit_code, success) = if let Some(sb) = sandbox {
-        let cwd = std::env::current_dir().context("shell_command: getting current directory")?;
+        let cwd = if let Some(dcwd) = default_cwd {
+            dcwd.to_path_buf()
+        } else {
+            std::env::current_dir().context("shell_command: getting current directory")?
+        };
         let out = sb.spawn(command, &cwd).await?;
         let success = out.exit_code == 0;
         (out.stdout, out.stderr, out.exit_code, success)
@@ -185,6 +237,214 @@ async fn read_file(args: serde_json::Value) -> Result<String> {
         .with_context(|| format!("read_file: reading '{path}'"))
 }
 
+/// Spawn a child agent session to complete a task in an isolated sandbox.
+///
+/// # Sandbox selection
+///
+/// - When `AMAEBI_SPAWN_SANDBOX=noop` is set, a [`NoopSandbox`] is used
+///   (runs commands directly on the host). Intended for tests.
+/// - Otherwise a [`DockerSandbox`] is created with `--network none`.
+///   If Docker is not available, an error is returned.
+///
+/// # Recursion prevention
+///
+/// The child executor is created with `spawn_ctx: None` so it cannot
+/// call `spawn_agent` itself.
+/// TODO: enforce a depth limit for nested agents if needed.
+async fn spawn_agent(args: serde_json::Value, ctx: &SpawnContext) -> Result<String> {
+    let task = args["task"]
+        .as_str()
+        .context("spawn_agent: missing string argument 'task'")?;
+    let workspace = PathBuf::from(
+        args["workspace"]
+            .as_str()
+            .context("spawn_agent: missing string argument 'workspace'")?,
+    );
+
+    // Fix 1: validate workspace path early.
+    if !workspace.is_absolute() {
+        anyhow::bail!(
+            "spawn_agent: workspace must be an absolute path, got: {}",
+            workspace.display()
+        );
+    }
+    if !workspace.exists() {
+        anyhow::bail!(
+            "spawn_agent: workspace does not exist: {}",
+            workspace.display()
+        );
+    }
+    if !workspace.is_dir() {
+        anyhow::bail!(
+            "spawn_agent: workspace is not a directory: {}",
+            workspace.display()
+        );
+    }
+    let workspace = workspace.canonicalize().with_context(|| {
+        format!(
+            "spawn_agent: canonicalizing workspace: {}",
+            workspace.display()
+        )
+    })?;
+
+    // Fix 4: inherit the parent's current model when the tool caller does not
+    // specify one explicitly.
+    let model = args["model"]
+        .as_str()
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| std::env::var("AMAEBI_MODEL").unwrap_or_else(|_| "gpt-4o".to_string()));
+
+    let extra_mounts = args["extra_mounts"].as_array().cloned().unwrap_or_default();
+    let mut ro_paths: Vec<PathBuf> = vec![];
+    let mut rw_paths: Vec<PathBuf> = vec![];
+    for mount in &extra_mounts {
+        let path = PathBuf::from(
+            mount["path"]
+                .as_str()
+                .context("extra_mounts[].path must be a string")?,
+        );
+        if !path.is_absolute() {
+            anyhow::bail!(
+                "spawn_agent: extra_mounts path must be absolute, got: {}",
+                path.display()
+            );
+        }
+        if !path.exists() {
+            anyhow::bail!(
+                "spawn_agent: extra_mounts path does not exist: {}",
+                path.display()
+            );
+        }
+        let canonical_path = path
+            .canonicalize()
+            .with_context(|| format!("extra_mounts: canonicalizing path: {}", path.display()))?;
+        let readonly = mount["readonly"].as_bool().unwrap_or(false);
+        if readonly {
+            ro_paths.push(canonical_path);
+        } else {
+            rw_paths.push(canonical_path);
+        }
+    }
+    let env: HashMap<String, String> = if let Some(obj) = args["env"].as_object() {
+        let mut map = HashMap::new();
+        for (k, v) in obj {
+            let val = v.as_str().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "spawn_agent: env value for key {} must be a string, got: {}",
+                    k,
+                    v
+                )
+            })?;
+            map.insert(k.clone(), val.to_string());
+        }
+        map
+    } else {
+        HashMap::new()
+    };
+
+    // Fix 3: build sandbox preamble accurately based on which backend will be used.
+    let using_noop = std::env::var("AMAEBI_SPAWN_SANDBOX").as_deref() == Ok("noop");
+    let mut context_lines = vec![
+        "[Sandbox Context]".to_string(),
+        if using_noop {
+            "You are running with a noop sandbox (no isolation); commands execute directly on the host.".to_string()
+        } else {
+            "You are running inside an isolated Docker sandbox.".to_string()
+        },
+        format!("- Working directory (read-write): {}", workspace.display()),
+    ];
+    for mount in &extra_mounts {
+        if let Some(path) = mount["path"].as_str() {
+            let readonly = mount["readonly"].as_bool().unwrap_or(false);
+            let mode = if readonly { "read-only" } else { "read-write" };
+            context_lines.push(format!("- Mount ({mode}): {path}"));
+        }
+    }
+    if !using_noop {
+        context_lines.push(
+            "- /tmp is isolated from the host; files written here do not persist across sessions"
+                .to_string(),
+        );
+        context_lines.push("- No outbound network access".to_string());
+    }
+    context_lines
+        .push("- Do not attempt to access paths outside the listed mounts above".to_string());
+    context_lines.push(String::new());
+    context_lines.push("Task:".to_string());
+    context_lines.push(task.to_string());
+    let full_task = context_lines.join("\n");
+
+    tracing::info!(task = %task, workspace = %workspace.display(), model = %model, "spawn_agent: starting child agent");
+
+    // Build the child sandbox.
+    let child_sandbox: Box<dyn Sandbox> =
+        if std::env::var("AMAEBI_SPAWN_SANDBOX").as_deref() == Ok("noop") {
+            Box::new(NoopSandbox)
+        } else {
+            let image = std::env::var("AMAEBI_SANDBOX_IMAGE")
+                .unwrap_or_else(|_| "amaebi-sandbox:bookworm-slim".to_string());
+            let docker = DockerSandbox::new(DockerSandboxConfig {
+                image,
+                workspace: workspace.clone(),
+                ro_paths,
+                rw_paths,
+                env,
+            });
+            if !docker.available() {
+                anyhow::bail!("Docker is not available; cannot spawn agent");
+            }
+            Box::new(docker)
+        };
+
+    // Child executor: no spawn_ctx (prevents unbounded recursion), and cwd
+    // defaults to the workspace so sandbox commands start in the right place.
+    let child_executor = LocalExecutor {
+        sandbox: Some(child_sandbox),
+        spawn_ctx: None,
+        default_cwd: Some(workspace.clone()),
+    };
+
+    // Build a minimal DaemonState for the child: reuse the parent's HTTP
+    // client, DB, compacting-sessions set, and shared token cache.  The child
+    // has no spawn_ctx so it cannot recursively spawn further agents.
+    let child_state = crate::daemon::DaemonState {
+        http: ctx.http.clone(),
+        tokens: Arc::clone(&ctx.tokens),
+        executor: Box::new(child_executor),
+        db: Arc::clone(&ctx.db),
+        compacting_sessions: Arc::clone(&ctx.compacting_sessions),
+    };
+
+    let messages = vec![
+        crate::copilot::Message::system(
+            "You are a child agent completing a specific task in an isolated sandbox. \
+             Use available tools to complete the task, then provide a concise summary \
+             of what you did and the outcome.",
+        ),
+        crate::copilot::Message::user(full_task),
+    ];
+
+    let mut sink = tokio::io::sink();
+    // Drop the sender immediately so the child loop treats the session as
+    // non-interactive (no steering, no question-asking).
+    let (_, mut steer_rx) = tokio::sync::mpsc::channel::<Option<String>>(1);
+
+    // Fix 5: child agents do not get spawn_agent in their tool schema to
+    // prevent unbounded recursion at the schema level.
+    let (final_text, _) = crate::daemon::run_agentic_loop(
+        &child_state,
+        &model,
+        messages,
+        &mut sink,
+        &mut steer_rx,
+        false,
+    )
+    .await?;
+
+    tracing::info!(result_len = %final_text.len(), "spawn_agent: child agent completed");
+    Ok(final_text)
+}
+
 /// Overwrite a file with new content.
 async fn edit_file(args: serde_json::Value) -> Result<String> {
     let path = args["path"]
@@ -205,9 +465,12 @@ async fn edit_file(args: serde_json::Value) -> Result<String> {
 // Tool schemas (OpenAI function-calling format)
 // ---------------------------------------------------------------------------
 
-/// Return the JSON schema array to include in every chat request.
-pub fn tool_schemas() -> Vec<serde_json::Value> {
-    vec![
+/// Return the JSON schema array to include in a chat request.
+///
+/// Pass `include_spawn_agent = true` for the parent (daemon) context.
+/// Pass `false` for child agent loops to prevent recursive spawning.
+pub fn tool_schemas(include_spawn_agent: bool) -> Vec<serde_json::Value> {
+    let mut schemas = vec![
         serde_json::json!({
             "type": "function",
             "function": {
@@ -307,7 +570,68 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                 }
             }
         }),
-    ]
+    ];
+    if include_spawn_agent {
+        schemas.push(serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "spawn_agent",
+                "description": "Spawn a child agent session to complete a task. \
+                                The child runs in an isolated Docker sandbox \
+                                (--network none) with its own workspace.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "task": {
+                            "type": "string",
+                            "description": "The task for the child agent to complete."
+                        },
+                        "workspace": {
+                            "type": "string",
+                            "description": "Absolute path to the workspace directory \
+                                            (e.g. a git worktree). Will be bind-mounted rw."
+                        },
+                        "model": {
+                            "type": "string",
+                            "description": "LLM model to use (optional; defaults to the AMAEBI_MODEL \
+                                            environment variable, or gpt-4o if unset)."
+                        },
+                        "extra_mounts": {
+                            "type": "array",
+                            "description": "Additional directories to mount into the sandbox (optional). \
+                                            Each path must be absolute and exist on the host.",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "path": {
+                                        "type": "string",
+                                        "description": "Absolute path on the host."
+                                    },
+                                    "readonly": {
+                                        "type": "boolean",
+                                        "description": "Mount as read-only (default: false)."
+                                    }
+                                },
+                                "required": ["path"]
+                            }
+                        },
+                        "env": {
+                            "type": "object",
+                            "description": "Environment variables to set inside the sandbox container (e.g. HTTP_PROXY).",
+                            "additionalProperties": { "type": "string" }
+                        },
+                        "parallel": {
+                            "type": "boolean",
+                            "description": "If true, this call may run concurrently with other spawn_agent calls \
+                                            in the same batch (default: false)."
+                        }
+                    },
+                    "required": ["task", "workspace"]
+                }
+            }
+        }));
+    }
+    schemas
 }
 
 // ---------------------------------------------------------------------------
@@ -317,13 +641,14 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use tempfile::TempDir;
 
     // ---- tool_schemas ----------------------------------------------------
 
     #[test]
     fn tool_schemas_have_expected_names() {
-        let schemas = tool_schemas();
+        let schemas = tool_schemas(true);
         let names: Vec<&str> = schemas
             .iter()
             .map(|s| s["function"]["name"].as_str().unwrap())
@@ -334,6 +659,7 @@ mod tests {
             "tmux_send_keys",
             "read_file",
             "edit_file",
+            "spawn_agent",
         ] {
             assert!(names.contains(&name), "missing tool: {name}");
         }
@@ -341,7 +667,7 @@ mod tests {
 
     #[test]
     fn tool_schemas_all_have_type_function() {
-        for schema in tool_schemas() {
+        for schema in tool_schemas(true) {
             assert_eq!(
                 schema["type"].as_str().unwrap(),
                 "function",
@@ -353,13 +679,80 @@ mod tests {
 
     #[test]
     fn tool_schemas_all_have_parameters_with_required_array() {
-        for schema in tool_schemas() {
+        for schema in tool_schemas(true) {
             let name = schema["function"]["name"].as_str().unwrap();
             assert!(
                 schema["function"]["parameters"]["required"].is_array(),
                 "missing required array for {name}"
             );
         }
+    }
+
+    // ---- spawn_agent schema -------------------------------------------------
+
+    #[test]
+    fn spawn_agent_schema_has_extra_mounts() {
+        let schemas = tool_schemas(true);
+        let spawn = schemas
+            .iter()
+            .find(|s| s["function"]["name"].as_str() == Some("spawn_agent"))
+            .expect("spawn_agent schema missing");
+        let props = &spawn["function"]["parameters"]["properties"];
+        assert!(
+            props["extra_mounts"].is_object(),
+            "extra_mounts property missing from spawn_agent schema"
+        );
+        assert_eq!(
+            props["extra_mounts"]["type"].as_str(),
+            Some("array"),
+            "extra_mounts should be type array"
+        );
+        // items.required must include "path"
+        let required = &props["extra_mounts"]["items"]["required"];
+        assert!(
+            required
+                .as_array()
+                .is_some_and(|r| r.iter().any(|v| v.as_str() == Some("path"))),
+            "extra_mounts items must require 'path'"
+        );
+    }
+
+    #[test]
+    fn spawn_agent_schema_has_env() {
+        let schemas = tool_schemas(true);
+        let spawn = schemas
+            .iter()
+            .find(|s| s["function"]["name"].as_str() == Some("spawn_agent"))
+            .expect("spawn_agent schema missing");
+        let props = &spawn["function"]["parameters"]["properties"];
+        assert!(
+            props["env"].is_object(),
+            "env property missing from spawn_agent schema"
+        );
+        assert_eq!(
+            props["env"]["type"].as_str(),
+            Some("object"),
+            "env should be type object"
+        );
+        assert!(
+            props["env"]["additionalProperties"].is_object(),
+            "env should have additionalProperties"
+        );
+    }
+
+    #[test]
+    fn spawn_agent_schema_has_parallel() {
+        let schemas = tool_schemas(true);
+        let spawn = schemas
+            .iter()
+            .find(|s| s["function"]["name"].as_str() == Some("spawn_agent"))
+            .expect("spawn_agent schema missing");
+        let props = &spawn["function"]["parameters"]["properties"];
+        assert_eq!(
+            props["parallel"]["type"].as_str(),
+            Some("boolean"),
+            "parallel property should be type boolean in spawn_agent schema"
+        );
     }
 
     // ---- shell_command ---------------------------------------------------
@@ -494,6 +887,7 @@ mod tests {
     // ---- LocalExecutor::new env-var wiring ----------------------------------
 
     #[test]
+    #[serial]
     fn new_without_env_var_has_no_sandbox() {
         std::env::remove_var("AMAEBI_SANDBOX");
         let exec = LocalExecutor::new();
@@ -501,6 +895,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn new_with_docker_env_var_creates_docker_sandbox() {
         std::env::set_var("AMAEBI_SANDBOX", "docker");
         let exec = LocalExecutor::new();
@@ -510,6 +905,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn new_with_sandbox_workspace_env_var_uses_that_path() {
         std::env::set_var("AMAEBI_SANDBOX", "docker");
         std::env::set_var("AMAEBI_SANDBOX_WORKSPACE", "/tmp/my-worktree");
@@ -517,9 +913,15 @@ mod tests {
         std::env::remove_var("AMAEBI_SANDBOX");
         std::env::remove_var("AMAEBI_SANDBOX_WORKSPACE");
         assert!(exec.sandbox.is_some());
+        assert_eq!(
+            exec.default_cwd.as_deref(),
+            Some(std::path::Path::new("/tmp/my-worktree")),
+            "default_cwd should be set to AMAEBI_SANDBOX_WORKSPACE"
+        );
     }
 
     #[test]
+    #[serial]
     fn new_with_unknown_env_var_value_has_no_sandbox() {
         std::env::set_var("AMAEBI_SANDBOX", "unknown");
         let exec = LocalExecutor::new();
@@ -533,10 +935,122 @@ mod tests {
     async fn shell_command_with_noop_sandbox() {
         let exec = LocalExecutor {
             sandbox: Some(Box::new(crate::sandbox::NoopSandbox)),
+            spawn_ctx: None,
+            default_cwd: None,
         };
         let args = serde_json::json!({"command": "echo hello"});
         let result = exec.execute("shell_command", args).await.unwrap();
         assert!(result.contains("hello"));
+    }
+
+    #[tokio::test]
+    async fn shell_command_noop_sandbox_uses_default_cwd() {
+        let tmp = TempDir::new().unwrap();
+        let exec = LocalExecutor {
+            sandbox: Some(Box::new(crate::sandbox::NoopSandbox)),
+            spawn_ctx: None,
+            default_cwd: Some(tmp.path().to_path_buf()),
+        };
+        // pwd should print the default_cwd, not the daemon process cwd.
+        let result = exec
+            .execute("shell_command", serde_json::json!({"command": "pwd"}))
+            .await
+            .unwrap();
+        assert!(
+            result
+                .trim()
+                .ends_with(tmp.path().file_name().unwrap().to_str().unwrap()),
+            "expected cwd under tmp, got: {result}"
+        );
+    }
+
+    // ---- tool_schemas include/exclude spawn_agent -----------------------
+
+    #[test]
+    fn tool_schemas_false_excludes_spawn_agent() {
+        let schemas = tool_schemas(false);
+        let names: Vec<&str> = schemas
+            .iter()
+            .map(|s| s["function"]["name"].as_str().unwrap())
+            .collect();
+        assert!(
+            !names.contains(&"spawn_agent"),
+            "spawn_agent should be excluded when include_spawn_agent=false"
+        );
+        // Core tools must still be present.
+        for name in ["shell_command", "read_file", "edit_file"] {
+            assert!(names.contains(&name), "missing core tool: {name}");
+        }
+    }
+
+    #[test]
+    fn tool_schemas_true_includes_spawn_agent() {
+        let schemas = tool_schemas(true);
+        let names: Vec<&str> = schemas
+            .iter()
+            .map(|s| s["function"]["name"].as_str().unwrap())
+            .collect();
+        assert!(
+            names.contains(&"spawn_agent"),
+            "spawn_agent should be present when include_spawn_agent=true"
+        );
+    }
+
+    // ---- spawn_agent workspace validation --------------------------------
+
+    #[tokio::test]
+    #[serial]
+    async fn spawn_agent_rejects_relative_workspace() {
+        let ctx = make_spawn_ctx();
+        let result = spawn_agent(
+            serde_json::json!({"task": "t", "workspace": "relative/path"}),
+            &ctx,
+        )
+        .await;
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("absolute"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn spawn_agent_rejects_nonexistent_workspace() {
+        let ctx = make_spawn_ctx();
+        let result = spawn_agent(
+            serde_json::json!({"task": "t", "workspace": "/tmp/amaebi_test_nonexistent_xyz"}),
+            &ctx,
+        )
+        .await;
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("does not exist"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn spawn_agent_rejects_workspace_that_is_a_file() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("notadir.txt");
+        std::fs::write(&file, "x").unwrap();
+        let ctx = make_spawn_ctx();
+        let result = spawn_agent(
+            serde_json::json!({"task": "t", "workspace": file.to_str().unwrap()}),
+            &ctx,
+        )
+        .await;
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("not a directory"), "got: {msg}");
+    }
+
+    /// Helper: build a minimal SpawnContext suitable for unit tests.
+    fn make_spawn_ctx() -> SpawnContext {
+        SpawnContext {
+            http: reqwest::Client::new(),
+            db: Arc::new(Mutex::new(rusqlite::Connection::open_in_memory().unwrap())),
+            compacting_sessions: Arc::new(Mutex::new(HashSet::new())),
+            tokens: Arc::new(crate::auth::TokenCache::new()),
+        }
     }
 
     // ---- unknown tool ---------------------------------------------------

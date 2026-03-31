@@ -278,6 +278,51 @@ fn find_amaebi_binary() -> Result<PathBuf> {
 }
 
 // ---------------------------------------------------------------------------
+// Cron helpers
+// ---------------------------------------------------------------------------
+
+/// Create a fresh home directory with `.amaebi/hosts.json` pre-populated.
+///
+/// Use this when you need to pre-seed a cron job (or other amaebi state)
+/// before starting the daemon.
+pub fn setup_home() -> Result<TempDir> {
+    let home_dir = TempDir::new().context("creating temp HOME")?;
+    let amaebi_dir = home_dir.path().join(".amaebi");
+    std::fs::create_dir_all(&amaebi_dir).context("creating .amaebi dir")?;
+    std::fs::write(
+        amaebi_dir.join("hosts.json"),
+        r#"{"github.com": {"oauth_token": "test-oauth-token", "user": "test-user"}}"#,
+    )
+    .context("writing dummy hosts.json")?;
+    Ok(home_dir)
+}
+
+/// Seed a cron job into `<home_path>/.amaebi/cron.db` using the amaebi CLI.
+///
+/// `HOME` is set to `home_path` so the cron.db lands in the right place.
+/// No auth tokens are needed — `cron add` is a pure SQLite write.
+pub async fn seed_cron_job(home_path: &Path, description: &str, schedule: &str) -> Result<()> {
+    let exe = find_amaebi_binary()?;
+    let output = Command::new(&exe)
+        .arg("cron")
+        .arg("add")
+        .arg(description)
+        .arg("--cron")
+        .arg(schedule)
+        .env("HOME", home_path)
+        .output()
+        .await
+        .context("running amaebi cron add")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "amaebi cron add failed (exit {}): {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Client helpers
 // ---------------------------------------------------------------------------
 

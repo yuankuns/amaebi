@@ -6,7 +6,7 @@
 //! 3. Connects a client to the daemon socket.
 //! 4. Exercises the daemon and asserts on the responses / captured requests.
 //!
-//! ## Current tests (8 total)
+//! ## Current tests (18 total)
 //!
 //! 1. `test_basic_chat_roundtrip` — basic chat round-trip
 //! 2. `test_tool_call_roundtrip` — tool-call round-trip (shell echo)
@@ -16,13 +16,24 @@
 //! 6. `test_compaction_preserves_summary` — summary text appears in next turn's messages
 //! 7. `test_hot_tail_preserved_after_compaction` — message count bounded to hot tail after compaction
 //! 8. `test_pre_flight_trim_on_resume` — resume loads history; pre-flight trim fires at low threshold
+//! 9. `spawn_agent_runs_task` — parent spawns child agent; child runs echo; parent gets result
+//! 10. `spawn_agent_child_cannot_spawn` — child agent cannot recursively call spawn_agent
+//! 11. `spawn_agent_uses_specified_model` — child agent uses the model from spawn_agent args
+//! 12. `spawn_agent_missing_workspace_returns_error` — missing workspace arg yields tool error to parent
+//! 13. `spawn_agent_workspace_passed_to_sandbox` — workspace path appears in child agent's LLM context
+//! 14. `spawn_agent_parallel_calls` — two spawn_agent calls with parallel=true run concurrently
+//! 15. `spawn_agent_parallel_timing` — parallel=true batch completes in ~5s not ~10s (ignored)
+//! 16. `cron_job_triggers_llm_call` — scheduled cron job fires and calls the LLM with the task prompt
+//! 17. `cron_job_result_not_sent_to_chat` — cron output goes to inbox only, never to the chat stream
+//! 18. `cron_job_with_spawn_agent` — cron job can call spawn_agent; child runs and returns result
 
 mod support;
 
 use support::{
     helpers::{
-        collect_text, connect_client, send_message, send_message_with_session, send_resume,
-        start_daemon, start_daemon_at_home_with_env, start_daemon_with_env,
+        collect_text, connect_client, seed_cron_job, send_message, send_message_with_session,
+        send_resume, setup_home, start_daemon, start_daemon_at_home_with_env,
+        start_daemon_with_env,
     },
     mock_llm::{MockLlmServer, ScriptedResponse},
 };
@@ -653,4 +664,732 @@ async fn test_pre_flight_trim_on_resume() {
 
     let _ = child3.kill().await;
     let _ = child3.wait().await;
+}
+
+// ---------------------------------------------------------------------------
+// 9. spawn_agent tool — child agent runs a task in a sandbox
+// ---------------------------------------------------------------------------
+
+/// The parent agent calls `spawn_agent`.  The child agent uses `shell_command`
+/// to run `echo hello`, then the child loop ends.  The parent receives the
+/// child's result as the tool output and returns a final response.
+///
+/// Uses `AMAEBI_SPAWN_SANDBOX=noop` so no Docker is required.
+#[tokio::test]
+async fn spawn_agent_runs_task() {
+    let server = MockLlmServer::start().await;
+
+    // 1. Parent agent first turn: LLM asks to spawn a child agent.
+    server.enqueue(ScriptedResponse::tool_call(
+        "call-spawn-001",
+        "spawn_agent",
+        r#"{"task":"run echo hello","workspace":"/tmp"}"#,
+    ));
+    // 2. Child agent first turn: LLM asks to run shell_command.
+    server.enqueue(ScriptedResponse::tool_call(
+        "call-shell-001",
+        "shell_command",
+        r#"{"command":"echo hello"}"#,
+    ));
+    // 3. Child agent second turn (after tool result): LLM returns final text.
+    server.enqueue(ScriptedResponse::text_chunks(vec!["hello"]));
+    // 4. Parent agent second turn (after spawn_agent result): final response.
+    server.enqueue(ScriptedResponse::text_chunks(vec!["Task done: hello"]));
+
+    let daemon = start_daemon_with_env(&server.url(), &[("AMAEBI_SPAWN_SANDBOX", "noop")])
+        .await
+        .expect("start_daemon");
+    let client = connect_client(&daemon.socket);
+
+    let responses = send_message(&client, "run a child task")
+        .await
+        .expect("send_message");
+
+    let text = collect_text(&responses);
+    assert!(
+        text.contains("hello"),
+        "expected 'hello' in response: {text:?}"
+    );
+
+    // Mock should have served exactly 4 requests: 2 for parent, 2 for child.
+    let reqs = server.take_requests();
+    assert_eq!(reqs.len(), 4, "expected 4 LLM requests, got {}", reqs.len());
+}
+
+// ---------------------------------------------------------------------------
+// 10. spawn_agent recursion prevention
+// ---------------------------------------------------------------------------
+
+/// A child agent must NOT be able to call spawn_agent itself.
+///
+/// Scenario:
+///   1. Parent LLM → calls spawn_agent
+///   2. Child LLM → calls spawn_agent (recursion attempt)
+///   3. Child tool executor returns error immediately (no extra LLM call)
+///   4. Child sends tool_result (error) → LLM returns final text reporting error
+///   5. Parent receives child output → LLM returns final response
+///
+/// Uses `AMAEBI_SPAWN_SANDBOX=noop` so no Docker is required.
+#[tokio::test]
+async fn spawn_agent_child_cannot_spawn() {
+    let server = MockLlmServer::start().await;
+
+    // 1. Parent agent first turn: LLM asks to spawn a child agent.
+    server.enqueue(ScriptedResponse::tool_call(
+        "call-spawn-parent",
+        "spawn_agent",
+        r#"{"task":"try to spawn another agent","workspace":"/tmp"}"#,
+    ));
+    // 2. Child agent first turn: LLM asks to spawn_agent (recursion attempt).
+    server.enqueue(ScriptedResponse::tool_call(
+        "call-spawn-child",
+        "spawn_agent",
+        r#"{"task":"nested","workspace":"/tmp"}"#,
+    ));
+    // 3. Child agent second turn: after the tool error is fed back, LLM returns final text.
+    server.enqueue(ScriptedResponse::text_chunks(vec![
+        "Child got error: spawn_agent not available",
+    ]));
+    // 4. Parent agent second turn: after child result, LLM returns final text.
+    server.enqueue(ScriptedResponse::text_chunks(vec![
+        "Parent done. Child reported recursion error.",
+    ]));
+
+    let daemon = start_daemon_with_env(&server.url(), &[("AMAEBI_SPAWN_SANDBOX", "noop")])
+        .await
+        .expect("start_daemon");
+    let client = connect_client(&daemon.socket);
+
+    let responses = send_message(&client, "try to spawn recursively")
+        .await
+        .expect("send_message");
+
+    let text = collect_text(&responses);
+    assert!(
+        text.contains("Parent done."),
+        "expected parent final text in response: {text:?}"
+    );
+
+    // Verify the child received a spawn_agent error in its tool result by
+    // checking the LLM received exactly 4 requests (2 parent + 2 child).
+    let reqs = server.take_requests();
+    assert_eq!(
+        reqs.len(),
+        4,
+        "expected 4 LLM requests (2 parent + 2 child), got {}",
+        reqs.len()
+    );
+
+    // The child's second request (index 2) must contain a tool_result message
+    // whose content includes the "spawn_agent is not available" error.
+    let child_second_req = &reqs[2];
+    let messages = child_second_req
+        .messages()
+        .expect("messages in child second request");
+    let all_content: String = messages
+        .iter()
+        .filter_map(|m| m.get("content").and_then(|c| c.as_str()))
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        all_content.contains("spawn_agent is not available"),
+        "expected spawn_agent error in child tool result, got:\n{all_content}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 11. spawn_agent model selection
+// ---------------------------------------------------------------------------
+
+/// When spawn_agent is called with a "model" argument, the child agent must use
+/// that model for its LLM requests.
+///
+/// Flow:
+///   1. Parent turn 1 → calls spawn_agent with model:"custom-model-123"
+///   2. Child turn 1 (uses custom-model-123) → returns final text
+///   3. Parent turn 2 → returns final text
+///
+/// Uses `AMAEBI_SPAWN_SANDBOX=noop` so no Docker is required.
+#[tokio::test]
+async fn spawn_agent_uses_specified_model() {
+    let server = MockLlmServer::start().await;
+
+    // 1. Parent LLM turn 1: calls spawn_agent with a specific model override.
+    server.enqueue(ScriptedResponse::tool_call(
+        "call-spawn-model",
+        "spawn_agent",
+        r#"{"task":"simple task","workspace":"/tmp","model":"custom-model-123"}"#,
+    ));
+    // 2. Child LLM turn 1 (should use "custom-model-123"): returns final text.
+    server.enqueue(ScriptedResponse::text_chunks(vec!["Child done."]));
+    // 3. Parent LLM turn 2 (after spawn_agent result): returns final text.
+    server.enqueue(ScriptedResponse::text_chunks(vec!["Parent done."]));
+
+    let daemon = start_daemon_with_env(&server.url(), &[("AMAEBI_SPAWN_SANDBOX", "noop")])
+        .await
+        .expect("start_daemon");
+    let client = connect_client(&daemon.socket);
+
+    let responses = send_message(&client, "run child with custom model")
+        .await
+        .expect("send_message");
+
+    let text = collect_text(&responses);
+    assert!(
+        text.contains("Parent done."),
+        "expected parent final text in response: {text:?}"
+    );
+
+    // 3 requests: parent turn 1, child turn 1, parent turn 2.
+    let reqs = server.take_requests();
+    assert_eq!(reqs.len(), 3, "expected 3 LLM requests, got {}", reqs.len());
+
+    // The child's request (index 1) must use "custom-model-123".
+    let child_req = &reqs[1];
+    assert_eq!(
+        child_req.model(),
+        Some("custom-model-123"),
+        "child agent should use the model specified in spawn_agent args, got: {:?}",
+        child_req.model()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 12. spawn_agent missing workspace returns error
+// ---------------------------------------------------------------------------
+
+/// When spawn_agent is called without the required "workspace" field, the tool
+/// must return an error to the parent agent rather than crashing.
+///
+/// Flow:
+///   1. Parent turn 1 → calls spawn_agent with only "task" (no workspace)
+///   2. Daemon executes spawn_agent → immediate error (no child LLM calls)
+///   3. Parent turn 2 → receives the error as a tool result, returns final text
+///
+/// After the test, the mock server must have exactly 2 requests (both parent),
+/// and the second request's messages must mention "workspace".
+///
+/// Uses `AMAEBI_SPAWN_SANDBOX=noop` so no Docker is required.
+#[tokio::test]
+async fn spawn_agent_missing_workspace_returns_error() {
+    let server = MockLlmServer::start().await;
+
+    // 1. Parent LLM turn 1: calls spawn_agent without the workspace field.
+    server.enqueue(ScriptedResponse::tool_call(
+        "call-spawn-noworkspace",
+        "spawn_agent",
+        r#"{"task":"do something without workspace"}"#,
+    ));
+    // 2. Parent LLM turn 2: receives the tool error result, returns final text.
+    server.enqueue(ScriptedResponse::text_chunks(vec![
+        "Received an error from spawn_agent.",
+    ]));
+
+    let daemon = start_daemon_with_env(&server.url(), &[("AMAEBI_SPAWN_SANDBOX", "noop")])
+        .await
+        .expect("start_daemon");
+    let client = connect_client(&daemon.socket);
+
+    let responses = send_message(&client, "spawn agent without workspace")
+        .await
+        .expect("send_message");
+
+    let text = collect_text(&responses);
+    assert!(
+        text.contains("error"),
+        "expected error indication in response: {text:?}"
+    );
+
+    // Exactly 2 LLM requests: both to the parent (no child was spawned).
+    let reqs = server.take_requests();
+    assert_eq!(
+        reqs.len(),
+        2,
+        "expected exactly 2 LLM requests (no child spawned), got {}",
+        reqs.len()
+    );
+
+    // The second parent request must carry the spawn_agent error as a tool
+    // result; its content should mention "workspace" (the missing field).
+    let second_req = &reqs[1];
+    let messages = second_req.messages().expect("messages in second request");
+    let all_content: String = messages
+        .iter()
+        .filter_map(|m| m.get("content").and_then(|c| c.as_str()))
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        all_content.contains("workspace"),
+        "error message should mention 'workspace', got:\n{all_content}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 13. spawn_agent workspace path passed to child LLM context
+// ---------------------------------------------------------------------------
+
+/// The workspace path supplied in spawn_agent args must appear in the system
+/// prompt sent to the child agent's LLM (embedded in the "[Sandbox Context]"
+/// preamble that `spawn_agent` prepends to the task).
+///
+/// Flow:
+///   1. Parent turn 1 → calls spawn_agent with a real temp-dir path as workspace
+///   2. Child turn 1 → returns final text (mock; we only care about the request)
+///   3. Parent turn 2 → returns final text
+///
+/// Uses `AMAEBI_SPAWN_SANDBOX=noop` so no Docker is required.
+#[tokio::test]
+async fn spawn_agent_workspace_passed_to_sandbox() {
+    let workspace_dir = tempfile::TempDir::new().expect("temp workspace dir");
+    let workspace_path = workspace_dir
+        .path()
+        .to_str()
+        .expect("utf8 workspace path")
+        .to_string();
+
+    let server = MockLlmServer::start().await;
+
+    // Build the spawn_agent args with a real filesystem path.
+    let args_json = serde_json::json!({
+        "task": "verify workspace",
+        "workspace": workspace_path,
+    })
+    .to_string();
+
+    // 1. Parent LLM turn 1: calls spawn_agent with the workspace path.
+    server.enqueue(ScriptedResponse::tool_call(
+        "call-spawn-ws",
+        "spawn_agent",
+        args_json,
+    ));
+    // 2. Child LLM turn 1: returns final text.
+    server.enqueue(ScriptedResponse::text_chunks(vec![
+        "Child workspace verified.",
+    ]));
+    // 3. Parent LLM turn 2: returns final text.
+    server.enqueue(ScriptedResponse::text_chunks(vec!["Workspace test done."]));
+
+    let daemon = start_daemon_with_env(&server.url(), &[("AMAEBI_SPAWN_SANDBOX", "noop")])
+        .await
+        .expect("start_daemon");
+    let client = connect_client(&daemon.socket);
+
+    let responses = send_message(&client, "check workspace passthrough")
+        .await
+        .expect("send_message");
+
+    let text = collect_text(&responses);
+    assert!(
+        text.contains("Workspace test done."),
+        "expected final text in response: {text:?}"
+    );
+
+    // 3 requests: parent turn 1, child turn 1, parent turn 2.
+    let reqs = server.take_requests();
+    assert_eq!(reqs.len(), 3, "expected 3 LLM requests, got {}", reqs.len());
+
+    // The child's request (index 1) must contain the workspace path in its
+    // messages — spawn_agent embeds it in the "[Sandbox Context]" preamble.
+    let child_req = &reqs[1];
+    let messages = child_req.messages().expect("messages in child request");
+    let all_content: String = messages
+        .iter()
+        .filter_map(|m| m.get("content").and_then(|c| c.as_str()))
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        all_content.contains(&workspace_path),
+        "child LLM request should contain workspace path {workspace_path:?}, got:\n{all_content}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 14. Two spawn_agent calls in one batch run concurrently
+// ---------------------------------------------------------------------------
+
+/// When the LLM returns two spawn_agent tool calls in a single response, the
+/// daemon must execute them concurrently rather than sequentially.
+///
+/// Each child runs `shell_command("sleep 1")` before returning its final text.
+/// If the children ran sequentially the wall-clock time would be ≥ 2 s; the
+/// assert of elapsed < 1.8 s proves they ran concurrently.
+///
+/// Mock LLM sequence (6 requests total):
+///   1. Parent turn 1  → multi_tool_calls: two spawn_agent with parallel=true
+///   2. Child 1 turn 1 → tool_call shell_command("sleep 1")
+///   3. Child 2 turn 1 → tool_call shell_command("sleep 1")
+///   4. Child 1 turn 2 → text "child1 done"
+///   5. Child 2 turn 2 → text "child2 done"
+///   6. Parent turn 2  → text "all done"
+///
+/// Uses `AMAEBI_SPAWN_SANDBOX=noop` so no Docker is required.
+#[tokio::test]
+async fn spawn_agent_parallel_calls() {
+    let server = MockLlmServer::start().await;
+
+    // 1. Parent turn 1: LLM returns two spawn_agent calls in one response.
+    server.enqueue(ScriptedResponse::multi_tool_calls([
+        (
+            "call-spawn-parallel-A",
+            "spawn_agent",
+            r#"{"task":"task A","workspace":"/tmp","parallel":true}"#,
+        ),
+        (
+            "call-spawn-parallel-B",
+            "spawn_agent",
+            r#"{"task":"task B","workspace":"/tmp","parallel":true}"#,
+        ),
+    ]));
+    // 2 & 3. First two child requests each get a shell_command that sleeps 1 s.
+    //        Order is non-deterministic; the mock queue serves them FIFO.
+    server.enqueue(ScriptedResponse::tool_call(
+        "sc-parallel-1",
+        "shell_command",
+        r#"{"command":"sleep 1"}"#,
+    ));
+    server.enqueue(ScriptedResponse::tool_call(
+        "sc-parallel-2",
+        "shell_command",
+        r#"{"command":"sleep 1"}"#,
+    ));
+    // 4 & 5. Final text for each child (order is non-deterministic).
+    server.enqueue(ScriptedResponse::text_chunks(vec!["child1 done"]));
+    server.enqueue(ScriptedResponse::text_chunks(vec!["child2 done"]));
+    // 6. Parent turn 2: receives both tool results, returns final text.
+    server.enqueue(ScriptedResponse::text_chunks(vec!["all done"]));
+
+    let daemon = start_daemon_with_env(&server.url(), &[("AMAEBI_SPAWN_SANDBOX", "noop")])
+        .await
+        .expect("start_daemon");
+    let client = connect_client(&daemon.socket);
+
+    let start = std::time::Instant::now();
+    let responses = send_message(&client, "run two child tasks in parallel")
+        .await
+        .expect("send_message");
+    let elapsed = start.elapsed();
+
+    let text = collect_text(&responses);
+    assert!(
+        text.contains("all done"),
+        "expected parent final text 'all done' in response: {text:?}"
+    );
+
+    // Parallel execution: ~1 s wall-clock + overhead.  Sequential would be
+    // ≥ 2 s of sleep alone, so < 2.5 s proves concurrency.
+    assert!(
+        elapsed.as_millis() < 2500,
+        "expected parallel execution to finish in < 2.5 s, took {elapsed:?}"
+    );
+
+    // 6 LLM requests: 1 parent + 2×(shell_command + text) + 1 parent final.
+    let reqs = server.take_requests();
+    assert_eq!(reqs.len(), 6, "expected 6 LLM requests, got {}", reqs.len());
+
+    // The parent's final request must contain results from both children.
+    let parent_final_req = &reqs[5];
+    let last_messages = parent_final_req
+        .messages()
+        .expect("messages in parent final request");
+    let all_content: String = last_messages
+        .iter()
+        .filter_map(|m| m.get("content").and_then(|c| c.as_str()))
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        all_content.contains("child1 done") || all_content.contains("child2 done"),
+        "parent final request should contain child tool results, got:\n{all_content}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 15. parallel=true batch completes in ~5s not ~10s
+// ---------------------------------------------------------------------------
+
+/// When the LLM returns two spawn_agent calls both with `parallel=true`, the
+/// daemon must run them concurrently.  Each child sleeps for 5 real seconds;
+/// the combined wall-clock time must be < 8 s (sequential would be 10 s+).
+///
+/// Mock LLM sequence (6 requests total):
+///   1. Parent turn 1  → multi_tool_calls: two spawn_agent with parallel=true
+///   2. Child X turn 1 → tool_call shell_command("sleep 5")
+///   3. Child Y turn 1 → tool_call shell_command("sleep 5")
+///   4. Child X turn 2 → text "child1 done"
+///   5. Child Y turn 2 → text "child2 done"
+///   6. Parent turn 2  → text "both done"
+///
+/// Uses `AMAEBI_SPAWN_SANDBOX=noop` so no Docker is required.
+#[tokio::test]
+#[ignore] // takes ~5 real seconds
+async fn spawn_agent_parallel_timing() {
+    let server = MockLlmServer::start().await;
+
+    // 1. Parent turn 1: two spawn_agent calls, both opt-in to parallel.
+    server.enqueue(ScriptedResponse::multi_tool_calls([
+        (
+            "call-timing-A",
+            "spawn_agent",
+            r#"{"task":"sleep task A","workspace":"/tmp","parallel":true}"#,
+        ),
+        (
+            "call-timing-B",
+            "spawn_agent",
+            r#"{"task":"sleep task B","workspace":"/tmp","parallel":true}"#,
+        ),
+    ]));
+    // 2 & 3. First two child requests (whichever child arrives first): each
+    //        gets a shell_command that sleeps 5 seconds.
+    server.enqueue(ScriptedResponse::tool_call(
+        "sc-timing-1",
+        "shell_command",
+        r#"{"command":"sleep 5"}"#,
+    ));
+    server.enqueue(ScriptedResponse::tool_call(
+        "sc-timing-2",
+        "shell_command",
+        r#"{"command":"sleep 5"}"#,
+    ));
+    // 4 & 5. Final text for each child (order is non-deterministic).
+    server.enqueue(ScriptedResponse::text_chunks(vec!["child1 done"]));
+    server.enqueue(ScriptedResponse::text_chunks(vec!["child2 done"]));
+    // 6. Parent turn 2: both results received.
+    server.enqueue(ScriptedResponse::text_chunks(vec!["both done"]));
+
+    let daemon = start_daemon_with_env(&server.url(), &[("AMAEBI_SPAWN_SANDBOX", "noop")])
+        .await
+        .expect("start_daemon");
+    let client = connect_client(&daemon.socket);
+
+    let start = std::time::Instant::now();
+    let responses = send_message(&client, "run two sleep tasks in parallel")
+        .await
+        .expect("send_message");
+    let elapsed = start.elapsed();
+
+    // Both children must have returned results visible in the parent's reply.
+    let text = collect_text(&responses);
+    assert!(
+        text.contains("both done"),
+        "expected parent final text 'both done', got: {text:?}"
+    );
+
+    // Parallel execution: ~5 s wall-clock.  Sequential would be ~10 s.
+    assert!(
+        elapsed.as_secs() < 8,
+        "expected parallel execution to finish in < 8 s, took {elapsed:?}"
+    );
+
+    // 6 LLM requests: 1 parent + 2×(shell_command + text) + 1 parent final.
+    let reqs = server.take_requests();
+    assert_eq!(reqs.len(), 6, "expected 6 LLM requests, got {}", reqs.len());
+}
+
+// ---------------------------------------------------------------------------
+// 16. Cron: job fires and calls the LLM
+// ---------------------------------------------------------------------------
+
+/// A scheduled cron job with schedule "* * * * *" must fire on the daemon's
+/// first scheduler tick (which is immediate — tokio intervals fire at t=0) and
+/// call the LLM with the job's description as the user prompt.
+///
+/// Strategy:
+/// 1. Create a temp home dir with `.amaebi/hosts.json`.
+/// 2. Seed a cron job via `amaebi cron add` before starting the daemon.
+/// 3. Start the daemon at that home directory.
+/// 4. The cron scheduler fires immediately; wait up to 5 s for the LLM call.
+/// 5. Assert the LLM received a request containing the cron task description.
+#[tokio::test]
+async fn cron_job_triggers_llm_call() {
+    let server = MockLlmServer::start().await;
+    server.enqueue(ScriptedResponse::text_chunks(vec!["cron-task-response"]));
+
+    // Set up a home dir and seed a cron job that always fires ("* * * * *").
+    let home_dir = setup_home().expect("setup_home");
+    seed_cron_job(home_dir.path(), "cron-unique-task-description", "* * * * *")
+        .await
+        .expect("seed_cron_job");
+
+    let (socket, mut child, _socket_dir) =
+        start_daemon_at_home_with_env(home_dir.path(), &server.url(), &[])
+            .await
+            .expect("start daemon");
+
+    // The cron scheduler fires its first tick immediately (tokio interval
+    // behaviour).  Wait up to 5 s for the LLM request to arrive.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        if server.peek_request_count() >= 1 || std::time::Instant::now() > deadline {
+            break;
+        }
+    }
+
+    let reqs = server.take_requests();
+    assert!(
+        !reqs.is_empty(),
+        "cron scheduler did not call the LLM within 5 s"
+    );
+
+    // The request's messages must contain the cron job description.
+    let messages = reqs[0].messages().expect("messages in cron LLM request");
+    let all_content: String = messages
+        .iter()
+        .filter_map(|m| m.get("content").and_then(|c| c.as_str()))
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        all_content.contains("cron-unique-task-description"),
+        "expected cron task description in LLM request messages, got:\n{all_content}"
+    );
+
+    // Keep socket alive until assertions are done.
+    drop(socket);
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+}
+
+// ---------------------------------------------------------------------------
+// 17. Cron: output does NOT appear in the chat stream
+// ---------------------------------------------------------------------------
+
+/// Cron jobs run with a sink writer — their output is deposited into the inbox
+/// and must NOT appear when a user sends a normal chat message on the same
+/// daemon.
+///
+/// Strategy:
+/// 1. Seed a cron job; start the daemon.
+/// 2. Wait for the cron scheduler to fire and complete.
+/// 3. Send a chat message.
+/// 4. Assert the chat response does NOT contain the cron's unique output.
+///
+/// Note: when the chat session starts with empty history, the Chat handler
+/// spawns a background cross-session compaction for the cron's just-completed
+/// session.  That task also calls the LLM, so we over-provision the mock queue
+/// (3 extra "ok" responses beyond the cron response) to prevent 500 errors.
+#[tokio::test]
+async fn cron_job_result_not_sent_to_chat() {
+    const CRON_OUTPUT: &str = "super-unique-cron-only-output-xyz987";
+
+    let server = MockLlmServer::start().await;
+    // Response 1: for the cron job's LLM call.
+    server.enqueue(ScriptedResponse::text_chunks(vec![CRON_OUTPUT]));
+    // Responses 2-4: for the cross-session compaction background task and the
+    // chat's own LLM call.  All say "ok" — we only care that they are NOT
+    // CRON_OUTPUT.  Over-provisioning by 1 prevents any accidental 500 errors.
+    server.enqueue(ScriptedResponse::text_chunks(vec!["ok"]));
+    server.enqueue(ScriptedResponse::text_chunks(vec!["ok"]));
+    server.enqueue(ScriptedResponse::text_chunks(vec!["ok"]));
+
+    let home_dir = setup_home().expect("setup_home");
+    seed_cron_job(home_dir.path(), "background cron task", "* * * * *")
+        .await
+        .expect("seed_cron_job");
+
+    let (socket, mut child, _socket_dir) =
+        start_daemon_at_home_with_env(home_dir.path(), &server.url(), &[])
+            .await
+            .expect("start daemon");
+
+    // Wait for the cron job to call the LLM (up to 5 s).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        if server.peek_request_count() >= 1 || std::time::Instant::now() > deadline {
+            break;
+        }
+    }
+    assert!(
+        server.peek_request_count() >= 1,
+        "cron job did not fire within 5 s"
+    );
+    // Give the cron job a moment to finish (store_conversation, InboxStore, etc.).
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    // Send a chat message; the cron output went to a sink, never to this stream.
+    let client = connect_client(&socket);
+    let responses = send_message(&client, "hello from chat")
+        .await
+        .expect("chat message");
+
+    let text = collect_text(&responses);
+    // The cron-specific output must NOT appear in the chat stream.
+    assert!(
+        !text.contains(CRON_OUTPUT),
+        "cron output must NOT appear in chat stream, got: {text:?}"
+    );
+    // The chat must have completed successfully (no Error frame).
+    assert!(
+        !responses
+            .iter()
+            .any(|r| matches!(r, support::helpers::Response::Error { .. })),
+        "chat request must not fail: {responses:?}"
+    );
+
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+}
+
+// ---------------------------------------------------------------------------
+// 18. Cron: job can call spawn_agent
+// ---------------------------------------------------------------------------
+
+/// A cron job runs inside the full agentic loop with `include_spawn_agent=true`,
+/// so it can call `spawn_agent`.  This test verifies the end-to-end flow:
+///   cron turn 1 → spawn_agent tool call
+///   child turn 1 → final text
+///   cron turn 2 → final text (after receiving child result)
+///
+/// Uses `AMAEBI_SPAWN_SANDBOX=noop` so no Docker is required.
+#[tokio::test]
+async fn cron_job_with_spawn_agent() {
+    let server = MockLlmServer::start().await;
+
+    // Cron LLM turn 1: calls spawn_agent.
+    server.enqueue(ScriptedResponse::tool_call(
+        "cron-spawn-call-001",
+        "spawn_agent",
+        r#"{"task":"child task from cron","workspace":"/tmp"}"#,
+    ));
+    // Child agent LLM turn 1: returns final text.
+    server.enqueue(ScriptedResponse::text_chunks(vec!["child-cron-result"]));
+    // Cron LLM turn 2 (after spawn_agent tool result): final cron text.
+    server.enqueue(ScriptedResponse::text_chunks(vec!["cron-spawn-done"]));
+
+    let home_dir = setup_home().expect("setup_home");
+    seed_cron_job(
+        home_dir.path(),
+        "cron task that spawns a child agent",
+        "* * * * *",
+    )
+    .await
+    .expect("seed_cron_job");
+
+    let (_socket, mut child, _socket_dir) = start_daemon_at_home_with_env(
+        home_dir.path(),
+        &server.url(),
+        &[("AMAEBI_SPAWN_SANDBOX", "noop")],
+    )
+    .await
+    .expect("start daemon");
+
+    // Wait for all 3 LLM requests: cron turn 1 + child turn 1 + cron turn 2.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        if server.peek_request_count() >= 3 || std::time::Instant::now() > deadline {
+            break;
+        }
+    }
+
+    let reqs = server.take_requests();
+    assert_eq!(
+        reqs.len(),
+        3,
+        "expected 3 LLM requests (cron + child + cron final), got {}:\n{:#?}",
+        reqs.len(),
+        reqs.iter().map(|r| &r.body).collect::<Vec<_>>()
+    );
+
+    let _ = child.kill().await;
+    let _ = child.wait().await;
 }

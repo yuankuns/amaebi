@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -19,6 +20,8 @@ pub struct DockerSandboxConfig {
     pub ro_paths: Vec<PathBuf>,
     /// Additional paths mounted read-write at the same path inside the container.
     pub rw_paths: Vec<PathBuf>,
+    /// Environment variables to inject into the container.
+    pub env: HashMap<String, String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -52,9 +55,17 @@ impl DockerSandbox {
             .to_str()
             .ok_or_else(|| anyhow::anyhow!("workspace path is not valid UTF-8"))?;
 
+        let uid = unsafe { libc::getuid() };
+        let gid = unsafe { libc::getgid() };
+
         let mut docker = Command::new("docker");
         docker.args(["run", "-d", "--rm", "--network", "none"]);
+        docker.args(["--user", &format!("{uid}:{gid}")]);
         docker.args(["-v", &format!("{workspace_str}:{workspace_str}:rw")]);
+
+        for (key, value) in &self.config.env {
+            docker.args(["-e", &format!("{key}={value}")]);
+        }
 
         for rw_path in &self.config.rw_paths {
             let s = rw_path
@@ -207,6 +218,7 @@ mod tests {
             workspace: workspace.path().to_path_buf(),
             ro_paths: vec![],
             rw_paths: vec![],
+            env: HashMap::new(),
         })
     }
 
@@ -294,6 +306,48 @@ mod tests {
         );
     }
 
+    /// Environment variables passed via `DockerSandboxConfig.env` must be
+    /// visible inside the container.
+    #[tokio::test]
+    #[ignore]
+    async fn docker_sandbox_env_var_is_set() {
+        let dir = TempDir::new().unwrap();
+        let sandbox = DockerSandbox::new(DockerSandboxConfig {
+            image: "amaebi-sandbox:bookworm-slim".to_string(),
+            workspace: dir.path().to_path_buf(),
+            ro_paths: vec![],
+            rw_paths: vec![],
+            env: HashMap::from([("TEST_VAR".to_string(), "hello123".to_string())]),
+        });
+        let out = sandbox.spawn("echo $TEST_VAR", dir.path()).await.unwrap();
+        assert!(
+            out.stdout.contains("hello123"),
+            "expected 'hello123' in stdout, got: {:?}",
+            out.stdout
+        );
+    }
+
+    /// The container must run as the current host UID.
+    #[tokio::test]
+    #[ignore]
+    async fn docker_sandbox_user_matches_host() {
+        let dir = TempDir::new().unwrap();
+        let sandbox = test_sandbox(&dir);
+        let out = sandbox.spawn("id -u", dir.path()).await.unwrap();
+        let host_uid = unsafe { libc::getuid() }.to_string();
+        assert!(
+            out.stdout.trim() == host_uid,
+            "expected uid {host_uid}, got: {:?}",
+            out.stdout
+        );
+    }
+
+    // TODO: docker_spawn_agent_no_recursion — verify that a child agent
+    // launched inside a DockerSandbox does not have spawn_agent available.
+    // This requires wiring a full agentic loop into the sandbox test, which
+    // is more integration-level than unit-level; covered at the daemon level
+    // by the `spawn_agent_child_cannot_spawn` integration test instead.
+
     #[tokio::test]
     #[ignore]
     async fn docker_sandbox_cannot_access_other_workspace() {
@@ -310,6 +364,7 @@ mod tests {
             workspace: workspace.path().to_path_buf(),
             ro_paths: vec![],
             rw_paths: vec![],
+            env: HashMap::new(),
         });
 
         let cmd = format!(

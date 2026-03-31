@@ -115,6 +115,41 @@ impl ScriptedResponse {
             ],
         }
     }
+
+    /// Create a response that returns multiple tool calls then stops.
+    ///
+    /// Each item in `calls` is `(id, name, arguments_json)`.
+    pub fn multi_tool_calls<I, S1, S2, S3>(calls: I) -> Self
+    where
+        I: IntoIterator<Item = (S1, S2, S3)>,
+        S1: Into<String>,
+        S2: Into<String>,
+        S3: Into<String>,
+    {
+        let mut chunks: Vec<(Chunk, Option<Duration>)> = Vec::new();
+        for (index, (id, name, args)) in calls.into_iter().enumerate() {
+            chunks.push((
+                Chunk::ToolCallDelta {
+                    index,
+                    id: Some(id.into()),
+                    function_name: Some(name.into()),
+                    arguments_fragment: String::new(),
+                },
+                None,
+            ));
+            chunks.push((
+                Chunk::ToolCallDelta {
+                    index,
+                    id: None,
+                    function_name: None,
+                    arguments_fragment: args.into(),
+                },
+                None,
+            ));
+        }
+        chunks.push((Chunk::Finish(FinishReason::ToolCalls), None));
+        Self { chunks }
+    }
 }
 
 // ---------------------------------------------------------------------------

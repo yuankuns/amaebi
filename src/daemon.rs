@@ -59,7 +59,7 @@ const MAX_SUMMARY_CHARS: usize = 500;
 /// State shared across all concurrent client connections via `Arc`.
 pub struct DaemonState {
     pub http: reqwest::Client,
-    pub tokens: TokenCache,
+    pub tokens: Arc<TokenCache>,
     /// Tool executor — `LocalExecutor` now; swappable with `DockerExecutor` in Phase 4.
     pub executor: Box<dyn ToolExecutor>,
     /// Persistent SQLite connection opened once at startup.
@@ -88,12 +88,28 @@ impl DaemonState {
             .await
             .unwrap_or_else(|e| Err(anyhow::anyhow!("DB init panicked: {e}")))
             .context("opening memory DB")?;
+
+        let db = Arc::new(Mutex::new(conn));
+        let compacting_sessions: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+
+        let tokens = Arc::new(TokenCache::new());
+
+        let spawn_ctx = Arc::new(tools::SpawnContext {
+            http: http.clone(),
+            db: Arc::clone(&db),
+            compacting_sessions: Arc::clone(&compacting_sessions),
+            tokens: Arc::clone(&tokens),
+        });
+
+        let mut executor = tools::LocalExecutor::new();
+        executor.spawn_ctx = Some(spawn_ctx);
+
         Ok(Self {
             http,
-            tokens: TokenCache::new(),
-            executor: Box::new(tools::LocalExecutor::new()),
-            db: Arc::new(Mutex::new(conn)),
-            compacting_sessions: Arc::new(Mutex::new(HashSet::new())),
+            tokens,
+            executor: Box::new(executor),
+            db,
+            compacting_sessions,
         })
     }
 }
@@ -414,7 +430,9 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                 let mut sink = tokio::io::sink();
                 let (_, mut steer_rx) = tokio::sync::mpsc::channel::<Option<String>>(1);
 
-                match run_agentic_loop(&state, &model, messages, &mut sink, &mut steer_rx).await {
+                match run_agentic_loop(&state, &model, messages, &mut sink, &mut steer_rx, true)
+                    .await
+                {
                     Ok((final_text, _)) => {
                         let user_text = truncate_chars(prompt.clone(), MAX_PROMPT_CHARS);
                         let assistant_text = truncate_chars(final_text.clone(), MAX_RESPONSE_CHARS);
@@ -573,7 +591,8 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                 inject_skill_files(&mut messages).await;
             }
 
-            match run_agentic_loop(&state, &model, messages, &mut writer, &mut steer_rx).await {
+            match run_agentic_loop(&state, &model, messages, &mut writer, &mut steer_rx, true).await
+            {
                 Ok((response_text, _)) => {
                     let user_text = truncate_chars(prompt.clone(), MAX_PROMPT_CHARS);
                     let assistant_text = truncate_chars(response_text.clone(), MAX_RESPONSE_CHARS);
@@ -768,7 +787,8 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
             // Used as a fallback when the API returns prompt_tokens = 0.
             let pre_send_tokens = count_message_tokens(&messages);
 
-            match run_agentic_loop(&state, &model, messages, &mut writer, &mut steer_rx).await {
+            match run_agentic_loop(&state, &model, messages, &mut writer, &mut steer_rx, true).await
+            {
                 Ok((response_text, prompt_tokens)) => {
                     let user_text = truncate_chars(prompt.clone(), MAX_PROMPT_CHARS);
                     let assistant_text = truncate_chars(response_text.clone(), MAX_RESPONSE_CHARS);
@@ -1120,11 +1140,12 @@ pub(crate) async fn run_agentic_loop<W>(
     mut messages: Vec<Message>,
     writer: &mut W,
     steer_rx: &mut tokio::sync::mpsc::Receiver<Option<String>>,
+    include_spawn_agent: bool,
 ) -> Result<(String, usize)>
 where
     W: AsyncWriteExt + Unpin,
 {
-    let schemas = tools::tool_schemas();
+    let schemas = tools::tool_schemas(include_spawn_agent);
     let final_text;
     let mut tools_were_used = false;
     let mut conclusion_nudge_sent = false;
@@ -1463,141 +1484,213 @@ where
                 messages.push(Message::assistant(assistant_text, api_calls));
 
                 let tool_calls_snapshot = &tool_calls;
-                let mut interrupted_at: Option<usize> = None;
-                let mut steer_text: Option<String> = None;
 
-                for (i, tc) in tool_calls_snapshot.iter().enumerate() {
-                    // Check for a mid-execution steer before running this tool.
-                    // If the user pressed Ctrl-C and typed a correction, honour
-                    // it immediately: skip this and all remaining tools.
-                    if let Ok(msg) = steer_rx.try_recv() {
-                        tracing::debug!(
-                            "mid-execution steer received; interrupting tool chain at index {i}"
-                        );
-                        // Stash the steer text — we must emit placeholder tool_result
-                        // entries for ALL skipped calls before appending the user message,
-                        // because the API requires assistant(tool_calls) →
-                        // tool(tool_result…) → user/assistant ordering.
-                        // msg is None for interrupt-only (no text to inject).
-                        steer_text = msg;
-                        if steer_text.is_some() {
-                            write_frame(writer, &Response::SteerAck).await?;
-                        }
-                        interrupted_at = Some(i);
-                        break;
+                // When every call in this batch is spawn_agent AND all of them
+                // opt in with `parallel=true`, run them concurrently.
+                // Default is sequential — the caller must explicitly request
+                // parallel execution for each call in the batch.
+                let all_spawn_agent = tool_calls_snapshot.len() > 1
+                    && tool_calls_snapshot
+                        .iter()
+                        .all(|tc| tc.name == "spawn_agent")
+                    && tool_calls_snapshot.iter().all(|tc| {
+                        tc.parse_args()
+                            .ok()
+                            .and_then(|v| v["parallel"].as_bool())
+                            .unwrap_or(false)
+                    });
+
+                if all_spawn_agent {
+                    // Emit all ToolUse frames sequentially first: the writer
+                    // is not Sync so we cannot interleave writes.
+                    for tc in tool_calls_snapshot.iter() {
+                        write_frame(
+                            writer,
+                            &Response::ToolUse {
+                                name: tc.name.clone(),
+                                detail: String::new(),
+                            },
+                        )
+                        .await?;
                     }
 
-                    tracing::debug!(tool = %tc.name, "executing tool");
-
-                    let tool_detail = {
-                        let args: serde_json::Value =
-                            serde_json::from_str(&tc.arguments).unwrap_or(serde_json::Value::Null);
-                        match tc.name.as_str() {
-                            "shell_command" => args
-                                .get("command")
-                                .and_then(|v| v.as_str())
-                                .map(|s| {
-                                    if s.len() > 80 {
-                                        format!("{}…", &s[..80])
-                                    } else {
-                                        s.to_string()
-                                    }
-                                })
-                                .unwrap_or_default(),
-                            "read_file" => args
-                                .get("path")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or_default()
-                                .to_string(),
-                            "edit_file" => args
-                                .get("path")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or_default()
-                                .to_string(),
-                            "tmux_send_keys" => args
-                                .get("keys")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or_default()
-                                .to_string(),
-                            "tmux_capture_pane" => args
-                                .get("target")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or_default()
-                                .to_string(),
-                            _ => String::new(),
-                        }
-                    };
-                    write_frame(
-                        writer,
-                        &Response::ToolUse {
-                            name: tc.name.clone(),
-                            detail: tool_detail,
+                    // Execute all spawn_agent calls concurrently, collecting
+                    // results in original order.
+                    // Steer interrupts are not checked here — they only apply
+                    // to the sequential path where we can abort cleanly before
+                    // the next tool runs.
+                    let results = futures_util::future::join_all(tool_calls_snapshot.iter().map(
+                        |tc| async move {
+                            let args = match tc.parse_args() {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    tracing::warn!(
+                                        tool = %tc.name,
+                                        error = %e,
+                                        "bad tool arguments"
+                                    );
+                                    return format!("argument error: {e:#}");
+                                }
+                            };
+                            match state.executor.execute(&tc.name, args).await {
+                                Ok(output) => {
+                                    tracing::debug!(
+                                        tool = %tc.name,
+                                        output_len = output.len(),
+                                        "tool succeeded"
+                                    );
+                                    truncate_chars(output, MAX_TOOL_OUTPUT_CHARS)
+                                }
+                                Err(e) => {
+                                    tracing::warn!(tool = %tc.name, error = %e, "tool failed");
+                                    format!("error: {e:#}")
+                                }
+                            }
                         },
-                    )
-                    .await?;
+                    ))
+                    .await;
 
-                    let args = match tc.parse_args() {
-                        Ok(v) => v,
-                        Err(e) => {
-                            tracing::warn!(tool = %tc.name, error = %e, "bad tool arguments");
+                    for (tc, result) in tool_calls_snapshot.iter().zip(results) {
+                        messages.push(Message::tool_result(&tc.id, result));
+                    }
+                } else {
+                    // Sequential path: honour steer interrupts between tools.
+                    let mut interrupted_at: Option<usize> = None;
+                    let mut steer_text: Option<String> = None;
+
+                    for (i, tc) in tool_calls_snapshot.iter().enumerate() {
+                        // Check for a mid-execution steer before running this tool.
+                        // If the user pressed Ctrl-C and typed a correction, honour
+                        // it immediately: skip this and all remaining tools.
+                        if let Ok(msg) = steer_rx.try_recv() {
+                            tracing::debug!(
+                                "mid-execution steer received; interrupting tool chain at index {i}"
+                            );
+                            // Stash the steer text — we must emit placeholder tool_result
+                            // entries for ALL skipped calls before appending the user message,
+                            // because the API requires assistant(tool_calls) →
+                            // tool(tool_result…) → user/assistant ordering.
+                            // msg is None for interrupt-only (no text to inject).
+                            steer_text = msg;
+                            if steer_text.is_some() {
+                                write_frame(writer, &Response::SteerAck).await?;
+                            }
+                            interrupted_at = Some(i);
+                            break;
+                        }
+
+                        tracing::debug!(tool = %tc.name, "executing tool");
+
+                        let tool_detail = {
+                            let args: serde_json::Value = serde_json::from_str(&tc.arguments)
+                                .unwrap_or(serde_json::Value::Null);
+                            match tc.name.as_str() {
+                                "shell_command" => args
+                                    .get("command")
+                                    .and_then(|v| v.as_str())
+                                    .map(|s| {
+                                        if s.len() > 80 {
+                                            format!("{}…", &s[..80])
+                                        } else {
+                                            s.to_string()
+                                        }
+                                    })
+                                    .unwrap_or_default(),
+                                "read_file" => args
+                                    .get("path")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or_default()
+                                    .to_string(),
+                                "edit_file" => args
+                                    .get("path")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or_default()
+                                    .to_string(),
+                                "tmux_send_keys" => args
+                                    .get("keys")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or_default()
+                                    .to_string(),
+                                "tmux_capture_pane" => args
+                                    .get("target")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or_default()
+                                    .to_string(),
+                                _ => String::new(),
+                            }
+                        };
+                        write_frame(
+                            writer,
+                            &Response::ToolUse {
+                                name: tc.name.clone(),
+                                detail: tool_detail,
+                            },
+                        )
+                        .await?;
+
+                        let args = match tc.parse_args() {
+                            Ok(v) => v,
+                            Err(e) => {
+                                tracing::warn!(tool = %tc.name, error = %e, "bad tool arguments");
+                                messages.push(Message::tool_result(
+                                    &tc.id,
+                                    format!("argument error: {e:#}"),
+                                ));
+                                continue;
+                            }
+                        };
+
+                        let result = match state.executor.execute(&tc.name, args).await {
+                            Ok(output) => {
+                                tracing::debug!(
+                                    tool = %tc.name,
+                                    output_len = output.len(),
+                                    "tool succeeded"
+                                );
+                                truncate_chars(output, MAX_TOOL_OUTPUT_CHARS)
+                            }
+                            Err(e) => {
+                                tracing::warn!(tool = %tc.name, error = %e, "tool failed");
+                                format!("error: {e:#}")
+                            }
+                        };
+
+                        messages.push(Message::tool_result(&tc.id, result));
+                    }
+
+                    // If the user injected a steer mid-chain, push placeholder
+                    // tool results for the tools that were never executed.  The
+                    // OpenAI API requires a tool_result for every tool_call in the
+                    // assistant message, even if we didn't actually run them.
+                    if let Some(skip_from) = interrupted_at {
+                        for tc in &tool_calls_snapshot[skip_from..] {
                             messages.push(Message::tool_result(
                                 &tc.id,
-                                format!("argument error: {e:#}"),
+                                "[interrupted by user before execution]",
                             ));
-                            continue;
                         }
-                    };
-
-                    let result = match state.executor.execute(&tc.name, args).await {
-                        Ok(output) => {
-                            tracing::debug!(
-                                tool = %tc.name,
-                                output_len = output.len(),
-                                "tool succeeded"
-                            );
-                            truncate_chars(output, MAX_TOOL_OUTPUT_CHARS)
-                        }
-                        Err(e) => {
-                            tracing::warn!(tool = %tc.name, error = %e, "tool failed");
-                            format!("error: {e:#}")
-                        }
-                    };
-
-                    messages.push(Message::tool_result(&tc.id, result));
-                }
-
-                // If the user injected a steer mid-chain, push placeholder
-                // tool results for the tools that were never executed.  The
-                // OpenAI API requires a tool_result for every tool_call in the
-                // assistant message, even if we didn't actually run them.
-                if let Some(skip_from) = interrupted_at {
-                    for tc in &tool_calls_snapshot[skip_from..] {
-                        messages.push(Message::tool_result(
-                            &tc.id,
-                            "[interrupted by user before execution]",
-                        ));
-                    }
-                    // When the interrupt carried steer text, use it directly.
-                    // When it was interrupt-only (None), block until the user
-                    // sends a correction before starting the next model turn —
-                    // proceeding immediately would race against incoming steer
-                    // text and re-enter the model without user guidance.
-                    let effective_steer = if let Some(text) = steer_text {
-                        Some(text)
-                    } else {
-                        loop {
-                            match steer_rx.recv().await {
-                                Some(Some(t)) => {
-                                    write_frame(writer, &Response::SteerAck).await?;
-                                    break Some(t);
+                        // When the interrupt carried steer text, use it directly.
+                        // When it was interrupt-only (None), block until the user
+                        // sends a correction before starting the next model turn —
+                        // proceeding immediately would race against incoming steer
+                        // text and re-enter the model without user guidance.
+                        let effective_steer = if let Some(text) = steer_text {
+                            Some(text)
+                        } else {
+                            loop {
+                                match steer_rx.recv().await {
+                                    Some(Some(t)) => {
+                                        write_frame(writer, &Response::SteerAck).await?;
+                                        break Some(t);
+                                    }
+                                    Some(None) => continue, // another bare interrupt; keep waiting
+                                    None => break None,     // channel closed; proceed without steer
                                 }
-                                Some(None) => continue, // another bare interrupt; keep waiting
-                                None => break None,     // channel closed; proceed without steer
                             }
+                        };
+                        if let Some(text) = effective_steer {
+                            messages.push(Message::user(text));
                         }
-                    };
-                    if let Some(text) = effective_steer {
-                        messages.push(Message::user(text));
                     }
                 }
 
@@ -1806,7 +1899,7 @@ async fn run_cron_job(state: Arc<DaemonState>, job: &cron::CronJob) {
     let mut sink = tokio::io::sink();
     let (_, mut steer_rx) = tokio::sync::mpsc::channel::<Option<String>>(1);
 
-    let result = run_agentic_loop(&state, &model, messages, &mut sink, &mut steer_rx).await;
+    let result = run_agentic_loop(&state, &model, messages, &mut sink, &mut steer_rx, true).await;
 
     let (output, run_ok) = match result {
         Ok((final_text, _)) => {
@@ -2285,8 +2378,8 @@ mod tests {
         let msgs = simulate_mid_steer(3, 1, Some("new direction"));
 
         assert_eq!(msgs[0].role, "assistant", "first message must be assistant");
-        for i in 1..=3 {
-            assert_eq!(msgs[i].role, "tool", "messages[{i}] must be role=tool");
+        for (i, msg) in msgs.iter().enumerate().take(4).skip(1) {
+            assert_eq!(msg.role, "tool", "messages[{i}] must be role=tool");
         }
         assert_eq!(
             msgs.last().unwrap().role,

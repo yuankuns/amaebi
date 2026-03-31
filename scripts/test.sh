@@ -17,6 +17,13 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 WORKDIR="$REPO_ROOT"
 
+# Log file: logs/test-YYYY-MM-DD-HHMMSS.log
+LOG_DIR="$REPO_ROOT/logs"
+mkdir -p "$LOG_DIR"
+LOG_FILE="$LOG_DIR/test-$(date +%Y-%m-%d-%H%M%S).log"
+exec > >(tee -a "$LOG_FILE") 2>&1
+echo "==> Log: $LOG_FILE"
+
 # This image is provided by OpenClaw. Set AMAEBI_DEV_IMAGE to use a custom image.
 # The default openclaw-sandbox-dev:bookworm-slim ships Rust/Cargo pre-installed
 # and is not publicly distributed — contact the OpenClaw team or build your own.
@@ -69,7 +76,9 @@ fi
 # which breaks `cargo build`. Build artifacts written into the bind-mounted
 # workspace will be root-owned, but that is an acceptable trade-off for a local
 # dev-test runner.
-if docker run --rm \
+echo "    image:   $DEV_IMAGE"
+echo "    workdir: $WORKDIR"
+CONTAINER_ID=$(docker run --rm -d \
     -w "$WORKDIR" \
     --user 0:0 \
     -v "$REPO_ROOT:$REPO_ROOT:rw" \
@@ -80,8 +89,12 @@ if docker run --rm \
     -e CARGO_HOME=/home/user/.cargo \
     -e RUST_BACKTRACE=1 \
     "$DEV_IMAGE" \
-    sh -c "cargo check && cargo test${FILTER:+ $FILTER} && cargo clippy -- -D warnings"
-then ok; else fail; fi
+    sh -c "cargo check && cargo test${FILTER:+ $FILTER} && cargo clippy -- -D warnings && echo __TESTS_PASSED__")
+echo "    container: $CONTAINER_ID"
+docker logs -f "$CONTAINER_ID"
+EXIT_CODE=$(docker wait "$CONTAINER_ID")
+docker rm "$CONTAINER_ID" &>/dev/null || true
+if [[ "$EXIT_CODE" == "0" ]]; then ok; else fail; fi
 
 # Step 2 (optional): Docker integration tests — run on host (needs docker daemon)
 if [[ "$RUN_DOCKER" == "1" ]]; then
@@ -94,6 +107,8 @@ if [[ "$RUN_DOCKER" == "1" ]]; then
         exit 1
     fi
 
+    echo "    image:   amaebi-sandbox:bookworm-slim"
+    echo "    running: cargo test -- --ignored"
     if "$HOST_CARGO" test -- --ignored; then ok; else fail; fi
 fi
 
