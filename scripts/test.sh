@@ -75,10 +75,26 @@ fi
 # for a local dev-test runner.
 echo "    image:   $DEV_IMAGE"
 echo "    workdir: $WORKDIR"
+# Capture the host user's UID/GID so we can restore ownership of any files
+# the container creates as root in the bind-mounted workspace (primarily
+# target/).  Without this, the host user cannot delete or modify those
+# files without sudo.
+HOST_UID=$(id -u)
+HOST_GID=$(id -g)
+# Ensure the container is always removed, even if the script is interrupted
+# (Ctrl-C) or exits early due to set -e.  CONTAINER_ID is initialised to ""
+# so the trap is a no-op before docker run assigns it.
+CONTAINER_ID=""
+cleanup_container() {
+    if [[ -n "$CONTAINER_ID" ]]; then
+        docker rm -f "$CONTAINER_ID" &>/dev/null || true
+    fi
+}
+trap cleanup_container EXIT INT TERM
 # Omit --rm so the container is not auto-deleted before `docker wait` reads
 # its exit code.  With --rm, the container is removed the instant it exits,
 # creating a race where `docker wait` (and sometimes `docker logs -f`) can
-# no longer find it.  The explicit `docker rm` below does the cleanup.
+# no longer find it.  The trap above handles cleanup instead.
 CONTAINER_ID=$(docker run -d \
     -w "$WORKDIR" \
     --user 0:0 \
@@ -89,12 +105,18 @@ CONTAINER_ID=$(docker run -d \
     -e RUSTUP_HOME=/root/.rustup \
     -e CARGO_HOME=/root/.cargo \
     -e RUST_BACKTRACE=1 \
+    -e HOST_UID="$HOST_UID" \
+    -e HOST_GID="$HOST_GID" \
     "$DEV_IMAGE" \
-    sh -c "cargo check && cargo test${FILTER:+ $FILTER} && cargo clippy -- -D warnings && echo __TESTS_PASSED__")
+    sh -c "cargo check && cargo test${FILTER:+ $FILTER} && cargo clippy -- -D warnings && echo __TESTS_PASSED__
+           rc=\$?
+           chown -hR \"\$HOST_UID:\$HOST_GID\" \"$WORKDIR/target\" 2>/dev/null || true
+           exit \$rc")
 echo "    container: $CONTAINER_ID"
 docker logs -f "$CONTAINER_ID"
 EXIT_CODE=$(docker wait "$CONTAINER_ID")
 docker rm "$CONTAINER_ID" &>/dev/null || true
+CONTAINER_ID=""
 if [[ "$EXIT_CODE" == "0" ]]; then ok; else fail; fi
 
 # Step 2 (optional): Docker integration tests — run on host (needs docker daemon)
@@ -106,6 +128,33 @@ if [[ "$RUN_DOCKER" == "1" ]]; then
         echo "    ⚠️  amaebi-sandbox:bookworm-slim not found. Build it first:"
         echo "       ./scripts/build-sandbox-image.sh"
         exit 1
+    fi
+
+    # Preflight: ensure target/ is writable by the host user.
+    # Step 1 runs cargo as root inside Docker and can leave root-owned artifacts.
+    # The inline chown above handles the normal path; this catches edge cases
+    # (e.g. the user ran Step 1 manually with an older script version).
+    if [[ -d "$WORKDIR/target" ]] && ! [[ -w "$WORKDIR/target" ]]; then
+        echo "    detected non-writable target/, repairing ownership via docker..."
+        HOST_UID=$(id -u)
+        HOST_GID=$(id -g)
+        if docker run --rm \
+            --user 0:0 \
+            -v "$WORKDIR:/repo" \
+            "$DEV_IMAGE" \
+            sh -c "chown -hR ${HOST_UID}:${HOST_GID} /repo/target || true"; then
+            if [[ -w "$WORKDIR/target" ]]; then
+                echo "    target ownership repaired"
+            else
+                echo "    ✗ target/ is still not writable after repair attempt."
+                echo "      Run manually: sudo chown -R ${HOST_UID}:${HOST_GID} $WORKDIR/target"
+                exit 1
+            fi
+        else
+            echo "    ✗ docker command failed while repairing target/ ownership."
+            echo "      Run manually: sudo chown -R ${HOST_UID}:${HOST_GID} $WORKDIR/target"
+            exit 1
+        fi
     fi
 
     echo "    image:   amaebi-sandbox:bookworm-slim"
