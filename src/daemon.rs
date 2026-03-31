@@ -26,6 +26,8 @@ fn max_output_tokens_for_model(model: &str) -> usize {
         ("o1", 100_000),
         ("o3", 100_000),
         ("claude", 16_384),
+        // Gemini models routed via AMAEBI_URL: all variants cap at 8 k output.
+        ("gemini", 8_192),
     ];
     TABLE
         .iter()
@@ -195,6 +197,13 @@ fn context_limit_for_model(model: &str) -> usize {
         ("o3", 200_000),
         // Claude models: 200k context window.
         ("claude", 200_000),
+        // Gemini models routed via AMAEBI_URL.
+        // More specific prefixes must precede less specific ones.
+        ("gemini-2.0-flash", 1_048_576), // Gemini 2.0 Flash: 1 M context
+        ("gemini-1.5-pro", 2_097_152),   // Gemini 1.5 Pro: 2 M context
+        ("gemini-1.5-flash", 1_048_576), // Gemini 1.5 Flash: 1 M context
+        ("gemini-1.0", 32_768),          // Gemini 1.0: 32 k context
+        ("gemini", 128_000),             // conservative catch-all for other Gemini variants
     ];
     TABLE
         .iter()
@@ -2168,6 +2177,19 @@ mod tests {
     }
 
     #[test]
+    fn context_limit_gemini_models() {
+        assert_eq!(context_limit_for_model("gemini-2.0-flash"), 1_048_576);
+        assert_eq!(context_limit_for_model("gemini-2.0-flash-001"), 1_048_576);
+        assert_eq!(context_limit_for_model("gemini-1.5-pro"), 2_097_152);
+        assert_eq!(context_limit_for_model("gemini-1.5-flash"), 1_048_576);
+        assert_eq!(context_limit_for_model("gemini-1.5-flash-8b"), 1_048_576);
+        assert_eq!(context_limit_for_model("gemini-1.0-pro"), 32_768);
+        // Catch-all for unrecognised Gemini variants.
+        assert_eq!(context_limit_for_model("gemini-flash"), 128_000);
+        assert_eq!(context_limit_for_model("gemini-pro"), 128_000);
+    }
+
+    #[test]
     fn context_limit_unknown_model_is_conservative() {
         // Unknown models fall back to 32k — never 0, never larger than any known model.
         let limit = context_limit_for_model("some-future-model-xyz");
@@ -2319,6 +2341,14 @@ mod tests {
         assert_eq!(max_output_tokens_for_model("o3-mini"), 100_000);
         assert_eq!(max_output_tokens_for_model("claude-3-5-sonnet"), 16_384);
         assert_eq!(max_output_tokens_for_model("claude-opus-4-6"), 16_384);
+    }
+
+    #[test]
+    fn max_output_tokens_gemini_models() {
+        assert_eq!(max_output_tokens_for_model("gemini-2.0-flash"), 8_192);
+        assert_eq!(max_output_tokens_for_model("gemini-1.5-pro"), 8_192);
+        assert_eq!(max_output_tokens_for_model("gemini-1.5-flash"), 8_192);
+        assert_eq!(max_output_tokens_for_model("gemini-flash"), 8_192);
     }
 
     #[test]

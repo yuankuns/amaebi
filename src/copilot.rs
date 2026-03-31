@@ -9,19 +9,60 @@ use crate::ipc::{write_frame, Response};
 
 const CHAT_ENDPOINT: &str = "https://api.githubcopilot.com/chat/completions";
 
-/// Return the chat completions URL.
+/// Core routing logic for `resolve_endpoint`.
 ///
-/// If the `AMAEBI_COPILOT_URL` environment variable is set and non-empty it
-/// overrides the default endpoint.  This is intended for tests that point the
-/// daemon at a local mock server; production deployments never set this
-/// variable so the default is used unconditionally in practice.
-fn chat_endpoint() -> String {
-    if let Ok(url) = std::env::var("AMAEBI_COPILOT_URL") {
-        if !url.trim().is_empty() {
-            return url.trim().to_string();
-        }
+/// Extracted for unit-testing without touching process environment variables.
+/// Returns `(url, use_copilot_headers)`.
+///
+/// * `copilot_url_override` — value of `AMAEBI_COPILOT_URL` (test override).
+/// * `amaebi_url`           — value of `AMAEBI_URL` (non-Claude endpoint).
+fn resolve_endpoint_with(
+    model: &str,
+    copilot_url_override: Option<&str>,
+    amaebi_url: Option<&str>,
+) -> (String, bool) {
+    // `AMAEBI_COPILOT_URL` is a test-only override that routes ALL models to a
+    // local mock server.  It must take priority over everything else so that
+    // integration tests remain model-agnostic.
+    if let Some(url) = copilot_url_override.filter(|u| !u.trim().is_empty()) {
+        return (url.trim().to_string(), true);
     }
-    CHAT_ENDPOINT.to_string()
+
+    // Claude models are served by the GitHub Copilot gateway.
+    if model.starts_with("claude") {
+        return (CHAT_ENDPOINT.to_string(), true);
+    }
+
+    // Non-Claude models (Gemini, GPT-5, etc.) must be routed to AMAEBI_URL,
+    // which accepts the same OpenAI-compatible wire format but does not require
+    // the GitHub Copilot-specific `Copilot-Integration-Id` / `Editor-Version`
+    // headers.
+    if let Some(url) = amaebi_url.filter(|u| !u.trim().is_empty()) {
+        return (url.trim().to_string(), false);
+    }
+
+    // AMAEBI_URL is not configured: fall back to the Copilot endpoint so the
+    // daemon stays usable, but warn so operators know the model may not be
+    // reachable through this path.
+    tracing::warn!(
+        model,
+        "AMAEBI_URL is not set; routing non-Claude model through the Copilot \
+         endpoint.  Set AMAEBI_URL to the correct endpoint for this model."
+    );
+    (CHAT_ENDPOINT.to_string(), true)
+}
+
+/// Return `(url, use_copilot_headers)` for the given model.
+///
+/// Routing order (first match wins):
+/// 1. `AMAEBI_COPILOT_URL` (if set) — test override, applies to ALL models.
+/// 2. `claude-*` models  → GitHub Copilot endpoint + Copilot-specific headers.
+/// 3. All other models   → `AMAEBI_URL` endpoint, no Copilot headers.
+/// 4. `AMAEBI_URL` unset → falls back to Copilot endpoint with a `warn!` log.
+fn resolve_endpoint(model: &str) -> (String, bool) {
+    let copilot_override = std::env::var("AMAEBI_COPILOT_URL").ok();
+    let amaebi_url = std::env::var("AMAEBI_URL").ok();
+    resolve_endpoint_with(model, copilot_override.as_deref(), amaebi_url.as_deref())
 }
 
 // ---------------------------------------------------------------------------
@@ -404,19 +445,24 @@ async fn send_with_retry(
         "stream_options": { "include_usage": true },
     });
 
+    let (endpoint_url, use_copilot_headers) = resolve_endpoint(model);
+
     let mut attempt = 0u32;
     loop {
-        let result = http
-            .post(chat_endpoint())
+        let mut req = http
+            .post(&endpoint_url)
             .header("Authorization", format!("Bearer {token}"))
             .header("Content-Type", "application/json")
             .header("Accept", "application/json")
-            .header("Copilot-Integration-Id", "vscode-chat")
-            .header("Editor-Version", "vscode/1.90.0")
-            .header("User-Agent", concat!("amaebi/", env!("CARGO_PKG_VERSION")))
-            .json(&body)
-            .send()
-            .await;
+            .header("User-Agent", concat!("amaebi/", env!("CARGO_PKG_VERSION")));
+
+        if use_copilot_headers {
+            req = req
+                .header("Copilot-Integration-Id", "vscode-chat")
+                .header("Editor-Version", "vscode/1.90.0");
+        }
+
+        let result = req.json(&body).send().await;
 
         match result {
             // ── Success ────────────────────────────────────────────────────
@@ -601,6 +647,74 @@ where
 mod tests {
     use super::*;
     use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
+
+    // ---- resolve_endpoint_with ------------------------------------------
+
+    #[test]
+    fn resolve_endpoint_copilot_override_applies_to_all_models() {
+        // AMAEBI_COPILOT_URL is a test override; it wins regardless of model.
+        let override_url = "http://mock:1234/chat/completions";
+        let (url, hdrs) = resolve_endpoint_with("gemini-2.0-flash", Some(override_url), None);
+        assert_eq!(url, override_url);
+        assert!(hdrs, "test override must use Copilot-style headers");
+
+        let (url2, hdrs2) = resolve_endpoint_with("claude-sonnet-4.6", Some(override_url), None);
+        assert_eq!(url2, override_url);
+        assert!(hdrs2);
+    }
+
+    #[test]
+    fn resolve_endpoint_claude_uses_copilot_endpoint_with_headers() {
+        let (url, hdrs) = resolve_endpoint_with("claude-sonnet-4.6", None, None);
+        assert_eq!(url, CHAT_ENDPOINT);
+        assert!(hdrs, "Claude models must send Copilot-specific headers");
+    }
+
+    #[test]
+    fn resolve_endpoint_all_claude_variants_hit_copilot() {
+        for model in &["claude-3-5-sonnet", "claude-opus-4.6", "claude-haiku-3.5"] {
+            let (url, hdrs) = resolve_endpoint_with(model, None, None);
+            assert_eq!(url, CHAT_ENDPOINT, "model={model}");
+            assert!(hdrs, "model={model}: must use Copilot headers");
+        }
+    }
+
+    #[test]
+    fn resolve_endpoint_non_claude_with_amaebi_url_no_copilot_headers() {
+        let amaebi = "https://amaebi.example.com/v1/chat/completions";
+        for model in &[
+            "gemini-2.0-flash",
+            "gemini-1.5-pro",
+            "gpt-4o",
+            "gpt-5.4",
+            "o3",
+        ] {
+            let (url, hdrs) = resolve_endpoint_with(model, None, Some(amaebi));
+            assert_eq!(url, amaebi, "model={model}");
+            assert!(
+                !hdrs,
+                "model={model}: amaebi endpoint must NOT send Copilot-specific headers"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_endpoint_non_claude_falls_back_to_copilot_without_amaebi_url() {
+        // Without AMAEBI_URL the daemon still works, but logs a warning.
+        let (url, hdrs) = resolve_endpoint_with("gemini-flash", None, None);
+        assert_eq!(url, CHAT_ENDPOINT);
+        assert!(hdrs, "fallback path uses Copilot headers");
+    }
+
+    #[test]
+    fn resolve_endpoint_whitespace_only_values_treated_as_unset() {
+        // Whitespace-only env var values must be ignored.
+        let (url, _) = resolve_endpoint_with("gemini-flash", Some("  "), Some("  "));
+        assert_eq!(
+            url, CHAT_ENDPOINT,
+            "whitespace AMAEBI_URL should fall back to Copilot"
+        );
+    }
 
     // ---- parse_retry_after_header ---------------------------------------
 
