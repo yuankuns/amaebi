@@ -4,6 +4,7 @@ use clap::Parser;
 mod agent_server;
 mod auth;
 mod auth_flow;
+mod bedrock;
 mod cli;
 mod client;
 mod config;

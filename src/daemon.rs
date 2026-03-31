@@ -34,6 +34,15 @@ fn max_output_tokens_for_model(model: &str) -> usize {
         ("claude", 16_384),
         // Gemini models: all variants cap at 8k output.
         ("gemini", 8_192),
+        // Bedrock models (prefixed by provider or cross-region geo prefix).
+        // Claude via Bedrock: same 16 k cap as Copilot-hosted Claude.
+        ("anthropic.", 16_384),
+        // Amazon Nova and Titan models: up to 5 k output.
+        ("amazon.", 5_120),
+        // Catch-all for other Bedrock providers (Cohere, Meta, Mistral, …).
+        ("us.", 16_384),
+        ("eu.", 16_384),
+        ("ap.", 16_384),
     ];
     TABLE
         .iter()
@@ -220,6 +229,17 @@ fn context_limit_for_model(model: &str) -> usize {
         ("gemini-1.5-flash", 1_048_576), // Gemini 1.5 Flash: 1 M context
         ("gemini-1.0", 32_768),          // Gemini 1.0: 32 k context
         ("gemini", 128_000),             // conservative catch-all for other Gemini variants
+        // Bedrock models.
+        // Anthropic Claude on Bedrock: 200k context.
+        ("anthropic.", 200_000),
+        // Amazon Nova Pro/Lite/Micro: 300k; use conservative 200k.
+        ("amazon.nova", 200_000),
+        // Amazon Titan: 32k.
+        ("amazon.", 32_768),
+        // Cross-region inference profiles: same as the base model family.
+        ("us.", 200_000),
+        ("eu.", 200_000),
+        ("ap.", 200_000),
     ];
     TABLE
         .iter()
@@ -1228,16 +1248,15 @@ fn is_unsupported_via_chat_completions(e: &anyhow::Error) -> bool {
         })
 }
 
-/// Send one model turn, with automatic endpoint selection and fallback.
+/// Send one model turn, routing to the correct backend automatically.
 ///
-/// 1. The base URL is derived from the `proxy-ep` field in the Copilot JWT
-///    so each user reaches their account-specific gateway automatically.
-/// 2. All models try `/v1/chat/completions` first.
-/// 3. If the model returns `400 unsupported_api_for_model` (e.g. gpt-5.x),
-///    the request is transparently retried via `/v1/responses` (OpenAI
-///    Responses API), which uses a different request/response format handled
-///    by `crate::responses`.
-/// 4. Auth errors (401/403) evict the token cache and retry once.
+/// * **Bedrock models** (`anthropic.*`, `amazon.*`, `us.*`, …) → SigV4-signed
+///   Bedrock Converse Stream API (`crate::bedrock`).
+/// * **All other models** → Copilot JWT endpoint derived from `proxy-ep`:
+///   1. Try `/v1/chat/completions` first.
+///   2. If the model returns `400 unsupported_api_for_model` (e.g. gpt-5.x),
+///      retry transparently via `/v1/responses` (`crate::responses`).
+///   3. Auth errors (401/403) evict the token cache and retry once.
 async fn invoke_model<W>(
     state: &DaemonState,
     model: &str,
@@ -1249,6 +1268,19 @@ async fn invoke_model<W>(
 where
     W: AsyncWriteExt + Unpin,
 {
+    // Bedrock models use SigV4 auth — no Copilot token needed.
+    if crate::bedrock::is_bedrock_model(model) {
+        return crate::bedrock::stream_chat(
+            &state.http,
+            model,
+            messages,
+            tools,
+            max_tokens,
+            writer,
+        )
+        .await;
+    }
+
     let tok = state
         .tokens
         .get(&state.http)
