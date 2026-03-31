@@ -505,7 +505,9 @@ mod tests {
         let server = MockLlmServer::start().await;
         server.enqueue(ScriptedResponse::text_chunks(vec!["hello"]));
 
-        let client = reqwest::Client::new();
+        // Use no_proxy() so the client connects directly to the local mock
+        // server even when an HTTP proxy is configured in the environment.
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
         let resp = client
             .post(server.url())
             .json(&json!({
@@ -530,7 +532,7 @@ mod tests {
         let server = MockLlmServer::start().await;
         server.enqueue(ScriptedResponse::text_chunks(vec!["ok"]));
 
-        let client = reqwest::Client::new();
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
         client
             .post(server.url())
             .json(&json!({

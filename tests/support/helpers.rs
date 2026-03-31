@@ -117,6 +117,10 @@ pub async fn start_daemon_with_env(
         .env("AMAEBI_COPILOT_URL", mock_url)
         .env("AMAEBI_COPILOT_TOKEN", "test-api-token")
         .env("RUST_LOG", "error")
+        // Bypass any corporate/system HTTP proxy for localhost so that the
+        // daemon's reqwest client connects directly to the mock server.
+        .env("no_proxy", "127.0.0.1,localhost")
+        .env("NO_PROXY", "127.0.0.1,localhost")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped());
@@ -194,6 +198,9 @@ pub async fn start_daemon(mock_url: &str) -> Result<DaemonHandle> {
         .env("AMAEBI_COPILOT_URL", mock_url)
         .env("AMAEBI_COPILOT_TOKEN", "test-api-token")
         .env("RUST_LOG", "error")
+        // Bypass any corporate/system HTTP proxy for localhost.
+        .env("no_proxy", "127.0.0.1,localhost")
+        .env("NO_PROXY", "127.0.0.1,localhost")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -243,6 +250,9 @@ pub async fn start_daemon_at_home_with_env(
         .env("AMAEBI_COPILOT_URL", mock_url)
         .env("AMAEBI_COPILOT_TOKEN", "test-api-token")
         .env("RUST_LOG", "error")
+        // Bypass any corporate/system HTTP proxy for localhost.
+        .env("no_proxy", "127.0.0.1,localhost")
+        .env("NO_PROXY", "127.0.0.1,localhost")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
