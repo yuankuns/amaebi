@@ -75,7 +75,11 @@ fi
 # for a local dev-test runner.
 echo "    image:   $DEV_IMAGE"
 echo "    workdir: $WORKDIR"
-CONTAINER_ID=$(docker run --rm -d \
+# Omit --rm so the container is not auto-deleted before `docker wait` reads
+# its exit code.  With --rm, the container is removed the instant it exits,
+# creating a race where `docker wait` (and sometimes `docker logs -f`) can
+# no longer find it.  The explicit `docker rm` below does the cleanup.
+CONTAINER_ID=$(docker run -d \
     -w "$WORKDIR" \
     --user 0:0 \
     -v "$REPO_ROOT:$REPO_ROOT:rw" \
