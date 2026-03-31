@@ -2035,3 +2035,10 @@ async fn gemini_models_route_via_copilot_and_succeed() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Responses API fallback regression test
+//
+// Verifies that when /chat/completions returns 400 unsupported_api_for_model
+// the daemon automatically retries via /v1/responses and delivers the
+// response to the client.

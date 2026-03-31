@@ -107,17 +107,9 @@ pub(crate) fn to_responses_input(messages: &[Message]) -> Vec<serde_json::Value>
             }
 
             "assistant" => {
-                // If there are tool calls, emit function_call items.
-                if !msg.tool_calls.is_empty() {
-                    for tc in &msg.tool_calls {
-                        out.push(serde_json::json!({
-                            "type": "function_call",
-                            "call_id": tc.id,
-                            "name": tc.function.name,
-                            "arguments": tc.function.arguments
-                        }));
-                    }
-                } else if let Some(ref text) = msg.content {
+                // Emit assistant text first (if any), then function_call items.
+                // Both can be present in the same turn (text + tool call).
+                if let Some(ref text) = msg.content {
                     if !text.is_empty() {
                         let id = format!("msg_{msg_idx}");
                         msg_idx += 1;
@@ -129,6 +121,14 @@ pub(crate) fn to_responses_input(messages: &[Message]) -> Vec<serde_json::Value>
                             "content": [{"type": "output_text", "text": text, "annotations": []}]
                         }));
                     }
+                }
+                for tc in &msg.tool_calls {
+                    out.push(serde_json::json!({
+                        "type": "function_call",
+                        "call_id": tc.id,
+                        "name": tc.function.name,
+                        "arguments": tc.function.arguments
+                    }));
                 }
             }
 
@@ -488,7 +488,17 @@ where
         }
     }
 
-    // Stream closed without [DONE] — still return what we have.
+    // Stream closed without [DONE] — flush any in-flight tool call so it is
+    // not silently dropped when the server closes the connection early.
+    if let Some(p) = pending.take() {
+        if !p.name.is_empty() {
+            tool_calls.push(ToolCall {
+                id: p.call_id,
+                name: p.name,
+                arguments: p.arguments,
+            });
+        }
+    }
     tracing::debug!("Responses API SSE stream closed without [DONE]");
     Ok(build_response(
         text,
@@ -605,6 +615,33 @@ mod tests {
         assert_eq!(fc["call_id"], "call_001");
         assert_eq!(fc["name"], "shell_command");
         assert_eq!(fc["arguments"], r#"{"command":"ls"}"#);
+    }
+
+    #[test]
+    fn assistant_text_and_tool_calls_both_emitted() {
+        // Regression: when an assistant turn has both text and tool calls,
+        // to_responses_input must emit the text message AND the function_call
+        // items — not drop the text in favour of the tool calls only.
+        let tc = ApiToolCall {
+            id: "call_002".into(),
+            kind: "function".into(),
+            function: ApiToolCallFunction {
+                name: "read_file".into(),
+                arguments: r#"{"path":"x"}"#.into(),
+            },
+        };
+        let msgs = vec![
+            Message::user("do both"),
+            Message::assistant(Some("I will read the file.".into()), vec![tc]),
+        ];
+        let input = to_responses_input(&msgs);
+        // Expect: user + output_text message + function_call = 3 items.
+        assert_eq!(input.len(), 3, "expected 3 input items, got: {input:?}");
+        assert_eq!(input[0]["role"], "user");
+        assert_eq!(input[1]["type"], "message");
+        assert_eq!(input[1]["content"][0]["text"], "I will read the file.");
+        assert_eq!(input[2]["type"], "function_call");
+        assert_eq!(input[2]["call_id"], "call_002");
     }
 
     #[test]
