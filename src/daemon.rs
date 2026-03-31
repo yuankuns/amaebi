@@ -18,6 +18,12 @@ use crate::tools::{self, ToolExecutor};
 fn max_output_tokens_for_model(model: &str) -> usize {
     // Ordered longest-prefix-first so that e.g. "gpt-4-turbo" beats "gpt-4".
     const TABLE: &[(&str, usize)] = &[
+        ("gpt-5.4", 32_768), // gpt-5.4 via Responses API
+        ("gpt-5.3", 32_768),
+        ("gpt-5.2", 32_768),
+        ("gpt-5.1", 32_768),
+        ("gpt-5-mini", 16_384),
+        ("gpt-5", 32_768), // catch-all for gpt-5 family
         ("gpt-4.1", 32_768),
         ("gpt-4o", 16_384),
         ("gpt-4-turbo", 4_096),
@@ -26,6 +32,8 @@ fn max_output_tokens_for_model(model: &str) -> usize {
         ("o1", 100_000),
         ("o3", 100_000),
         ("claude", 16_384),
+        // Gemini models: all variants cap at 8k output.
+        ("gemini", 8_192),
     ];
     TABLE
         .iter()
@@ -186,6 +194,8 @@ fn count_message_tokens(messages: &[Message]) -> usize {
 fn context_limit_for_model(model: &str) -> usize {
     // Ordered longest-prefix-first so that e.g. "gpt-4-turbo" beats "gpt-4".
     const TABLE: &[(&str, usize)] = &[
+        // gpt-5.x via Responses API: 128k context (conservative)
+        ("gpt-5", 128_000),
         ("gpt-4o", 128_000),
         ("gpt-4.1", 1_047_576),
         ("gpt-4-turbo", 128_000),
@@ -195,6 +205,12 @@ fn context_limit_for_model(model: &str) -> usize {
         ("o3", 200_000),
         // Claude models: 200k context window.
         ("claude", 200_000),
+        // Gemini models — more specific prefixes must precede less specific ones.
+        ("gemini-2.0-flash", 1_048_576), // Gemini 2.0 Flash: 1 M context
+        ("gemini-1.5-pro", 2_097_152),   // Gemini 1.5 Pro: 2 M context
+        ("gemini-1.5-flash", 1_048_576), // Gemini 1.5 Flash: 1 M context
+        ("gemini-1.0", 32_768),          // Gemini 1.0: 32 k context
+        ("gemini", 128_000),             // conservative catch-all for other Gemini variants
     ];
     TABLE
         .iter()
@@ -1057,22 +1073,17 @@ async fn compact_session(
     // Use a direct API call with no tools so the model cannot execute shell
     // commands during background summarisation.
     let compact_result: Result<String> = async {
-        let token = state
-            .tokens
-            .get(&state.http)
-            .await
-            .context("compact_session: refreshing token")?;
         let mut sink = tokio::io::sink();
-        let resp = copilot::stream_chat(
-            &state.http,
-            &token,
+        let resp = invoke_model(
+            &state,
             &model,
             &messages,
             &[],
             response_max_tokens(&model),
             &mut sink,
         )
-        .await?;
+        .await
+        .context("compact_session: model call failed")?;
         Ok(resp.text)
     }
     .await;
@@ -1106,6 +1117,166 @@ async fn compact_session(
         Err(ref e) => tracing::warn!(error = %e, "compact_session: API error"),
     }
     // _guard is dropped here (and on any earlier return), releasing the slot.
+}
+
+// ---------------------------------------------------------------------------
+// Model dispatch
+// ---------------------------------------------------------------------------
+
+/// Returns `true` when `e` is the specific 400 indicating the model needs the
+/// Responses API (`/v1/responses`) instead of Chat Completions.
+fn is_unsupported_via_chat_completions(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<copilot::CopilotHttpError>()
+        .is_some_and(|he| {
+            he.status.as_u16() == 400 && he.body.contains("unsupported_api_for_model")
+        })
+}
+
+/// Send one model turn, with automatic endpoint selection and fallback.
+///
+/// 1. The base URL is derived from the `proxy-ep` field in the Copilot JWT
+///    so each user reaches their account-specific gateway automatically.
+/// 2. All models try `/v1/chat/completions` first.
+/// 3. If the model returns `400 unsupported_api_for_model` (e.g. gpt-5.x),
+///    the request is transparently retried via `/v1/responses` (OpenAI
+///    Responses API), which uses a different request/response format handled
+///    by `crate::responses`.
+/// 4. Auth errors (401/403) evict the token cache and retry once.
+async fn invoke_model<W>(
+    state: &DaemonState,
+    model: &str,
+    messages: &[Message],
+    tools: &[serde_json::Value],
+    max_tokens: usize,
+    writer: &mut W,
+) -> Result<copilot::CopilotResponse>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    let tok = state
+        .tokens
+        .get(&state.http)
+        .await
+        .context("refreshing Copilot API token")?;
+
+    let result = copilot::stream_chat(
+        &state.http,
+        &tok.value,
+        &tok.base_url,
+        model,
+        messages,
+        tools,
+        max_tokens,
+        writer,
+    )
+    .await;
+
+    match result {
+        Ok(r) => Ok(r),
+
+        // Model requires Responses API — retry transparently using the same
+        // per-account base URL so enterprise gateways are reached correctly.
+        Err(ref e) if is_unsupported_via_chat_completions(e) => {
+            tracing::debug!(
+                model,
+                "model not accessible via /chat/completions; retrying via Responses API"
+            );
+            let r = crate::responses::stream_chat(
+                &state.http,
+                &tok.value,
+                &tok.base_url,
+                model,
+                messages,
+                tools,
+                max_tokens,
+                writer,
+            )
+            .await;
+            // The Responses API can also return 401/403 on token expiry.
+            // Evict the cache and retry once with a fresh token.
+            match r {
+                Ok(r) => Ok(r),
+                Err(e2) => {
+                    let is_auth = e2
+                        .downcast_ref::<copilot::CopilotHttpError>()
+                        .is_some_and(|he| matches!(he.status.as_u16(), 401 | 403));
+                    if is_auth {
+                        tracing::warn!(
+                            error = %e2,
+                            "Responses API auth error; evicting token and retrying"
+                        );
+                        state.tokens.invalidate().await;
+                        let fresh = state
+                            .tokens
+                            .get(&state.http)
+                            .await
+                            .context("fetching fresh token after Responses API auth error")?;
+                        crate::responses::stream_chat(
+                            &state.http,
+                            &fresh.value,
+                            &fresh.base_url,
+                            model,
+                            messages,
+                            tools,
+                            max_tokens,
+                            writer,
+                        )
+                        .await
+                    } else {
+                        Err(e2)
+                    }
+                }
+            }
+        }
+
+        // Auth error — evict the token cache and retry once with a fresh token.
+        Err(e) => {
+            let is_auth_err = e
+                .downcast_ref::<copilot::CopilotHttpError>()
+                .is_some_and(|he| matches!(he.status.as_u16(), 401 | 403));
+            if is_auth_err {
+                tracing::warn!(error = %e, "Copilot auth error; evicting token and retrying");
+                state.tokens.invalidate().await;
+                let fresh = state
+                    .tokens
+                    .get(&state.http)
+                    .await
+                    .context("fetching fresh Copilot token after auth error")?;
+                // Use Chat Completions with fresh token; Responses API fallback
+                // applies here too if needed.
+                let r2 = copilot::stream_chat(
+                    &state.http,
+                    &fresh.value,
+                    &fresh.base_url,
+                    model,
+                    messages,
+                    tools,
+                    max_tokens,
+                    writer,
+                )
+                .await;
+                match r2 {
+                    Ok(r) => Ok(r),
+                    Err(ref e2) if is_unsupported_via_chat_completions(e2) => {
+                        crate::responses::stream_chat(
+                            &state.http,
+                            &fresh.value,
+                            &fresh.base_url,
+                            model,
+                            messages,
+                            tools,
+                            max_tokens,
+                            writer,
+                        )
+                        .await
+                    }
+                    Err(e2) => Err(e2),
+                }
+            } else {
+                Err(e)
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1164,63 +1335,18 @@ where
             // skipped the tool chain at execution time).  No SteerAck is sent.
         }
 
-        // Re-fetch the token on every iteration so long-running agentic loops
-        // survive token expiration.
-        let token = state
-            .tokens
-            .get(&state.http)
-            .await
-            .context("refreshing Copilot API token inside agentic loop")?;
-
-        // stream_chat retries 5xx, 429, and transport errors internally up to
-        // its MAX_RETRIES, but those errors can still surface here if retries
-        // are exhausted, or if parsing/IO errors occur while streaming.
-        // 4xx responses (except 429) are surfaced immediately as CopilotHttpError;
-        // for auth-adjacent ones (400/401/403) we evict the cache and retry once
-        // with a fresh token. Any other error (exhausted retries, context overflow,
-        // etc.) propagates.
-        let resp = match copilot::stream_chat(
-            &state.http,
-            &token,
+        // All models route through the Copilot JWT endpoint; invoke_model
+        // falls back to the Responses API automatically when needed.
+        // Token management and auth-error retry are handled inside invoke_model.
+        let resp = invoke_model(
+            state,
             model,
             &messages,
             &schemas,
             response_max_tokens(model),
             writer,
         )
-        .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                let is_auth_err = e
-                    .downcast_ref::<copilot::CopilotHttpError>()
-                    .is_some_and(|he| matches!(he.status.as_u16(), 400 | 401 | 403));
-                if is_auth_err {
-                    tracing::warn!(
-                        error = %e,
-                        "Copilot auth error; evicting token cache and retrying once"
-                    );
-                    state.tokens.invalidate().await;
-                    let fresh_token = state
-                        .tokens
-                        .get(&state.http)
-                        .await
-                        .context("fetching fresh token after auth error")?;
-                    copilot::stream_chat(
-                        &state.http,
-                        &fresh_token,
-                        model,
-                        &messages,
-                        &schemas,
-                        response_max_tokens(model),
-                        writer,
-                    )
-                    .await?
-                } else {
-                    return Err(e);
-                }
-            }
-        };
+        .await?;
 
         last_prompt_tokens = resp.prompt_tokens;
 
@@ -2183,6 +2309,19 @@ mod tests {
     }
 
     #[test]
+    fn context_limit_gemini_models() {
+        assert_eq!(context_limit_for_model("gemini-2.0-flash"), 1_048_576);
+        assert_eq!(context_limit_for_model("gemini-2.0-flash-001"), 1_048_576);
+        assert_eq!(context_limit_for_model("gemini-1.5-pro"), 2_097_152);
+        assert_eq!(context_limit_for_model("gemini-1.5-flash"), 1_048_576);
+        assert_eq!(context_limit_for_model("gemini-1.5-flash-8b"), 1_048_576);
+        assert_eq!(context_limit_for_model("gemini-1.0-pro"), 32_768);
+        // Catch-all for unrecognised Gemini variants.
+        assert_eq!(context_limit_for_model("gemini-flash"), 128_000);
+        assert_eq!(context_limit_for_model("gemini-pro"), 128_000);
+    }
+
+    #[test]
     fn context_limit_unknown_model_is_conservative() {
         // Unknown models fall back to 32k — never 0, never larger than any known model.
         let limit = context_limit_for_model("some-future-model-xyz");
@@ -2334,6 +2473,14 @@ mod tests {
         assert_eq!(max_output_tokens_for_model("o3-mini"), 100_000);
         assert_eq!(max_output_tokens_for_model("claude-3-5-sonnet"), 16_384);
         assert_eq!(max_output_tokens_for_model("claude-opus-4-6"), 16_384);
+    }
+
+    #[test]
+    fn max_output_tokens_gemini_models() {
+        assert_eq!(max_output_tokens_for_model("gemini-2.0-flash"), 8_192);
+        assert_eq!(max_output_tokens_for_model("gemini-1.5-pro"), 8_192);
+        assert_eq!(max_output_tokens_for_model("gemini-1.5-flash"), 8_192);
+        assert_eq!(max_output_tokens_for_model("gemini-flash"), 8_192);
     }
 
     #[test]

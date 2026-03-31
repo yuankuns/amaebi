@@ -7,21 +7,25 @@ use tokio::io::AsyncWriteExt;
 
 use crate::ipc::{write_frame, Response};
 
-const CHAT_ENDPOINT: &str = "https://api.githubcopilot.com/chat/completions";
+/// Chat-completions path suffix appended to the base URL.
+const CHAT_PATH: &str = "/chat/completions";
 
-/// Return the chat completions URL.
+/// Build the full chat-completions URL from a Copilot API base URL.
 ///
-/// If the `AMAEBI_COPILOT_URL` environment variable is set and non-empty it
-/// overrides the default endpoint.  This is intended for tests that point the
-/// daemon at a local mock server; production deployments never set this
-/// variable so the default is used unconditionally in practice.
-fn chat_endpoint() -> String {
+/// The base URL is derived from the `proxy-ep` field embedded in the Copilot
+/// JWT (see `auth::base_url_from_token`), so all models — Claude, GPT, Gemini
+/// — are routed through the user's own Copilot API endpoint rather than a
+/// hardcoded host.
+///
+/// `AMAEBI_COPILOT_URL` is a test-only override that redirects all requests
+/// to a local mock server; it is never set in production.
+pub(crate) fn chat_endpoint(base_url: &str) -> String {
     if let Ok(url) = std::env::var("AMAEBI_COPILOT_URL") {
         if !url.trim().is_empty() {
             return url.trim().to_string();
         }
     }
-    CHAT_ENDPOINT.to_string()
+    format!("{base_url}{CHAT_PATH}")
 }
 
 // ---------------------------------------------------------------------------
@@ -387,6 +391,7 @@ pub(crate) fn parse_retry_after_header(headers: &reqwest::header::HeaderMap) -> 
 ///   deciding whether to refresh the token and retry.
 ///
 /// On success returns the raw `reqwest::Response` (status 2xx).
+#[allow(clippy::too_many_arguments)]
 async fn send_with_retry(
     http: &reqwest::Client,
     token: &str,
@@ -394,6 +399,8 @@ async fn send_with_retry(
     messages: &[Message],
     tools: &[serde_json::Value],
     max_tokens: usize,
+    endpoint_url: &str,
+    use_copilot_headers: bool,
 ) -> Result<reqwest::Response> {
     let body = serde_json::json!({
         "model": model,
@@ -406,17 +413,18 @@ async fn send_with_retry(
 
     let mut attempt = 0u32;
     loop {
-        let result = http
-            .post(chat_endpoint())
+        let mut req = http
+            .post(endpoint_url)
             .header("Authorization", format!("Bearer {token}"))
             .header("Content-Type", "application/json")
             .header("Accept", "application/json")
-            .header("Copilot-Integration-Id", "vscode-chat")
-            .header("Editor-Version", "vscode/1.90.0")
-            .header("User-Agent", concat!("amaebi/", env!("CARGO_PKG_VERSION")))
-            .json(&body)
-            .send()
-            .await;
+            .header("User-Agent", concat!("amaebi/", env!("CARGO_PKG_VERSION")));
+        if use_copilot_headers {
+            req = req
+                .header("Copilot-Integration-Id", "vscode-chat")
+                .header("Editor-Version", "vscode/1.90.0");
+        }
+        let result = req.json(&body).send().await;
 
         match result {
             // ── Success ────────────────────────────────────────────────────
@@ -439,7 +447,8 @@ async fn send_with_retry(
                 tracing::warn!(
                     attempt,
                     delay_ms = delay.as_millis(),
-                    "Copilot rate-limited (429); backing off before retry"
+                    endpoint = %endpoint_url,
+                    "API rate-limited (429); backing off before retry"
                 );
                 // Drain the body so the underlying connection can be returned
                 // to the pool for reuse, then sleep before retrying.
@@ -467,7 +476,8 @@ async fn send_with_retry(
                     attempt,
                     status = %status,
                     delay_ms = delay.as_millis(),
-                    "Copilot server error; retrying with exponential backoff"
+                    endpoint = %endpoint_url,
+                    "API server error; retrying with exponential backoff"
                 );
                 // Drain the body so the underlying connection can be returned
                 // to the pool for reuse, then sleep before retrying.
@@ -494,14 +504,16 @@ async fn send_with_retry(
             // ── Transport / network error ──────────────────────────────────
             Err(e) => {
                 if attempt >= MAX_RETRIES {
-                    return Err(anyhow::Error::from(e).context("sending chat request to Copilot"));
+                    return Err(anyhow::Error::from(e)
+                        .context(format!("sending chat request to {endpoint_url}")));
                 }
                 let delay = backoff_delay(attempt);
                 tracing::warn!(
                     attempt,
                     error = %e,
                     delay_ms = delay.as_millis(),
-                    "Copilot request failed (transport error); retrying"
+                    endpoint = %endpoint_url,
+                    "API request failed (transport error); retrying"
                 );
                 tokio::time::sleep(delay).await;
                 attempt += 1;
@@ -522,9 +534,17 @@ async fn send_with_retry(
 ///
 /// Text chunks are forwarded to `writer` as `Response::Text` frames as they
 /// arrive.  Returns a [`CopilotResponse`] describing the full turn result.
+/// Send a streaming chat request to the Copilot API.
+///
+/// `token` is the short-lived Copilot JWT; `base_url` is derived from the
+/// `proxy-ep` field embedded in that JWT (see `auth::base_url_from_token`).
+/// All models — Claude, GPT, Gemini — are routed through the same endpoint;
+/// the Copilot API handles model dispatch internally.
+#[allow(clippy::too_many_arguments)]
 pub async fn stream_chat<W>(
     http: &reqwest::Client,
     token: &str,
+    base_url: &str,
     model: &str,
     messages: &[Message],
     tools: &[serde_json::Value],
@@ -534,8 +554,12 @@ pub async fn stream_chat<W>(
 where
     W: AsyncWriteExt + Unpin,
 {
-    tracing::debug!(messages = messages.len(), "sending chat request to Copilot");
-    let resp = send_with_retry(http, token, model, messages, tools, max_tokens).await?;
+    let endpoint = chat_endpoint(base_url);
+    tracing::debug!(messages = messages.len(), endpoint = %endpoint, model, "sending chat request");
+    let resp = send_with_retry(
+        http, token, model, messages, tools, max_tokens, &endpoint, true,
+    )
+    .await?;
     parse_sse_stream(resp, writer).await
 }
 
@@ -601,6 +625,31 @@ where
 mod tests {
     use super::*;
     use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
+
+    // ---- chat_endpoint -----------------------------------------------------
+
+    #[test]
+    #[serial_test::serial]
+    fn chat_endpoint_uses_provided_base_url() {
+        // The endpoint is constructed from the caller-supplied base URL
+        // (derived from proxy-ep in the Copilot JWT).
+        // Serialized so it cannot race with chat_endpoint_test_override_wins,
+        // which sets AMAEBI_COPILOT_URL.
+        std::env::remove_var("AMAEBI_COPILOT_URL");
+        assert_eq!(
+            chat_endpoint("https://api.individual.githubcopilot.com"),
+            "https://api.individual.githubcopilot.com/chat/completions"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn chat_endpoint_test_override_wins() {
+        std::env::set_var("AMAEBI_COPILOT_URL", "http://mock:1234/chat/completions");
+        let result = chat_endpoint("https://api.individual.githubcopilot.com");
+        std::env::remove_var("AMAEBI_COPILOT_URL");
+        assert_eq!(result, "http://mock:1234/chat/completions");
+    }
 
     // ---- parse_retry_after_header ---------------------------------------
 

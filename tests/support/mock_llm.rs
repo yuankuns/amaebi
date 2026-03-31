@@ -170,9 +170,15 @@ impl CapturedRequest {
         self.body.get("model").and_then(|v| v.as_str())
     }
 
-    /// Return the `max_tokens` field.
+    /// Return the output-token limit.
+    ///
+    /// Checks `max_tokens` (Chat Completions) and `max_output_tokens`
+    /// (Responses API) so helpers work for both request formats.
     pub fn max_tokens(&self) -> Option<u64> {
-        self.body.get("max_tokens").and_then(|v| v.as_u64())
+        self.body
+            .get("max_tokens")
+            .or_else(|| self.body.get("max_output_tokens"))
+            .and_then(|v| v.as_u64())
     }
 
     /// Return `true` if `stream` is `true`.
@@ -183,9 +189,15 @@ impl CapturedRequest {
             .unwrap_or(false)
     }
 
-    /// Return the messages array.
+    /// Return the messages / input array.
+    ///
+    /// Checks `messages` (Chat Completions) and `input` (Responses API)
+    /// so helpers work for both request formats.
     pub fn messages(&self) -> Option<&Vec<Value>> {
-        self.body.get("messages").and_then(|v| v.as_array())
+        self.body
+            .get("messages")
+            .or_else(|| self.body.get("input"))
+            .and_then(|v| v.as_array())
     }
 }
 
@@ -238,6 +250,7 @@ impl MockLlmServer {
 
         let app = Router::new()
             .route("/chat/completions", post(handle_completion))
+            .route("/v1/responses", post(handle_responses_api))
             .with_state(state.clone());
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -479,6 +492,101 @@ async fn handle_completion(
             }
         }
         let _ = tx.send(Ok(bytes::Bytes::from("data: [DONE]\n\n"))).await;
+    });
+
+    let stream = ReceiverStream::new(rx);
+    let response = AxumResponse::builder()
+        .status(200)
+        .header("Content-Type", "text/event-stream")
+        .header("Cache-Control", "no-cache")
+        .body(Body::from_stream(stream))
+        .expect("building SSE response");
+
+    Ok(response)
+}
+
+/// Handler for the Responses API endpoint (`POST /v1/responses`).
+///
+/// Accepts the Responses API wire format (`input` array instead of `messages`)
+/// and serves queued scripted responses exactly like the Chat Completions
+/// handler, so tests can exercise the 400→Responses-API fallback path with a
+/// single mock server.
+async fn handle_responses_api(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<AxumResponse<Body>, (StatusCode, String)> {
+    // Capture the raw request (parse leniently since the format differs).
+    let body_value: serde_json::Value =
+        serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+    let captured_headers: Vec<(String, String)> = headers
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
+        .collect();
+    state.captured.lock().unwrap().push(CapturedRequest {
+        headers: captured_headers,
+        body: body_value,
+    });
+
+    // Pop a queued item — share the same queue as /chat/completions.
+    let item = match state.responses.lock().unwrap().pop_front() {
+        Some(i) => i,
+        None => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "no scripted response queued".to_string(),
+            ))
+        }
+    };
+
+    // Pre-canned HTTP error.
+    let scripted = match item {
+        QueuedItem::Response(r) => r,
+        QueuedItem::Error { status, body } => {
+            let code = StatusCode::from_u16(status)
+                .expect("invalid HTTP status code for scripted error in mock LLM server");
+            return Err((code, body));
+        }
+    };
+
+    // Emit SSE in Chat Completions format — the daemon's Responses API parser
+    // handles the actual format; for test purposes the mock can emit the same
+    // SSE stream that the chat completions handler does, because
+    // `AMAEBI_COPILOT_URL` routes the fallback to this mock endpoint which the
+    // test controls entirely.
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::convert::Infallible>>(16);
+
+    tokio::spawn(async move {
+        for (chunk, delay) in scripted.chunks {
+            if let Some(d) = delay {
+                tokio::time::sleep(d).await;
+            }
+            let line = match &chunk {
+                Chunk::Text(t) => {
+                    // Emit Responses API SSE format so the parser in responses.rs
+                    // can decode it.
+                    let data = serde_json::json!({
+                        "type": "response.output_text.delta",
+                        "delta": t
+                    });
+                    format!("data: {}\n\n", serde_json::to_string(&data).unwrap())
+                }
+                Chunk::ToolCallDelta { .. } | Chunk::Finish(_) => {
+                    // Not needed for current tests; emit a no-op done event.
+                    "data: {\"type\":\"response.completed\"}\n\n".to_string()
+                }
+            };
+            if tx.send(Ok(bytes::Bytes::from(line))).await.is_err() {
+                return;
+            }
+        }
+        let done = serde_json::json!({"type": "response.completed"});
+        let _ = tx
+            .send(Ok(bytes::Bytes::from(format!(
+                "data: {}\n\n",
+                serde_json::to_string(&done).unwrap()
+            ))))
+            .await;
     });
 
     let stream = ReceiverStream::new(rx);

@@ -1821,3 +1821,224 @@ async fn llm_error_path_surfaces_error_frame_and_daemon_stays_alive() {
         "expected Done on recovery message: {r2:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Endpoint routing regression tests
+//
+// All models (Claude, GPT, Gemini) are routed through the same Copilot
+// endpoint.  The correct base URL is derived from the `proxy-ep` field
+// embedded in the Copilot JWT.  This eliminates the previous 400
+// "unsupported_api_for_model" errors for gpt-5.4 and gemini models, which
+// occurred because those models are only accessible via the user's
+// account-specific Copilot gateway (e.g. api.individual.githubcopilot.com),
+// not the generic api.githubcopilot.com host.
+// ---------------------------------------------------------------------------
+
+/// All models — claude-*, gpt-5.4, gemini-* — must use the same Copilot
+/// endpoint and Copilot JWT.  This is the regression test for the 400
+/// "unsupported_api_for_model" bug that affected non-Claude models.
+#[tokio::test]
+async fn all_models_use_copilot_endpoint_and_jwt() {
+    for model in &["gpt-5.4", "gemini-2.5-pro", "claude-sonnet-4.6", "gpt-4o"] {
+        let server = MockLlmServer::start().await;
+        server.enqueue(ScriptedResponse::text_chunks(vec!["ok"]));
+
+        let daemon = start_daemon(&server.url()).await.expect("start_daemon");
+        let client = connect_client(&daemon.socket);
+
+        send_message_with_session(&client, "hi", "sess-routing", model)
+            .await
+            .expect("send_message");
+
+        let reqs = server.take_requests();
+        assert!(!reqs.is_empty(), "model={model}: no requests captured");
+
+        // All models must use the Copilot JWT (AMAEBI_COPILOT_TOKEN = "test-api-token").
+        let auth = reqs[0]
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("authorization"))
+            .map(|(_, v)| v.as_str())
+            .unwrap_or("");
+
+        assert!(
+            auth.contains("test-api-token"),
+            "model={model}: expected Copilot JWT in Authorization header; got: {auth:?}"
+        );
+
+        // The correct model name must be forwarded to the API.
+        assert_eq!(
+            reqs[0].model(),
+            Some(model.as_ref()),
+            "model={model}: wrong model field in request"
+        );
+    }
+}
+
+/// When `/chat/completions` returns `400 unsupported_api_for_model`, the daemon
+/// must transparently retry via the Responses API (`/v1/responses`) and the
+/// client must receive the final text from that fallback call.
+///
+/// This is the regression test for the gpt-5.4 / gpt-5.x bug: those models
+/// are not accessible via `/chat/completions` and require the Responses API.
+#[tokio::test]
+async fn responses_api_fallback_on_unsupported_model() {
+    let server = MockLlmServer::start().await;
+
+    // First request hits /chat/completions → 400 unsupported_api_for_model.
+    server.enqueue_error(
+        400,
+        r#"{"error":{"code":"unsupported_api_for_model","message":"model is not accessible via the /chat/completions endpoint"}}"#,
+    );
+    // Second request hits /v1/responses (fallback) → text response.
+    server.enqueue(ScriptedResponse::text_chunks(vec!["fallback-ok"]));
+
+    let daemon = start_daemon(&server.url()).await.expect("start_daemon");
+    let client = connect_client(&daemon.socket);
+
+    let responses = send_message_with_session(&client, "hello", "sess-fallback", "gpt-5.4")
+        .await
+        .expect("send_message");
+
+    let text = collect_text(&responses);
+    assert!(
+        text.contains("fallback-ok"),
+        "expected fallback response text; got: {text:?}"
+    );
+
+    // Two requests must have been made: one to /chat/completions (400), one to /v1/responses.
+    let reqs = server.take_requests();
+    assert_eq!(
+        reqs.len(),
+        2,
+        "expected 2 requests (chat completions + responses fallback), got {}",
+        reqs.len()
+    );
+}
+
+/// All gpt-5.x model variants must trigger the Responses API fallback when
+/// /chat/completions returns 400 unsupported_api_for_model.
+#[tokio::test]
+async fn responses_api_fallback_all_gpt5_variants() {
+    for model in &["gpt-5.4", "gpt-5.4-mini", "gpt-5", "gpt-5-turbo"] {
+        let server = MockLlmServer::start().await;
+        server.enqueue_error(
+            400,
+            r#"{"error":{"code":"unsupported_api_for_model","message":"not via chat/completions"}}"#,
+        );
+        server.enqueue(ScriptedResponse::text_chunks(vec!["responses-ok"]));
+
+        let daemon = start_daemon(&server.url()).await.expect("start_daemon");
+        let client = connect_client(&daemon.socket);
+
+        let responses =
+            send_message_with_session(&client, "ping", &format!("sess-gpt5-{model}"), model)
+                .await
+                .expect("send_message");
+
+        let text = collect_text(&responses);
+        assert!(
+            text.contains("responses-ok"),
+            "model={model}: expected Responses API text; got: {text:?}"
+        );
+
+        let reqs = server.take_requests();
+        assert_eq!(
+            reqs.len(),
+            2,
+            "model={model}: expected 2 requests (chat/completions + /v1/responses), got {}",
+            reqs.len()
+        );
+    }
+}
+
+/// Claude and gpt-4o models must succeed via /chat/completions directly,
+/// without needing the Responses API fallback.
+#[tokio::test]
+async fn chat_completions_models_no_fallback_needed() {
+    for model in &["claude-sonnet-4.6", "claude-opus-4.6", "gpt-4o", "gpt-4.1"] {
+        let server = MockLlmServer::start().await;
+        // Enqueue exactly one response — if the daemon made a second request
+        // (fallback) the mock would error with "no scripted response queued".
+        server.enqueue(ScriptedResponse::text_chunks(vec!["direct-ok"]));
+
+        let daemon = start_daemon(&server.url()).await.expect("start_daemon");
+        let client = connect_client(&daemon.socket);
+
+        let responses =
+            send_message_with_session(&client, "ping", &format!("sess-direct-{model}"), model)
+                .await
+                .expect("send_message");
+
+        let text = collect_text(&responses);
+        assert!(
+            text.contains("direct-ok"),
+            "model={model}: expected direct response; got: {text:?}"
+        );
+
+        let reqs = server.take_requests();
+        assert_eq!(
+            reqs.len(),
+            1,
+            "model={model}: expected exactly 1 request (no fallback), got {}",
+            reqs.len()
+        );
+    }
+}
+
+/// Gemini models must route through the Copilot JWT endpoint and return
+/// a valid response via /chat/completions (no Responses API needed).
+#[tokio::test]
+async fn gemini_models_route_via_copilot_and_succeed() {
+    for model in &[
+        "gemini-2.5-pro",
+        "gemini-2.0-flash",
+        "gemini-1.5-pro",
+        "gemini-flash",
+    ] {
+        let server = MockLlmServer::start().await;
+        server.enqueue(ScriptedResponse::text_chunks(vec!["gemini-ok"]));
+
+        let daemon = start_daemon(&server.url()).await.expect("start_daemon");
+        let client = connect_client(&daemon.socket);
+
+        let responses =
+            send_message_with_session(&client, "ping", &format!("sess-gemini-{model}"), model)
+                .await
+                .expect("send_message");
+
+        let text = collect_text(&responses);
+        assert!(
+            text.contains("gemini-ok"),
+            "model={model}: expected response text; got: {text:?}"
+        );
+
+        // Exactly one request — direct /chat/completions, no fallback.
+        let reqs = server.take_requests();
+        assert_eq!(
+            reqs.len(),
+            1,
+            "model={model}: expected 1 request, got {}",
+            reqs.len()
+        );
+
+        // Copilot JWT must be present.
+        let auth = reqs[0]
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("authorization"))
+            .map(|(_, v)| v.as_str())
+            .unwrap_or("");
+        assert!(
+            auth.contains("test-api-token"),
+            "model={model}: Copilot JWT missing; got: {auth:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Responses API fallback regression test
+//
+// Verifies that when /chat/completions returns 400 unsupported_api_for_model
+// the daemon automatically retries via /v1/responses and delivers the
+// response to the client.
