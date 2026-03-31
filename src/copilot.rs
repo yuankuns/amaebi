@@ -7,49 +7,25 @@ use tokio::io::AsyncWriteExt;
 
 use crate::ipc::{write_frame, Response};
 
-/// GitHub Copilot chat endpoint — serves Claude models.
-const CHAT_ENDPOINT: &str = "https://api.githubcopilot.com/chat/completions";
+/// Chat-completions path suffix appended to the base URL.
+const CHAT_PATH: &str = "/chat/completions";
 
-/// GitHub Models endpoint — serves all models listed by `amaebi models`,
-/// including GPT-5, Gemini, and any model that returns
-/// `unsupported_api_for_model` from the Copilot endpoint.
+/// Build the full chat-completions URL from a Copilot API base URL.
 ///
-/// Authentication uses the raw GitHub OAuth token (no Copilot JWT exchange).
-pub(crate) const GITHUB_MODELS_ENDPOINT: &str =
-    "https://models.inference.ai.azure.com/chat/completions";
-
-/// Return the Copilot chat URL (Claude models).
+/// The base URL is derived from the `proxy-ep` field embedded in the Copilot
+/// JWT (see `auth::base_url_from_token`), so all models — Claude, GPT, Gemini
+/// — are routed through the user's own Copilot API endpoint rather than a
+/// hardcoded host.
 ///
-/// `AMAEBI_COPILOT_URL` is a test-only override that redirects to a local
-/// mock server; it is never set in production.
-fn chat_endpoint() -> String {
+/// `AMAEBI_COPILOT_URL` is a test-only override that redirects all requests
+/// to a local mock server; it is never set in production.
+pub(crate) fn chat_endpoint(base_url: &str) -> String {
     if let Ok(url) = std::env::var("AMAEBI_COPILOT_URL") {
         if !url.trim().is_empty() {
             return url.trim().to_string();
         }
     }
-    CHAT_ENDPOINT.to_string()
-}
-
-/// Return the GitHub Models endpoint URL (non-Claude models).
-///
-/// Override priority (for tests):
-/// 1. `AMAEBI_GITHUB_MODELS_URL` — points specifically at a GitHub Models mock,
-///    allowing tests to distinguish the two backends.
-/// 2. `AMAEBI_COPILOT_URL` — single-mock fallback so tests that don't need to
-///    differentiate endpoints continue to work unchanged.
-pub(crate) fn github_models_endpoint() -> String {
-    if let Ok(url) = std::env::var("AMAEBI_GITHUB_MODELS_URL") {
-        if !url.trim().is_empty() {
-            return url.trim().to_string();
-        }
-    }
-    if let Ok(url) = std::env::var("AMAEBI_COPILOT_URL") {
-        if !url.trim().is_empty() {
-            return url.trim().to_string();
-        }
-    }
-    GITHUB_MODELS_ENDPOINT.to_string()
+    format!("{base_url}{CHAT_PATH}")
 }
 
 // ---------------------------------------------------------------------------
@@ -558,9 +534,17 @@ async fn send_with_retry(
 ///
 /// Text chunks are forwarded to `writer` as `Response::Text` frames as they
 /// arrive.  Returns a [`CopilotResponse`] describing the full turn result.
+/// Send a streaming chat request to the Copilot API.
+///
+/// `token` is the short-lived Copilot JWT; `base_url` is derived from the
+/// `proxy-ep` field embedded in that JWT (see `auth::base_url_from_token`).
+/// All models — Claude, GPT, Gemini — are routed through the same endpoint;
+/// the Copilot API handles model dispatch internally.
+#[allow(clippy::too_many_arguments)]
 pub async fn stream_chat<W>(
     http: &reqwest::Client,
     token: &str,
+    base_url: &str,
     model: &str,
     messages: &[Message],
     tools: &[serde_json::Value],
@@ -570,46 +554,10 @@ pub async fn stream_chat<W>(
 where
     W: AsyncWriteExt + Unpin,
 {
-    let endpoint = chat_endpoint();
-    tracing::debug!(messages = messages.len(), endpoint = %endpoint, "sending chat request");
-    let resp = send_with_retry(
-        http, token, model, messages, tools, max_tokens, &endpoint, true,
-    )
-    .await?;
-    parse_sse_stream(resp, writer).await
-}
-
-/// Send a streaming chat request to the **GitHub Models** endpoint.
-///
-/// Used for non-Claude models (GPT-5, Gemini, …) that are accessible via
-/// the GitHub Models API (`models.inference.ai.azure.com`) but not via the
-/// Copilot chat-completions endpoint.
-///
-/// `oauth_token` is the raw GitHub OAuth token from `auth::read_oauth_token()`,
-/// NOT the short-lived Copilot API JWT.
-pub async fn stream_chat_models<W>(
-    http: &reqwest::Client,
-    oauth_token: &str,
-    model: &str,
-    messages: &[Message],
-    tools: &[serde_json::Value],
-    max_tokens: usize,
-    writer: &mut W,
-) -> Result<CopilotResponse>
-where
-    W: AsyncWriteExt + Unpin,
-{
-    let endpoint = github_models_endpoint();
+    let endpoint = chat_endpoint(base_url);
     tracing::debug!(messages = messages.len(), endpoint = %endpoint, model, "sending chat request");
     let resp = send_with_retry(
-        http,
-        oauth_token,
-        model,
-        messages,
-        tools,
-        max_tokens,
-        &endpoint,
-        false,
+        http, token, model, messages, tools, max_tokens, &endpoint, true,
     )
     .await?;
     parse_sse_stream(resp, writer).await
@@ -681,14 +629,22 @@ mod tests {
     // ---- chat_endpoint -----------------------------------------------------
 
     #[test]
+    fn chat_endpoint_uses_provided_base_url() {
+        // The endpoint is constructed from the caller-supplied base URL
+        // (derived from proxy-ep in the Copilot JWT).
+        assert_eq!(
+            chat_endpoint("https://api.individual.githubcopilot.com"),
+            "https://api.individual.githubcopilot.com/chat/completions"
+        );
+    }
+
+    #[test]
     #[serial_test::serial]
-    fn chat_endpoint_default_is_copilot() {
-        // Without AMAEBI_COPILOT_URL all models use the Copilot endpoint.
-        // Claude, GPT, Gemini, and any other model the Copilot gateway
-        // supports are all reached through the same URL — no per-model
-        // routing is required.
+    fn chat_endpoint_test_override_wins() {
+        std::env::set_var("AMAEBI_COPILOT_URL", "http://mock:1234/chat/completions");
+        let result = chat_endpoint("https://api.individual.githubcopilot.com");
         std::env::remove_var("AMAEBI_COPILOT_URL");
-        assert_eq!(chat_endpoint(), CHAT_ENDPOINT);
+        assert_eq!(result, "http://mock:1234/chat/completions");
     }
 
     // ---- parse_retry_after_header ---------------------------------------

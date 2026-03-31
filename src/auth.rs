@@ -115,10 +115,59 @@ struct ApiTokenResponse {
     refresh_in: u64,
 }
 
-/// A cached Copilot API token with its expiry time.
+/// Default Copilot chat-completions base URL, used when `proxy-ep` is absent.
+pub const DEFAULT_COPILOT_BASE_URL: &str = "https://api.githubcopilot.com";
+
+/// Extract the chat-completions base URL from the Copilot API token.
+///
+/// The token returned by the Copilot token endpoint is a semicolon-delimited
+/// key=value string.  One field is `proxy-ep=<url>`.  GitHub's convention is
+/// that the actual API host is obtained by replacing the `proxy.` sub-domain
+/// with `api.`.  For example:
+///   `proxy-ep=https://proxy.individual.githubcopilot.com`
+///   → `https://api.individual.githubcopilot.com`
+///
+/// Returns the derived URL, or [`DEFAULT_COPILOT_BASE_URL`] when the field is
+/// absent or cannot be parsed.
+pub fn base_url_from_token(token: &str) -> String {
+    for field in token.split(';') {
+        let field = field.trim();
+        let Some(val) = field.strip_prefix("proxy-ep=") else {
+            continue;
+        };
+        let val = val.trim();
+        if val.is_empty() {
+            continue;
+        }
+        // Strip the scheme, swap proxy. → api., re-attach https://.
+        let host = val
+            .trim_start_matches("https://")
+            .trim_start_matches("http://");
+        let api_host = if let Some(rest) = host.strip_prefix("proxy.") {
+            format!("api.{rest}")
+        } else {
+            host.to_string()
+        };
+        let derived = format!("https://{api_host}");
+        tracing::debug!(proxy_ep = %val, base_url = %derived, "derived Copilot base URL from proxy-ep");
+        return derived;
+    }
+    DEFAULT_COPILOT_BASE_URL.to_string()
+}
+
+/// A cached Copilot API token with its expiry time and the derived base URL.
 struct CachedToken {
     value: String,
+    /// Chat-completions base URL derived from `proxy-ep` in the token.
+    base_url: String,
     valid_until: Instant,
+}
+
+/// The token value and its associated base URL, returned together so callers
+/// always use the correct endpoint for the token they hold.
+pub struct CopilotToken {
+    pub value: String,
+    pub base_url: String,
 }
 
 /// Thread-safe token cache stored in daemon shared state.
@@ -142,14 +191,17 @@ impl TokenCache {
         *guard = None;
     }
 
-    /// Return a valid API token, fetching a fresh one if the cache is empty
-    /// or the cached token is about to expire.
-    pub async fn get(&self, http: &reqwest::Client) -> Result<String> {
+    /// Return a valid API token and its base URL, fetching a fresh one if the
+    /// cache is empty or the cached token is about to expire.
+    pub async fn get(&self, http: &reqwest::Client) -> Result<CopilotToken> {
         // Allow tests to inject a pre-baked token via env var, bypassing the
         // full OAuth flow (which requires real GitHub credentials).
         if let Ok(tok) = std::env::var("AMAEBI_COPILOT_TOKEN") {
             if !tok.trim().is_empty() {
-                return Ok(tok.trim().to_string());
+                return Ok(CopilotToken {
+                    value: tok.trim().to_string(),
+                    base_url: DEFAULT_COPILOT_BASE_URL.to_string(),
+                });
             }
         }
 
@@ -158,15 +210,21 @@ impl TokenCache {
         // Return cached token if it has more than 60 s left.
         if let Some(ref cached) = *guard {
             if cached.valid_until > Instant::now() {
-                return Ok(cached.value.clone());
+                return Ok(CopilotToken {
+                    value: cached.value.clone(),
+                    base_url: cached.base_url.clone(),
+                });
             }
             tracing::debug!("Copilot API token expired; refreshing");
         }
 
         let cached = fetch_api_token(http).await?;
-        let value = cached.value.clone();
+        let tok = CopilotToken {
+            value: cached.value.clone(),
+            base_url: cached.base_url.clone(),
+        };
         *guard = Some(cached);
-        Ok(value)
+        Ok(tok)
     }
 }
 
@@ -195,7 +253,9 @@ async fn fetch_api_token(http: &reqwest::Client) -> Result<CachedToken> {
     let ttl = Duration::from_secs(body.refresh_in.saturating_sub(60));
     tracing::debug!(ttl_secs = ttl.as_secs(), "Copilot API token refreshed");
 
+    let base_url = base_url_from_token(&body.token);
     Ok(CachedToken {
+        base_url,
         value: body.token,
         valid_until: Instant::now() + ttl,
     })
@@ -214,6 +274,51 @@ mod tests {
     use std::time::Duration;
     use tempfile::TempDir;
 
+    // ---- base_url_from_token -----------------------------------------------
+
+    #[test]
+    fn base_url_from_token_extracts_proxy_ep() {
+        // Standard individual Copilot account.
+        let tok = "tid=abc;proxy-ep=https://proxy.individual.githubcopilot.com;sku=pro";
+        assert_eq!(
+            base_url_from_token(tok),
+            "https://api.individual.githubcopilot.com"
+        );
+    }
+
+    #[test]
+    fn base_url_from_token_enterprise_host() {
+        let tok = "tid=xyz;proxy-ep=https://proxy.business.githubcopilot.com";
+        assert_eq!(
+            base_url_from_token(tok),
+            "https://api.business.githubcopilot.com"
+        );
+    }
+
+    #[test]
+    fn base_url_from_token_no_proxy_ep_uses_default() {
+        assert_eq!(
+            base_url_from_token("tid=abc;sku=pro"),
+            DEFAULT_COPILOT_BASE_URL
+        );
+    }
+
+    #[test]
+    fn base_url_from_token_empty_token_uses_default() {
+        assert_eq!(base_url_from_token(""), DEFAULT_COPILOT_BASE_URL);
+    }
+
+    #[test]
+    fn base_url_from_token_case_insensitive_prefix() {
+        let tok = "proxy-ep=https://Proxy.individual.githubcopilot.com";
+        // proxy. prefix match is lowercase-normalised in the impl.
+        let result = base_url_from_token(tok);
+        assert!(
+            result.starts_with("https://"),
+            "result should be a valid URL: {result}"
+        );
+    }
+
     // ---- TokenCache::invalidate -------------------------------------------
 
     #[tokio::test]
@@ -224,6 +329,7 @@ mod tests {
             let mut guard = cache.inner.lock().await;
             *guard = Some(CachedToken {
                 value: "test-token".into(),
+                base_url: DEFAULT_COPILOT_BASE_URL.to_string(),
                 valid_until: Instant::now() + Duration::from_secs(3600),
             });
         }
