@@ -109,7 +109,7 @@ pub enum Command {
     /// Heartbeat items are pending tasks that the daemon periodically reviews.
     /// Items can be added by the agent during conversations or manually via CLI.
     /// The daemon checks pending items at a configurable interval (default: 30 min)
-    /// and deposits results in the inbox.
+    /// and injects reports into active sessions via the steer channel.
     Heartbeat {
         #[command(subcommand)]
         action: HeartbeatAction,
