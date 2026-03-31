@@ -795,6 +795,12 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                     )
                 })
             };
+            // Record where the current user prompt sits BEFORE inject_skill_files,
+            // which may append extra system messages after the user turn.
+            // Capturing here ensures the stored turn delta starts at the user
+            // prompt and never includes the injected skill-file system messages
+            // (which would otherwise be replayed as history on subsequent turns).
+            let mut user_prompt_idx = messages.len() - 1;
             inject_skill_files(&mut messages).await;
 
             // Pre-flight token check: if over the compaction threshold, trim to hot tail.
@@ -817,6 +823,8 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                     &past_summaries,
                     own_summary.as_deref(),
                 );
+                // Update before inject so the index stays correct after inject.
+                user_prompt_idx = messages.len() - 1;
                 inject_skill_files(&mut messages).await;
                 tracing::debug!(
                     hot_tail = trimmed.len(),
@@ -826,11 +834,6 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
             } else {
                 false
             };
-
-            // Record where the current user prompt sits in the message array.
-            // After the agentic loop, everything from this index onward is the
-            // delta (user + tool exchanges + assistant reply) to persist.
-            let user_prompt_idx = messages.len() - 1;
 
             // Snapshot the token count before messages is moved into the loop.
             // Used as a fallback when the API returns prompt_tokens = 0.
