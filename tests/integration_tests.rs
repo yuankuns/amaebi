@@ -1039,12 +1039,12 @@ async fn spawn_agent_parallel_calls() {
     server.enqueue(ScriptedResponse::tool_call(
         "sc-parallel-1",
         "shell_command",
-        r#"{"command":"sleep 1"}"#,
+        r#"{"command":"sleep 2"}"#,
     ));
     server.enqueue(ScriptedResponse::tool_call(
         "sc-parallel-2",
         "shell_command",
-        r#"{"command":"sleep 1"}"#,
+        r#"{"command":"sleep 2"}"#,
     ));
     // 4 & 5. Final text for each child (order is non-deterministic).
     server.enqueue(ScriptedResponse::text_chunks(vec!["child1 done"]));
@@ -1070,11 +1070,11 @@ async fn spawn_agent_parallel_calls() {
     );
 
     // Parallel execution: nominally ~1 s + overhead. In loaded CI runners this
-    // path can be noisier; keep the guard loose enough to avoid flakiness while
-    // still catching obvious sequential regressions (sequential would be ≥ 2 s).
+    // path can be noisier; use a moderate margin while still catching
+    // obvious sequential regressions (sequential would be ≥ 4 s here).
     assert!(
-        elapsed.as_millis() < 5000,
-        "expected parallel execution to finish in < 5.0 s, took {elapsed:?}"
+        elapsed.as_millis() < 3500,
+        "expected parallel execution to finish in < 3.5 s, took {elapsed:?}"
     );
 
     // 6 LLM requests: 1 parent + 2×(shell_command + text) + 1 parent final.

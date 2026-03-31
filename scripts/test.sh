@@ -94,7 +94,8 @@ trap cleanup_container EXIT INT TERM
 # Omit --rm so the container is not auto-deleted before `docker wait` reads
 # its exit code.  With --rm, the container is removed the instant it exits,
 # creating a race where `docker wait` (and sometimes `docker logs -f`) can
-# no longer find it.  The trap above handles cleanup instead.
+# no longer find it.  The explicit cleanup below handles the normal path,
+# while the trap provides cleanup on interrupts/early exits.
 CONTAINER_ID=$(docker run -d \
     -w "$WORKDIR" \
     --user 0:0 \
@@ -134,8 +135,8 @@ if [[ "$RUN_DOCKER" == "1" ]]; then
     # Step 1 runs cargo as root inside Docker and can leave root-owned artifacts.
     # The inline chown above handles the normal path; this catches edge cases
     # (e.g. the user ran Step 1 manually with an older script version).
-    if [[ -d "$WORKDIR/target" ]] && ! [[ -w "$WORKDIR/target" ]]; then
-        echo "    detected non-writable target/, repairing ownership via docker..."
+    if [[ -d "$WORKDIR/target" ]] && { ! [[ -w "$WORKDIR/target" ]] || find "$WORKDIR/target" ! -w -print -quit 2>/dev/null | grep -q .; }; then
+        echo "    detected non-writable paths under target/, repairing ownership via docker..."
         HOST_UID=$(id -u)
         HOST_GID=$(id -g)
         if docker run --rm \
