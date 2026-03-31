@@ -1874,3 +1874,44 @@ async fn all_models_use_copilot_endpoint_and_jwt() {
         );
     }
 }
+
+/// When `/chat/completions` returns `400 unsupported_api_for_model`, the daemon
+/// must transparently retry via the Responses API (`/v1/responses`) and the
+/// client must receive the final text from that fallback call.
+///
+/// This is the regression test for the gpt-5.4 / gpt-5.x bug: those models
+/// are not accessible via `/chat/completions` and require the Responses API.
+#[tokio::test]
+async fn responses_api_fallback_on_unsupported_model() {
+    let server = MockLlmServer::start().await;
+
+    // First request hits /chat/completions → 400 unsupported_api_for_model.
+    server.enqueue_error(
+        400,
+        r#"{"error":{"code":"unsupported_api_for_model","message":"model is not accessible via the /chat/completions endpoint"}}"#,
+    );
+    // Second request hits /v1/responses (fallback) → text response.
+    server.enqueue(ScriptedResponse::text_chunks(vec!["fallback-ok"]));
+
+    let daemon = start_daemon(&server.url()).await.expect("start_daemon");
+    let client = connect_client(&daemon.socket);
+
+    let responses = send_message_with_session(&client, "hello", "sess-fallback", "gpt-5.4")
+        .await
+        .expect("send_message");
+
+    let text = collect_text(&responses);
+    assert!(
+        text.contains("fallback-ok"),
+        "expected fallback response text; got: {text:?}"
+    );
+
+    // Two requests must have been made: one to /chat/completions (400), one to /v1/responses.
+    let reqs = server.take_requests();
+    assert_eq!(
+        reqs.len(),
+        2,
+        "expected 2 requests (chat completions + responses fallback), got {}",
+        reqs.len()
+    );
+}

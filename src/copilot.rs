@@ -629,9 +629,13 @@ mod tests {
     // ---- chat_endpoint -----------------------------------------------------
 
     #[test]
+    #[serial_test::serial]
     fn chat_endpoint_uses_provided_base_url() {
         // The endpoint is constructed from the caller-supplied base URL
         // (derived from proxy-ep in the Copilot JWT).
+        // Serialized so it cannot race with chat_endpoint_test_override_wins,
+        // which sets AMAEBI_COPILOT_URL.
+        std::env::remove_var("AMAEBI_COPILOT_URL");
         assert_eq!(
             chat_endpoint("https://api.individual.githubcopilot.com"),
             "https://api.individual.githubcopilot.com/chat/completions"

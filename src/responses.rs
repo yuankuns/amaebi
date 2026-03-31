@@ -33,8 +33,16 @@ use crate::ipc::{write_frame, Response};
 /// base URL so that tests pointing at a single mock server work unchanged.
 fn responses_endpoint(base_url: &str) -> String {
     if let Ok(url) = std::env::var("AMAEBI_COPILOT_URL") {
-        if !url.trim().is_empty() {
-            return url.trim().to_string();
+        let trimmed = url.trim();
+        if !trimmed.is_empty() {
+            // AMAEBI_COPILOT_URL is typically set to the full /chat/completions
+            // URL in tests.  Strip that path suffix so both Chat Completions and
+            // the Responses API share the same host, then append /v1/responses.
+            // This lets a single mock server handle both endpoints.
+            let base = trimmed
+                .trim_end_matches("/chat/completions")
+                .trim_end_matches('/');
+            return format!("{base}/v1/responses");
         }
     }
     format!("{}/v1/responses", base_url.trim_end_matches('/'))
