@@ -29,11 +29,13 @@
 
 mod support;
 
+use std::time::Duration;
+
 use support::{
     helpers::{
         collect_text, connect_client, seed_cron_job, send_message, send_message_with_session,
         send_resume, setup_home, start_daemon, start_daemon_at_home_with_env,
-        start_daemon_with_env,
+        start_daemon_with_env, Request, Response,
     },
     mock_llm::{MockLlmServer, ScriptedResponse},
 };
@@ -1392,4 +1394,390 @@ async fn cron_job_with_spawn_agent() {
 
     let _ = child.kill().await;
     let _ = child.wait().await;
+}
+
+// ===========================================================================
+// REGRESSION TESTS — Issue #24
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// R1. Steer E2E: SteerAck delivered and message injected into LLM context
+// ---------------------------------------------------------------------------
+
+/// Inject a `Steer` message on the same socket connection as the ongoing Chat
+/// while a tool is executing.  The daemon must:
+///   1. Consume the steer at the top of the next loop iteration.
+///   2. Send `Response::SteerAck` to the client.
+///   3. Include the steer text in the messages sent to the LLM on that turn.
+///   4. Complete the session with `Response::Done` (no panic).
+///
+/// Flow:
+///   - Chat → LLM: shell_command("sleep 0.3")   [gives steer time to arrive]
+///   - While sleep runs: client sends Steer on the same socket
+///   - Loop iteration 2: steer consumed → SteerAck → LLM called with steer
+///   - LLM: text "steer-acknowledged"
+///
+/// The bidirectional socket protocol (Chat + Steer on the same connection)
+/// is exercised end-to-end.
+#[tokio::test]
+async fn steer_e2e_delivers_ack_and_injects_message() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::UnixStream;
+
+    let server = MockLlmServer::start().await;
+
+    // Turn 1: a 300 ms sleep gives the steer plenty of time to arrive before
+    // the second loop iteration's `steer_rx.try_recv()` call.
+    server.enqueue(ScriptedResponse::tool_call(
+        "steer-tool-1",
+        "shell_command",
+        r#"{"command":"sleep 0.3"}"#,
+    ));
+    // Turn 2: text reply produced after the steer is consumed.
+    server.enqueue(ScriptedResponse::text_chunks(vec!["steer-acknowledged"]));
+
+    let daemon = start_daemon(&server.url()).await.expect("daemon");
+    let session_id = uuid::Uuid::new_v4().to_string();
+
+    // Open a raw bidirectional socket: Chat and Steer share the same connection.
+    let stream = UnixStream::connect(&daemon.socket)
+        .await
+        .expect("connect to daemon socket");
+    let (read_half, mut write_half) = stream.into_split();
+
+    // Send the initial Chat request.
+    let chat_req = Request::Chat {
+        prompt: "run a slow tool".to_string(),
+        tmux_pane: None,
+        session_id: Some(session_id.clone()),
+        model: "gpt-4o".to_string(),
+    };
+    let mut json_line = serde_json::to_string(&chat_req).unwrap();
+    json_line.push('\n');
+    write_half
+        .write_all(json_line.as_bytes())
+        .await
+        .expect("sending Chat request");
+
+    // Read responses line by line; inject Steer immediately after ToolUse.
+    let mut lines = BufReader::new(read_half).lines();
+    let mut responses: Vec<Response> = Vec::new();
+    let mut steer_sent = false;
+
+    let read_result = tokio::time::timeout(Duration::from_secs(15), async {
+        while let Some(line) = lines
+            .next_line()
+            .await
+            .expect("reading response line")
+        {
+            if line.is_empty() {
+                continue;
+            }
+            let frame: Response =
+                serde_json::from_str(&line).expect("parsing response frame");
+            let done = matches!(frame, Response::Done | Response::Error { .. });
+
+            // Inject Steer on the same socket the moment we see the ToolUse
+            // frame — the tool is now executing, giving the daemon's reader
+            // task time to forward the message before the next iteration.
+            if !steer_sent {
+                if let Response::ToolUse { .. } = &frame {
+                    let steer_req = Request::Steer {
+                        session_id: session_id.clone(),
+                        message: "please adjust approach".to_string(),
+                    };
+                    let mut steer_line = serde_json::to_string(&steer_req).unwrap();
+                    steer_line.push('\n');
+                    write_half
+                        .write_all(steer_line.as_bytes())
+                        .await
+                        .expect("sending Steer request");
+                    steer_sent = true;
+                }
+            }
+
+            responses.push(frame);
+            if done {
+                break;
+            }
+        }
+    })
+    .await;
+
+    read_result.expect("steer E2E test timed out after 15 s");
+    assert!(steer_sent, "ToolUse frame never appeared — steer not injected");
+
+    // The daemon must have sent SteerAck confirming the message was consumed.
+    assert!(
+        responses.iter().any(|r| matches!(r, Response::SteerAck)),
+        "expected SteerAck in responses: {responses:?}"
+    );
+
+    // Session must complete cleanly.
+    assert!(
+        responses.iter().any(|r| matches!(r, Response::Done)),
+        "expected Done frame (no crash): {responses:?}"
+    );
+    assert!(
+        !responses
+            .iter()
+            .any(|r| matches!(r, Response::Error { .. })),
+        "unexpected Error frame: {responses:?}"
+    );
+
+    // The steer text must appear in the LLM's second request.
+    let reqs = server.take_requests();
+    assert_eq!(reqs.len(), 2, "expected 2 LLM requests, got {}", reqs.len());
+    let second_req_messages = reqs[1].messages().expect("messages in second LLM request");
+    let all_content: String = second_req_messages
+        .iter()
+        .filter_map(|m| m.get("content").and_then(|c| c.as_str()))
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        all_content.contains("adjust approach"),
+        "steer text must appear in LLM second-turn context:\n{all_content}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// R2. Sandbox credential protection: child context must not expose host creds
+// ---------------------------------------------------------------------------
+
+/// When `spawn_agent` creates a child agent with a noop sandbox, the child's
+/// LLM request messages must not contain:
+///   - the daemon's host HOME directory path (which holds `hosts.json`)
+///   - the `AMAEBI_COPILOT_TOKEN` value used by the test suite
+///
+/// The [Sandbox Context] preamble is only allowed to mention the explicitly
+/// supplied `workspace` path and sandbox type — not any host credential paths.
+///
+/// Flow:
+///   - Parent turn 1 → spawn_agent{ workspace: "/tmp" }   (no extra_mounts)
+///   - Child turn 1  → text "child done"
+///   - Parent turn 2 → text "all done"
+///
+/// Uses `AMAEBI_SPAWN_SANDBOX=noop` so no Docker is required.
+#[tokio::test]
+async fn sandbox_noop_child_does_not_expose_credentials() {
+    let server = MockLlmServer::start().await;
+
+    server.enqueue(ScriptedResponse::tool_call(
+        "cred-spawn-1",
+        "spawn_agent",
+        r#"{"task":"check environment","workspace":"/tmp"}"#,
+    ));
+    server.enqueue(ScriptedResponse::text_chunks(vec!["child done"]));
+    server.enqueue(ScriptedResponse::text_chunks(vec!["all done"]));
+
+    let daemon = start_daemon_with_env(&server.url(), &[("AMAEBI_SPAWN_SANDBOX", "noop")])
+        .await
+        .expect("daemon");
+    let client = connect_client(&daemon.socket);
+
+    let responses = send_message(&client, "spawn a child")
+        .await
+        .expect("send_message");
+
+    let text = collect_text(&responses);
+    assert!(
+        text.contains("all done"),
+        "expected parent final text: {text:?}"
+    );
+
+    let reqs = server.take_requests();
+    assert_eq!(reqs.len(), 3, "expected 3 LLM requests, got {}", reqs.len());
+
+    // Child's request is at index 1.
+    let child_messages = reqs[1].messages().expect("messages in child LLM request");
+    let all_content: String = child_messages
+        .iter()
+        .flat_map(|m| {
+            let content = m.get("content");
+            if let Some(s) = content.and_then(|c| c.as_str()) {
+                vec![s.to_string()]
+            } else if let Some(arr) = content.and_then(|c| c.as_array()) {
+                arr.iter()
+                    .filter_map(|p| p.get("text").and_then(|t| t.as_str()).map(str::to_string))
+                    .collect()
+            } else {
+                vec![]
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    // The AMAEBI_COPILOT_TOKEN must never appear in child LLM messages.
+    assert!(
+        !all_content.contains("test-api-token"),
+        "child context must not expose AMAEBI_COPILOT_TOKEN value: {all_content}"
+    );
+
+    // The daemon's HOME directory (which contains hosts.json) must not be
+    // listed as a mount or otherwise mentioned in the child's context.
+    let home_str = daemon
+        .home
+        .to_str()
+        .expect("home path is valid UTF-8");
+    assert!(
+        !all_content.contains(home_str),
+        "child context must not expose host HOME path {home_str:?}: {all_content}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// R3. Sub-agent chain: session remains usable after child recursion is blocked
+// ---------------------------------------------------------------------------
+
+/// Regression: when a child agent attempts to call `spawn_agent` (recursion),
+/// the daemon must:
+///   1. Return the explicit error string to the child's LLM.
+///   2. Allow the child to complete with a coherent text reply.
+///   3. Allow the parent to complete with a coherent text reply.
+///   4. Leave the session usable for a subsequent message (no state corruption).
+///
+/// Flow (round 1):
+///   Parent turn 1 → spawn_agent
+///   Child turn 1  → spawn_agent attempt (recursion)
+///   Child turn 2  → text "child: recursion blocked"
+///   Parent turn 2 → text "parent: child reported error"
+/// Flow (round 2, same session_id):
+///   Chat → text "session still works"
+///
+/// Uses `AMAEBI_SPAWN_SANDBOX=noop` so no Docker is required.
+#[tokio::test]
+async fn subagent_chain_session_remains_usable_after_recursion_block() {
+    let server = MockLlmServer::start().await;
+
+    // Round 1 ----------------------------------------------------------------
+    server.enqueue(ScriptedResponse::tool_call(
+        "chain-parent-spawn",
+        "spawn_agent",
+        r#"{"task":"try nested spawn","workspace":"/tmp"}"#,
+    ));
+    // Child tries to spawn again — should receive the recursion-blocked error.
+    server.enqueue(ScriptedResponse::tool_call(
+        "chain-child-nested",
+        "spawn_agent",
+        r#"{"task":"nested task","workspace":"/tmp"}"#,
+    ));
+    server.enqueue(ScriptedResponse::text_chunks(vec![
+        "child: recursion blocked",
+    ]));
+    server.enqueue(ScriptedResponse::text_chunks(vec![
+        "parent: child reported error",
+    ]));
+
+    // Round 2 (verify session still usable) ----------------------------------
+    server.enqueue(ScriptedResponse::text_chunks(vec!["session still works"]));
+
+    let session_id = uuid::Uuid::new_v4().to_string();
+    let daemon = start_daemon_with_env(&server.url(), &[("AMAEBI_SPAWN_SANDBOX", "noop")])
+        .await
+        .expect("daemon");
+    let client = connect_client(&daemon.socket);
+
+    // Round 1.
+    let r1 = send_message_with_session(&client, "do nested agent task", &session_id, "gpt-4o")
+        .await
+        .expect("round 1");
+    let text1 = collect_text(&r1);
+    assert!(
+        text1.contains("parent: child reported error"),
+        "expected coherent parent response: {text1:?}"
+    );
+    assert!(
+        !r1.iter().any(|r| matches!(r, Response::Error { .. })),
+        "no Error frames expected in round 1: {r1:?}"
+    );
+
+    // Round 2: same session_id — daemon must still be functional.
+    let r2 = send_message_with_session(&client, "follow-up", &session_id, "gpt-4o")
+        .await
+        .expect("round 2");
+    let text2 = collect_text(&r2);
+    assert!(
+        text2.contains("session still works"),
+        "session should be usable after recursion failure: {text2:?}"
+    );
+    assert!(
+        !r2.iter().any(|r| matches!(r, Response::Error { .. })),
+        "no Error frames expected in round 2: {r2:?}"
+    );
+
+    // The child's second LLM request (index 2) must include the explicit
+    // "spawn_agent is not available" error in the tool result.
+    let reqs = server.take_requests();
+    // 4 requests for round 1 (parent×2 + child×2) + 1 for round 2 = 5.
+    assert_eq!(
+        reqs.len(),
+        5,
+        "expected 5 LLM requests total, got {}",
+        reqs.len()
+    );
+    let child_second_messages = reqs[2].messages().expect("messages in child turn 2");
+    let child_ctx: String = child_second_messages
+        .iter()
+        .filter_map(|m| m.get("content").and_then(|c| c.as_str()))
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        child_ctx.contains("spawn_agent is not available"),
+        "child must receive explicit recursion-blocked error: {child_ctx}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// R4. LLM error path: Error frame surfaced; daemon stays alive for next message
+// ---------------------------------------------------------------------------
+
+/// When the LLM returns a non-retryable 4xx HTTP error, the daemon must:
+///   1. Surface a `Response::Error` frame to the client (not panic or hang).
+///   2. Remain alive and fully functional for subsequent messages.
+///
+/// A 422 status is used because 4xx (other than 429) bypasses the retry/
+/// back-off logic in `copilot.rs`, so the test completes without any sleep.
+///
+/// Flow:
+///   Message 1 → mock returns 422 → Error frame
+///   Message 2 → mock returns text "recovered" → Done frame
+#[tokio::test]
+async fn llm_error_path_surfaces_error_frame_and_daemon_stays_alive() {
+    let server = MockLlmServer::start().await;
+
+    // First request: LLM returns a non-retryable 422 error.
+    server.enqueue_error(422, "mock: unprocessable entity");
+    // Second request: normal text reply — daemon must still be reachable.
+    server.enqueue(ScriptedResponse::text_chunks(vec!["recovered"]));
+
+    let daemon = start_daemon(&server.url()).await.expect("daemon");
+    let client = connect_client(&daemon.socket);
+
+    // Message 1: should result in an Error frame, no panic.
+    let r1 = send_message(&client, "trigger an llm error")
+        .await
+        .expect("send_message (error case)");
+    assert!(
+        r1.iter().any(|r| matches!(r, Response::Error { .. })),
+        "expected Error frame on LLM 422 failure: {r1:?}"
+    );
+    // Done is NOT sent after Error; ensure there is no Done either (clean terminal).
+    assert!(
+        !r1.iter().any(|r| matches!(r, Response::Done)),
+        "Done must not follow Error: {r1:?}"
+    );
+
+    // Message 2: daemon must still be alive and return a normal response.
+    let r2 = send_message(&client, "retry after error")
+        .await
+        .expect("send_message (recovery case)");
+    let text2 = collect_text(&r2);
+    assert!(
+        text2.contains("recovered"),
+        "daemon must be usable after LLM error: {text2:?}"
+    );
+    assert!(
+        r2.iter().any(|r| matches!(r, Response::Done)),
+        "expected Done on recovery message: {r2:?}"
+    );
 }

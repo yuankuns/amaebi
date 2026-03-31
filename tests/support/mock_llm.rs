@@ -190,13 +190,26 @@ impl CapturedRequest {
 }
 
 // ---------------------------------------------------------------------------
+// Queued item (scripted SSE response or a pre-canned HTTP error)
+// ---------------------------------------------------------------------------
+
+/// An item in the mock server's response queue.
+#[derive(Clone, Debug)]
+pub(crate) enum QueuedItem {
+    /// Stream a normal SSE scripted response.
+    Response(ScriptedResponse),
+    /// Return an HTTP error immediately (no SSE body).
+    Error { status: u16, body: String },
+}
+
+// ---------------------------------------------------------------------------
 // Server state
 // ---------------------------------------------------------------------------
 
 #[derive(Clone)]
 struct ServerState {
     /// Queue of scripted responses. Tests push; handler pops.
-    responses: Arc<Mutex<VecDeque<ScriptedResponse>>>,
+    responses: Arc<Mutex<VecDeque<QueuedItem>>>,
     /// Log of all captured requests.
     captured: Arc<Mutex<Vec<CapturedRequest>>>,
     /// Whether to validate incoming requests.
@@ -218,7 +231,7 @@ impl MockLlmServer {
     /// Start the server on a random free port and return a handle.
     pub async fn start() -> Self {
         let state = ServerState {
-            responses: Arc::new(Mutex::new(VecDeque::new())),
+            responses: Arc::new(Mutex::new(VecDeque::<QueuedItem>::new())),
             captured: Arc::new(Mutex::new(Vec::new())),
             validate: true,
         };
@@ -257,7 +270,27 @@ impl MockLlmServer {
 
     /// Push a scripted response onto the queue.
     pub fn enqueue(&self, resp: ScriptedResponse) {
-        self.state.responses.lock().unwrap().push_back(resp);
+        self.state
+            .responses
+            .lock()
+            .unwrap()
+            .push_back(QueuedItem::Response(resp));
+    }
+
+    /// Push an HTTP error response (non-retryable 4xx) onto the queue.
+    ///
+    /// When this item is popped the handler returns the given status code and
+    /// body without streaming any SSE.  Use a 4xx status to bypass the
+    /// daemon's retry-on-5xx logic so tests complete without backoff delays.
+    pub fn enqueue_error(&self, status: u16, body: impl Into<String>) {
+        self.state
+            .responses
+            .lock()
+            .unwrap()
+            .push_back(QueuedItem::Error {
+                status,
+                body: body.into(),
+            });
     }
 
     /// Take and return all captured requests since the last call.
@@ -402,14 +435,24 @@ async fn handle_completion(
         body: body_value,
     });
 
-    // Pop a scripted response — fail fast if nothing queued.
-    let scripted = match state.responses.lock().unwrap().pop_front() {
-        Some(r) => r,
+    // Pop a queued item — fail fast if nothing queued.
+    let item = match state.responses.lock().unwrap().pop_front() {
+        Some(i) => i,
         None => {
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "no scripted response queued".to_string(),
             ))
+        }
+    };
+
+    // Pre-canned HTTP error: return immediately without streaming.
+    let scripted = match item {
+        QueuedItem::Response(r) => r,
+        QueuedItem::Error { status, body } => {
+            let code = StatusCode::from_u16(status)
+                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            return Err((code, body));
         }
     };
 
