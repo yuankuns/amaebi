@@ -678,6 +678,15 @@ where
         }
         // Discard all bytes we have already consumed in this chunk.
         buf.drain(..cursor);
+
+        // If we still cannot parse a complete frame and the buffer has grown
+        // beyond our safety cap, abort instead of buffering unbounded data.
+        if buf.len() > MAX_FRAME_SIZE {
+            anyhow::bail!(
+                "Bedrock event stream frame exceeds maximum size ({} bytes)",
+                MAX_FRAME_SIZE
+            );
+        }
     }
 
     // Flush any tool-use blocks that arrived without a contentBlockStop
