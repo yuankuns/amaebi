@@ -6,32 +6,18 @@
 //! 3. Connects a client to the daemon socket.
 //! 4. Exercises the daemon and asserts on the responses / captured requests.
 //!
-//! ## Current tests (24 total)
+//! ## Covered scenarios
 //!
-//! 1. `test_basic_chat_roundtrip` — basic chat round-trip
-//! 2. `test_tool_call_roundtrip` — tool-call round-trip (shell echo)
-//! 3. `test_max_tokens_present_in_request` — max_tokens present and > 0 in LLM request
-//! 4. `test_request_format_valid` — LLM request contains model, stream:true, messages with roles
-//! 5. `test_compaction_triggered_at_threshold` — Compacting frame emitted when threshold exceeded
-//! 6. `test_compaction_preserves_summary` — summary text appears in next turn's messages
-//! 7. `test_hot_tail_preserved_after_compaction` — message count bounded to hot tail after compaction
-//! 8. `test_pre_flight_trim_on_resume` — resume loads history; pre-flight trim fires at low threshold
-//! 9. `spawn_agent_runs_task` — parent spawns child agent; child runs echo; parent gets result
-//! 10. `spawn_agent_child_cannot_spawn` — child agent cannot recursively call spawn_agent
-//! 11. `spawn_agent_uses_specified_model` — child agent uses the model from spawn_agent args
-//! 12. `spawn_agent_missing_workspace_returns_error` — missing workspace arg yields tool error to parent
-//! 13. `spawn_agent_workspace_passed_to_sandbox` — workspace path appears in child agent's LLM context
-//! 14. `spawn_agent_parallel_calls` — two spawn_agent calls with parallel=true run concurrently
-//! 15. `spawn_agent_parallel_timing` — parallel=true batch completes in ~5s not ~10s (ignored)
-//! 16. `cron_job_triggers_llm_call` — scheduled cron job fires and calls the LLM with the task prompt
-//! 17. `cron_job_result_not_sent_to_chat` — cron output goes to inbox only, never to the chat stream
-//! 18. `cron_job_with_spawn_agent` — cron job can call spawn_agent; child runs and returns result
-//! 19. `steer_e2e_delivers_ack_and_injects_message` — steer is acked and injected into next loop turn
-//! 20. `sandbox_noop_child_does_not_expose_credentials` — child context must not leak host credential paths
-//! 21. `subagent_chain_session_remains_usable_after_recursion_block` — recursion block does not poison session
-//! 22. `llm_error_path_surfaces_error_frame_and_daemon_stays_alive` — non-retryable LLM error surfaces cleanly and recovers
-//! 23. `support::mock_llm::tests::mock_server_captures_request` — mock server captures request payloads
-//! 24. `support::mock_llm::tests::mock_server_returns_text` — mock server streams scripted text chunks
+//! - basic chat/tool-call round-trips
+//! - request format and token/max-token behavior
+//! - compaction trigger + summary/hot-tail behavior
+//! - resume pre-flight trim behavior
+//! - spawn_agent flow (normal run, recursion block, model/workspace handling, parallel path)
+//! - cron flow (trigger, isolation from chat output, spawn_agent from cron)
+//! - steer end-to-end behavior
+//! - sandbox credential exposure regression checks
+//! - sub-agent chain/session resilience
+//! - non-retryable LLM error-path recovery
 
 mod support;
 
