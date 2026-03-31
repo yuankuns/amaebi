@@ -33,9 +33,17 @@ fn chat_endpoint() -> String {
 
 /// Return the GitHub Models endpoint URL (non-Claude models).
 ///
-/// `AMAEBI_COPILOT_URL` test override applies here too so integration tests
-/// that point both backends at the same mock server continue to work.
-fn github_models_endpoint() -> String {
+/// Override priority (for tests):
+/// 1. `AMAEBI_GITHUB_MODELS_URL` — points specifically at a GitHub Models mock,
+///    allowing tests to distinguish the two backends.
+/// 2. `AMAEBI_COPILOT_URL` — single-mock fallback so tests that don't need to
+///    differentiate endpoints continue to work unchanged.
+pub(crate) fn github_models_endpoint() -> String {
+    if let Ok(url) = std::env::var("AMAEBI_GITHUB_MODELS_URL") {
+        if !url.trim().is_empty() {
+            return url.trim().to_string();
+        }
+    }
     if let Ok(url) = std::env::var("AMAEBI_COPILOT_URL") {
         if !url.trim().is_empty() {
             return url.trim().to_string();

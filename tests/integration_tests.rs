@@ -1821,3 +1821,173 @@ async fn llm_error_path_surfaces_error_frame_and_daemon_stays_alive() {
         "expected Done on recovery message: {r2:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Endpoint routing regression tests
+//
+// Regression for: non-Claude models (gpt-5.x, gemini-*) returned 400
+// "unsupported_api_for_model" from the Copilot endpoint.
+// Fix: route non-Claude models to the GitHub Models endpoint
+// (models.inference.ai.azure.com) using the Copilot JWT.
+//
+// Single-server tests verify the token used; two-server tests verify
+// which endpoint URL is actually targeted.
+// ---------------------------------------------------------------------------
+
+/// Non-Claude models must use the Copilot JWT sent to the GitHub Models
+/// endpoint, NOT the raw OAuth token.
+#[tokio::test]
+async fn non_claude_model_uses_github_models_endpoint() {
+    let server = MockLlmServer::start().await;
+    server.enqueue(ScriptedResponse::text_chunks(vec!["hello from gpt-5.4"]));
+
+    let daemon = start_daemon(&server.url()).await.expect("start_daemon");
+    let client = connect_client(&daemon.socket);
+
+    let responses = send_message_with_session(&client, "hi", "sess-gpt5", "gpt-5.4")
+        .await
+        .expect("send_message");
+
+    let text = collect_text(&responses);
+    assert!(
+        text.contains("hello from gpt-5.4"),
+        "unexpected text: {text:?}"
+    );
+
+    let reqs = server.take_requests();
+    assert!(!reqs.is_empty(), "no requests captured");
+
+    // Non-Claude uses the Copilot JWT (AMAEBI_COPILOT_TOKEN = "test-api-token").
+    let auth_header = reqs[0]
+        .headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("authorization"))
+        .map(|(_, v)| v.as_str())
+        .unwrap_or("");
+
+    assert!(
+        auth_header.contains("test-api-token"),
+        "non-Claude model should use Copilot JWT; got Authorization: {auth_header:?}"
+    );
+}
+
+/// Claude models must use the Copilot JWT to the Copilot endpoint (unchanged).
+#[tokio::test]
+async fn claude_model_uses_copilot_endpoint() {
+    let server = MockLlmServer::start().await;
+    server.enqueue(ScriptedResponse::text_chunks(vec!["hello from claude"]));
+
+    let daemon = start_daemon(&server.url()).await.expect("start_daemon");
+    let client = connect_client(&daemon.socket);
+
+    let responses = send_message_with_session(&client, "hi", "sess-claude", "claude-sonnet-4.6")
+        .await
+        .expect("send_message");
+
+    let text = collect_text(&responses);
+    assert!(
+        text.contains("hello from claude"),
+        "unexpected text: {text:?}"
+    );
+
+    let reqs = server.take_requests();
+    assert!(!reqs.is_empty(), "no requests captured");
+
+    let auth_header = reqs[0]
+        .headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("authorization"))
+        .map(|(_, v)| v.as_str())
+        .unwrap_or("");
+
+    assert!(
+        auth_header.contains("test-api-token"),
+        "Claude model should use Copilot JWT; got Authorization: {auth_header:?}"
+    );
+}
+
+/// Two-server test: gpt-5.4 must reach the GitHub Models mock, NOT the
+/// Copilot mock (regression for bug 1: wrong endpoint).
+#[tokio::test]
+async fn non_claude_routed_to_github_models_not_copilot() {
+    let copilot_mock = MockLlmServer::start().await;
+    let models_mock = MockLlmServer::start().await;
+
+    models_mock.enqueue(ScriptedResponse::text_chunks(vec!["from github models"]));
+
+    let daemon = start_daemon_with_env(
+        &copilot_mock.url(),
+        &[("AMAEBI_GITHUB_MODELS_URL", models_mock.url().as_str())],
+    )
+    .await
+    .expect("start_daemon");
+    let client = connect_client(&daemon.socket);
+
+    let responses = send_message_with_session(&client, "hi", "sess-routing", "gpt-5.4")
+        .await
+        .expect("send_message");
+
+    let text = collect_text(&responses);
+    assert!(
+        text.contains("from github models"),
+        "gpt-5.4 response should come from GitHub Models mock; got: {text:?}"
+    );
+
+    let models_reqs = models_mock.take_requests();
+    let copilot_reqs = copilot_mock.take_requests();
+
+    assert_eq!(
+        models_reqs.len(),
+        1,
+        "GitHub Models mock should receive gpt-5.4 request"
+    );
+    assert_eq!(
+        copilot_reqs.len(),
+        0,
+        "Copilot mock must NOT receive gpt-5.4 request (regression: bug 1)"
+    );
+    assert_eq!(models_reqs[0].model(), Some("gpt-5.4"));
+}
+
+/// Two-server test: claude-* must reach the Copilot mock, NOT the GitHub
+/// Models mock.
+#[tokio::test]
+async fn claude_routed_to_copilot_not_github_models() {
+    let copilot_mock = MockLlmServer::start().await;
+    let models_mock = MockLlmServer::start().await;
+
+    copilot_mock.enqueue(ScriptedResponse::text_chunks(vec!["from copilot"]));
+
+    let daemon = start_daemon_with_env(
+        &copilot_mock.url(),
+        &[("AMAEBI_GITHUB_MODELS_URL", models_mock.url().as_str())],
+    )
+    .await
+    .expect("start_daemon");
+    let client = connect_client(&daemon.socket);
+
+    let responses =
+        send_message_with_session(&client, "hi", "sess-claude-routing", "claude-sonnet-4.6")
+            .await
+            .expect("send_message");
+
+    let text = collect_text(&responses);
+    assert!(
+        text.contains("from copilot"),
+        "claude response should come from Copilot mock; got: {text:?}"
+    );
+
+    let copilot_reqs = copilot_mock.take_requests();
+    let models_reqs = models_mock.take_requests();
+
+    assert_eq!(
+        copilot_reqs.len(),
+        1,
+        "Copilot mock should receive claude request"
+    );
+    assert_eq!(
+        models_reqs.len(),
+        0,
+        "GitHub Models mock must NOT receive Claude requests"
+    );
+}
