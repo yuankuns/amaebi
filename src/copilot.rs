@@ -614,10 +614,12 @@ mod tests {
     // ---- chat_endpoint -----------------------------------------------------
 
     #[test]
+    #[serial_test::serial]
     fn chat_endpoint_default_is_copilot() {
         // Without AMAEBI_COPILOT_URL all models use the Copilot endpoint.
-        // All model families (Claude, GPT, Gemini, …) are served by the
-        // Copilot gateway — no per-model URL routing needed.
+        // Claude, GPT, Gemini, and any other model the Copilot gateway
+        // supports are all reached through the same URL — no per-model
+        // routing is required.
         std::env::remove_var("AMAEBI_COPILOT_URL");
         assert_eq!(chat_endpoint(), CHAT_ENDPOINT);
     }

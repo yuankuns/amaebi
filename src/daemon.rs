@@ -26,7 +26,7 @@ fn max_output_tokens_for_model(model: &str) -> usize {
         ("o1", 100_000),
         ("o3", 100_000),
         ("claude", 16_384),
-        // Gemini models routed via AMAEBI_URL: all variants cap at 8k output.
+        // Gemini models served by the Copilot gateway: all variants cap at 8k output.
         ("gemini", 8_192),
     ];
     TABLE
@@ -197,7 +197,7 @@ fn context_limit_for_model(model: &str) -> usize {
         ("o3", 200_000),
         // Claude models: 200k context window.
         ("claude", 200_000),
-        // Gemini models routed via AMAEBI_URL.
+        // Gemini models served by the Copilot gateway.
         // More specific prefixes must precede less specific ones.
         ("gemini-2.0-flash", 1_048_576), // Gemini 2.0 Flash: 1 M context
         ("gemini-1.5-pro", 2_097_152),   // Gemini 1.5 Pro: 2 M context
