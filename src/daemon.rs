@@ -32,7 +32,7 @@ fn max_output_tokens_for_model(model: &str) -> usize {
         ("o1", 100_000),
         ("o3", 100_000),
         ("claude", 16_384),
-        // Gemini models served by the Copilot gateway: all variants cap at 8k output.
+        // Gemini models: all variants cap at 8k output.
         ("gemini", 8_192),
     ];
     TABLE
@@ -205,8 +205,7 @@ fn context_limit_for_model(model: &str) -> usize {
         ("o3", 200_000),
         // Claude models: 200k context window.
         ("claude", 200_000),
-        // Gemini models served by the Copilot gateway.
-        // More specific prefixes must precede less specific ones.
+        // Gemini models — more specific prefixes must precede less specific ones.
         ("gemini-2.0-flash", 1_048_576), // Gemini 2.0 Flash: 1 M context
         ("gemini-1.5-pro", 2_097_152),   // Gemini 1.5 Pro: 2 M context
         ("gemini-1.5-flash", 1_048_576), // Gemini 1.5 Flash: 1 M context
@@ -1175,7 +1174,8 @@ where
     match result {
         Ok(r) => Ok(r),
 
-        // Model requires Responses API — retry transparently.
+        // Model requires Responses API — retry transparently using the same
+        // per-account base URL so enterprise gateways are reached correctly.
         Err(ref e) if is_unsupported_via_chat_completions(e) => {
             tracing::debug!(
                 model,
@@ -1184,6 +1184,7 @@ where
             crate::responses::stream_chat(
                 &state.http,
                 &tok.value,
+                &tok.base_url,
                 model,
                 messages,
                 tools,
@@ -1225,6 +1226,7 @@ where
                         crate::responses::stream_chat(
                             &state.http,
                             &fresh.value,
+                            &fresh.base_url,
                             model,
                             messages,
                             tools,
@@ -1298,9 +1300,9 @@ where
             // skipped the tool chain at execution time).  No SteerAck is sent.
         }
 
-        // Dispatch to the correct backend (Copilot for Claude, GitHub Models
-        // for everything else).  Token management and auth-error retry are
-        // handled inside invoke_model.
+        // All models route through the Copilot JWT endpoint; invoke_model
+        // falls back to the Responses API automatically when needed.
+        // Token management and auth-error retry are handled inside invoke_model.
         let resp = invoke_model(
             state,
             model,

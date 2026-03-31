@@ -22,20 +22,22 @@ use crate::ipc::{write_frame, Response};
 // Constants
 // ---------------------------------------------------------------------------
 
-const RESPONSES_ENDPOINT: &str = "https://api.githubcopilot.com/v1/responses";
-
-/// Return the Responses API URL.
+/// Build the Responses API URL from the account-specific `base_url`.
 ///
-/// `AMAEBI_COPILOT_URL` is a test-only override; when set it replaces the
-/// endpoint for both Chat Completions and the Responses API so tests that
-/// use a single mock server work without changes.
-fn responses_endpoint() -> String {
+/// `base_url` is derived from the `proxy-ep` field in the Copilot JWT and
+/// already points to the correct per-account gateway (individual, enterprise,
+/// etc.).  Appending `/v1/responses` gives the Responses API endpoint for
+/// that account.
+///
+/// `AMAEBI_COPILOT_URL` is a test-only override; when set it is used as the
+/// base URL so that tests pointing at a single mock server work unchanged.
+fn responses_endpoint(base_url: &str) -> String {
     if let Ok(url) = std::env::var("AMAEBI_COPILOT_URL") {
         if !url.trim().is_empty() {
             return url.trim().to_string();
         }
     }
-    RESPONSES_ENDPOINT.to_string()
+    format!("{}/v1/responses", base_url.trim_end_matches('/'))
 }
 const MAX_RETRIES: u32 = 3;
 const MAX_RETRY_AFTER_SECS: u64 = 30;
@@ -176,6 +178,7 @@ fn infer_initiator(messages: &[Message]) -> &'static str {
 async fn send_with_retry(
     http: &reqwest::Client,
     token: &str,
+    base_url: &str,
     model: &str,
     messages: &[Message],
     tools: &[serde_json::Value],
@@ -195,7 +198,7 @@ async fn send_with_retry(
         body["tools"] = serde_json::Value::Array(responses_tools);
     }
 
-    let url = responses_endpoint();
+    let url = responses_endpoint(base_url);
 
     let initiator = infer_initiator(messages);
 
@@ -514,6 +517,7 @@ fn build_response(
 pub async fn stream_chat<W>(
     http: &reqwest::Client,
     token: &str,
+    base_url: &str,
     model: &str,
     messages: &[Message],
     tools: &[serde_json::Value],
@@ -528,7 +532,7 @@ where
         model,
         "sending chat request via Responses API"
     );
-    let resp = send_with_retry(http, token, model, messages, tools, max_tokens).await?;
+    let resp = send_with_retry(http, token, base_url, model, messages, tools, max_tokens).await?;
     parse_responses_stream(resp, writer).await
 }
 

@@ -140,13 +140,16 @@ pub fn base_url_from_token(token: &str) -> String {
             continue;
         }
         // Strip the scheme, swap proxy. → api., re-attach https://.
+        // Normalise to lowercase for the prefix check so that unexpected
+        // capitalisation (e.g. "Proxy.") is handled correctly.
         let host = val
             .trim_start_matches("https://")
             .trim_start_matches("http://");
-        let api_host = if let Some(rest) = host.strip_prefix("proxy.") {
+        let host_lower = host.to_lowercase();
+        let api_host = if let Some(rest) = host_lower.strip_prefix("proxy.") {
             format!("api.{rest}")
         } else {
-            host.to_string()
+            host_lower
         };
         let derived = format!("https://{api_host}");
         tracing::debug!(proxy_ep = %val, base_url = %derived, "derived Copilot base URL from proxy-ep");
@@ -310,12 +313,11 @@ mod tests {
 
     #[test]
     fn base_url_from_token_case_insensitive_prefix() {
+        // "Proxy." (capitalised) must still be swapped to "api.".
         let tok = "proxy-ep=https://Proxy.individual.githubcopilot.com";
-        // proxy. prefix match is lowercase-normalised in the impl.
-        let result = base_url_from_token(tok);
-        assert!(
-            result.starts_with("https://"),
-            "result should be a valid URL: {result}"
+        assert_eq!(
+            base_url_from_token(tok),
+            "https://api.individual.githubcopilot.com"
         );
     }
 
