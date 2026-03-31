@@ -1717,9 +1717,17 @@ where
 
 /// Read global config files from `~/.amaebi/` and inject them as system messages.
 ///
-/// Loads `AGENTS.md` and `SOUL.md` from the user's amaebi home directory
-/// (`~/.amaebi/`).  Files that do not exist or are whitespace-only are
-/// silently skipped.  No per-project or CWD-relative files are read.
+/// Always injects `AGENTS.md` (agent guidelines), `DEV_WORKFLOW.md` (coding
+/// workflow rules), and `SOUL.md` (persona) when present and non-empty.
+///
+/// Also checks for on-demand operations docs (`OPERATIONS_INDEX.md`,
+/// `DEPLOYMENT.md`, `CONFIG_REFERENCE.md`, `RUNBOOK.md`).  Rather than
+/// preloading their full content, it injects a single pointer message listing
+/// the absolute paths of whichever files exist, so the agent can load them
+/// with `read_file` when the task requires it.
+///
+/// Files that do not exist or are whitespace-only are silently skipped.
+/// No per-project or CWD-relative files are read.
 pub(crate) async fn inject_skill_files(messages: &mut Vec<Message>) {
     let home = match amaebi_home() {
         Ok(p) => p,
@@ -1769,7 +1777,8 @@ async fn inject_skill_files_from(messages: &mut Vec<Message>, amaebi_home: &std:
     for filename in ONDEMAND_FILES {
         let path = amaebi_home.join(filename);
         match tokio::fs::metadata(&path).await {
-            Ok(_) => available.push(path.display().to_string()),
+            Ok(metadata) if metadata.is_file() => available.push(path.display().to_string()),
+            Ok(_) => {} // exists but is not a regular file; ignore
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => {
                 tracing::debug!(file = %path.display(), error = %e, "could not stat on-demand file");
@@ -2281,9 +2290,15 @@ mod tests {
         assert_eq!(messages.len(), 1, "one on-demand pointer message expected");
         let body = messages[0].content.as_deref().unwrap_or("");
         assert!(body.contains("## On-demand Operations Docs"));
+        assert!(body.contains("read_file"));
+        // Paths must be absolute (include the temp dir prefix), not bare filenames.
+        let prefix = dir.path().to_str().unwrap();
+        assert!(
+            body.contains(prefix),
+            "pointer message must contain absolute paths, got: {body}"
+        );
         assert!(body.contains("OPERATIONS_INDEX.md"));
         assert!(body.contains("DEPLOYMENT.md"));
-        assert!(body.contains("read_file"));
     }
 
     #[tokio::test]
@@ -2303,6 +2318,26 @@ mod tests {
             !has_ondemand,
             "no on-demand pointer message when files absent"
         );
+    }
+
+    #[tokio::test]
+    async fn skill_files_combined_fixed_and_ondemand() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("AGENTS.md"), "agent guidelines").unwrap();
+        std::fs::write(dir.path().join("DEV_WORKFLOW.md"), "workflow rules").unwrap();
+        std::fs::write(dir.path().join("OPERATIONS_INDEX.md"), "ops index").unwrap();
+        let mut messages: Vec<Message> = vec![];
+        inject_skill_files_from(&mut messages, dir.path()).await;
+        // 3 messages: AGENTS.md, DEV_WORKFLOW.md, on-demand pointer.
+        assert_eq!(messages.len(), 3, "expected 3 messages, got: {messages:#?}");
+        let bodies: Vec<&str> = messages
+            .iter()
+            .map(|m| m.content.as_deref().unwrap_or(""))
+            .collect();
+        assert!(bodies[0].contains("## Agent Guidelines"));
+        assert!(bodies[1].contains("## Dev Workflow"));
+        assert!(bodies[2].contains("## On-demand Operations Docs"));
+        assert!(bodies[2].contains("OPERATIONS_INDEX.md"));
     }
 
     #[test]
