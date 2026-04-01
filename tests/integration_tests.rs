@@ -1659,9 +1659,6 @@ async fn subagent_chain_session_remains_usable_after_recursion_block() {
         "parent: child reported error",
     ]));
 
-    // Round 2 (verify session still usable) ----------------------------------
-    server.enqueue(ScriptedResponse::text_chunks(vec!["session still works"]));
-
     let session_id = uuid::Uuid::new_v4().to_string();
     let daemon = start_daemon_with_env(&server.url(), &[("AMAEBI_SPAWN_SANDBOX", "noop")])
         .await
@@ -1682,7 +1679,28 @@ async fn subagent_chain_session_remains_usable_after_recursion_block() {
         "no Error frames expected in round 1: {r1:?}"
     );
 
-    // Round 2: same session_id — daemon must still be functional.
+    // Wait until every Round 1 response has been consumed from the mock queue.
+    // On slow CI runners, transient 5xx retries inside the daemon can shift
+    // queue ordering: a retry of any Round 1 request would consume the next
+    // queued item, which — if Round 2's response was already in the queue —
+    // would be "session still works".  By waiting here and only enqueuing the
+    // Round 2 response after the queue is empty, we guarantee that response
+    // can only be consumed by Round 2's actual LLM request.
+    let drain_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        if server.pending_response_count() == 0 || std::time::Instant::now() > drain_deadline {
+            break;
+        }
+    }
+    // Snapshot the Round 1 request log before starting Round 2.
+    let reqs_r1 = server.take_requests();
+
+    // Round 2 (verify session still usable) ----------------------------------
+    // Enqueue the Round 2 response only now — after Round 1 is fully drained —
+    // so it cannot be consumed by any in-flight Round 1 retry or background task.
+    server.enqueue(ScriptedResponse::text_chunks(vec!["session still works"]));
+
     let r2 = send_message_with_session(&client, "follow-up", &session_id, "gpt-4o")
         .await
         .expect("round 2");
@@ -1696,9 +1714,12 @@ async fn subagent_chain_session_remains_usable_after_recursion_block() {
         "no Error frames expected in round 2: {r2:?}"
     );
 
+    // Combine request logs from both rounds for the final structural checks.
+    let mut reqs = reqs_r1;
+    reqs.extend(server.take_requests());
+
     // The child's second LLM request (index 2) must include the explicit
     // "spawn_agent is not available" error in the tool result.
-    let reqs = server.take_requests();
     // 4 requests for round 1 (parent×2 + child×2) + 1 for round 2 = 5.
     assert_eq!(
         reqs.len(),
