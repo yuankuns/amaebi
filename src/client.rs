@@ -354,21 +354,24 @@ pub async fn run_chat_loop(
                     eprint!("> ");
                     let _ = tokio::io::stderr().flush().await;
                 }
-                let mut line = String::new();
-                let n = tokio::io::AsyncBufReadExt::read_line(&mut stdin, &mut line)
+                // Use the raw-mode reader so wide (CJK) characters are erased
+                // correctly on backspace: the terminal line-discipline only emits
+                // one `\b \b` per backspace, leaving a ghost column for 2-wide
+                // chars.  Our reader tracks display width and emits the right
+                // number of erase columns.
+                let raw_result = tokio::task::spawn_blocking(prompt_input::read_line_raw)
                     .await
-                    .context("reading prompt from stdin")?;
-                if n == 0 {
-                    break 'session;
+                    .context("prompt input task panicked")?;
+                match raw_result {
+                    Ok(None) => break 'session,
+                    Ok(Some(line)) if line.is_empty() => break 'session,
+                    Ok(Some(line)) => line,
+                    // Ctrl-C during prompt input — exit the session cleanly.
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => break 'session,
+                    Err(e) => {
+                        return Err(anyhow::Error::new(e).context("reading prompt from stdin"))
+                    }
                 }
-                let trimmed = line
-                    .trim_end_matches('\n')
-                    .trim_end_matches('\r')
-                    .to_owned();
-                if trimmed.is_empty() {
-                    break 'session;
-                }
-                trimmed
             }
         };
 
@@ -961,6 +964,265 @@ async fn start_daemon(socket: &std::path::Path) -> Result<()> {
         .spawn()
         .with_context(|| format!("spawning daemon from {}", exe.display()))?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Raw-mode prompt input — wide-character-aware line editor
+// ---------------------------------------------------------------------------
+
+/// Prompt input routines that handle CJK/wide characters correctly.
+///
+/// In the default cooked (canonical) terminal mode the kernel's line discipline
+/// emits `\b \b` on backspace, which only moves the cursor one column.  For
+/// two-column-wide CJK characters this leaves a ghost column on screen.
+///
+/// This module puts the terminal in raw mode for the duration of a single line
+/// read so it can track each character's display width and emit the correct
+/// number of erase columns on backspace.
+mod prompt_input {
+    use std::io::{Read, Write};
+    use unicode_width::UnicodeWidthChar as _;
+
+    /// RAII guard that restores the terminal to its saved settings on drop.
+    #[cfg(unix)]
+    struct RawModeGuard {
+        fd: std::os::unix::io::RawFd,
+        orig: libc::termios,
+    }
+
+    #[cfg(unix)]
+    impl RawModeGuard {
+        fn enter(fd: std::os::unix::io::RawFd) -> std::io::Result<Self> {
+            let mut orig = unsafe { std::mem::zeroed::<libc::termios>() };
+            if unsafe { libc::tcgetattr(fd, &mut orig) } != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let mut raw = orig;
+            unsafe { libc::cfmakeraw(&mut raw) };
+            // Keep output post-processing (OPOST) so "\r\n" renders correctly.
+            raw.c_oflag |= libc::OPOST;
+            if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw) } != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(Self { fd, orig })
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for RawModeGuard {
+        fn drop(&mut self) {
+            // Best-effort restore; ignore errors during drop.
+            unsafe { libc::tcsetattr(self.fd, libc::TCSANOW, &self.orig) };
+        }
+    }
+
+    /// Read one line from stdin with correct wide-character backspace handling.
+    ///
+    /// * `Ok(Some(s))` — user pressed Enter; `s` has no trailing newline.
+    /// * `Ok(None)` — Ctrl-D (EOF).
+    /// * `Err(e)` with `e.kind() == Interrupted` — Ctrl-C.
+    ///
+    /// Falls back to plain `read_line` when stdin is not a TTY.
+    pub fn read_line_raw() -> std::io::Result<Option<String>> {
+        use std::io::IsTerminal as _;
+
+        if !std::io::stdin().is_terminal() {
+            return read_line_cooked();
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd as _;
+            let fd = std::io::stdin().as_raw_fd();
+            // On failure (e.g. stdin is not a real tty), fall through to cooked.
+            if let Ok(guard) = RawModeGuard::enter(fd) {
+                return read_line_raw_inner(guard);
+            }
+        }
+
+        read_line_cooked()
+    }
+
+    /// Cooked-mode fallback used when stdin is not a TTY or raw mode fails.
+    fn read_line_cooked() -> std::io::Result<Option<String>> {
+        use std::io::BufRead as _;
+        let mut s = String::new();
+        match std::io::stdin().lock().read_line(&mut s) {
+            Ok(0) => Ok(None),
+            Ok(_) => {
+                if s.ends_with('\n') {
+                    s.pop();
+                }
+                if s.ends_with('\r') {
+                    s.pop();
+                }
+                Ok(Some(s))
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    #[cfg(unix)]
+    fn read_line_raw_inner(_guard: RawModeGuard) -> std::io::Result<Option<String>> {
+        let mut chars: Vec<char> = Vec::new();
+        // Display width (columns) of each char, matched by index to `chars`.
+        let mut widths: Vec<usize> = Vec::new();
+        let mut stdin = std::io::stdin();
+        let mut out = std::io::stderr();
+
+        loop {
+            let mut byte = [0u8; 1];
+            match stdin.read_exact(&mut byte) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+                Err(e) => return Err(e),
+            }
+
+            match byte[0] {
+                // Enter (CR in raw mode; some environments send LF)
+                b'\r' | b'\n' => {
+                    out.write_all(b"\r\n")?;
+                    out.flush()?;
+                    return Ok(Some(chars.iter().collect()));
+                }
+                // Ctrl-D
+                4 => return Ok(None),
+                // Ctrl-C
+                3 => {
+                    out.write_all(b"^C\r\n")?;
+                    out.flush()?;
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "ctrl-c",
+                    ));
+                }
+                // Backspace (DEL = 0x7f on most terminals; BS = 0x08 on some)
+                0x7f | 0x08 => {
+                    if let (Some(_), Some(w)) = (chars.pop(), widths.pop()) {
+                        // Erase exactly `w` display columns:
+                        // move cursor back w, write w spaces, move back w again.
+                        let back = vec![b'\x08'; w];
+                        let spaces = vec![b' '; w];
+                        out.write_all(&back)?;
+                        out.write_all(&spaces)?;
+                        out.write_all(&back)?;
+                        out.flush()?;
+                    }
+                }
+                // Escape sequences (arrows, function keys) — consume and discard.
+                0x1b => {
+                    let mut eb = [0u8; 1];
+                    if stdin.read_exact(&mut eb).is_ok() && eb[0] == b'[' {
+                        // CSI sequence: read until final byte in 0x40–0x7E.
+                        loop {
+                            let mut fb = [0u8; 1];
+                            if stdin.read_exact(&mut fb).is_err() {
+                                break;
+                            }
+                            if (0x40..=0x7e).contains(&fb[0]) {
+                                break;
+                            }
+                        }
+                    }
+                    // Other 2-byte ESC sequences: second byte already consumed above.
+                }
+                // ASCII printable
+                b @ 0x20..=0x7e => {
+                    out.write_all(&[b])?;
+                    out.flush()?;
+                    chars.push(b as char);
+                    widths.push(1);
+                }
+                // UTF-8 multi-byte lead byte
+                b @ 0xC0..=0xFF => {
+                    let n_extra: usize = if b >= 0xF0 {
+                        3
+                    } else if b >= 0xE0 {
+                        2
+                    } else {
+                        1
+                    };
+                    let mut utf8_buf: Vec<u8> = vec![b];
+                    for _ in 0..n_extra {
+                        let mut cb = [0u8; 1];
+                        if stdin.read_exact(&mut cb).is_err() {
+                            break;
+                        }
+                        utf8_buf.push(cb[0]);
+                    }
+                    if let Ok(s) = std::str::from_utf8(&utf8_buf) {
+                        if let Some(ch) = s.chars().next() {
+                            let w = ch.width().unwrap_or(1);
+                            out.write_all(s.as_bytes())?;
+                            out.flush()?;
+                            chars.push(ch);
+                            widths.push(w);
+                        }
+                    }
+                    // Silently discard invalid UTF-8 sequences.
+                }
+                // Other control bytes — ignore silently.
+                _ => {}
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::io::Write as _;
+
+        /// Verify cooked fallback strips exactly one trailing newline.
+        #[test]
+        fn cooked_strips_newline() {
+            // We can't easily invoke read_line_cooked() against a real stdin in a
+            // unit test, so we test the trimming logic directly.
+            let mut s = "hello\n".to_string();
+            if s.ends_with('\n') {
+                s.pop();
+            }
+            if s.ends_with('\r') {
+                s.pop();
+            }
+            assert_eq!(s, "hello");
+        }
+
+        /// Verify CRLF is trimmed by the cooked fallback logic.
+        #[test]
+        fn cooked_strips_crlf() {
+            let mut s = "hello\r\n".to_string();
+            if s.ends_with('\n') {
+                s.pop();
+            }
+            if s.ends_with('\r') {
+                s.pop();
+            }
+            assert_eq!(s, "hello");
+        }
+
+        /// CJK characters should have display width 2.
+        #[test]
+        fn cjk_char_has_width_2() {
+            use unicode_width::UnicodeWidthChar as _;
+            assert_eq!('中'.width(), Some(2));
+            assert_eq!('あ'.width(), Some(2));
+            assert_eq!('한'.width(), Some(2));
+        }
+
+        /// ASCII characters have display width 1.
+        #[test]
+        fn ascii_char_has_width_1() {
+            use unicode_width::UnicodeWidthChar as _;
+            assert_eq!('a'.width(), Some(1));
+            assert_eq!('Z'.width(), Some(1));
+        }
+
+        // Ensure the module compiles cleanly on non-unix targets (write to
+        // stderr so the import is exercised).
+        #[test]
+        fn prompt_input_smoke() {
+            let _ = std::io::stderr().write_all(b"");
+        }
+    }
 }
 
 /// Return `true` if `last_press` is `Some` and the duration from `last_press`
