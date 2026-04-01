@@ -156,18 +156,43 @@ impl CronStore {
     ///
     /// - version 0 (original): 5-column schema
     /// - version 1: adds `one_shot`, `created_by_model`, `parent_session_id`
+    ///
+    /// Each ALTER is guarded by a `PRAGMA table_info` column-existence check so
+    /// the migration is idempotent: a crash between the ALTER statements and the
+    /// `user_version` bump cannot leave the DB in an unrecoverable state.
     fn migrate(&self, conn: &Connection) -> Result<()> {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .context("reading user_version")?;
         if version < 1 {
-            conn.execute_batch(
-                "ALTER TABLE cron_jobs ADD COLUMN one_shot INTEGER NOT NULL DEFAULT 0;
-                 ALTER TABLE cron_jobs ADD COLUMN created_by_model INTEGER NOT NULL DEFAULT 0;
-                 ALTER TABLE cron_jobs ADD COLUMN parent_session_id TEXT;
-                 PRAGMA user_version = 1;",
-            )
-            .context("migrating cron_jobs schema to version 1")?;
+            // Collect existing column names once.
+            let existing_cols: std::collections::HashSet<String> = conn
+                .prepare("PRAGMA table_info(cron_jobs)")
+                .context("PRAGMA table_info")?
+                .query_map([], |row| row.get::<_, String>(1))
+                .context("reading table_info")?
+                .collect::<rusqlite::Result<_>>()
+                .context("collecting column names")?;
+
+            // Wrap the whole migration in an explicit transaction so that a
+            // crash mid-way does not leave us with only some columns added.
+            conn.execute_batch("BEGIN IMMEDIATE;")
+                .context("beginning migration transaction")?;
+
+            let add_if_missing = |col: &str, def: &str| -> Result<()> {
+                if !existing_cols.contains(col) {
+                    conn.execute_batch(&format!("ALTER TABLE cron_jobs ADD COLUMN {col} {def};"))
+                        .with_context(|| format!("adding column {col}"))?;
+                }
+                Ok(())
+            };
+
+            add_if_missing("one_shot", "INTEGER NOT NULL DEFAULT 0")?;
+            add_if_missing("created_by_model", "INTEGER NOT NULL DEFAULT 0")?;
+            add_if_missing("parent_session_id", "TEXT")?;
+
+            conn.execute_batch("PRAGMA user_version = 1; COMMIT;")
+                .context("committing migration")?;
         }
         Ok(())
     }
@@ -253,7 +278,35 @@ impl CronStore {
         schedule: &str,
         parent_session_id: Option<&str>,
     ) -> Result<String> {
-        parse_schedule(schedule).with_context(|| format!("invalid cron schedule: {schedule:?}"))?;
+        let sched = parse_schedule(schedule)
+            .with_context(|| format!("invalid cron schedule: {schedule:?}"))?;
+
+        // One-shot jobs require exact single values for minute, hour, dom, and
+        // month so that due_jobs() can pin the fire time to a specific datetime.
+        // Wildcards, ranges, steps, and lists in any of these fields mean the
+        // job would be skipped (due_jobs calls exact_value() → None → warn +
+        // continue), and the follow-up would never execute.
+        if sched.minute.exact_value().is_none() {
+            anyhow::bail!(
+                "schedule_followup: 'minute' field must be a single exact value (got {schedule:?}); \
+                 wildcards, ranges, steps, and lists are not allowed for one-shot follow-ups"
+            );
+        }
+        if sched.hour.exact_value().is_none() {
+            anyhow::bail!(
+                "schedule_followup: 'hour' field must be a single exact value (got {schedule:?})"
+            );
+        }
+        if sched.dom.exact_value().is_none() {
+            anyhow::bail!(
+                "schedule_followup: 'dom' field must be a single exact value (got {schedule:?})"
+            );
+        }
+        if sched.month.exact_value().is_none() {
+            anyhow::bail!(
+                "schedule_followup: 'month' field must be a single exact value (got {schedule:?})"
+            );
+        }
 
         let id = uuid::Uuid::new_v4().to_string();
         let created_at = chrono::Utc::now().to_rfc3339();
@@ -913,7 +966,7 @@ mod tests {
     fn add_oneshot_stores_model_flags() {
         let (store, _dir) = open_temp();
         let id = store
-            .add_oneshot("check deploy", "0 9 * * *", None)
+            .add_oneshot("check deploy", "0 9 1 4 *", None)
             .unwrap();
         let jobs = store.list().unwrap();
         assert_eq!(jobs.len(), 1);
@@ -928,7 +981,7 @@ mod tests {
         let (store, _dir) = open_temp();
         let sid = "test-session-uuid";
         store
-            .add_oneshot("follow up on PR", "30 10 * * *", Some(sid))
+            .add_oneshot("follow up on PR", "30 10 1 4 *", Some(sid))
             .unwrap();
         let jobs = store.list().unwrap();
         assert_eq!(jobs[0].parent_session_id.as_deref(), Some(sid));
@@ -945,12 +998,42 @@ mod tests {
     }
 
     #[test]
+    fn add_oneshot_rejects_wildcard_fields() {
+        let (store, _dir) = open_temp();
+        // dom = * — would be skipped by due_jobs, so must be rejected up-front.
+        assert!(
+            store.add_oneshot("bad", "0 9 * * *", None).is_err(),
+            "wildcard dom must be rejected"
+        );
+        // month = * — same issue.
+        assert!(
+            store.add_oneshot("bad", "0 9 1 * *", None).is_err(),
+            "wildcard month must be rejected"
+        );
+        // step in minute — multiple values, not a single exact value.
+        assert!(
+            store.add_oneshot("bad", "*/5 9 1 4 *", None).is_err(),
+            "step in minute must be rejected"
+        );
+        // list in hour — multiple values.
+        assert!(
+            store.add_oneshot("bad", "0 9,10 1 4 *", None).is_err(),
+            "list in hour must be rejected"
+        );
+        // All exact values → must succeed.
+        assert!(
+            store.add_oneshot("good", "0 9 1 4 *", None).is_ok(),
+            "exact minute/hour/dom/month must be accepted"
+        );
+    }
+
+    #[test]
     fn list_model_created_excludes_human_jobs() {
         let (store, _dir) = open_temp();
         // human-created via add()
         store.add("human job", "0 8 * * *").unwrap();
         // model-created via add_oneshot()
-        let model_id = store.add_oneshot("model job", "0 9 * * *", None).unwrap();
+        let model_id = store.add_oneshot("model job", "0 9 1 4 *", None).unwrap();
 
         let model_jobs = store.list_model_created().unwrap();
         assert_eq!(model_jobs.len(), 1, "only model-created job should appear");
@@ -967,7 +1050,7 @@ mod tests {
     #[test]
     fn delete_if_model_created_removes_model_job() {
         let (store, _dir) = open_temp();
-        let id = store.add_oneshot("model job", "0 9 * * *", None).unwrap();
+        let id = store.add_oneshot("model job", "0 9 1 4 *", None).unwrap();
         let deleted = store.delete_if_model_created(&id).unwrap();
         assert!(deleted, "delete_if_model_created should return true");
         assert!(store.list().unwrap().is_empty());

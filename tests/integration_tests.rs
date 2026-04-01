@@ -2521,7 +2521,10 @@ async fn schedule_followup_tool_call_writes_cron_db() {
 
     // Verify the cron job was written to cron.db with the correct flags.
     let cron_db = daemon.home.join(".amaebi/cron.db");
-    assert!(cron_db.exists(), "cron.db must exist after schedule_followup");
+    assert!(
+        cron_db.exists(),
+        "cron.db must exist after schedule_followup"
+    );
 
     let conn = rusqlite::Connection::open(&cron_db).expect("open cron.db");
     let (one_shot, created_by_model, description): (i64, i64, String) = conn
@@ -2803,7 +2806,10 @@ async fn scheduled_followup_fires_and_deposits_inbox_report() {
 
     // Assert inbox.db has an unread report.
     let inbox_db = home_dir.path().join(".amaebi/inbox.db");
-    assert!(inbox_db.exists(), "inbox.db must exist after followup fires");
+    assert!(
+        inbox_db.exists(),
+        "inbox.db must exist after followup fires"
+    );
 
     let conn = rusqlite::Connection::open(&inbox_db).expect("open inbox.db");
     let (output, read): (String, i64) = conn
@@ -2829,7 +2835,10 @@ async fn scheduled_followup_fires_and_deposits_inbox_report() {
             |r| r.get(0),
         )
         .unwrap_or(-1);
-    assert_eq!(count, 0, "one-shot job must be deleted from cron.db after firing");
+    assert_eq!(
+        count, 0,
+        "one-shot job must be deleted from cron.db after firing"
+    );
 
     let _ = child.kill().await;
     let _ = child.wait().await;
