@@ -117,11 +117,16 @@ impl DaemonState {
             tokens: Arc::clone(&tokens),
         });
 
+        // FollowupContext has no per-session state — session_id is passed
+        // through each execute() call so concurrent sessions are isolated.
+        let followup_ctx = Arc::new(tools::FollowupContext {
+            current_session_id: None,
+            cron_db_path: None, // use ~/.amaebi/cron.db
+        });
+
         let mut executor = tools::LocalExecutor::new();
         executor.spawn_ctx = Some(spawn_ctx);
-        // Install follow-up context per run so the correct session_id is used
-        // and non-follow-up contexts can disable the tools entirely.
-        executor.followup_ctx = None;
+        executor.followup_ctx = Some(followup_ctx);
 
         Ok(Self {
             http,
