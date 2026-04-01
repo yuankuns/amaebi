@@ -2324,8 +2324,20 @@ async fn heartbeat_injects_into_active_session() {
         reqs.len()
     );
 
-    // The heartbeat LLM request must contain the item description.
-    let hb_req = &reqs[1];
+    // Locate the heartbeat LLM request by content rather than by index:
+    // the scheduler runs concurrently so request ordering is not guaranteed.
+    let hb_req = reqs
+        .iter()
+        .find(|req| {
+            req.messages().is_some_and(|msgs| {
+                msgs.iter().any(|m| {
+                    m.get("content")
+                        .and_then(|c| c.as_str())
+                        .is_some_and(|s| s.contains("check build status"))
+                })
+            })
+        })
+        .expect("heartbeat LLM request not found in captured requests");
     let hb_messages = hb_req.messages().expect("messages in heartbeat request");
     let hb_content: String = hb_messages
         .iter()

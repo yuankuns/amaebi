@@ -140,18 +140,6 @@ impl DaemonState {
 
 /// Register a session as active, storing the steer sender so the heartbeat
 /// scheduler can inject follow-up messages into the running agentic loop.
-fn register_active_session(
-    state: &DaemonState,
-    session_id: &str,
-    steer_tx: tokio::sync::mpsc::Sender<Option<String>>,
-) {
-    state
-        .active_sessions
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .insert(session_id.to_owned(), steer_tx);
-}
-
 /// Deregister a session and auto-dismiss its pending heartbeat items.
 ///
 /// Called when a Chat/Resume connection closes (both success and error paths).
@@ -575,13 +563,23 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                 return Ok(());
             }
 
-            // Same one-active-chat-per-session guard as the Chat handler.
-            if state
-                .active_sessions
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .contains_key(&session_id)
-            {
+            let (steer_tx, mut steer_rx) = tokio::sync::mpsc::channel::<Option<String>>(16);
+
+            // Atomic check+insert: same guard as Chat, same TOCTOU fix.
+            // The MutexGuard is dropped before the .await so the future stays Send.
+            let session_already_active = {
+                let mut sessions = state
+                    .active_sessions
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
+                if sessions.contains_key(&session_id) {
+                    true
+                } else {
+                    sessions.insert(session_id.clone(), steer_tx.clone());
+                    false
+                }
+            };
+            if session_already_active {
                 write_frame(
                     &mut writer,
                     &Response::Error {
@@ -595,11 +593,6 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                 .await?;
                 return Ok(());
             }
-
-            let (steer_tx, mut steer_rx) = tokio::sync::mpsc::channel::<Option<String>>(16);
-
-            // Register as active for heartbeat injection.
-            register_active_session(&state, &session_id, steer_tx.clone());
 
             let expected_resume_sid = session_id.clone();
             tokio::spawn(async move {
@@ -755,15 +748,25 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
             // history and steer lookups are isolated (not all lumped under "").
             let sid = session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
-            // Enforce one active chat per session.  A session is per-directory,
-            // so two concurrent `amaebi ask` invocations in the same folder
-            // would otherwise race on history writes and heartbeat injection.
-            if state
-                .active_sessions
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .contains_key(&sid)
-            {
+            // Steering channel: the spawned reader task sends user corrections
+            // here; the agentic loop drains them between model turns.
+            let (steer_tx, mut steer_rx) = tokio::sync::mpsc::channel::<Option<String>>(16);
+
+            // Enforce one active chat per session and register atomically.
+            // Drop the MutexGuard before the .await so the future stays Send.
+            let session_already_active = {
+                let mut sessions = state
+                    .active_sessions
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
+                if sessions.contains_key(&sid) {
+                    true
+                } else {
+                    sessions.insert(sid.clone(), steer_tx.clone());
+                    false
+                }
+            };
+            if session_already_active {
                 write_frame(
                     &mut writer,
                     &Response::Error {
@@ -777,14 +780,6 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                 .await?;
                 return Ok(());
             }
-
-            // Steering channel: the spawned reader task sends user corrections
-            // here; the agentic loop drains them between model turns.
-            let (steer_tx, mut steer_rx) = tokio::sync::mpsc::channel::<Option<String>>(16);
-
-            // Register as active so the heartbeat scheduler can inject into
-            // this session's agentic loop while it's alive.
-            register_active_session(&state, &sid, steer_tx.clone());
 
             // Spawn a task that reads subsequent frames from the client on
             // this connection.  Any Steer frames are forwarded to steer_tx so
@@ -2411,6 +2406,7 @@ async fn run_cron_job(state: Arc<DaemonState>, job: &cron::CronJob) {
     let model = std::env::var("AMAEBI_MODEL").unwrap_or_else(|_| "gpt-4o".to_string());
 
     let mut messages = build_messages(&job.description, None, &[], &[], None);
+    inject_session_id(&mut messages, &session_id);
     inject_skill_files(&mut messages).await;
     // Cron jobs are non-interactive: drop the sender immediately so steer_rx.recv()
     // returns None at once if the model ends with '?', rather than timing out.

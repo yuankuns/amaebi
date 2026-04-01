@@ -525,13 +525,20 @@ async fn run_heartbeat(action: cli::HeartbeatAction, socket: std::path::PathBuf)
             line.push('\n');
             writer.write_all(line.as_bytes()).await?;
             let mut lines = BufReader::new(reader).lines();
+            let mut got_done = false;
             while let Some(frame) = lines.next_line().await? {
                 let resp: ipc::Response = serde_json::from_str(&frame)?;
                 match resp {
-                    ipc::Response::Done => break,
+                    ipc::Response::Done => {
+                        got_done = true;
+                        break;
+                    }
                     ipc::Response::Error { message } => anyhow::bail!("{message}"),
                     _ => {}
                 }
+            }
+            if !got_done {
+                anyhow::bail!("daemon closed connection without confirming heartbeat add");
             }
             println!("Heartbeat item added for session {session_id}.");
         }
@@ -550,6 +557,7 @@ async fn run_heartbeat(action: cli::HeartbeatAction, socket: std::path::PathBuf)
 
             let mut lines = BufReader::new(reader).lines();
             let mut count = 0;
+            let mut got_done = false;
             while let Some(frame) = lines.next_line().await? {
                 let resp: ipc::Response = serde_json::from_str(&frame)?;
                 match resp {
@@ -565,10 +573,16 @@ async fn run_heartbeat(action: cli::HeartbeatAction, socket: std::path::PathBuf)
                             sanitize(&description)
                         );
                     }
-                    ipc::Response::Done => break,
+                    ipc::Response::Done => {
+                        got_done = true;
+                        break;
+                    }
                     ipc::Response::Error { message } => anyhow::bail!("{message}"),
                     _ => {}
                 }
+            }
+            if !got_done {
+                anyhow::bail!("daemon closed connection without completing heartbeat list");
             }
             if count == 0 {
                 let scope = if all {
@@ -589,13 +603,20 @@ async fn run_heartbeat(action: cli::HeartbeatAction, socket: std::path::PathBuf)
             line.push('\n');
             writer.write_all(line.as_bytes()).await?;
             let mut lines = BufReader::new(reader).lines();
+            let mut got_done = false;
             while let Some(frame) = lines.next_line().await? {
                 let resp: ipc::Response = serde_json::from_str(&frame)?;
                 match resp {
-                    ipc::Response::Done => break,
+                    ipc::Response::Done => {
+                        got_done = true;
+                        break;
+                    }
                     ipc::Response::Error { message } => anyhow::bail!("{message}"),
                     _ => {}
                 }
+            }
+            if !got_done {
+                anyhow::bail!("daemon closed connection without confirming dismiss");
             }
             println!("Heartbeat item #{id} dismissed.");
         }
@@ -609,13 +630,20 @@ async fn run_heartbeat(action: cli::HeartbeatAction, socket: std::path::PathBuf)
             line.push('\n');
             writer.write_all(line.as_bytes()).await?;
             let mut lines = BufReader::new(reader).lines();
+            let mut got_done = false;
             while let Some(frame) = lines.next_line().await? {
                 let resp: ipc::Response = serde_json::from_str(&frame)?;
                 match resp {
-                    ipc::Response::Done => break,
+                    ipc::Response::Done => {
+                        got_done = true;
+                        break;
+                    }
                     ipc::Response::Error { message } => anyhow::bail!("{message}"),
                     _ => {}
                 }
+            }
+            if !got_done {
+                anyhow::bail!("daemon closed connection without confirming trigger");
             }
             println!("Heartbeat check triggered.");
         }
