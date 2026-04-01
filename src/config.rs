@@ -68,6 +68,15 @@ impl HeartbeatConfig {
         let Some((start, end)) = self.active_hours else {
             return true;
         };
+        // Treat out-of-range values as misconfigured — log and treat as always active.
+        if start > 23 || end > 23 {
+            tracing::warn!(
+                start,
+                end,
+                "heartbeat active_hours values must be in 0–23; treating as always active"
+            );
+            return true;
+        }
         let hour = chrono::Utc::now()
             .format("%H")
             .to_string()

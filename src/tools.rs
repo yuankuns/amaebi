@@ -602,32 +602,36 @@ pub fn tool_schemas(include_spawn_agent: bool) -> Vec<serde_json::Value> {
             }
         }),
     ];
-    if include_spawn_agent {
-        schemas.push(serde_json::json!({
-            "type": "function",
-            "function": {
-                "name": "heartbeat_note",
-                "description": "Record a pending follow-up item for the heartbeat checker \
-                                to review later. Use this when you identify something that \
-                                should be checked after this conversation ends (e.g. a test \
-                                to re-run, a deployment to verify, a file to check after a \
-                                cron job completes).",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "description": {
-                            "type": "string",
-                            "description": "What should be checked or done later."
-                        },
-                        "session_id": {
-                            "type": "string",
-                            "description": "The session UUID. Provided in the system prompt for interactive chat sessions; omit if not available (e.g. in cron contexts)."
-                        }
+    // heartbeat_note is always included when the executor has a spawn_ctx
+    // (i.e. a database connection), regardless of the spawn_agent gate.
+    // Child agents that run with include_spawn_agent=false should still be
+    // able to record follow-up items.
+    schemas.push(serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": "heartbeat_note",
+            "description": "Record a pending follow-up item for the heartbeat checker \
+                            to review later. Use this when you identify something that \
+                            should be checked after this conversation ends (e.g. a test \
+                            to re-run, a deployment to verify, a file to check after a \
+                            cron job completes).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "description": {
+                        "type": "string",
+                        "description": "What should be checked or done later."
                     },
-                    "required": ["description"]
-                }
+                    "session_id": {
+                        "type": "string",
+                        "description": "The session UUID. Provided in the system prompt for interactive chat sessions; omit if not available (e.g. in cron contexts)."
+                    }
+                },
+                "required": ["description"]
             }
-        }));
+        }
+    }));
+    if include_spawn_agent {
         schemas.push(serde_json::json!({
             "type": "function",
             "function": {

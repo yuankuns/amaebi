@@ -1078,39 +1078,56 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
             match result {
                 Ok(id) => {
                     tracing::debug!(id, "heartbeat item added");
+                    write_frame(&mut writer, &Response::Done).await?;
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "failed to add heartbeat item");
+                    write_frame(
+                        &mut writer,
+                        &Response::Error {
+                            message: format!("failed to add heartbeat item: {e:#}"),
+                        },
+                    )
+                    .await?;
                 }
             }
-            write_frame(&mut writer, &Response::Done).await?;
         }
 
         Request::HeartbeatList { session_id, all } => {
             let db = Arc::clone(&state.db);
-            let items = tokio::task::spawn_blocking(move || {
+            let result = tokio::task::spawn_blocking(move || {
                 let conn = db.lock().unwrap_or_else(|p| p.into_inner());
                 memory_db::list_heartbeat_items(&conn, &session_id, all)
             })
             .await
-            .unwrap_or_else(|e| Err(anyhow::anyhow!("heartbeat list panicked: {e}")))
-            .unwrap_or_else(|e| {
-                tracing::warn!(error = %e, "failed to list heartbeat items");
-                vec![]
-            });
-            for item in items {
-                write_frame(
-                    &mut writer,
-                    &Response::HeartbeatEntry {
-                        id: item.id,
-                        description: item.description,
-                        status: item.status,
-                        created_at: item.created_at,
-                    },
-                )
-                .await?;
+            .unwrap_or_else(|e| Err(anyhow::anyhow!("heartbeat list panicked: {e}")));
+            match result {
+                Ok(items) => {
+                    for item in items {
+                        write_frame(
+                            &mut writer,
+                            &Response::HeartbeatEntry {
+                                id: item.id,
+                                description: item.description,
+                                status: item.status,
+                                created_at: item.created_at,
+                            },
+                        )
+                        .await?;
+                    }
+                    write_frame(&mut writer, &Response::Done).await?;
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to list heartbeat items");
+                    write_frame(
+                        &mut writer,
+                        &Response::Error {
+                            message: format!("failed to list heartbeat items: {e:#}"),
+                        },
+                    )
+                    .await?;
+                }
             }
-            write_frame(&mut writer, &Response::Done).await?;
         }
 
         Request::HeartbeatDismiss { id } => {
@@ -1121,10 +1138,21 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
             })
             .await
             .unwrap_or_else(|e| Err(anyhow::anyhow!("heartbeat dismiss panicked: {e}")));
-            if let Err(e) = result {
-                tracing::warn!(error = %e, "failed to dismiss heartbeat item");
+            match result {
+                Ok(()) => {
+                    write_frame(&mut writer, &Response::Done).await?;
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to dismiss heartbeat item");
+                    write_frame(
+                        &mut writer,
+                        &Response::Error {
+                            message: format!("failed to dismiss heartbeat item: {e:#}"),
+                        },
+                    )
+                    .await?;
+                }
             }
-            write_frame(&mut writer, &Response::Done).await?;
         }
 
         Request::HeartbeatTrigger => {
@@ -2488,7 +2516,8 @@ async fn run_heartbeat_scheduler(state: Arc<DaemonState>) {
 
         // Interval guard — skip if not enough time has elapsed, unless this
         // was an explicit manual trigger (which always bypasses the guard).
-        let interval_dur = std::time::Duration::from_secs(hb_config.interval_minutes * 60);
+        let interval_secs = hb_config.interval_minutes.saturating_mul(60);
+        let interval_dur = std::time::Duration::from_secs(interval_secs);
         if !manual_triggered && last_run.elapsed() < interval_dur {
             continue;
         }
