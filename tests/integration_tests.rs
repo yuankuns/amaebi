@@ -246,6 +246,11 @@ async fn test_compaction_triggered_at_threshold() {
             break;
         }
     }
+    assert_eq!(
+        server.pending_response_count(),
+        0,
+        "seed responses were not fully drained before Phase 2; possible race on slow CI"
+    );
     server.take_requests(); // drain seed request log
 
     // --- Phase 2: restart daemon with low threshold ---
@@ -303,6 +308,11 @@ async fn test_compaction_triggered_at_threshold() {
             break;
         }
     }
+    assert_eq!(
+        server.pending_response_count(),
+        0,
+        "compaction summary response was not consumed before assertion; possible race on slow CI"
+    );
 
     let reqs = server.take_requests();
     assert!(

@@ -280,6 +280,8 @@ impl CronStore {
                         one_shot, created_by_model, parent_session_id
                  FROM cron_jobs
                  WHERE created_by_model = 1
+                   AND one_shot = 1
+                   AND last_run IS NULL
                  ORDER BY created_at ASC",
             )
             .context("preparing model jobs query")?;
@@ -312,7 +314,10 @@ impl CronStore {
         let conn = self.connect()?;
         let n = conn
             .execute(
-                "DELETE FROM cron_jobs WHERE id = ?1 AND created_by_model = 1",
+                "DELETE FROM cron_jobs WHERE id = ?1
+                    AND created_by_model = 1
+                    AND one_shot = 1
+                    AND last_run IS NULL",
                 params![id],
             )
             .context("deleting model cron job")?;

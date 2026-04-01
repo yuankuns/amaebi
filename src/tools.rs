@@ -12,8 +12,10 @@ use crate::sandbox::{docker::DockerSandboxConfig, DockerSandbox, NoopSandbox, Sa
 // ---------------------------------------------------------------------------
 
 /// Context passed to `LocalExecutor` so the `schedule_followup`,
-/// `cancel_followup`, and `list_followups` tools can read/write `cron.db`
-/// and look up parent-session summaries from the memory DB.
+/// `cancel_followup`, and `list_followups` tools can read/write `cron.db`.
+///
+/// Note: parent-session summary lookup is performed by `run_cron_job` at
+/// fire time using `state.db` directly; this struct does not carry a DB handle.
 ///
 /// Set to `None` in child agents and in follow-up-triggered loops to prevent
 /// recursive scheduling.

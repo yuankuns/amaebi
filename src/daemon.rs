@@ -2252,7 +2252,7 @@ async fn run_cron_job(state: Arc<DaemonState>, job: &cron::CronJob) {
         let db = Arc::clone(&state.db);
         let sid_c = sid.clone();
         tokio::task::spawn_blocking(move || {
-            let conn = db.lock().expect("db lock poisoned");
+            let conn = db.lock().unwrap_or_else(|p| p.into_inner());
             memory_db::get_session_own_summary(&conn, &sid_c)
         })
         .await
@@ -2268,12 +2268,15 @@ async fn run_cron_job(state: Arc<DaemonState>, job: &cron::CronJob) {
             );
             None
         })
-        .map(|s| format!("[Context from previous session]\n{s}"))
     } else {
         None
     };
 
-    let mut messages = build_messages(&job.description, None, &[], &[], own_summary.as_deref());
+    // Inject via past_summaries so build_messages labels it correctly as
+    // "Summaries from past sessions" rather than the within-session
+    // "[Summary of earlier in this session]" label used by own_summary.
+    let past_summaries: Vec<String> = own_summary.into_iter().collect();
+    let mut messages = build_messages(&job.description, None, &[], &past_summaries, None);
     inject_skill_files(&mut messages).await;
 
     // Cron/follow-up jobs are non-interactive: drop the sender immediately so
