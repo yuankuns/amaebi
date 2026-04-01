@@ -358,17 +358,24 @@ async fn test_compaction_preserves_summary() {
         "expected Compacting in turn A: {ra:?}"
     );
 
-    // Wait for background summary to complete (2 requests: chat + summary).
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    // Wait until the mock server's response queue is empty, meaning both the
+    // chat response ("Turn A reply.") and the background summary response
+    // (SUMMARY_TEXT) have been consumed.  Checking the response queue is more
+    // reliable than counting received requests: it directly confirms that the
+    // background summary task has actually fetched its response, eliminating
+    // the race where a slow CI machine times out before the task fires and
+    // SUMMARY_TEXT is still queued when Turn B consumes it instead.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
     loop {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        if server.peek_request_count() >= 2 || std::time::Instant::now() > deadline {
+        if server.pending_response_count() == 0 || std::time::Instant::now() > deadline {
             break;
         }
     }
     server.take_requests();
-    // Extra wait for SQLite write.
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    // Extra wait for the daemon to write the summary to SQLite after receiving
+    // the LLM response.  Increased to 1 s to give slow CI runners more headroom.
+    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
 
     // Phase 3: follow-up turn on same daemon — summary should appear in context.
     server.enqueue(ScriptedResponse::text_chunks(vec!["Turn B reply."]));

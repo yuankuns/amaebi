@@ -315,6 +315,16 @@ impl MockLlmServer {
     pub fn peek_request_count(&self) -> usize {
         self.state.captured.lock().unwrap().len()
     }
+
+    /// Return the number of scripted responses still waiting to be served.
+    ///
+    /// Use this to wait until all enqueued responses have been consumed by the
+    /// daemon before sending follow-up requests, avoiding races where a slow
+    /// background task hasn't yet consumed its response when the next request
+    /// fires.
+    pub fn pending_response_count(&self) -> usize {
+        self.state.responses.lock().unwrap().len()
+    }
 }
 
 // ---------------------------------------------------------------------------
