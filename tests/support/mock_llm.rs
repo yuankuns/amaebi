@@ -172,11 +172,11 @@ impl CapturedRequest {
 
     /// Return the output-token limit.
     ///
-    /// Checks `max_tokens` (Chat Completions) and `max_output_tokens`
+    /// Checks `max_completion_tokens` (Chat Completions) and `max_output_tokens`
     /// (Responses API) so helpers work for both request formats.
     pub fn max_tokens(&self) -> Option<u64> {
         self.body
-            .get("max_tokens")
+            .get("max_completion_tokens")
             .or_else(|| self.body.get("max_output_tokens"))
             .and_then(|v| v.as_u64())
     }
@@ -327,7 +327,7 @@ struct ChatRequest {
     messages: Vec<Value>,
     #[allow(dead_code)]
     stream: Option<bool>,
-    max_tokens: Option<u64>,
+    max_completion_tokens: Option<u64>,
 }
 
 fn validate_request(req: &ChatRequest) -> Result<(), String> {
@@ -342,8 +342,8 @@ fn validate_request(req: &ChatRequest) -> Result<(), String> {
             return Err(format!("message[{i}] missing role"));
         }
     }
-    if req.max_tokens.is_none() {
-        return Err("max_tokens is missing".into());
+    if req.max_completion_tokens.is_none() {
+        return Err("max_completion_tokens is missing".into());
     }
     Ok(())
 }
@@ -441,7 +441,7 @@ async fn handle_completion(
         "model": req_body.model,
         "messages": req_body.messages,
         "stream": req_body.stream,
-        "max_tokens": req_body.max_tokens,
+        "max_completion_tokens": req_body.max_completion_tokens,
     });
     state.captured.lock().unwrap().push(CapturedRequest {
         headers: captured_headers,
@@ -622,7 +622,7 @@ mod tests {
                 "model": "gpt-4o",
                 "messages": [{"role": "user", "content": "hi"}],
                 "stream": true,
-                "max_tokens": 4096
+                "max_completion_tokens": 4096
             }))
             .send()
             .await
@@ -647,7 +647,7 @@ mod tests {
                 "model": "gpt-4o",
                 "messages": [{"role": "user", "content": "test"}],
                 "stream": true,
-                "max_tokens": 1234
+                "max_completion_tokens": 1234
             }))
             .send()
             .await
