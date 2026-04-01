@@ -829,6 +829,619 @@ mod tests {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Shell-only regression tests for the perf_sweep baseline/benchmark fixes.
+// These do not call the LLM — they verify the executor's Check evaluation and
+// context-variable propagation are correct.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod shell_regression_tests {
+    use super::*;
+    use crate::test_utils::with_temp_home;
+    use crate::workflows::{Action, Check, Context, FailStrategy, ResourcePool, Stage, Workflow};
+    use std::sync::Arc;
+
+    async fn test_state() -> Arc<DaemonState> {
+        Arc::new(DaemonState::new().await.expect("DaemonState::new"))
+    }
+
+    /// The perf_sweep baseline stage uses Action::Shell{"true"} +
+    /// Check::BenchmarkNoRegression{threshold=∞}.  After it runs,
+    /// ctx["benchmark_baseline"] must contain the JSON from the check command.
+    #[tokio::test]
+    async fn baseline_check_seeds_benchmark_baseline() {
+        let _guard = with_temp_home();
+        let state = test_state().await;
+
+        let wf = Workflow {
+            name: "baseline-test".into(),
+            stages: vec![Stage::new(
+                "baseline",
+                Action::Shell {
+                    command: "true".into(),
+                },
+            )
+            .with_check(Check::BenchmarkNoRegression {
+                command: r#"echo '{"fps": 100.0, "latency_ms": 10.0}'"#.into(),
+                threshold: f64::INFINITY,
+            })
+            .with_on_fail(FailStrategy::Abort)],
+        };
+
+        let mut ctx = Context::new();
+        // No baseline yet.
+        assert!(ctx.get("benchmark_baseline").is_none());
+
+        execute_with_ctx(&wf, &state, "gpt-4o", ctx.clone(), &ResourcePool::empty())
+            .await
+            .unwrap();
+
+        // The BenchmarkNoRegression check must have seeded ctx["benchmark_baseline"].
+        // We verify by running the check again on a fresh context seeded from the
+        // workflow: re-run in isolation to inspect the context.
+        // Simpler: run a two-stage workflow and inspect via a Shell stage.
+        let outfile = tempfile::NamedTempFile::new().unwrap();
+        let path = outfile.path().to_str().unwrap().to_owned();
+
+        let wf2 = Workflow {
+            name: "verify-baseline".into(),
+            stages: vec![
+                // Stage 1: seed baseline (threshold=∞ → always passes, saves benchmark_baseline)
+                Stage::new(
+                    "baseline",
+                    Action::Shell {
+                        command: "true".into(),
+                    },
+                )
+                .with_check(Check::BenchmarkNoRegression {
+                    command: r#"echo '{"fps": 100.0}'"#.into(),
+                    threshold: f64::INFINITY,
+                })
+                .with_on_fail(FailStrategy::Abort),
+                // Stage 2: write ctx["benchmark_baseline"] to a file for inspection
+                Stage::new(
+                    "dump",
+                    Action::Shell {
+                        command: format!("printf '%s' '{{benchmark_baseline}}' > {path}"),
+                    },
+                )
+                .with_on_fail(FailStrategy::Abort),
+            ],
+        };
+
+        ctx = Context::new();
+        execute_with_ctx(&wf2, &state, "gpt-4o", ctx, &ResourcePool::empty())
+            .await
+            .unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            content.contains("fps"),
+            "benchmark_baseline should contain the bench output; got: {content:?}"
+        );
+    }
+
+    /// After seeding the baseline, a subsequent BenchmarkNoRegression check
+    /// must detect a real regression and propagate it as an error.
+    #[tokio::test]
+    async fn benchmark_regression_detected_after_baseline_seeded() {
+        let _guard = with_temp_home();
+        let state = test_state().await;
+
+        let wf = Workflow {
+            name: "regression-detect".into(),
+            stages: vec![
+                // Seed baseline: fps=100
+                Stage::new(
+                    "baseline",
+                    Action::Shell {
+                        command: "true".into(),
+                    },
+                )
+                .with_check(Check::BenchmarkNoRegression {
+                    command: r#"echo '{"fps": 100.0}'"#.into(),
+                    threshold: f64::INFINITY,
+                })
+                .with_on_fail(FailStrategy::Abort),
+                // Simulate a regressed run: fps=50 (−50%, well above 5% threshold)
+                Stage::new(
+                    "bench-regressed",
+                    Action::Shell {
+                        command: "true".into(),
+                    },
+                )
+                .with_check(Check::BenchmarkNoRegression {
+                    command: r#"echo '{"fps": 50.0}'"#.into(),
+                    threshold: 0.05,
+                })
+                .with_on_fail(FailStrategy::Abort),
+            ],
+        };
+
+        let result = execute_with_ctx(
+            &wf,
+            &state,
+            "gpt-4o",
+            Context::new(),
+            &ResourcePool::empty(),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "50% fps regression should be detected: {result:?}"
+        );
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("fps") || msg.contains("regression"),
+            "error should name the regressing metric; got: {msg}"
+        );
+    }
+
+    /// Bench should NOT regress when the metric improves after baseline is seeded.
+    #[tokio::test]
+    async fn no_false_regression_when_metric_improves_after_baseline() {
+        let _guard = with_temp_home();
+        let state = test_state().await;
+
+        let wf = Workflow {
+            name: "no-regression".into(),
+            stages: vec![
+                Stage::new(
+                    "baseline",
+                    Action::Shell {
+                        command: "true".into(),
+                    },
+                )
+                .with_check(Check::BenchmarkNoRegression {
+                    command: r#"echo '{"fps": 100.0}'"#.into(),
+                    threshold: f64::INFINITY,
+                })
+                .with_on_fail(FailStrategy::Abort),
+                // fps improved: no regression
+                Stage::new(
+                    "bench-improved",
+                    Action::Shell {
+                        command: "true".into(),
+                    },
+                )
+                .with_check(Check::BenchmarkNoRegression {
+                    command: r#"echo '{"fps": 120.0}'"#.into(),
+                    threshold: 0.05,
+                })
+                .with_on_fail(FailStrategy::Abort),
+            ],
+        };
+
+        execute_with_ctx(
+            &wf,
+            &state,
+            "gpt-4o",
+            Context::new(),
+            &ResourcePool::empty(),
+        )
+        .await
+        .expect("improvement should not trigger regression");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// LLM-mocked integration tests.
+// Use a minimal inline SSE server (axum dev-dep) to exercise the full
+// executor code path including Action::Llm and the Retry strategy.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod llm_tests {
+    use super::*;
+    use crate::test_utils::with_temp_home;
+    use crate::workflows::{Action, Check, Context, FailStrategy, ResourcePool, Stage, Workflow};
+    use axum::{
+        extract::State as AxState, response::Response as AxResponse, routing::post, Router,
+    };
+    use serial_test::serial;
+    use std::{
+        collections::VecDeque,
+        sync::{Arc as SArc, Mutex as SMutex},
+    };
+    use tokio::sync::oneshot;
+
+    // ---- Minimal mock SSE server ----------------------------------------
+
+    /// Queue of text responses + a request counter.
+    #[derive(Clone, Default)]
+    struct MockState {
+        queue: SArc<SMutex<VecDeque<String>>>,
+        request_count: SArc<SMutex<usize>>,
+    }
+
+    struct MiniMock {
+        url: String,
+        state: MockState,
+        _shutdown: oneshot::Sender<()>,
+    }
+
+    impl MiniMock {
+        async fn start() -> Self {
+            let st = MockState::default();
+            let app = Router::new()
+                .route("/chat/completions", post(Self::handle))
+                .with_state(st.clone());
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let (tx, rx) = oneshot::channel::<()>();
+            tokio::spawn(async move {
+                axum::serve(listener, app)
+                    .with_graceful_shutdown(async {
+                        let _ = rx.await;
+                    })
+                    .await
+                    .ok();
+            });
+            Self {
+                url: format!("http://{addr}/chat/completions"),
+                state: st,
+                _shutdown: tx,
+            }
+        }
+
+        fn enqueue(&self, text: impl Into<String>) {
+            self.state.queue.lock().unwrap().push_back(text.into());
+        }
+
+        fn request_count(&self) -> usize {
+            *self.state.request_count.lock().unwrap()
+        }
+
+        async fn handle(
+            AxState(st): AxState<MockState>,
+            _body: axum::body::Bytes,
+        ) -> AxResponse<axum::body::Body> {
+            *st.request_count.lock().unwrap() += 1;
+            let text = st.queue.lock().unwrap().pop_front().unwrap_or_default();
+            let escaped = serde_json::to_string(&text).unwrap();
+            let sse = format!(
+                "data: {{\"id\":\"m\",\"object\":\"chat.completion.chunk\",\"model\":\"mock\",\
+                 \"choices\":[{{\"index\":0,\"delta\":{{\"role\":\"assistant\",\"content\":{escaped}}},\
+                 \"finish_reason\":null}}]}}\n\n\
+                 data: {{\"id\":\"m\",\"object\":\"chat.completion.chunk\",\"model\":\"mock\",\
+                 \"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"stop\"}}]}}\n\n\
+                 data: [DONE]\n\n"
+            );
+            AxResponse::builder()
+                .status(200)
+                .header("content-type", "text/event-stream")
+                .body(axum::body::Body::from(sse))
+                .unwrap()
+        }
+    }
+
+    // ---- Env guard for AMAEBI_COPILOT_URL / TOKEN -----------------------
+
+    struct LlmEnvGuard {
+        old_url: Option<String>,
+        old_token: Option<String>,
+    }
+
+    impl LlmEnvGuard {
+        fn set(url: &str) -> Self {
+            let old_url = std::env::var("AMAEBI_COPILOT_URL").ok();
+            let old_token = std::env::var("AMAEBI_COPILOT_TOKEN").ok();
+            // SAFETY: HOME_LOCK (held by with_temp_home caller) serialises
+            // all env-var mutations in this test process.
+            unsafe {
+                std::env::set_var("AMAEBI_COPILOT_URL", url);
+                std::env::set_var("AMAEBI_COPILOT_TOKEN", "test-mock-token");
+            }
+            Self { old_url, old_token }
+        }
+    }
+
+    impl Drop for LlmEnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.old_url {
+                    Some(v) => std::env::set_var("AMAEBI_COPILOT_URL", v),
+                    None => std::env::remove_var("AMAEBI_COPILOT_URL"),
+                }
+                match &self.old_token {
+                    Some(v) => std::env::set_var("AMAEBI_COPILOT_TOKEN", v),
+                    None => std::env::remove_var("AMAEBI_COPILOT_TOKEN"),
+                }
+            }
+        }
+    }
+
+    // ---- DaemonState for mock tests -------------------------------------
+    //
+    // Build a DaemonState whose reqwest Client has `.no_proxy()` so that
+    // requests to the localhost mock server bypass any corporate HTTP proxy
+    // configured in the test environment.  Using DaemonState::new() would
+    // build a client that honours the system proxy, causing requests to
+    // http://127.0.0.1:PORT to be forwarded through the proxy and fail.
+
+    async fn mock_daemon_state(mock_url: &str) -> (Arc<DaemonState>, LlmEnvGuard) {
+        let guard = LlmEnvGuard::set(mock_url);
+
+        let http = reqwest::Client::builder()
+            .no_proxy() // bypass corporate proxy; mock runs on localhost
+            .build()
+            .expect("mock reqwest client");
+
+        let db_path = crate::memory_db::db_path().expect("db_path");
+        let conn = tokio::task::spawn_blocking(move || crate::memory_db::init_db(&db_path))
+            .await
+            .unwrap()
+            .expect("init_db");
+
+        let db = Arc::new(std::sync::Mutex::new(conn));
+        let compacting = Arc::new(std::sync::Mutex::new(
+            std::collections::HashSet::<String>::new(),
+        ));
+        let active = Arc::new(std::sync::Mutex::new(
+            std::collections::HashSet::<String>::new(),
+        ));
+        let tokens = Arc::new(crate::auth::TokenCache::new());
+
+        let spawn_ctx = Arc::new(crate::tools::SpawnContext {
+            http: http.clone(),
+            db: Arc::clone(&db),
+            compacting_sessions: Arc::clone(&compacting),
+            tokens: Arc::clone(&tokens),
+        });
+        let mut executor = crate::tools::LocalExecutor::new();
+        executor.spawn_ctx = Some(spawn_ctx);
+
+        let state = Arc::new(DaemonState {
+            http,
+            tokens,
+            executor: Box::new(executor),
+            db,
+            compacting_sessions: compacting,
+            active_sessions: active,
+        });
+
+        (state, guard)
+    }
+
+    // ---- Tests ----------------------------------------------------------
+
+    /// Action::Llm must write its output to `/tmp/amaebi_llm_output.txt` and
+    /// set ctx["last_llm_output_file"] so that downstream Shell stages can
+    /// safely read the commit message / analysis without shell injection.
+    #[tokio::test]
+    #[serial]
+    async fn llm_stage_writes_output_file() {
+        let _home = with_temp_home();
+        let mock = MiniMock::start().await;
+        mock.enqueue("fix: add caching layer");
+        let (state, _env) = mock_daemon_state(&mock.url).await;
+        let wf = Workflow {
+            name: "file-test".into(),
+            stages: vec![Stage::new(
+                "gen",
+                Action::Llm {
+                    prompt: "write a commit message".into(),
+                },
+            )],
+        };
+
+        let summary = execute(
+            &wf,
+            &state,
+            "gpt-4o",
+            Context::new(),
+            &ResourcePool::empty(),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            summary.contains("fix: add caching layer"),
+            "summary: {summary}"
+        );
+        // The executor must persist the output so Shell stages can use it.
+        let content = tokio::fs::read_to_string("/tmp/amaebi_llm_output.txt")
+            .await
+            .unwrap();
+        assert!(
+            content.contains("fix: add caching layer"),
+            "output file content: {content}"
+        );
+        assert_eq!(mock.request_count(), 1);
+    }
+
+    /// A Shell stage following an Llm stage must be able to reference
+    /// {last_llm_output_file} and read the LLM's output from it.
+    /// This is the core regression test for the dev-loop commit-message bug.
+    #[tokio::test]
+    #[serial]
+    async fn shell_stage_reads_last_llm_output_file() {
+        let _home = with_temp_home();
+        let mock = MiniMock::start().await;
+        mock.enqueue("fix: implement new cache");
+        let (state, _env) = mock_daemon_state(&mock.url).await;
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_str().unwrap().to_owned();
+
+        // Mirrors the dev-loop push-pr pattern: Llm generates text, Shell
+        // reads it via {last_llm_output_file}.
+        let wf = Workflow {
+            name: "commit-msg-test".into(),
+            stages: vec![
+                Stage::new(
+                    "generate-msg",
+                    Action::Llm {
+                        prompt: "write a commit message".into(),
+                    },
+                ),
+                Stage::new(
+                    "use-msg",
+                    Action::Shell {
+                        command: format!("cp {{last_llm_output_file}} {path}"),
+                    },
+                )
+                .with_on_fail(FailStrategy::Abort),
+            ],
+        };
+
+        execute(
+            &wf,
+            &state,
+            "gpt-4o",
+            Context::new(),
+            &ResourcePool::empty(),
+        )
+        .await
+        .unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            content.contains("fix: implement new cache"),
+            "Shell stage did not read LLM output correctly; got: {content:?}"
+        );
+    }
+
+    /// When a Shell stage fails and the on_fail strategy is Retry, the
+    /// executor must call the LLM with the inject_prompt (containing the error
+    /// context) and then re-run the Shell stage.
+    #[tokio::test]
+    #[serial]
+    async fn retry_calls_llm_with_inject_prompt_then_reruns_stage() {
+        let _home = with_temp_home();
+        let mock = MiniMock::start().await;
+        // The workflow has 1 Llm stage + 1 Shell stage with Retry.
+        // The Shell stage fails on the first attempt; the Retry calls the LLM
+        // (mock response 1) and then re-runs the shell.  The shell succeeds on
+        // the second attempt because it detects a sentinel file written by the
+        // first failure.
+        mock.enqueue("retry fix"); // consumed by inject_prompt LLM call
+        let _env = LlmEnvGuard::set(&mock.url);
+
+        let (state, _env) = mock_daemon_state(&mock.url).await;
+        let sentinel = tempfile::NamedTempFile::new().unwrap();
+        let sentinel_path = sentinel.path().to_str().unwrap().to_owned();
+        // Pre-delete so the shell can recreate it.
+        std::fs::remove_file(&sentinel_path).ok();
+
+        // Shell logic:
+        // - 1st run: sentinel absent → create it → exit 1 (simulate test failure)
+        // - 2nd run: sentinel present → exit 0 (simulate fixed code)
+        let shell_cmd = format!(
+            "if [ -f {sentinel_path} ]; then exit 0; else touch {sentinel_path}; exit 1; fi"
+        );
+
+        let wf = Workflow {
+            name: "retry-llm-test".into(),
+            stages: vec![
+                Stage::new("flaky-stage", Action::Shell { command: shell_cmd }).with_on_fail(
+                    FailStrategy::Retry {
+                        max: 1,
+                        inject_prompt: "Tests failed with: {stderr}. Please fix.".into(),
+                    },
+                ),
+            ],
+        };
+
+        execute(
+            &wf,
+            &state,
+            "gpt-4o",
+            Context::new(),
+            &ResourcePool::empty(),
+        )
+        .await
+        .expect("workflow should succeed after retry");
+
+        // The mock must have received exactly 1 request (the inject_prompt LLM call).
+        assert_eq!(
+            mock.request_count(),
+            1,
+            "expected 1 LLM call for inject_prompt; got {}",
+            mock.request_count()
+        );
+        // The sentinel file must exist (was created on the first failed run).
+        assert!(
+            std::path::Path::new(&sentinel_path).exists(),
+            "sentinel file missing — first stage run did not execute"
+        );
+    }
+
+    /// A BenchmarkNoRegression check with threshold=∞ must always pass and
+    /// seed ctx["benchmark_baseline"].  A subsequent check with threshold=0.05
+    /// must detect a real regression.  This exercises the end-to-end perf_sweep
+    /// baseline initialisation fix in a workflow that calls the LLM for context.
+    #[tokio::test]
+    #[serial]
+    async fn perf_sweep_baseline_then_regression_detected() {
+        let _home = with_temp_home();
+        let mock = MiniMock::start().await;
+        // The Llm "analyze" stage consumes one mock response.
+        mock.enqueue("- OPT: vectorise inner loop\n- OPT: use SIMD");
+        let _env = LlmEnvGuard::set(&mock.url);
+
+        let (state, _env) = mock_daemon_state(&mock.url).await;
+
+        let wf = Workflow {
+            name: "perf-regression-test".into(),
+            stages: vec![
+                // 1. LLM analyzes (produces last_llm_output — not used here)
+                Stage::new(
+                    "analyze",
+                    Action::Llm {
+                        prompt: "list optimizations".into(),
+                    },
+                )
+                .with_on_fail(FailStrategy::Abort),
+                // 2. Baseline: noop action + threshold=∞ check seeds benchmark_baseline
+                Stage::new(
+                    "baseline",
+                    Action::Shell {
+                        command: "true".into(),
+                    },
+                )
+                .with_check(Check::BenchmarkNoRegression {
+                    command: r#"echo '{"fps": 100.0}'"#.into(),
+                    threshold: f64::INFINITY,
+                })
+                .with_on_fail(FailStrategy::Abort),
+                // 3. Regression check: fps dropped to 60 — should fail
+                Stage::new(
+                    "bench-after-opt",
+                    Action::Shell {
+                        command: "true".into(),
+                    },
+                )
+                .with_check(Check::BenchmarkNoRegression {
+                    command: r#"echo '{"fps": 60.0}'"#.into(),
+                    threshold: 0.05,
+                })
+                .with_on_fail(FailStrategy::Abort),
+            ],
+        };
+
+        let result = execute(
+            &wf,
+            &state,
+            "gpt-4o",
+            Context::new(),
+            &ResourcePool::empty(),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "40% fps regression must be detected; result: {result:?}"
+        );
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("fps") || msg.contains("regression"),
+            "error must name the regressed metric; got: {msg}"
+        );
+        // LLM was called exactly once (for the analyze stage).
+        assert_eq!(mock.request_count(), 1);
+    }
+}
+
 // Helper: execute a workflow with a pre-seeded context (bypasses LLM stages
 // that would require a real token/daemon in tests).
 #[cfg(test)]
