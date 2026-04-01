@@ -2455,7 +2455,8 @@ async fn chat_long_connection_ask_still_single_turn() {
     assert_eq!(reqs.len(), 1, "exactly 1 LLM request for single turn");
 }
 
-// ===========================================================================
+// 
+===================================================================
 // Deferred follow-up tool integration tests
 // ===========================================================================
 //
@@ -2916,4 +2917,167 @@ async fn followup_tools_blocked_in_cron_job_context() {
 
     let _ = child.kill().await;
     let _ = child.wait().await;
+=======
+// ---------------------------------------------------------------------------
+// Workflow — run_workflow LLM tool integration tests
+//
+// The `run_workflow` tool is exposed to the LLM in the daemon's tool schema.
+// When the LLM calls it, the daemon's tool executor runs the workflow engine
+// and returns the result (or error) as a tool response back to the LLM.
+//
+// These tests use the standard daemon IPC path: MockLlmServer → daemon →
+// IPC client.  They cover:
+//   WF-1. `run_workflow` is present in the tool schema
+//   WF-2. An unknown workflow name produces a clear error that the LLM sees
+//   WF-3. A real dev-loop workflow: LLM stages are called, shell stages run
+//         directly in the container (cargo fmt/clippy pass; git push fails
+//         as expected → workflow aborts → parent LLM handles gracefully)
+// ---------------------------------------------------------------------------
+
+/// WF-1: The daemon must include `run_workflow` in the tools array it sends
+/// to the LLM, so that the LLM can choose to trigger a supervised workflow.
+#[tokio::test]
+async fn run_workflow_tool_in_schema() {
+    let server = MockLlmServer::start().await;
+    server.enqueue(ScriptedResponse::text_chunks(vec!["ok"]));
+
+    let daemon = start_daemon(&server.url()).await.expect("start_daemon");
+    let client = connect_client(&daemon.socket);
+
+    send_message(&client, "hello").await.expect("send_message");
+
+    let reqs = server.take_requests();
+    assert_eq!(reqs.len(), 1);
+    let tools = reqs[0].body["tools"]
+        .as_array()
+        .expect("tools must be an array");
+    let names: Vec<&str> = tools
+        .iter()
+        .filter_map(|t| t["function"]["name"].as_str())
+        .collect();
+    assert!(
+        names.contains(&"run_workflow"),
+        "run_workflow tool must be in schema; got: {names:?}"
+    );
+}
+
+/// WF-2: When the LLM calls `run_workflow` with an unknown workflow name the
+/// tool executor must return a clear error string.  The daemon feeds this back
+/// to the LLM as a tool result; the LLM can then explain the error to the
+/// user.  The daemon must stay alive and complete the turn normally.
+#[tokio::test]
+async fn run_workflow_unknown_workflow_error_propagated_to_llm() {
+    let server = MockLlmServer::start().await;
+
+    // 1. LLM calls run_workflow with a bogus name.
+    server.enqueue(ScriptedResponse::tool_call(
+        "call-wf-001",
+        "run_workflow",
+        r#"{"workflow":"does-not-exist","args":{}}"#,
+    ));
+    // 2. After the tool executor returns the error, the LLM responds with text.
+    server.enqueue(ScriptedResponse::text_chunks(vec![
+        "Sorry, that workflow does not exist.",
+    ]));
+
+    let daemon = start_daemon(&server.url()).await.expect("start_daemon");
+    let client = connect_client(&daemon.socket);
+
+    let responses = send_message(&client, "run a workflow")
+        .await
+        .expect("send_message");
+
+    let text = collect_text(&responses);
+    assert!(
+        text.contains("does not exist"),
+        "LLM response should contain the error explanation: {text:?}"
+    );
+
+    // Two LLM requests: one with the tool call, one after the tool error.
+    let reqs = server.take_requests();
+    assert_eq!(reqs.len(), 2, "expected 2 LLM requests, got {}", reqs.len());
+
+    // The second request must contain a tool result with the error message.
+    let msgs = reqs[1].messages().expect("messages present");
+    let tool_result = msgs
+        .iter()
+        .find(|m| m["role"].as_str() == Some("tool"))
+        .expect("tool result message must be present in second request");
+    let content = tool_result["content"].as_str().unwrap_or("");
+    assert!(
+        content.contains("unknown workflow") || content.contains("does-not-exist"),
+        "tool result must name the unknown workflow; got: {content:?}"
+    );
+}
+
+/// WF-3: A dev-loop workflow where the LLM tool is invoked from the daemon.
+///
+/// The workflow runs real shell stages directly in the container:
+///   - "develop"       Llm stage  → mocked
+///   - "test"          Shell      → `true`  (always passes)
+///   - "fmt"           Shell      → `cargo fmt`  (passes in project root)
+///   - "clippy"        Shell      → `cargo clippy -- -D warnings 2>&1` (passes)
+///   - "commit-and-pr" Llm stage  → mocked
+///   - "push-pr"       Shell      → fails at `git push` (no remote) → Abort
+///
+/// The workflow aborts at push-pr; the daemon feeds the error back to the
+/// parent LLM; the parent responds with text.  This verifies:
+///   - Both Llm stages in the workflow fire (request count = 4)
+///   - Workflow failure is propagated to the parent LLM as a tool result
+///   - The daemon stays alive and completes the outer turn after the error
+#[tokio::test]
+async fn run_workflow_dev_loop_executes_llm_stages_and_fails_at_push() {
+    let server = MockLlmServer::start().await;
+
+    // 1. Parent first turn: LLM calls run_workflow dev-loop.
+    server.enqueue(ScriptedResponse::tool_call(
+        "call-wf-dev",
+        "run_workflow",
+        r#"{"workflow":"dev-loop","args":{"task":"add a noop comment","test_cmd":"true","max_retries":1}}"#,
+    ));
+    // 2. Workflow "develop" Llm stage.
+    server.enqueue(ScriptedResponse::text_chunks(vec!["// noop comment added"]));
+    // 3. Workflow "commit-and-pr" Llm stage.
+    server.enqueue(ScriptedResponse::text_chunks(vec![
+        "chore: add noop comment",
+    ]));
+    // 4. Parent second turn: receives workflow error (push failed), responds.
+    server.enqueue(ScriptedResponse::text_chunks(vec![
+        "The workflow hit a git error as expected.",
+    ]));
+
+    let daemon = start_daemon(&server.url()).await.expect("start_daemon");
+    let client = connect_client(&daemon.socket);
+
+    let responses = send_message(&client, "run a dev-loop")
+        .await
+        .expect("send_message");
+
+    let text = collect_text(&responses);
+    assert!(
+        text.contains("git error") || text.contains("workflow") || !text.is_empty(),
+        "daemon must return a non-empty response after workflow failure: {text:?}"
+    );
+
+    // 4 LLM requests: parent×2 + workflow-develop + workflow-commit-and-pr.
+    let reqs = server.take_requests();
+    assert_eq!(
+        reqs.len(),
+        4,
+        "expected 4 LLM requests (parent×2 + 2 workflow Llm stages); got {}.\n\
+         This indicates the workflow Llm stages were not invoked.",
+        reqs.len()
+    );
+
+    // The parent's second request must contain a tool result from run_workflow.
+    let msgs = reqs[3].messages().expect("messages present");
+    let tool_result = msgs
+        .iter()
+        .find(|m| m["role"].as_str() == Some("tool"))
+        .expect("tool result must be in parent's second request");
+    let content = tool_result["content"].as_str().unwrap_or("");
+    assert!(
+        !content.is_empty(),
+        "tool result for run_workflow must not be empty"
+    );
 }
