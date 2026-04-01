@@ -104,6 +104,19 @@ pub enum Command {
         #[command(subcommand)]
         action: CronAction,
     },
+    /// Manage heartbeat follow-up items.
+    ///
+    /// Heartbeat items are pending tasks that the daemon periodically reviews.
+    /// Items can be added by the agent during conversations or manually via CLI.
+    /// The daemon checks pending items at a configurable interval (default: 30 min)
+    /// and injects reports into active sessions via the steer channel.
+    Heartbeat {
+        #[command(subcommand)]
+        action: HeartbeatAction,
+        /// Path to the Unix socket.
+        #[arg(long, default_value = DEFAULT_SOCKET, global = true)]
+        socket: PathBuf,
+    },
     /// Read reports from completed cron tasks.
     ///
     /// Cron tasks run autonomously in the background; their output is stored
@@ -207,6 +220,28 @@ pub enum CronAction {
         /// UUID of the job to remove (shown in `cron list`).
         id: String,
     },
+}
+
+#[derive(clap::Subcommand, Debug)]
+pub enum HeartbeatAction {
+    /// Add a heartbeat item for the current directory's session.
+    Add {
+        /// Description of what should be checked later.
+        description: String,
+    },
+    /// List heartbeat items for the current directory's session.
+    List {
+        /// Include resolved and dismissed items.
+        #[arg(long)]
+        all: bool,
+    },
+    /// Dismiss a heartbeat item by its ID.
+    Dismiss {
+        /// The numeric ID of the item (shown in `heartbeat list`).
+        id: i64,
+    },
+    /// Trigger an immediate heartbeat check.
+    Trigger,
 }
 
 #[derive(clap::Subcommand, Debug)]

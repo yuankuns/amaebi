@@ -110,6 +110,37 @@ CREATE TABLE IF NOT EXISTS session_summaries (
     summary    TEXT NOT NULL,
     timestamp  TEXT NOT NULL
 );
+
+-- Full conversation turns stored as serialized JSON (Vec<Message>).
+-- Each row represents one complete agentic-loop turn: the user message,
+-- any tool-call/result exchanges, and the final assistant reply.
+-- This is the openclaw/pi approach: persist the entire message sequence so
+-- subsequent turns can see the full reasoning chain, not just the final text.
+CREATE TABLE IF NOT EXISTS session_turns (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT    NOT NULL,
+    timestamp  TEXT    NOT NULL,
+    turn_json  TEXT    NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_session_turns_session
+    ON session_turns(session_id, id);
+
+-- Heartbeat items: pending follow-up tasks the agent records during conversations.
+-- A background heartbeat scheduler periodically reviews pending items and surfaces
+-- actionable ones via the inbox.
+CREATE TABLE IF NOT EXISTS heartbeat_items (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id  TEXT    NOT NULL,
+    description TEXT    NOT NULL,
+    status      TEXT    NOT NULL DEFAULT 'pending',
+    created_at  TEXT    NOT NULL,
+    resolved_at TEXT,
+    source      TEXT    NOT NULL DEFAULT 'agent'
+);
+
+CREATE INDEX IF NOT EXISTS idx_heartbeat_session_status
+    ON heartbeat_items (session_id, status);
 ";
 
 // ---------------------------------------------------------------------------
@@ -314,7 +345,9 @@ pub fn clear(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "DELETE FROM memories;
          INSERT INTO memories_fts(memories_fts) VALUES ('rebuild');
-         DELETE FROM session_summaries;",
+         DELETE FROM session_summaries;
+         DELETE FROM session_turns;
+         DELETE FROM heartbeat_items;",
     )
     .context("clearing memories")
 }
@@ -464,6 +497,228 @@ pub fn get_recent_summaries(
 
     summaries.reverse(); // oldest first → model reads history in order
     Ok(summaries)
+}
+
+// ---------------------------------------------------------------------------
+// Full-turn history (consistent chat — openclaw/pi approach)
+// ---------------------------------------------------------------------------
+
+/// Append a serialized turn to `session_turns`.
+///
+/// `turn_json` must be a valid JSON array of `copilot::Message` objects.
+/// Called by the Chat handler after every successful agentic-loop iteration.
+pub fn store_session_turn(
+    conn: &Connection,
+    session_id: &str,
+    timestamp: &str,
+    turn_json: &str,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO session_turns (session_id, timestamp, turn_json)
+         VALUES (?1, ?2, ?3)",
+        params![session_id, timestamp, turn_json],
+    )
+    .context("inserting session turn")?;
+    Ok(())
+}
+
+/// Return all turn JSON blobs for `session_id` in chronological order.
+///
+/// Each blob is a JSON array of `copilot::Message` objects covering one
+/// complete agentic-loop turn (user prompt + tool exchanges + assistant reply).
+pub fn get_session_turns_json(conn: &Connection, session_id: &str) -> Result<Vec<String>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT turn_json FROM session_turns
+             WHERE session_id = ?1
+             ORDER BY id ASC",
+        )
+        .context("preparing get_session_turns_json")?;
+
+    let blobs = stmt
+        .query_map(params![session_id], |row| row.get::<_, String>(0))
+        .context("executing get_session_turns_json")?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .context("collecting session turn blobs")?;
+
+    Ok(blobs)
+}
+
+/// Delete all `session_turns` rows for `session_id`.
+///
+/// Called when the session is fully compacted so the replaced history is
+/// not accidentally re-expanded on the next request.
+pub fn delete_session_turns(conn: &Connection, session_id: &str) -> Result<()> {
+    conn.execute(
+        "DELETE FROM session_turns WHERE session_id = ?1",
+        params![session_id],
+    )
+    .context("deleting session turns")?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Heartbeat items
+// ---------------------------------------------------------------------------
+
+/// A pending follow-up item recorded by the agent or user during a conversation.
+#[derive(Debug, Clone)]
+pub struct HeartbeatItem {
+    pub id: i64,
+    #[allow(dead_code)]
+    pub session_id: String,
+    pub description: String,
+    pub status: String,
+    pub created_at: String,
+    #[allow(dead_code)]
+    pub resolved_at: Option<String>,
+    #[allow(dead_code)]
+    pub source: String,
+}
+
+/// Insert a new heartbeat item. Returns the row id.
+pub fn add_heartbeat_item(
+    conn: &Connection,
+    session_id: &str,
+    description: &str,
+    source: &str,
+) -> Result<i64> {
+    let timestamp = chrono::Utc::now().to_rfc3339();
+    conn.execute(
+        "INSERT INTO heartbeat_items (session_id, description, source, created_at)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![session_id, description, source, timestamp],
+    )
+    .context("inserting heartbeat item")?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// Return all pending heartbeat items for a session.
+pub fn get_pending_heartbeat_items(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<Vec<HeartbeatItem>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, session_id, description, status, created_at, resolved_at, source
+             FROM heartbeat_items
+             WHERE session_id = ?1 AND status = 'pending'
+             ORDER BY id ASC",
+        )
+        .context("preparing get_pending_heartbeat_items")?;
+
+    let items = stmt
+        .query_map(params![session_id], row_to_heartbeat_item)
+        .context("executing get_pending_heartbeat_items")?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .context("collecting pending heartbeat items")?;
+    Ok(items)
+}
+
+/// Return all session IDs that have at least one pending heartbeat item.
+#[allow(dead_code)]
+pub fn get_sessions_with_pending_heartbeats(conn: &Connection) -> Result<Vec<String>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT DISTINCT session_id FROM heartbeat_items
+             WHERE status = 'pending'
+             ORDER BY session_id",
+        )
+        .context("preparing get_sessions_with_pending_heartbeats")?;
+
+    let sessions = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .context("executing get_sessions_with_pending_heartbeats")?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .context("collecting sessions with pending heartbeats")?;
+    Ok(sessions)
+}
+
+/// Mark a heartbeat item as resolved.
+#[allow(dead_code)]
+pub fn resolve_heartbeat_item(conn: &Connection, id: i64, timestamp: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE heartbeat_items SET status = 'resolved', resolved_at = ?1 WHERE id = ?2",
+        params![timestamp, id],
+    )
+    .context("resolving heartbeat item")?;
+    Ok(())
+}
+
+/// Mark a heartbeat item as dismissed (cancelled).
+pub fn dismiss_heartbeat_item(conn: &Connection, id: i64) -> Result<()> {
+    conn.execute(
+        "UPDATE heartbeat_items SET status = 'dismissed' WHERE id = ?1",
+        params![id],
+    )
+    .context("dismissing heartbeat item")?;
+    Ok(())
+}
+
+/// Dismiss only the *pending* heartbeat items for a session.
+///
+/// Called when a session closes (auto-dismiss on close).  Resolved and
+/// dismissed items are preserved so `heartbeat list --all` keeps its history.
+pub fn dismiss_pending_heartbeat_items(conn: &Connection, session_id: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE heartbeat_items SET status = 'dismissed'
+         WHERE session_id = ?1 AND status = 'pending'",
+        params![session_id],
+    )
+    .context("dismissing pending heartbeat items")?;
+    Ok(())
+}
+
+/// Delete all heartbeat items for a session (used only in full memory clear).
+#[allow(dead_code)]
+pub fn clear_heartbeat_items(conn: &Connection, session_id: &str) -> Result<()> {
+    conn.execute(
+        "DELETE FROM heartbeat_items WHERE session_id = ?1",
+        params![session_id],
+    )
+    .context("clearing heartbeat items")?;
+    Ok(())
+}
+
+/// Return all heartbeat items for a session (any status), ordered by creation.
+pub fn list_heartbeat_items(
+    conn: &Connection,
+    session_id: &str,
+    all: bool,
+) -> Result<Vec<HeartbeatItem>> {
+    let sql = if all {
+        "SELECT id, session_id, description, status, created_at, resolved_at, source
+         FROM heartbeat_items
+         WHERE session_id = ?1
+         ORDER BY id ASC"
+    } else {
+        "SELECT id, session_id, description, status, created_at, resolved_at, source
+         FROM heartbeat_items
+         WHERE session_id = ?1 AND status = 'pending'
+         ORDER BY id ASC"
+    };
+    let mut stmt = conn
+        .prepare(sql)
+        .context("preparing list_heartbeat_items")?;
+
+    let items = stmt
+        .query_map(params![session_id], row_to_heartbeat_item)
+        .context("executing list_heartbeat_items")?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .context("collecting heartbeat items")?;
+    Ok(items)
+}
+
+fn row_to_heartbeat_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<HeartbeatItem> {
+    Ok(HeartbeatItem {
+        id: row.get(0)?,
+        session_id: row.get(1)?,
+        description: row.get(2)?,
+        status: row.get(3)?,
+        created_at: row.get(4)?,
+        resolved_at: row.get(5)?,
+        source: row.get(6)?,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -792,5 +1047,144 @@ mod tests {
         // Exclude s3 (current session); expect oldest-first order.
         let summaries = get_recent_summaries(&conn, "s3", 10).unwrap();
         assert_eq!(summaries, vec!["summary A", "summary B"]);
+    }
+
+    // ---- session_turns (consistent chat) -----------------------------------
+
+    #[test]
+    fn store_and_get_session_turns_json_roundtrip() {
+        let (conn, _dir) = open_test_db();
+
+        let turn1 = r#"[{"role":"user","content":"hello"},{"role":"assistant","content":"hi"}]"#;
+        let turn2 = r#"[{"role":"user","content":"bye"},{"role":"assistant","content":"cya"}]"#;
+
+        store_session_turn(&conn, "s1", "2026-01-01T00:00:00Z", turn1).unwrap();
+        store_session_turn(&conn, "s1", "2026-01-01T00:00:01Z", turn2).unwrap();
+        // Different session — must not appear.
+        store_session_turn(&conn, "s2", "2026-01-01T00:00:00Z", r#"[]"#).unwrap();
+
+        let blobs = get_session_turns_json(&conn, "s1").unwrap();
+        assert_eq!(blobs.len(), 2, "expected 2 turns for s1");
+        assert_eq!(blobs[0], turn1);
+        assert_eq!(blobs[1], turn2);
+
+        let other = get_session_turns_json(&conn, "s2").unwrap();
+        assert_eq!(other.len(), 1);
+
+        let none = get_session_turns_json(&conn, "nonexistent").unwrap();
+        assert!(none.is_empty());
+    }
+
+    #[test]
+    fn get_session_turns_json_returns_chronological_order() {
+        let (conn, _dir) = open_test_db();
+        for i in 0..5u32 {
+            let json = format!(r#"[{{"role":"user","content":"turn {i}"}}]"#);
+            store_session_turn(&conn, "sess", "2026-01-01T00:00:00Z", &json).unwrap();
+        }
+        let blobs = get_session_turns_json(&conn, "sess").unwrap();
+        for (i, blob) in blobs.iter().enumerate() {
+            assert!(
+                blob.contains(&format!("turn {i}")),
+                "unexpected order: {blob}"
+            );
+        }
+    }
+
+    #[test]
+    fn delete_session_turns_removes_only_that_session() {
+        let (conn, _dir) = open_test_db();
+        store_session_turn(&conn, "s1", "2026-01-01T00:00:00Z", r#"[]"#).unwrap();
+        store_session_turn(&conn, "s1", "2026-01-01T00:00:01Z", r#"[]"#).unwrap();
+        store_session_turn(&conn, "s2", "2026-01-01T00:00:00Z", r#"[]"#).unwrap();
+
+        delete_session_turns(&conn, "s1").unwrap();
+
+        assert!(get_session_turns_json(&conn, "s1").unwrap().is_empty());
+        assert_eq!(get_session_turns_json(&conn, "s2").unwrap().len(), 1);
+    }
+
+    // ---- heartbeat items ---------------------------------------------------
+
+    #[test]
+    fn heartbeat_add_and_list_pending() {
+        let (conn, _dir) = open_test_db();
+        let id1 = add_heartbeat_item(&conn, "s1", "check deploy", "agent").unwrap();
+        let id2 = add_heartbeat_item(&conn, "s1", "re-run tests", "user").unwrap();
+        add_heartbeat_item(&conn, "s2", "other session", "agent").unwrap();
+
+        assert!(id1 > 0);
+        assert!(id2 > id1);
+
+        let pending = get_pending_heartbeat_items(&conn, "s1").unwrap();
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending[0].description, "check deploy");
+        assert_eq!(pending[0].source, "agent");
+        assert_eq!(pending[1].description, "re-run tests");
+        assert_eq!(pending[1].source, "user");
+    }
+
+    #[test]
+    fn heartbeat_resolve_and_dismiss() {
+        let (conn, _dir) = open_test_db();
+        let id1 = add_heartbeat_item(&conn, "s1", "item A", "agent").unwrap();
+        let id2 = add_heartbeat_item(&conn, "s1", "item B", "agent").unwrap();
+        let id3 = add_heartbeat_item(&conn, "s1", "item C", "agent").unwrap();
+
+        resolve_heartbeat_item(&conn, id1, "2026-01-01T01:00:00Z").unwrap();
+        dismiss_heartbeat_item(&conn, id2).unwrap();
+
+        let pending = get_pending_heartbeat_items(&conn, "s1").unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, id3);
+
+        let all = list_heartbeat_items(&conn, "s1", true).unwrap();
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[0].status, "resolved");
+        assert!(all[0].resolved_at.is_some());
+        assert_eq!(all[1].status, "dismissed");
+        assert_eq!(all[2].status, "pending");
+    }
+
+    #[test]
+    fn heartbeat_sessions_with_pending() {
+        let (conn, _dir) = open_test_db();
+        add_heartbeat_item(&conn, "s1", "item", "agent").unwrap();
+        add_heartbeat_item(&conn, "s2", "item", "agent").unwrap();
+        let id3 = add_heartbeat_item(&conn, "s3", "item", "agent").unwrap();
+
+        // Resolve s3's only item — it should not appear.
+        resolve_heartbeat_item(&conn, id3, "2026-01-01T01:00:00Z").unwrap();
+
+        let sessions = get_sessions_with_pending_heartbeats(&conn).unwrap();
+        assert_eq!(sessions, vec!["s1", "s2"]);
+    }
+
+    #[test]
+    fn heartbeat_clear_items() {
+        let (conn, _dir) = open_test_db();
+        add_heartbeat_item(&conn, "s1", "A", "agent").unwrap();
+        add_heartbeat_item(&conn, "s1", "B", "agent").unwrap();
+        add_heartbeat_item(&conn, "s2", "C", "agent").unwrap();
+
+        clear_heartbeat_items(&conn, "s1").unwrap();
+
+        assert!(get_pending_heartbeat_items(&conn, "s1").unwrap().is_empty());
+        assert_eq!(get_pending_heartbeat_items(&conn, "s2").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn heartbeat_list_filters_by_status() {
+        let (conn, _dir) = open_test_db();
+        add_heartbeat_item(&conn, "s1", "pending item", "agent").unwrap();
+        let id2 = add_heartbeat_item(&conn, "s1", "resolved item", "agent").unwrap();
+        resolve_heartbeat_item(&conn, id2, "2026-01-01T01:00:00Z").unwrap();
+
+        let pending_only = list_heartbeat_items(&conn, "s1", false).unwrap();
+        assert_eq!(pending_only.len(), 1);
+        assert_eq!(pending_only[0].description, "pending item");
+
+        let all = list_heartbeat_items(&conn, "s1", true).unwrap();
+        assert_eq!(all.len(), 2);
     }
 }

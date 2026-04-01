@@ -257,8 +257,9 @@ impl acp::Agent for AmaebiAgent {
         let state = Arc::clone(&self.state);
         let model = Arc::clone(&self.model);
 
-        // Oneshot to receive the loop's final text.
-        let (result_tx, result_rx) = oneshot::channel::<Result<(String, usize), String>>();
+        // Oneshot to receive the loop's final text and token count.
+        let (result_tx, result_rx) =
+            oneshot::channel::<Result<(String, usize, Vec<crate::copilot::Message>), String>>();
 
         // Run the agentic loop in a background local task.
         // ACP mode has no steering channel — create a channel and immediately
@@ -315,7 +316,8 @@ impl acp::Agent for AmaebiAgent {
                 Response::ToolUse { .. }
                 | Response::MemoryEntry { .. }
                 | Response::WaitingForInput { .. }
-                | Response::Compacting => {
+                | Response::Compacting
+                | Response::HeartbeatEntry { .. } => {
                     // Not relevant on the ACP forwarding path.
                 }
                 Response::SteerAck => {
@@ -332,7 +334,7 @@ impl acp::Agent for AmaebiAgent {
 
         // Await the loop outcome; propagate any error to the ACP client.
         let final_text = match result_rx.await {
-            Ok(Ok((text, _))) => text,
+            Ok(Ok((text, _, _messages))) => text,
             Ok(Err(e)) => return Err(acp::Error::internal_error().data(e)),
             Err(_) => return Err(acp::Error::internal_error()),
         };
