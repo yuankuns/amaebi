@@ -1041,6 +1041,29 @@ mod tests {
         for name in ["shell_command", "read_file", "edit_file"] {
             assert!(names.contains(&name), "missing core tool: {name}");
         }
+        // heartbeat_note must be present even when spawn_agent is disabled —
+        // it is decoupled from the spawn_agent gate (comment 22 regression).
+        assert!(
+            names.contains(&"heartbeat_note"),
+            "heartbeat_note must be present when include_spawn_agent=false"
+        );
+    }
+
+    #[test]
+    fn heartbeat_note_present_in_both_schema_variants() {
+        // heartbeat_note must be available in child-agent contexts (false) AND
+        // in the full parent context (true).
+        for include in [false, true] {
+            let schemas = tool_schemas(include);
+            let count = schemas
+                .iter()
+                .filter(|s| s["function"]["name"].as_str() == Some("heartbeat_note"))
+                .count();
+            assert_eq!(
+                count, 1,
+                "include_spawn_agent={include}: expected exactly 1 heartbeat_note schema, got {count}"
+            );
+        }
     }
 
     #[test]

@@ -2438,3 +2438,95 @@ async fn heartbeat_ok_does_not_inject() {
     let _ = child.kill().await;
     let _ = child.wait().await;
 }
+
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Regression tests for comments 22-27 (heartbeat fixes)
+// ---------------------------------------------------------------------------
+
+/// Happy-path roundtrip: HeartbeatAdd → Done, HeartbeatList returns item,
+/// HeartbeatDismiss → Done, list shows no pending items after dismiss.
+///
+/// Regression for comments 23-25: each handler returns Response::Done on
+/// success (and Response::Error on DB failure — unit-tested in daemon.rs).
+#[tokio::test]
+async fn heartbeat_ipc_add_list_dismiss_roundtrip() {
+    use support::helpers::{send_heartbeat_add, send_heartbeat_list, send_request, Response};
+
+    let server = MockLlmServer::start().await;
+    let home = setup_home().expect("setup_home");
+    let (socket, mut child, _socket_dir) =
+        start_daemon_at_home_with_env(home.path(), &server.url(), &[])
+            .await
+            .expect("start_daemon");
+
+    let session_id = "test-hb-roundtrip";
+
+    // Add an item — daemon must succeed (no Error response).
+    send_heartbeat_add(
+        &connect_client(&socket),
+        session_id,
+        "check build after deploy",
+    )
+    .await
+    .expect("heartbeat_add must succeed");
+
+    // List items — must include the item we just added, followed by Done.
+    let list_responses = send_heartbeat_list(&connect_client(&socket), session_id, false)
+        .await
+        .expect("heartbeat_list");
+    let entries: Vec<_> = list_responses
+        .iter()
+        .filter_map(|r| {
+            if let Response::HeartbeatEntry {
+                id,
+                description,
+                status,
+                ..
+            } = r
+            {
+                Some((*id, description.as_str(), status.as_str()))
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(entries.len(), 1, "expected 1 pending item; got {entries:?}");
+    assert!(
+        entries[0].1.contains("check build after deploy"),
+        "unexpected description: {:?}",
+        entries[0].1
+    );
+    assert_eq!(entries[0].2, "pending");
+    let item_id = entries[0].0;
+
+    // Dismiss the item — daemon must respond with Done, not Error.
+    let dismiss = send_request(
+        &connect_client(&socket),
+        &Request::HeartbeatDismiss { id: item_id },
+    )
+    .await
+    .expect("heartbeat_dismiss");
+    assert!(
+        dismiss.iter().any(|r| matches!(r, Response::Done)),
+        "HeartbeatDismiss must respond with Done: {dismiss:?}"
+    );
+    assert!(
+        !dismiss.iter().any(|r| matches!(r, Response::Error { .. })),
+        "HeartbeatDismiss must not return Error on success: {dismiss:?}"
+    );
+
+    // List pending again — dismissed item must not appear.
+    let pending = send_heartbeat_list(&connect_client(&socket), session_id, false)
+        .await
+        .expect("heartbeat_list after dismiss");
+    assert!(
+        !pending
+            .iter()
+            .any(|r| matches!(r, Response::HeartbeatEntry { .. })),
+        "dismissed item should not appear in pending list: {pending:?}"
+    );
+
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+}

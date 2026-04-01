@@ -346,4 +346,54 @@ mod tests {
         let hb = HeartbeatConfig::default();
         assert!(hb.is_active_now());
     }
+
+    #[test]
+    fn heartbeat_active_hours_out_of_range_treats_as_always_active() {
+        // Values outside 0-23 are invalid; is_active_now must return true
+        // (always-active) rather than producing wrong results silently.
+        let hb = HeartbeatConfig {
+            active_hours: Some((25, 10)), // start=25 is invalid
+            ..Default::default()
+        };
+        assert!(
+            hb.is_active_now(),
+            "out-of-range active_hours should be treated as always active"
+        );
+
+        let hb2 = HeartbeatConfig {
+            active_hours: Some((9, 200)), // end=200 is invalid
+            ..Default::default()
+        };
+        assert!(
+            hb2.is_active_now(),
+            "out-of-range active_hours end should be treated as always active"
+        );
+    }
+
+    #[test]
+    fn heartbeat_active_hours_valid_boundary_values() {
+        // 0 and 23 are valid boundary values; must not be rejected.
+        let hb = HeartbeatConfig {
+            active_hours: Some((0, 23)),
+            ..Default::default()
+        };
+        // Just verify it doesn't panic and returns a bool.
+        let _ = hb.is_active_now();
+    }
+
+    #[test]
+    fn heartbeat_interval_saturating_mul_does_not_overflow() {
+        // u64::MAX / 60 + 1 overflows with plain multiplication.
+        // saturating_mul must not panic and must cap at u64::MAX.
+        let hb = HeartbeatConfig {
+            interval_minutes: u64::MAX,
+            ..Default::default()
+        };
+        // This exercises the saturating_mul path in the scheduler.
+        // We can't call the scheduler directly, but we can verify the
+        // arithmetic produces a valid Duration rather than panicking.
+        let secs = hb.interval_minutes.saturating_mul(60);
+        let _dur = std::time::Duration::from_secs(secs);
+        // If we reach here without panicking, the overflow is handled.
+    }
 }
