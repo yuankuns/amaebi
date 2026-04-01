@@ -540,7 +540,12 @@ impl LongChatConnection {
         tokio::time::timeout(Duration::from_secs(30), async {
             loop {
                 match self.read_frame().await? {
-                    None => break,
+                    None => {
+                        // EOF without Done/Error — daemon crashed or protocol error.
+                        anyhow::bail!(
+                            "connection closed before Done/Error frame (daemon crash or protocol violation?)"
+                        );
+                    }
                     Some(frame) => {
                         let done = matches!(frame, Response::Done | Response::Error { .. });
                         responses.push(frame);

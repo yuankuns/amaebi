@@ -320,6 +320,9 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
     // Tracks the session_id so context is reset when the client switches sessions.
     let mut carried_messages: Option<Vec<Message>> = None;
     let mut carried_session_id: Option<String> = None;
+    // Count of unsolicited frames received while an agentic loop was running.
+    // Flushed as error responses after the loop releases the writer lock.
+    let mut pending_unsolicited: u32 = 0;
     // Held for the lifetime of a Chat connection once a session is claimed.
     // Ensures a second connection cannot use the same session concurrently.
     let mut chat_session_guard: Option<ActiveSessionGuard> = None;
@@ -608,21 +611,26 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                                 }
                                 _ => {
                                     tracing::warn!("dropping unsolicited frame during active agentic loop");
-                                    // Use try_lock to avoid blocking Steer/Interrupt routing:
-                                    // the agentic loop holds the writer lock for most of the
-                                    // turn; awaiting it here would stall the select loop and
-                                    // delay steering frames.  If we can't acquire it immediately
-                                    // we skip the error reply rather than blocking.
-                                    if let Ok(mut w) = writer.try_lock() {
-                                        let _ = write_frame(&mut *w, &Response::Error {
-                                            message: "busy: another request is already in progress on this connection".into(),
-                                        }).await;
-                                    }
+                                    // Defer the error reply: the agentic loop holds the writer
+                                    // lock; awaiting it here would stall Steer routing.  Instead
+                                    // we increment a counter and flush the errors right after the
+                                    // loop returns and releases the lock.
+                                    pending_unsolicited += 1;
                                 }
                             }}}
                         }}
                     }
                 };
+                // Flush deferred busy-errors now that the writer lock is free.
+                if pending_unsolicited > 0 {
+                    let mut w = writer.lock().await;
+                    for _ in 0..pending_unsolicited {
+                        let _ = write_frame(&mut *w, &Response::Error {
+                            message: "busy: another request is already in progress on this connection".into(),
+                        }).await;
+                    }
+                    pending_unsolicited = 0;
+                }
                 match result {
                     Ok((response_text, _, _)) => {
                         store_conversation(
@@ -853,21 +861,24 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                                 }
                                 _ => {
                                     tracing::warn!("dropping unsolicited frame during active chat loop");
-                                    // Use try_lock to avoid blocking Steer/Interrupt routing:
-                                    // the agentic loop holds the writer lock for most of the
-                                    // turn; awaiting it here would stall the select loop and
-                                    // delay steering frames.  If we can't acquire it immediately
-                                    // we skip the error reply rather than blocking.
-                                    if let Ok(mut w) = writer.try_lock() {
-                                        let _ = write_frame(&mut *w, &Response::Error {
-                                            message: "busy: another request is already in progress on this connection".into(),
-                                        }).await;
-                                    }
+                                    // Defer the error reply (same reason as Resume path above).
+                                    pending_unsolicited += 1;
                                 }
                             }}}
                         }}
                     }
                 };
+
+                // Flush deferred busy-errors now that the writer lock is free.
+                if pending_unsolicited > 0 {
+                    let mut w = writer.lock().await;
+                    for _ in 0..pending_unsolicited {
+                        let _ = write_frame(&mut *w, &Response::Error {
+                            message: "busy: another request is already in progress on this connection".into(),
+                        }).await;
+                    }
+                    pending_unsolicited = 0;
+                }
 
                 match loop_result {
                     Ok((response_text, prompt_tokens, final_messages)) => {
@@ -1489,33 +1500,44 @@ where
 
                     // Block until the user replies via the steering channel.
                     // Timeout after 5 minutes to avoid infinite hangs.
-                    // An interrupt (None) now breaks out immediately so the session
-                    // is not left stuck when the user cancels the reply prompt.
-                    let steer_result = match tokio::time::timeout(
+                    enum WaitInputOutcome {
+                        Reply(String),
+                        UserCancelled,
+                        Disconnected,
+                    }
+                    let outcome = match tokio::time::timeout(
                         std::time::Duration::from_secs(300),
                         steer_rx.recv(),
                     )
                     .await
                     {
-                        Ok(Some(Some(reply))) => Ok(Some(reply)),
+                        Ok(Some(Some(reply))) => Ok(WaitInputOutcome::Reply(reply)),
                         Ok(Some(None)) => {
                             // Interrupt: user cancelled the reply prompt.
                             tracing::debug!(
                                 context = "waiting_for_input_reply",
                                 "interrupt received; aborting waiting-for-input"
                             );
-                            Ok(None)
+                            Ok(WaitInputOutcome::UserCancelled)
                         }
-                        Ok(None) => Ok(None),
+                        Ok(None) => Ok(WaitInputOutcome::Disconnected),
                         Err(e) => Err(e),
                     };
-                    match steer_result {
-                        Ok(Some(user_reply)) => {
+                    match outcome {
+                        Ok(WaitInputOutcome::Reply(user_reply)) => {
                             messages.push(Message::user(user_reply));
                             write_frame(writer, &Response::SteerAck).await?;
                             continue;
                         }
-                        Ok(None) => {
+                        Ok(WaitInputOutcome::UserCancelled) => {
+                            // User cancelled — resume the loop; session stays open.
+                            tracing::debug!(
+                                context = "waiting_for_input_reply",
+                                "user cancelled waiting-for-input; resuming session"
+                            );
+                            continue;
+                        }
+                        Ok(WaitInputOutcome::Disconnected) => {
                             // Channel closed — client disconnected.
                             tracing::debug!(
                                 reason = "client_disconnected",

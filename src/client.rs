@@ -357,7 +357,7 @@ pub async fn run_chat_loop(
                 let mut line = String::new();
                 let n = tokio::io::AsyncBufReadExt::read_line(&mut stdin, &mut line)
                     .await
-                    .unwrap_or(0);
+                    .context("reading prompt from stdin")?;
                 if n == 0 {
                     break 'session;
                 }
@@ -446,21 +446,13 @@ pub async fn run_chat_loop(
                             }
                         }
                         Response::WaitingForInput { prompt: extra } => {
+                            // Show the prompt and set steer_pending so the next
+                            // iteration of the select! loop reads stdin via the
+                            // existing steer arm — keeping SIGINT responsive.
                             if !extra.is_empty() { eprintln!("\n{extra}"); }
                             eprint!(">");
                             let _ = tokio::io::stderr().flush().await;
-                            let mut reply = String::new();
-                            if tokio::io::AsyncBufReadExt::read_line(
-                                &mut stdin, &mut reply
-                            ).await.unwrap_or(0) == 0 { break 'session; }
-                            let trimmed = reply.trim_end_matches('\n').trim_end_matches('\r').to_owned();
-                            if !trimmed.is_empty() {
-                                let steer_req = Request::Steer { session_id: session_id.clone(), message: trimmed };
-                                if let Ok(mut frame) = serde_json::to_string(&steer_req) {
-                                    frame.push('\n');
-                                    let _ = write_half.write_all(frame.as_bytes()).await;
-                                }
-                            }
+                            steer_pending = true;
                         }
                         Response::SteerAck => {
                             steer_pending = false;
@@ -482,7 +474,7 @@ pub async fn run_chat_loop(
                         let mut buf = String::new();
                         let n = tokio::io::AsyncBufReadExt::read_line(
                             &mut stdin, &mut buf
-                        ).await.unwrap_or(0);
+                        ).await.unwrap_or(0); // EOF/error = treat as no input
                         if n > 0 { Some(buf) } else { None }
                     } else {
                         std::future::pending::<Option<String>>().await
