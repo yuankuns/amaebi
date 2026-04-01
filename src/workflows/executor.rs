@@ -1,8 +1,11 @@
 use anyhow::{anyhow, Context as _, Result};
 use async_recursion::async_recursion;
 use regex::Regex;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::task::{Context as TaskContext, Poll};
+use tokio::io::{self as tio, AsyncWrite};
 use tokio::sync::Mutex;
 
 /// Monotonic counter for unique LLM output temp-file names.
@@ -40,7 +43,14 @@ pub async fn execute(
 
     let mut messages: Vec<Message> = {
         let mut msgs = build_messages(
-            &format!("You are executing the workflow: {}.", workflow.name),
+            &format!(
+                "You are executing the workflow: {}. \
+                 Work autonomously — use available tools (shell_command, edit_file, \
+                 read_file) to complete each stage. \
+                 Never ask for clarification or user input; make your best judgment \
+                 and proceed.",
+                workflow.name
+            ),
             None,
             &[],
             &[],
@@ -450,6 +460,61 @@ async fn run_check(check: &Option<Check>, ctx: &mut Context) -> Result<()> {
 // LLM turn
 // ---------------------------------------------------------------------------
 
+/// A writer that discards all output but intercepts `WaitingForInput` frames
+/// and automatically steers the agentic loop to continue working autonomously.
+///
+/// Without this, dropping `steer_tx` causes `steer_rx.recv()` to return `None`
+/// (Disconnected) immediately when Claude asks a question, making the agentic
+/// loop exit early — before Claude has done any actual work.
+struct AutoContinueWriter {
+    pending: Vec<u8>,
+    steer_tx: tokio::sync::mpsc::Sender<Option<String>>,
+}
+
+impl AutoContinueWriter {
+    fn new(steer_tx: tokio::sync::mpsc::Sender<Option<String>>) -> Self {
+        Self {
+            pending: Vec::new(),
+            steer_tx,
+        }
+    }
+}
+
+impl Unpin for AutoContinueWriter {}
+
+impl AsyncWrite for AutoContinueWriter {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        _cx: &mut TaskContext<'_>,
+        buf: &[u8],
+    ) -> Poll<tio::Result<usize>> {
+        self.pending.extend_from_slice(buf);
+        // Process complete newline-delimited JSON frames.
+        while let Some(pos) = self.pending.iter().position(|&b| b == b'\n') {
+            let line = self.pending[..pos].to_vec();
+            self.pending.drain(..=pos);
+            if std::str::from_utf8(&line).is_ok_and(|s| s.contains("\"waiting_for_input\"")) {
+                // Claude is asking a question. Reply immediately so the agentic
+                // loop continues rather than blocking for 5 minutes or exiting.
+                let _ = self.steer_tx.try_send(Some(
+                    "Continue working autonomously. \
+                     Do not ask for clarification — use your best judgment and proceed."
+                        .into(),
+                ));
+            }
+        }
+        Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _: &mut TaskContext<'_>) -> Poll<tio::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _: &mut TaskContext<'_>) -> Poll<tio::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
 pub async fn llm_turn(
     state: &Arc<DaemonState>,
     model: &str,
@@ -457,24 +522,32 @@ pub async fn llm_turn(
     prompt: &str,
 ) -> Result<String> {
     messages.push(Message::user(prompt.to_owned()));
-    let (_, mut steer_rx) = tokio::sync::mpsc::channel::<Option<String>>(1);
-    let mut sink = tokio::io::sink();
-    let (text, _, _) = run_agentic_loop(
+
+    // Keep steer_tx alive for the duration of the call so the Disconnected
+    // branch in run_agentic_loop is never triggered prematurely.
+    // AutoContinueWriter intercepts WaitingForInput frames and auto-replies.
+    let (steer_tx, mut steer_rx) = tokio::sync::mpsc::channel::<Option<String>>(4);
+    let mut writer = AutoContinueWriter::new(steer_tx.clone());
+
+    let (text, _, returned_messages) = run_agentic_loop(
         state,
         model,
         messages.clone(),
-        &mut sink,
+        &mut writer,
         &mut steer_rx,
         false, // workflow LLM turns must not expose spawn_agent / run_workflow
     )
     .await
     .context("LLM turn failed")?;
-    // run_agentic_loop does not return the updated message list; append the
-    // assistant reply manually so the conversation context accumulates.
-    messages.push(crate::copilot::Message::assistant(
-        Some(text.clone()),
-        vec![],
-    ));
+
+    drop(steer_tx); // safe to drop now that the loop has finished
+
+    // Replace messages with the full history returned by run_agentic_loop,
+    // which includes all tool calls and results from the stage.  Discarding
+    // this (as the previous `_` did) caused Claude to lose context about what
+    // it had already tried, making retries much less effective.
+    *messages = returned_messages;
+
     Ok(text)
 }
 
