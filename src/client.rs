@@ -493,17 +493,9 @@ pub async fn run_chat_loop(
                         if trimmed.is_empty() {
                             steer_pending = false;
                             last_ctrl_c = None; // cancelling steer resets the double-Ctrl-C window
-                            // Send a no-op Steer so the daemon's interrupt-handling
-                            // path is not left waiting for a follow-up message.
-                            // The daemon ignores Steer frames with empty content.
-                            let cancel_req = Request::Steer {
-                                session_id: session_id.clone(),
-                                message: String::new(),
-                            };
-                            if let Ok(mut frame) = serde_json::to_string(&cancel_req) {
-                                frame.push('\n');
-                                let _ = write_half.write_all(frame.as_bytes()).await;
-                            }
+                            // No Steer frame sent on cancel: the daemon's WAITING_FOR_INPUT
+                            // path now treats the already-sent Interrupt (None) as a cancel
+                            // signal, so no follow-up message is needed.
                             // Flush buffered text now that steer is cancelled.
                             for chunk in steer_text_buf.drain(..) {
                                 let _ = stdout.write_all(chunk.as_bytes()).await;

@@ -571,7 +571,7 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                         f = frame_rx.recv() => { match f {
                             None => { loop_handle.abort(); break 'connection; }
                             Some(line) => { if let Ok(req) = serde_json::from_str::<Request>(&line) { match req {
-                                Request::Steer { session_id: sid, message } if sid == expected_sid => { let _ = steer_tx.send(Some(message)).await; }
+                                Request::Steer { session_id: sid, message } if sid == expected_sid => { if !message.is_empty() { let _ = steer_tx.send(Some(message)).await; } }
                                 Request::Interrupt { session_id: sid } if sid == expected_sid => { let _ = steer_tx.send(None).await; }
                                 // Steer/Interrupt for a different session: silently ignore per IPC contract.
                                 Request::Steer { .. } | Request::Interrupt { .. } => {
@@ -791,7 +791,7 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                         f = frame_rx.recv() => { match f {
                             None => { loop_handle.abort(); break 'connection; }
                             Some(line) => { if let Ok(req) = serde_json::from_str::<Request>(&line) { match req {
-                                Request::Steer { session_id: sid, message } if sid == expected_chat_sid => { let _ = steer_tx.send(Some(message)).await; }
+                                Request::Steer { session_id: sid, message } if sid == expected_chat_sid => { if !message.is_empty() { let _ = steer_tx.send(Some(message)).await; } }
                                 Request::Interrupt { session_id: sid } if sid == expected_chat_sid => { let _ = steer_tx.send(None).await; }
                                 // Steer/Interrupt for a different session: silently ignore per IPC contract.
                                 Request::Steer { .. } | Request::Interrupt { .. } => {
@@ -1321,10 +1321,6 @@ where
         // and the next iteration).
         while let Ok(steer_msg) = steer_rx.try_recv() {
             if let Some(msg) = steer_msg {
-                if msg.is_empty() {
-                    // Empty steer = cancel signal from client; skip silently.
-                    continue;
-                }
                 messages.push(Message::user(msg));
                 write_frame(writer, &Response::SteerAck).await?;
             }
@@ -1401,35 +1397,25 @@ where
 
                     // Block until the user replies via the steering channel.
                     // Timeout after 5 minutes to avoid infinite hangs.
-                    // A bare interrupt (Ctrl-C / None) is ignored while the
-                    // session is already waiting for input — keep waiting.
-                    let steer_result = 'wait_input: loop {
-                        match tokio::time::timeout(
-                            std::time::Duration::from_secs(300),
-                            steer_rx.recv(),
-                        )
-                        .await
-                        {
-                            Ok(Some(Some(reply))) if !reply.is_empty() => {
-                                break 'wait_input Ok(Some(reply))
-                            }
-                            Ok(Some(Some(_))) => {
-                                // Empty steer = client cancelled; keep waiting.
-                                tracing::debug!(
-                                    "empty steer received while waiting for input; continuing"
-                                );
-                                continue 'wait_input;
-                            }
-                            Ok(Some(None)) => {
-                                tracing::debug!(
-                                    context = "waiting_for_input_reply",
-                                    "interrupt ignored while waiting for input"
-                                );
-                                continue 'wait_input;
-                            }
-                            Ok(None) => break 'wait_input Ok(None),
-                            Err(e) => break 'wait_input Err(e),
+                    // An interrupt (None) now breaks out immediately so the session
+                    // is not left stuck when the user cancels the reply prompt.
+                    let steer_result = match tokio::time::timeout(
+                        std::time::Duration::from_secs(300),
+                        steer_rx.recv(),
+                    )
+                    .await
+                    {
+                        Ok(Some(Some(reply))) => Ok(Some(reply)),
+                        Ok(Some(None)) => {
+                            // Interrupt: user cancelled the reply prompt.
+                            tracing::debug!(
+                                context = "waiting_for_input_reply",
+                                "interrupt received; aborting waiting-for-input"
+                            );
+                            Ok(None)
                         }
+                        Ok(None) => Ok(None),
+                        Err(e) => Err(e),
                     };
                     match steer_result {
                         Ok(Some(user_reply)) => {
