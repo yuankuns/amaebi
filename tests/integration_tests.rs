@@ -112,12 +112,12 @@ async fn test_tool_call_roundtrip() {
 }
 
 // ---------------------------------------------------------------------------
-// 3. max_tokens sent correctly
+// 3. max_completion_tokens sent correctly
 // ---------------------------------------------------------------------------
 
-/// The daemon must include a positive `max_tokens` in every request to the LLM.
+/// The daemon must include a positive `max_completion_tokens` in every request to the LLM.
 #[tokio::test]
-async fn test_max_tokens_present_in_request() {
+async fn test_max_completion_tokens_present_in_request() {
     let server = MockLlmServer::start().await;
     server.enqueue(ScriptedResponse::text_chunks(vec!["ok"]));
 
@@ -130,14 +130,14 @@ async fn test_max_tokens_present_in_request() {
     let reqs = server.take_requests();
     assert!(!reqs.is_empty(), "no requests captured");
 
-    let max_tokens = reqs[0].max_tokens();
+    let max_completion_tokens = reqs[0].max_completion_tokens();
     assert!(
-        max_tokens.is_some(),
-        "max_tokens missing from request body: {:?}",
+        max_completion_tokens.is_some(),
+        "max_completion_tokens missing from request body: {:?}",
         reqs[0].body
     );
-    let val = max_tokens.unwrap();
-    assert!(val > 0, "max_tokens should be > 0, got {val}");
+    let val = max_completion_tokens.unwrap();
+    assert!(val > 0, "max_completion_tokens should be > 0, got {val}");
 }
 
 // ---------------------------------------------------------------------------
@@ -185,10 +185,10 @@ async fn test_request_format_valid() {
         );
     }
 
-    // max_tokens must be present
+    // max_completion_tokens must be present
     assert!(
-        req.max_tokens().is_some(),
-        "max_tokens missing: {:?}",
+        req.max_completion_tokens().is_some(),
+        "max_completion_tokens missing: {:?}",
         req.body
     );
 }
