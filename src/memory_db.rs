@@ -62,7 +62,7 @@ pub fn db_path() -> Result<PathBuf> {
 // Schema
 // ---------------------------------------------------------------------------
 
-const SCHEMA: &str = "
+pub(crate) const SCHEMA: &str = "
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous  = NORMAL;
 

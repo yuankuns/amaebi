@@ -117,8 +117,14 @@ impl DaemonState {
             tokens: Arc::clone(&tokens),
         });
 
+        let followup_ctx = Arc::new(tools::FollowupContext {
+            current_session_id: String::new(), // overridden per-session in run_agentic_loop
+            cron_db_path: None,                // use ~/.amaebi/cron.db
+        });
+
         let mut executor = tools::LocalExecutor::new();
         executor.spawn_ctx = Some(spawn_ctx);
+        executor.followup_ctx = Some(followup_ctx);
 
         Ok(Self {
             http,
@@ -472,8 +478,16 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                     }
                     let mut sink = tokio::io::sink();
                     let (_, mut steer_rx) = tokio::sync::mpsc::channel::<Option<String>>(1);
-                    match run_agentic_loop(&state, &model, messages, &mut sink, &mut steer_rx, true)
-                        .await
+                    match run_agentic_loop(
+                        &state,
+                        &model,
+                        messages,
+                        &mut sink,
+                        &mut steer_rx,
+                        true,
+                        true,
+                    )
+                    .await
                     {
                         Ok((final_text, _, _)) => {
                             store_conversation(
@@ -593,6 +607,7 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                         messages,
                         &mut *w,
                         &mut steer_rx,
+                        true,
                         true,
                     )
                     .await
@@ -842,6 +857,7 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                         messages,
                         &mut *w,
                         &mut steer_rx,
+                        true,
                         true,
                     )
                     .await
@@ -1408,11 +1424,12 @@ pub(crate) async fn run_agentic_loop<W>(
     writer: &mut W,
     steer_rx: &mut tokio::sync::mpsc::Receiver<Option<String>>,
     include_spawn_agent: bool,
+    include_followup: bool,
 ) -> Result<(String, usize, Vec<Message>)>
 where
     W: AsyncWriteExt + Unpin,
 {
-    let schemas = tools::tool_schemas(include_spawn_agent);
+    let schemas = tools::tool_schemas(include_spawn_agent, include_followup);
     let final_text;
     let mut tools_were_used = false;
     let mut conclusion_nudge_sent = false;
@@ -2174,7 +2191,12 @@ async fn run_cron_scheduler(state: Arc<DaemonState>) {
 
 /// Execute a single cron job: runs the agentic loop, saves output to inbox.
 async fn run_cron_job(state: Arc<DaemonState>, job: &cron::CronJob) {
-    tracing::info!(id = %job.id, description = %job.description, "cron: firing job");
+    let kind = if job.one_shot {
+        "one-shot"
+    } else {
+        "recurring"
+    };
+    tracing::info!(id = %job.id, description = %job.description, kind, "cron: firing job");
 
     // Generate a fresh session UUID for this run.
     let session_id = uuid::Uuid::new_v4().to_string();
@@ -2182,14 +2204,35 @@ async fn run_cron_job(state: Arc<DaemonState>, job: &cron::CronJob) {
     // Resolve model from env var (same default as CLI client).
     let model = std::env::var("AMAEBI_MODEL").unwrap_or_else(|_| "gpt-4o".to_string());
 
-    let mut messages = build_messages(&job.description, None, &[], &[], None);
+    // If this job has a parent session, inject its summary as context.
+    let own_summary: Option<String> = if let Some(ref sid) = job.parent_session_id {
+        let db = state.db.lock().expect("db lock poisoned");
+        memory_db::get_session_own_summary(&db, sid)
+            .unwrap_or(None)
+            .map(|s| format!("[Context from previous session]\n{s}"))
+    } else {
+        None
+    };
+
+    let mut messages = build_messages(&job.description, None, &[], &[], own_summary.as_deref());
     inject_skill_files(&mut messages).await;
-    // Cron jobs are non-interactive: drop the sender immediately so steer_rx.recv()
-    // returns None at once if the model ends with '?', rather than timing out.
+
+    // Cron/follow-up jobs are non-interactive: drop the sender immediately so
+    // steer_rx.recv() returns None at once if the model ends with '?', rather
+    // than timing out.  Also disable followup tools to prevent recursive scheduling.
     let mut sink = tokio::io::sink();
     let (_, mut steer_rx) = tokio::sync::mpsc::channel::<Option<String>>(1);
 
-    let result = run_agentic_loop(&state, &model, messages, &mut sink, &mut steer_rx, true).await;
+    let result = run_agentic_loop(
+        &state,
+        &model,
+        messages,
+        &mut sink,
+        &mut steer_rx,
+        true,
+        false,
+    )
+    .await;
 
     let (output, run_ok) = match result {
         Ok((final_text, _, _)) => {
@@ -2222,7 +2265,17 @@ async fn run_cron_job(state: Arc<DaemonState>, job: &cron::CronJob) {
         }
     }
 
-    tracing::info!(id = %job.id, "cron: job complete");
+    // One-shot jobs are self-deleting: remove from cron.db after execution so
+    // the scheduler never re-fires them.
+    if job.one_shot {
+        if let Err(e) = cron::delete_job(&job.id) {
+            tracing::warn!(error = %e, id = %job.id, "cron: failed to delete one-shot job after run");
+        } else {
+            tracing::debug!(id = %job.id, "cron: one-shot job deleted after execution");
+        }
+    }
+
+    tracing::info!(id = %job.id, kind, "cron: job complete");
 }
 
 // ---------------------------------------------------------------------------

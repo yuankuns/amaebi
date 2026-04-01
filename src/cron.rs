@@ -34,7 +34,7 @@ use crate::auth::amaebi_home;
 // ---------------------------------------------------------------------------
 
 /// A registered cron job.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct CronJob {
     /// UUID v4 identifier.
     pub id: String,
@@ -46,6 +46,14 @@ pub struct CronJob {
     pub created_at: String,
     /// RFC 3339 timestamp of the last successful run, or `None`.
     pub last_run: Option<String>,
+    /// If `true`, the job is deleted automatically after its first execution.
+    pub one_shot: bool,
+    /// If `true`, this job was created via the `schedule_followup` tool by the
+    /// model (as opposed to being added by the user via `amaebi cron add`).
+    pub created_by_model: bool,
+    /// Session UUID whose summary is injected as context when this job fires.
+    /// `None` means the job runs without any inherited session context.
+    pub parent_session_id: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -69,8 +77,9 @@ impl CronStore {
         Ok(store)
     }
 
-    /// Open the cron database at an explicit path (used in tests).
-    #[cfg(test)]
+    /// Open the cron database at an explicit path.
+    ///
+    /// Used in tests and by components that manage their own DB path.
     pub fn open_at(db_path: PathBuf) -> Result<Self> {
         let store = Self { db_path };
         store.init()?;
@@ -138,6 +147,27 @@ impl CronStore {
             );",
         )
         .context("creating cron_jobs table")?;
+        self.migrate(&conn)?;
+        Ok(())
+    }
+
+    /// Incremental schema migration using `PRAGMA user_version`.
+    ///
+    /// - version 0 (original): 5-column schema
+    /// - version 1: adds `one_shot`, `created_by_model`, `parent_session_id`
+    fn migrate(&self, conn: &Connection) -> Result<()> {
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .context("reading user_version")?;
+        if version < 1 {
+            conn.execute_batch(
+                "ALTER TABLE cron_jobs ADD COLUMN one_shot INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE cron_jobs ADD COLUMN created_by_model INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE cron_jobs ADD COLUMN parent_session_id TEXT;
+                 PRAGMA user_version = 1;",
+            )
+            .context("migrating cron_jobs schema to version 1")?;
+        }
         Ok(())
     }
 
@@ -150,7 +180,8 @@ impl CronStore {
         let conn = self.connect()?;
         let mut stmt = conn
             .prepare(
-                "SELECT id, description, schedule, created_at, last_run
+                "SELECT id, description, schedule, created_at, last_run,
+                        one_shot, created_by_model, parent_session_id
                  FROM cron_jobs
                  ORDER BY created_at ASC",
             )
@@ -164,6 +195,9 @@ impl CronStore {
                     schedule: row.get(2)?,
                     created_at: row.get(3)?,
                     last_run: row.get(4)?,
+                    one_shot: row.get::<_, i64>(5).unwrap_or(0) != 0,
+                    created_by_model: row.get::<_, i64>(6).unwrap_or(0) != 0,
+                    parent_session_id: row.get(7).unwrap_or(None),
                 })
             })
             .context("executing cron list query")?;
@@ -203,6 +237,84 @@ impl CronStore {
         let n = conn
             .execute("DELETE FROM cron_jobs WHERE id = ?1", params![id])
             .context("deleting cron job")?;
+        let _ = self.restrict_sidecar_permissions();
+        Ok(n > 0)
+    }
+
+    /// Register a one-shot follow-up job created by the model.
+    ///
+    /// Sets `one_shot = true` and `created_by_model = true`.  Optionally
+    /// records the `parent_session_id` whose summary will be injected as
+    /// context when the job fires.  Returns the new job's UUID.
+    pub fn add_oneshot(
+        &self,
+        description: &str,
+        schedule: &str,
+        parent_session_id: Option<&str>,
+    ) -> Result<String> {
+        parse_schedule(schedule).with_context(|| format!("invalid cron schedule: {schedule:?}"))?;
+
+        let id = uuid::Uuid::new_v4().to_string();
+        let created_at = chrono::Utc::now().to_rfc3339();
+        let conn = self.connect()?;
+        conn.execute(
+            "INSERT INTO cron_jobs
+                (id, description, schedule, created_at, last_run,
+                 one_shot, created_by_model, parent_session_id)
+             VALUES (?1, ?2, ?3, ?4, NULL, 1, 1, ?5)",
+            params![id, description, schedule, created_at, parent_session_id],
+        )
+        .context("inserting oneshot cron job")?;
+        let _ = self.restrict_sidecar_permissions();
+        Ok(id)
+    }
+
+    /// Return only the jobs that were created by the model
+    /// (`created_by_model = true`).
+    pub fn list_model_created(&self) -> Result<Vec<CronJob>> {
+        let conn = self.connect()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, description, schedule, created_at, last_run,
+                        one_shot, created_by_model, parent_session_id
+                 FROM cron_jobs
+                 WHERE created_by_model = 1
+                 ORDER BY created_at ASC",
+            )
+            .context("preparing model jobs query")?;
+
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(CronJob {
+                    id: row.get(0)?,
+                    description: row.get(1)?,
+                    schedule: row.get(2)?,
+                    created_at: row.get(3)?,
+                    last_run: row.get(4)?,
+                    one_shot: row.get::<_, i64>(5).unwrap_or(0) != 0,
+                    created_by_model: row.get::<_, i64>(6).unwrap_or(0) != 0,
+                    parent_session_id: row.get(7).unwrap_or(None),
+                })
+            })
+            .context("executing model jobs query")?;
+
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("collecting model job rows")
+    }
+
+    /// Delete a model-created job by ID.
+    ///
+    /// Returns `Ok(true)` if the job existed and was deleted, `Ok(false)` if
+    /// no such job exists **or the job was not created by the model** (human
+    /// jobs are protected from deletion via this path).
+    pub fn delete_if_model_created(&self, id: &str) -> Result<bool> {
+        let conn = self.connect()?;
+        let n = conn
+            .execute(
+                "DELETE FROM cron_jobs WHERE id = ?1 AND created_by_model = 1",
+                params![id],
+            )
+            .context("deleting model cron job")?;
         let _ = self.restrict_sidecar_permissions();
         Ok(n > 0)
     }
@@ -555,6 +667,7 @@ mod tests {
                 schedule: "30 9 * * *".into(),
                 created_at: "2026-01-01T00:00:00Z".into(),
                 last_run: Some(just_ran),
+                ..Default::default()
             },
             CronJob {
                 id: "b".into(),
@@ -562,6 +675,7 @@ mod tests {
                 schedule: "30 9 * * *".into(),
                 created_at: "2026-01-01T00:00:00Z".into(),
                 last_run: Some(long_ago),
+                ..Default::default()
             },
             CronJob {
                 id: "c".into(),
@@ -569,6 +683,7 @@ mod tests {
                 schedule: "30 9 * * *".into(),
                 created_at: "2026-01-01T00:00:00Z".into(),
                 last_run: None,
+                ..Default::default()
             },
         ];
 
@@ -588,6 +703,7 @@ mod tests {
             schedule: "30 9 * * *".into(),
             created_at: "2026-01-01T00:00:00Z".into(),
             last_run: None,
+            ..Default::default()
         }];
         assert!(due_jobs(&jobs, &now).is_empty());
     }
@@ -601,6 +717,7 @@ mod tests {
             schedule: "not a cron expression".into(),
             created_at: "2026-01-01T00:00:00Z".into(),
             last_run: None,
+            ..Default::default()
         }];
         // Must not panic; bad job is simply skipped.
         assert!(due_jobs(&jobs, &now).is_empty());
@@ -674,5 +791,123 @@ mod tests {
     fn store_empty_list_when_no_jobs() {
         let (store, _dir) = open_temp();
         assert!(store.list().unwrap().is_empty());
+    }
+
+    // ---- add_oneshot / list_model_created / delete_if_model_created ---------
+
+    #[test]
+    fn add_oneshot_stores_model_flags() {
+        let (store, _dir) = open_temp();
+        let id = store
+            .add_oneshot("check deploy", "0 9 * * *", None)
+            .unwrap();
+        let jobs = store.list().unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].id, id);
+        assert!(jobs[0].one_shot, "one_shot must be true");
+        assert!(jobs[0].created_by_model, "created_by_model must be true");
+        assert!(jobs[0].parent_session_id.is_none());
+    }
+
+    #[test]
+    fn add_oneshot_stores_parent_session_id() {
+        let (store, _dir) = open_temp();
+        let sid = "test-session-uuid";
+        store
+            .add_oneshot("follow up on PR", "30 10 * * *", Some(sid))
+            .unwrap();
+        let jobs = store.list().unwrap();
+        assert_eq!(jobs[0].parent_session_id.as_deref(), Some(sid));
+    }
+
+    #[test]
+    fn add_oneshot_rejects_invalid_schedule() {
+        let (store, _dir) = open_temp();
+        assert!(store.add_oneshot("bad", "not-a-cron", None).is_err());
+        assert!(
+            store.list().unwrap().is_empty(),
+            "nothing should be written on error"
+        );
+    }
+
+    #[test]
+    fn list_model_created_excludes_human_jobs() {
+        let (store, _dir) = open_temp();
+        // human-created via add()
+        store.add("human job", "0 8 * * *").unwrap();
+        // model-created via add_oneshot()
+        let model_id = store.add_oneshot("model job", "0 9 * * *", None).unwrap();
+
+        let model_jobs = store.list_model_created().unwrap();
+        assert_eq!(model_jobs.len(), 1, "only model-created job should appear");
+        assert_eq!(model_jobs[0].id, model_id);
+    }
+
+    #[test]
+    fn list_model_created_empty_when_no_model_jobs() {
+        let (store, _dir) = open_temp();
+        store.add("human job", "0 8 * * *").unwrap();
+        assert!(store.list_model_created().unwrap().is_empty());
+    }
+
+    #[test]
+    fn delete_if_model_created_removes_model_job() {
+        let (store, _dir) = open_temp();
+        let id = store.add_oneshot("model job", "0 9 * * *", None).unwrap();
+        let deleted = store.delete_if_model_created(&id).unwrap();
+        assert!(deleted, "delete_if_model_created should return true");
+        assert!(store.list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn delete_if_model_created_rejects_human_job() {
+        let (store, _dir) = open_temp();
+        let id = store.add("human job", "0 8 * * *").unwrap();
+        let deleted = store.delete_if_model_created(&id).unwrap();
+        assert!(!deleted, "human job must not be deleted via this method");
+        assert_eq!(store.list().unwrap().len(), 1, "human job must still exist");
+    }
+
+    #[test]
+    fn delete_if_model_created_nonexistent_returns_false() {
+        let (store, _dir) = open_temp();
+        assert!(!store.delete_if_model_created("no-such-id").unwrap());
+    }
+
+    // ---- schema migration ---------------------------------------------------
+
+    #[test]
+    fn schema_migration_adds_new_columns_to_existing_db() {
+        // Simulate a pre-migration DB: create the old 5-column schema manually.
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("cron.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE cron_jobs (
+                    id TEXT PRIMARY KEY, description TEXT NOT NULL,
+                    schedule TEXT NOT NULL, created_at TEXT NOT NULL, last_run TEXT
+                );
+                INSERT INTO cron_jobs (id, description, schedule, created_at)
+                VALUES ('old-id', 'legacy job', '0 9 * * *', '2026-01-01T00:00:00Z');",
+            )
+            .unwrap();
+            // user_version stays at 0 (default)
+        }
+        // Opening via CronStore must trigger migration without error.
+        let store = CronStore::open_at(path).unwrap();
+        let jobs = store.list().unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].id, "old-id");
+        // New columns must have their default values on the migrated row.
+        assert!(!jobs[0].one_shot, "migrated row: one_shot default false");
+        assert!(
+            !jobs[0].created_by_model,
+            "migrated row: created_by_model default false"
+        );
+        assert!(
+            jobs[0].parent_session_id.is_none(),
+            "migrated row: parent_session_id default null"
+        );
     }
 }

@@ -10,6 +10,7 @@ mod config;
 mod copilot;
 mod cron;
 mod daemon;
+mod followup;
 mod inbox;
 mod ipc;
 mod memory_db;

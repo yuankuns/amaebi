@@ -275,6 +275,7 @@ impl acp::Agent for AmaebiAgent {
                 &mut write_half,
                 &mut steer_rx,
                 true,
+                true,
             )
             .await
             .map(|(text, tokens, _messages)| (text, tokens)) // discard messages Vec
