@@ -299,6 +299,227 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
 }
 
 // ---------------------------------------------------------------------------
+// Interactive chat REPL (long connection)
+// ---------------------------------------------------------------------------
+
+/// Run a persistent multi-turn chat session on a single socket connection.
+///
+/// Ctrl-C mid-generation → interrupt + steer prompt (same as `amaebi ask`).
+/// Double Ctrl-C within 2 s → exit. Empty line or Ctrl-D → exit.
+#[allow(unused_assignments)] // steer_pending is read inside select! async blocks
+pub async fn run_chat_loop(
+    socket: PathBuf,
+    initial_prompt: Option<String>,
+    model: Option<String>,
+) -> Result<()> {
+    let mut sigint = signal(SignalKind::interrupt()).context("setting up SIGINT handler")?;
+
+    let model = model
+        .or_else(|| std::env::var("AMAEBI_MODEL").ok())
+        .unwrap_or_else(|| "gpt-4o".to_string());
+
+    let cwd = std::env::current_dir().context("getting current directory")?;
+    let session_id = tokio::task::spawn_blocking(move || session::get_or_create(&cwd))
+        .await
+        .context("session::get_or_create panicked")?
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "failed to resolve session id; using \"global\"");
+            "global".to_string()
+        });
+
+    if std::io::stderr().is_terminal() {
+        eprintln!("Chat session started (ID: {session_id}). Empty line or Ctrl-D to exit.\n");
+    }
+
+    let stream = connect_or_start_daemon(&socket).await?;
+    let (read_half, mut write_half) = stream.into_split();
+    let mut lines = BufReader::new(read_half).lines();
+
+    let mut stdout = tokio::io::stdout();
+    // Single BufReader for stdin — reused across all prompt/steer reads so
+    // buffered bytes are never dropped between reads.
+    let mut stdin = BufReader::new(tokio::io::stdin());
+    let mut next_prompt = initial_prompt;
+    let mut last_ctrl_c: Option<Instant> = None;
+    let mut steer_pending = false;
+    // Text chunks buffered while a steer correction is being typed so that
+    // streaming output does not interleave with user input.
+    let mut steer_text_buf: Vec<String> = Vec::new();
+
+    'session: loop {
+        let prompt = match next_prompt.take() {
+            Some(p) => p,
+            None => {
+                if std::io::stderr().is_terminal() {
+                    eprint!("> ");
+                    let _ = tokio::io::stderr().flush().await;
+                }
+                let mut line = String::new();
+                let n = tokio::io::AsyncBufReadExt::read_line(&mut stdin, &mut line)
+                    .await
+                    .context("reading prompt from stdin")?;
+                if n == 0 {
+                    break 'session;
+                }
+                let trimmed = line
+                    .trim_end_matches('\n')
+                    .trim_end_matches('\r')
+                    .to_owned();
+                if trimmed.is_empty() {
+                    break 'session;
+                }
+                trimmed
+            }
+        };
+
+        let req = Request::Chat {
+            prompt: prompt.clone(),
+            tmux_pane: std::env::var("TMUX_PANE").ok(),
+            session_id: Some(session_id.clone()),
+            model: model.clone(),
+        };
+        let mut req_line = serde_json::to_string(&req)?;
+        req_line.push('\n');
+        write_half.write_all(req_line.as_bytes()).await?;
+        steer_pending = false;
+
+        loop {
+            tokio::select! {
+                biased;
+
+                result = sigint.recv() => {
+                    let Some(_) = result else { break 'session; };
+                    let now = Instant::now();
+                    if is_within_window(last_ctrl_c, now, DOUBLE_CTRLC_WINDOW) {
+                        eprintln!();
+                        let _ = stdout.flush().await;
+                        return Err(anyhow::Error::new(Interrupted));
+                    }
+                    steer_pending = true;
+                    if std::io::stderr().is_terminal() {
+                        eprintln!("\n^C interrupted. Enter correction (empty line to cancel): ");
+                        eprint!(">");
+                        let _ = tokio::io::stderr().flush().await;
+                    }
+                    let interrupt_req = Request::Interrupt { session_id: session_id.clone() };
+                    if let Ok(mut frame) = serde_json::to_string(&interrupt_req) {
+                        frame.push('\n');
+                        let _ = write_half.write_all(frame.as_bytes()).await;
+                    }
+                    last_ctrl_c = Some(now);
+                }
+
+                result = lines.next_line() => {
+                    let line = result.context("reading response")?;
+                    let Some(line) = line else { break 'session; };
+                    let resp: Response = serde_json::from_str(&line)?;
+                    match resp {
+                        Response::Text { chunk } => {
+                            if steer_pending {
+                                // Buffer text while the user is typing a steer
+                                // correction so streaming output does not
+                                // interleave with the correction prompt.
+                                steer_text_buf.push(chunk);
+                            } else {
+                                stdout.write_all(chunk.as_bytes()).await?;
+                                stdout.flush().await?;
+                            }
+                        }
+                        Response::Done => {
+                            // Flush any text that arrived while steer was pending.
+                            for chunk in steer_text_buf.drain(..) {
+                                stdout.write_all(chunk.as_bytes()).await?;
+                            }
+                            stdout.write_all(b"\n").await?;
+                            stdout.flush().await?;
+                            break;
+                        }
+                        Response::Error { message } => anyhow::bail!("{message}"),
+                        Response::ToolUse { name, detail } => {
+                            if std::io::stderr().is_terminal() {
+                                match name.as_str() {
+                                    "shell_command" => eprintln!("```bash\n$ {detail}\n```"),
+                                    "read_file"     => eprintln!("📄 {detail}"),
+                                    "edit_file"     => eprintln!("✏️  {detail}"),
+                                    _ => eprintln!("🔧 {name}: {detail}"),
+                                }
+                            }
+                        }
+                        Response::WaitingForInput { prompt: extra } => {
+                            // Show the prompt and set steer_pending so the next
+                            // iteration of the select! loop reads stdin via the
+                            // existing steer arm — keeping SIGINT responsive.
+                            if !extra.is_empty() { eprintln!("\n{extra}"); }
+                            eprint!(">");
+                            let _ = tokio::io::stderr().flush().await;
+                            steer_pending = true;
+                        }
+                        Response::SteerAck => {
+                            steer_pending = false;
+                            // Flush text buffered while the steer was pending.
+                            for chunk in steer_text_buf.drain(..) {
+                                let _ = stdout.write_all(chunk.as_bytes()).await;
+                            }
+                            let _ = stdout.flush().await;
+                        }
+                        Response::Compacting => {
+                            if std::io::stderr().is_terminal() { eprintln!("\n[compacting…]"); }
+                        }
+                        _ => {}
+                    }
+                }
+
+                line = async {
+                    if steer_pending {
+                        let mut buf = String::new();
+                        let n = tokio::io::AsyncBufReadExt::read_line(
+                            &mut stdin, &mut buf
+                        ).await.unwrap_or(0); // EOF/error = treat as no input
+                        if n > 0 { Some(buf) } else { None }
+                    } else {
+                        std::future::pending::<Option<String>>().await
+                    }
+                } => {
+                    if let Some(text) = line {
+                        let trimmed = text.trim_end_matches('\n').trim_end_matches('\r');
+                        if trimmed.is_empty() {
+                            steer_pending = false;
+                            last_ctrl_c = None; // cancelling steer resets the double-Ctrl-C window
+                            // No Steer frame sent on cancel: the daemon's WAITING_FOR_INPUT
+                            // path now treats the already-sent Interrupt (None) as a cancel
+                            // signal, so no follow-up message is needed.
+                            // Flush buffered text now that steer is cancelled.
+                            for chunk in steer_text_buf.drain(..) {
+                                let _ = stdout.write_all(chunk.as_bytes()).await;
+                            }
+                            let _ = stdout.flush().await;
+                        } else {
+                            let steer_req = Request::Steer {
+                                session_id: session_id.clone(),
+                                message: trimmed.to_owned(),
+                            };
+                            if let Ok(mut frame) = serde_json::to_string(&steer_req) {
+                                frame.push('\n');
+                                let _ = write_half.write_all(frame.as_bytes()).await;
+                            }
+                            steer_pending = false;
+                            last_ctrl_c = None;
+                        }
+                    } else {
+                        break 'session;
+                    }
+                }
+            }
+        }
+    }
+
+    if std::io::stderr().is_terminal() {
+        eprintln!("\nSession ended. ID: {session_id}");
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Detach mode
 // ---------------------------------------------------------------------------
 

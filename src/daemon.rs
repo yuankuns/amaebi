@@ -82,6 +82,13 @@ pub struct DaemonState {
     /// insert the session ID.  The task removes itself on completion.  If the
     /// ID is already present, skip the spawn to prevent overlapping compactions.
     pub compacting_sessions: Arc<Mutex<HashSet<String>>>,
+    /// Sessions currently held by an active connection (Chat, Ask, or Resume).
+    ///
+    /// A session may only be used by one connection at a time.  Before processing
+    /// any Chat/Ask/Resume request, the daemon inserts the session ID here.  If
+    /// it is already present the request is rejected with a Response::Error so
+    /// concurrent clients cannot interleave writes to the same session history.
+    pub active_sessions: Arc<Mutex<HashSet<String>>>,
 }
 
 impl DaemonState {
@@ -99,6 +106,7 @@ impl DaemonState {
 
         let db = Arc::new(Mutex::new(conn));
         let compacting_sessions: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+        let active_sessions: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
 
         let tokens = Arc::new(TokenCache::new());
 
@@ -118,6 +126,7 @@ impl DaemonState {
             executor: Box::new(executor),
             db,
             compacting_sessions,
+            active_sessions,
         })
     }
 }
@@ -286,146 +295,276 @@ pub async fn run(socket: PathBuf) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Result<()> {
-    let (reader, mut writer) = tokio::io::split(stream);
-    let mut lines = BufReader::new(reader).lines();
+    let (owned_reader, owned_writer) = stream.into_split();
 
-    let line = lines
-        .next_line()
-        .await
-        .context("reading request")?
-        .context("client disconnected before sending a request")?;
+    // Shared writer — the agentic-loop task holds the lock during generation;
+    // the main task acquires it for Done/Error and for single-turn requests.
+    let writer: Arc<tokio::sync::Mutex<tokio::net::unix::OwnedWriteHalf>> =
+        Arc::new(tokio::sync::Mutex::new(owned_writer));
 
-    let req: Request = serde_json::from_str(&line).context("parsing request JSON")?;
-
-    match req {
-        Request::ClearMemory => {
-            tracing::info!("received memory clear request");
-            let db = Arc::clone(&state.db);
-            let result = tokio::task::spawn_blocking(move || {
-                let conn = db.lock().unwrap_or_else(|p| p.into_inner());
-                memory_db::clear(&conn)
-            })
-            .await
-            .unwrap_or_else(|e| Err(anyhow::anyhow!("DB clear panicked: {e}")));
-            if let Err(e) = result {
-                tracing::warn!(error = %e, "failed to clear memory DB");
+    // Forwarding task: reads every line from the socket and sends it to a
+    // channel so the main task can use select! to route steer frames while
+    // the agentic loop runs.
+    let (frame_tx, mut frame_rx) = tokio::sync::mpsc::channel::<String>(64);
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(owned_reader).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            if frame_tx.send(line).await.is_err() {
+                break;
             }
-            write_frame(&mut writer, &Response::Done).await?;
         }
+    });
 
-        Request::StoreMemory { user, assistant } => {
-            // Use a stable session id for ACP-sourced memory so it lands in
-            // the same logical bucket as other global (non-directory) writes.
-            store_conversation(&state, "global", &user, &assistant).await;
-            write_frame(&mut writer, &Response::Done).await?;
+    // Carries the messages array across Chat turns on this connection.
+    // None → first turn (load from DB). Some → subsequent turns (extend).
+    // Tracks the session_id so context is reset when the client switches sessions.
+    let mut carried_messages: Option<Vec<Message>> = None;
+    let mut carried_session_id: Option<String> = None;
+    // Count of unsolicited frames received while an agentic loop was running.
+    // Flushed as error responses after the loop releases the writer lock.
+    let mut pending_unsolicited: u32 = 0;
+    // Held for the lifetime of a Chat connection once a session is claimed.
+    // Ensures a second connection cannot use the same session concurrently.
+    let mut chat_session_guard: Option<ActiveSessionGuard> = None;
+
+    'connection: loop {
+        let line = match frame_rx.recv().await {
+            Some(l) => l,
+            None => break 'connection,
+        };
+        if line.trim().is_empty() {
+            continue;
         }
-
-        Request::RetrieveContext { prompt } => {
-            let db = Arc::clone(&state.db);
-            let entries = tokio::task::spawn_blocking(move || {
-                let conn = db.lock().unwrap_or_else(|p| p.into_inner());
-                memory_db::retrieve_context(&conn, &prompt, 4, 10)
-            })
-            .await
-            .unwrap_or_else(|e| Err(anyhow::anyhow!("memory read panicked: {e}")))
-            .unwrap_or_else(|e| {
-                tracing::warn!(error = %e, "failed to retrieve memory context via IPC");
-                vec![]
-            });
-            for entry in entries {
-                write_frame(
-                    &mut writer,
-                    &Response::MemoryEntry {
-                        role: entry.role,
-                        content: truncate_chars(entry.content, MAX_HISTORY_CHARS),
-                    },
-                )
-                .await?;
-            }
-            write_frame(&mut writer, &Response::Done).await?;
-        }
-
-        Request::Steer { .. } => {
-            // A Steer frame arriving on a fresh connection (not mid-Chat) is
-            // an error — there is no running agentic loop to steer.
-            write_frame(
-                &mut writer,
-                &Response::Error {
-                    message: "no active agentic loop to steer on this connection".into(),
-                },
-            )
-            .await?;
-        }
-
-        Request::Interrupt { .. } => {
-            // An Interrupt arriving on a fresh connection is silently ignored —
-            // there is no active loop to interrupt.
-            tracing::debug!("ignoring Interrupt on fresh connection (no active loop)");
-        }
-
-        Request::SubmitDetach {
-            prompt,
-            tmux_pane,
-            model,
-            session_id,
-        } => {
-            tracing::info!(
-                model = %model,
-                prompt_len = prompt.len(),
-                "received detach request"
-            );
-
-            // Verify auth eagerly so we can return an error before detaching.
-            if let Err(e) = state.tokens.get(&state.http).await {
-                write_frame(
-                    &mut writer,
+        let req: Request = match serde_json::from_str(&line) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(error = %e, "unparseable request frame; sending error to client");
+                let mut w = writer.lock().await;
+                let _ = write_frame(
+                    &mut *w,
                     &Response::Error {
-                        message: format!("authentication error: {e:#}"),
+                        message: format!("invalid request: {e}"),
                     },
                 )
-                .await?;
-                return Ok(());
+                .await;
+                continue;
             }
+        };
 
-            // Generate a fresh UUID for detached tasks when the client does
-            // not provide one, so every background task has a stable identifier
-            // that appears in inbox reports and can be resumed later.
-            let sid = session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-
-            // Acknowledge immediately — client can exit after this.
-            write_frame(
-                &mut writer,
-                &Response::DetachAccepted {
-                    session_id: sid.clone(),
-                },
-            )
-            .await?;
-
-            // Spawn the agentic loop as a fully detached background task.
-            let state = Arc::clone(&state);
-            tokio::spawn(async move {
-                // Load full session history from SQLite; token budget trims it below.
+        match req {
+            Request::ClearMemory => {
+                tracing::info!("received memory clear request");
                 let db = Arc::clone(&state.db);
-                let sid_clone = sid.clone();
-                let history = tokio::task::spawn_blocking(move || {
+                let result = tokio::task::spawn_blocking(move || {
                     let conn = db.lock().unwrap_or_else(|p| p.into_inner());
-                    memory_db::get_session_history(&conn, &sid_clone)
+                    memory_db::clear(&conn)
                 })
                 .await
-                .unwrap_or_else(|e| {
-                    tracing::warn!(error = %e, "detach history load panicked");
-                    Ok(vec![])
+                .unwrap_or_else(|e| Err(anyhow::anyhow!("DB clear panicked: {e}")));
+                if let Err(e) = result {
+                    tracing::warn!(error = %e, "failed to clear memory DB");
+                }
+                let mut w = writer.lock().await;
+                write_frame(&mut *w, &Response::Done).await?;
+            }
+
+            Request::StoreMemory { user, assistant } => {
+                store_conversation(&state, "global", &user, &assistant).await;
+                let mut w = writer.lock().await;
+                write_frame(&mut *w, &Response::Done).await?;
+            }
+
+            Request::RetrieveContext { prompt } => {
+                let db = Arc::clone(&state.db);
+                let entries = tokio::task::spawn_blocking(move || {
+                    let conn = db.lock().unwrap_or_else(|p| p.into_inner());
+                    memory_db::retrieve_context(&conn, &prompt, 4, 10)
                 })
+                .await
+                .unwrap_or_else(|e| Err(anyhow::anyhow!("memory read panicked: {e}")))
                 .unwrap_or_else(|e| {
-                    tracing::warn!(error = %e, "failed to load detach history");
+                    tracing::warn!(error = %e, "failed to retrieve memory context via IPC");
                     vec![]
                 });
+                let mut w = writer.lock().await;
+                for entry in entries {
+                    write_frame(
+                        &mut *w,
+                        &Response::MemoryEntry {
+                            role: entry.role,
+                            content: truncate_chars(entry.content, MAX_HISTORY_CHARS),
+                        },
+                    )
+                    .await?;
+                }
+                write_frame(&mut *w, &Response::Done).await?;
+            }
 
-                let mut messages =
-                    build_messages(&prompt, tmux_pane.as_deref(), &history, &[], None);
+            Request::Steer { .. } => {
+                let mut w = writer.lock().await;
+                write_frame(
+                    &mut *w,
+                    &Response::Error {
+                        message: "no active agentic loop to steer on this connection".into(),
+                    },
+                )
+                .await?;
+            }
+
+            Request::Interrupt { .. } => {
+                tracing::debug!("ignoring Interrupt on fresh connection (no active loop)");
+            }
+
+            Request::SubmitDetach {
+                prompt,
+                tmux_pane,
+                model,
+                session_id,
+            } => {
+                tracing::info!(model = %model, prompt_len = prompt.len(), "received detach request");
+                if let Err(e) = state.tokens.get(&state.http).await {
+                    let mut w = writer.lock().await;
+                    write_frame(
+                        &mut *w,
+                        &Response::Error {
+                            message: format!("authentication error: {e:#}"),
+                        },
+                    )
+                    .await?;
+                    break 'connection;
+                }
+                let sid = session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                {
+                    let mut w = writer.lock().await;
+                    write_frame(
+                        &mut *w,
+                        &Response::DetachAccepted {
+                            session_id: sid.clone(),
+                        },
+                    )
+                    .await?;
+                }
+                let state = Arc::clone(&state);
+                tokio::spawn(async move {
+                    let db = Arc::clone(&state.db);
+                    let sid_c = sid.clone();
+                    let history = tokio::task::spawn_blocking(move || {
+                        let conn = db.lock().unwrap_or_else(|p| p.into_inner());
+                        memory_db::get_session_history(&conn, &sid_c)
+                    })
+                    .await
+                    .unwrap_or_else(|_| Ok(vec![]))
+                    .unwrap_or_default();
+                    let mut messages =
+                        build_messages(&prompt, tmux_pane.as_deref(), &history, &[], None);
+                    inject_skill_files(&mut messages).await;
+                    let threshold = compaction_threshold_tokens(&model);
+                    if count_message_tokens(&messages) > threshold {
+                        let hot = HOT_TAIL_PAIRS * 2;
+                        let trimmed = if history.len() > hot {
+                            &history[history.len() - hot..]
+                        } else {
+                            &history[..]
+                        };
+                        messages =
+                            build_messages(&prompt, tmux_pane.as_deref(), trimmed, &[], None);
+                        inject_skill_files(&mut messages).await;
+                    }
+                    let mut sink = tokio::io::sink();
+                    let (_, mut steer_rx) = tokio::sync::mpsc::channel::<Option<String>>(1);
+                    match run_agentic_loop(&state, &model, messages, &mut sink, &mut steer_rx, true)
+                        .await
+                    {
+                        Ok((final_text, _, _)) => {
+                            store_conversation(
+                                &state,
+                                &sid,
+                                &truncate_chars(prompt.clone(), MAX_PROMPT_CHARS),
+                                &truncate_chars(final_text.clone(), MAX_RESPONSE_CHARS),
+                            )
+                            .await;
+                            let task_desc = truncate_chars(prompt, 200);
+                            if let Ok(inbox) = InboxStore::open() {
+                                let _ = inbox.save_report(&sid, &task_desc, &final_text);
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!(error = %e, "detach agentic loop error");
+                            let task_desc = truncate_chars(prompt, 200);
+                            if let Ok(inbox) = InboxStore::open() {
+                                let _ =
+                                    inbox.save_report(&sid, &task_desc, &format!("[error] {e:#}"));
+                            }
+                        }
+                    }
+                });
+            }
+
+            Request::Resume {
+                prompt,
+                tmux_pane,
+                model,
+                session_id,
+            } => {
+                tracing::info!(model = %model, session_id = %session_id, prompt_len = prompt.len(), "received resume request");
+                let _resume_session_guard = match claim_session(&state.active_sessions, &session_id)
+                {
+                    Ok(g) => g,
+                    Err(()) => {
+                        let mut w = writer.lock().await;
+                        write_frame(
+                            &mut *w,
+                            &Response::Error {
+                                message: format!(
+                                    "session {session_id} is already in use by another connection"
+                                ),
+                            },
+                        )
+                        .await?;
+                        continue 'connection;
+                    }
+                };
+                if let Err(e) = state.tokens.get(&state.http).await {
+                    let mut w = writer.lock().await;
+                    write_frame(
+                        &mut *w,
+                        &Response::Error {
+                            message: format!("authentication error: {e:#}"),
+                        },
+                    )
+                    .await?;
+                    break 'connection;
+                }
+                let (steer_tx, mut steer_rx) = tokio::sync::mpsc::channel::<Option<String>>(16);
+                let expected_sid = session_id.clone();
+                let db = Arc::clone(&state.db);
+                let sid_c = session_id.clone();
+                let (history, summaries, own_summary) =
+                    tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+                        let conn = db.lock().unwrap_or_else(|p| p.into_inner());
+                        Ok((
+                            memory_db::get_session_history(&conn, &sid_c)?,
+                            memory_db::get_recent_summaries(&conn, &sid_c, MAX_SUMMARIES)?,
+                            memory_db::get_session_own_summary(&conn, &sid_c)?,
+                        ))
+                    })
+                    .await
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(error=%e,"resume load panicked");
+                        Ok((vec![], vec![], None))
+                    })
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(error=%e,"resume load failed");
+                        (vec![], vec![], None)
+                    });
+                let mut messages = build_messages(
+                    &prompt,
+                    tmux_pane.as_deref(),
+                    &history,
+                    &summaries,
+                    own_summary.as_deref(),
+                );
                 inject_skill_files(&mut messages).await;
-
-                // Pre-flight token check: trim to hot tail if over budget.
                 let threshold = compaction_threshold_tokens(&model);
                 if count_message_tokens(&messages) > threshold {
                     let hot = HOT_TAIL_PAIRS * 2;
@@ -434,447 +573,366 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                     } else {
                         &history[..]
                     };
-                    messages = build_messages(&prompt, tmux_pane.as_deref(), trimmed, &[], None);
+                    messages = build_messages(
+                        &prompt,
+                        tmux_pane.as_deref(),
+                        trimmed,
+                        &summaries,
+                        own_summary.as_deref(),
+                    );
                     inject_skill_files(&mut messages).await;
                 }
-
-                // Use a sink writer — output frames are discarded; we only
-                // need the return value (final_text) for the inbox.
-                // Drop the sender immediately (`_`) so steer_rx.recv() in the
-                // agentic loop returns None at once instead of timing out if
-                // the model ends with '?'.
-                let mut sink = tokio::io::sink();
-                let (_, mut steer_rx) = tokio::sync::mpsc::channel::<Option<String>>(1);
-
-                match run_agentic_loop(&state, &model, messages, &mut sink, &mut steer_rx, true)
+                let writer_loop = Arc::clone(&writer);
+                let state_loop = Arc::clone(&state);
+                let model_loop = model.clone();
+                let mut loop_handle = tokio::spawn(async move {
+                    let mut w = writer_loop.lock().await;
+                    run_agentic_loop(
+                        &state_loop,
+                        &model_loop,
+                        messages,
+                        &mut *w,
+                        &mut steer_rx,
+                        true,
+                    )
                     .await
-                {
-                    Ok((final_text, _)) => {
-                        let user_text = truncate_chars(prompt.clone(), MAX_PROMPT_CHARS);
-                        let assistant_text = truncate_chars(final_text.clone(), MAX_RESPONSE_CHARS);
-
-                        // Persist to SQLite memory store.
-                        store_conversation(&state, &sid, &user_text, &assistant_text).await;
-
-                        // Save result to inbox so the user gets a notification.
-                        let task_desc = truncate_chars(prompt, 200);
-                        match InboxStore::open() {
-                            Ok(inbox) => {
-                                if let Err(e) = inbox.save_report(&sid, &task_desc, &final_text) {
-                                    tracing::warn!(
-                                        error = %e,
-                                        "detach: failed to save inbox report"
-                                    );
+                });
+                let result = loop {
+                    tokio::select! { biased;
+                        r = &mut loop_handle => { break r.unwrap_or_else(|e| Err(anyhow::anyhow!("loop panicked: {e}"))); }
+                        f = frame_rx.recv() => { match f {
+                            None => { loop_handle.abort(); break 'connection; }
+                            Some(line) => { if let Ok(req) = serde_json::from_str::<Request>(&line) { match req {
+                                Request::Steer { session_id: sid, message } if sid == expected_sid => { if !message.is_empty() { let _ = steer_tx.send(Some(message)).await; } }
+                                Request::Interrupt { session_id: sid } if sid == expected_sid => { let _ = steer_tx.send(None).await; }
+                                // Steer/Interrupt for a different session: silently ignore per IPC contract.
+                                Request::Steer { .. } | Request::Interrupt { .. } => {
+                                    tracing::debug!("ignoring steer/interrupt for non-active session");
                                 }
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    error = %e,
-                                    "detach: failed to open inbox"
-                                );
-                            }
-                        }
+                                _ => {
+                                    tracing::warn!("dropping unsolicited frame during active agentic loop");
+                                    // Defer the error reply: the agentic loop holds the writer
+                                    // lock; awaiting it here would stall Steer routing.  Instead
+                                    // we increment a counter and flush the errors right after the
+                                    // loop returns and releases the lock.
+                                    pending_unsolicited += 1;
+                                }
+                            }}}
+                        }}
+                    }
+                };
+                // Flush deferred busy-errors now that the writer lock is free.
+                if pending_unsolicited > 0 {
+                    let mut w = writer.lock().await;
+                    for _ in 0..pending_unsolicited {
+                        let _ = write_frame(&mut *w, &Response::Error {
+                            message: "busy: another request is already in progress on this connection".into(),
+                        }).await;
+                    }
+                    pending_unsolicited = 0;
+                }
+                match result {
+                    Ok((response_text, _, _)) => {
+                        store_conversation(
+                            &state,
+                            &session_id,
+                            &truncate_chars(prompt.clone(), MAX_PROMPT_CHARS),
+                            &truncate_chars(response_text, MAX_RESPONSE_CHARS),
+                        )
+                        .await;
+                        let mut w = writer.lock().await;
+                        write_frame(&mut *w, &Response::Done).await?;
                     }
                     Err(e) => {
-                        tracing::error!(error = %e, "detach agentic loop error");
-                        // Save the error itself to inbox so user is informed.
-                        let task_desc = truncate_chars(prompt, 200);
-                        if let Ok(inbox) = InboxStore::open() {
-                            let _ = inbox.save_report(&sid, &task_desc, &format!("[error] {e:#}"));
+                        tracing::error!(error = %e, "resume agentic loop error");
+                        let mut w = writer.lock().await;
+                        let _ = write_frame(
+                            &mut *w,
+                            &Response::Error {
+                                message: format!("agent error: {e:#}"),
+                            },
+                        )
+                        .await;
+                    }
+                }
+            }
+
+            Request::Chat {
+                prompt,
+                tmux_pane,
+                model,
+                session_id,
+            } => {
+                tracing::info!(pane = ?tmux_pane, model = %model, prompt_len = prompt.len(), "received chat request");
+                let sid = session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+                // If the session_id changed, release any prior session claim and
+                // discard carried context before claiming the new session.
+                if carried_session_id.as_deref() != Some(&sid) {
+                    chat_session_guard = None; // releases old claim if any
+                    carried_messages = None;
+                }
+
+                // Claim the session on the first turn (or after a session change).
+                // A second connection that tries to use the same session will get
+                // an error instead of corrupting the shared SQLite history.
+                if chat_session_guard.is_none() {
+                    match claim_session(&state.active_sessions, &sid) {
+                        Ok(g) => chat_session_guard = Some(g),
+                        Err(()) => {
+                            let mut w = writer.lock().await;
+                            write_frame(
+                                &mut *w,
+                                &Response::Error {
+                                    message: format!(
+                                        "session {sid} is already in use by another connection"
+                                    ),
+                                },
+                            )
+                            .await?;
+                            continue 'connection;
                         }
                     }
                 }
-            });
-        }
 
-        Request::Resume {
-            prompt,
-            tmux_pane,
-            model,
-            session_id,
-        } => {
-            tracing::info!(
-                model = %model,
-                session_id = %session_id,
-                prompt_len = prompt.len(),
-                "received resume request"
-            );
-
-            if let Err(e) = state.tokens.get(&state.http).await {
-                write_frame(
-                    &mut writer,
-                    &Response::Error {
-                        message: format!("authentication error: {e:#}"),
-                    },
-                )
-                .await?;
-                return Ok(());
-            }
-
-            let (steer_tx, mut steer_rx) = tokio::sync::mpsc::channel::<Option<String>>(16);
-            let expected_resume_sid = session_id.clone();
-            tokio::spawn(async move {
-                while let Ok(Some(frame)) = lines.next_line().await {
-                    match serde_json::from_str::<Request>(&frame) {
-                        Ok(Request::Steer {
-                            session_id: steer_sid,
-                            message,
-                        }) => {
-                            if steer_sid != expected_resume_sid {
-                                tracing::debug!(
-                                    expected = %expected_resume_sid,
-                                    got = %steer_sid,
-                                    "ignoring steer frame with mismatched session_id on resume"
-                                );
-                                continue;
-                            }
-                            if steer_tx.send(Some(message)).await.is_err() {
-                                break;
-                            }
-                        }
-                        Ok(Request::Interrupt {
-                            session_id: steer_sid,
-                        }) => {
-                            if steer_sid != expected_resume_sid {
-                                tracing::debug!(
-                                    expected = %expected_resume_sid,
-                                    got = %steer_sid,
-                                    "ignoring interrupt frame with mismatched session_id on resume"
-                                );
-                                continue;
-                            }
-                            if steer_tx.send(None).await.is_err() {
-                                break;
-                            }
-                        }
-                        Ok(_) | Err(_) => {
-                            tracing::debug!("unexpected frame on established resume connection");
-                        }
-                    }
-                }
-            });
-
-            // Resume: load the FULL history from SQLite without a sliding-window cap,
-            // plus summaries from other sessions for cross-session context,
-            // and the session's own running summary if one was already compacted.
-            let db = Arc::clone(&state.db);
-            let sid_clone = session_id.clone();
-            let (history, summaries, own_summary) =
-                tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-                    let conn = db.lock().unwrap_or_else(|p| p.into_inner());
-                    let history = memory_db::get_session_history(&conn, &sid_clone)?;
-                    let summaries =
-                        memory_db::get_recent_summaries(&conn, &sid_clone, MAX_SUMMARIES)?;
-                    let own_summary = memory_db::get_session_own_summary(&conn, &sid_clone)?;
-                    Ok((history, summaries, own_summary))
-                })
-                .await
-                .unwrap_or_else(|e| {
-                    tracing::warn!(error = %e, "resume history load panicked");
-                    Ok((vec![], vec![], None))
-                })
-                .unwrap_or_else(|e| {
-                    tracing::warn!(error = %e, "failed to load resume history");
-                    (vec![], vec![], None)
-                });
-
-            // Resume: full history for re-hydration; token budget trims if needed.
-            let mut messages = build_messages(
-                &prompt,
-                tmux_pane.as_deref(),
-                &history,
-                &summaries,
-                own_summary.as_deref(),
-            );
-            inject_skill_files(&mut messages).await;
-
-            // Pre-flight token check.
-            let threshold = compaction_threshold_tokens(&model);
-            if count_message_tokens(&messages) > threshold {
-                let hot = HOT_TAIL_PAIRS * 2;
-                let trimmed = if history.len() > hot {
-                    &history[history.len() - hot..]
-                } else {
-                    &history[..]
-                };
-                messages = build_messages(
-                    &prompt,
-                    tmux_pane.as_deref(),
-                    trimmed,
-                    &summaries,
-                    own_summary.as_deref(),
-                );
-                inject_skill_files(&mut messages).await;
-            }
-
-            match run_agentic_loop(&state, &model, messages, &mut writer, &mut steer_rx, true).await
-            {
-                Ok((response_text, _)) => {
-                    let user_text = truncate_chars(prompt.clone(), MAX_PROMPT_CHARS);
-                    let assistant_text = truncate_chars(response_text.clone(), MAX_RESPONSE_CHARS);
-
-                    store_conversation(&state, &session_id, &user_text, &assistant_text).await;
-                    write_frame(&mut writer, &Response::Done).await?;
-                }
-                Err(e) => {
-                    tracing::error!(error = %e, "resume agentic loop error");
-                    let _ = write_frame(
-                        &mut writer,
+                if let Err(e) = state.tokens.get(&state.http).await {
+                    let mut w = writer.lock().await;
+                    write_frame(
+                        &mut *w,
                         &Response::Error {
-                            message: format!("agent error: {e:#}"),
+                            message: format!("authentication error: {e:#}"),
                         },
                     )
-                    .await;
+                    .await?;
+                    break 'connection;
                 }
-            }
-        }
 
-        Request::Chat {
-            prompt,
-            tmux_pane,
-            model,
-            session_id,
-        } => {
-            tracing::info!(
-                pane = ?tmux_pane,
-                model = %model,
-                prompt_len = prompt.len(),
-                "received chat request"
-            );
-
-            // Verify authentication before entering the loop so we can return
-            // a clear error to the user instead of failing mid-conversation.
-            if let Err(e) = state.tokens.get(&state.http).await {
-                tracing::error!(error = %e, "failed to get Copilot API token");
-                write_frame(
-                    &mut writer,
-                    &Response::Error {
-                        message: format!("authentication error: {e:#}"),
-                    },
-                )
-                .await?;
-                return Ok(());
-            }
-
-            // Resolve session first so the steer reader can validate the
-            // session_id on incoming Steer frames.
-            // Older clients that omit session_id get a fresh UUID so their
-            // history and steer lookups are isolated (not all lumped under "").
-            let sid = session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-
-            // Steering channel: the spawned reader task sends user corrections
-            // here; the agentic loop drains them between model turns.
-            let (steer_tx, mut steer_rx) = tokio::sync::mpsc::channel::<Option<String>>(16);
-
-            // Spawn a task that reads subsequent frames from the client on
-            // this connection.  Any Steer frames are forwarded to steer_tx so
-            // the running agentic loop can inject them between tool turns.
-            // The task exits when the client closes the connection (EOF) or
-            // when steer_tx is dropped (agentic loop finished).
-            let expected_chat_sid = sid.clone();
-            tokio::spawn(async move {
-                while let Ok(Some(frame)) = lines.next_line().await {
-                    match serde_json::from_str::<Request>(&frame) {
-                        Ok(Request::Steer {
-                            session_id: steer_sid,
-                            message,
-                        }) => {
-                            if steer_sid != expected_chat_sid {
-                                tracing::debug!(
-                                    expected = %expected_chat_sid,
-                                    got = %steer_sid,
-                                    "ignoring steer frame with mismatched session_id on chat"
-                                );
-                                continue;
-                            }
-                            if steer_tx.send(Some(message)).await.is_err() {
-                                break; // agentic loop has finished; channel closed
-                            }
-                        }
-                        Ok(Request::Interrupt {
-                            session_id: steer_sid,
-                        }) => {
-                            if steer_sid != expected_chat_sid {
-                                tracing::debug!(
-                                    expected = %expected_chat_sid,
-                                    got = %steer_sid,
-                                    "ignoring interrupt frame with mismatched session_id on chat"
-                                );
-                                continue;
-                            }
-                            // None = interrupt-only; no steer text to inject.
-                            if steer_tx.send(None).await.is_err() {
-                                break;
-                            }
-                        }
-                        Ok(_) | Err(_) => {
-                            // Unexpected frame type mid-stream; ignore.
-                            tracing::debug!("unexpected frame type on established chat connection");
-                        }
-                    }
-                }
-            });
-
-            // Load full session history, past-session summaries, and the session's own
-            // running summary (if any) for token-budget-driven compaction decisions.
-            let db = Arc::clone(&state.db);
-            let sid_clone = sid.clone();
-            let (history, past_summaries, own_summary) =
-                tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-                    let conn = db.lock().unwrap_or_else(|p| p.into_inner());
-                    let history = memory_db::get_session_history(&conn, &sid_clone)?;
-                    let past_summaries =
-                        memory_db::get_recent_summaries(&conn, &sid_clone, MAX_SUMMARIES)?;
-                    let own_summary = memory_db::get_session_own_summary(&conn, &sid_clone)?;
-                    Ok((history, past_summaries, own_summary))
-                })
-                .await
-                .unwrap_or_else(|e| {
-                    tracing::warn!(error = %e, "session history load panicked");
-                    Ok((vec![], vec![], None))
-                })
-                .unwrap_or_else(|e| {
-                    tracing::warn!(error = %e, "failed to load session history");
-                    (vec![], vec![], None)
-                });
-
-            // Cross-session: if this is the first turn of a new session, compact any
-            // old sessions that have never been summarised.
-            if history.is_empty() {
-                let db = Arc::clone(&state.db);
-                let sid_clone = sid.clone();
-                let old_sessions = tokio::task::spawn_blocking(move || {
-                    let conn = db.lock().unwrap_or_else(|p| p.into_inner());
-                    memory_db::get_sessions_without_summary(&conn, &sid_clone, MAX_SUMMARIES)
-                })
-                .await
-                .unwrap_or_else(|_| Ok(vec![]))
-                .unwrap_or_default();
-
-                for old_sid in old_sessions {
-                    // Cross-session: summarise the full closed session (keep_recent = 0).
-                    tokio::spawn(compact_session(
-                        Arc::clone(&state),
-                        old_sid,
-                        model.clone(),
-                        0,
-                    ));
-                }
-            }
-
-            let mut messages = build_messages(
-                &prompt,
-                tmux_pane.as_deref(),
-                &history,
-                &past_summaries,
-                own_summary.as_deref(),
-            );
-            inject_skill_files(&mut messages).await;
-
-            // Pre-flight token check: if over the compaction threshold, trim to hot tail.
-            // Also record whether we had to trim — that alone is enough to schedule
-            // compaction even if the API does not return usage data.
-            let threshold = compaction_threshold_tokens(&model);
-            let pre_flight_trimmed = if count_message_tokens(&messages) > threshold {
-                let hot = HOT_TAIL_PAIRS * 2;
-                let trimmed = if history.len() > hot {
-                    &history[history.len() - hot..]
-                } else {
-                    &history[..]
-                };
-                messages = build_messages(
-                    &prompt,
-                    tmux_pane.as_deref(),
-                    trimmed,
-                    &past_summaries,
-                    own_summary.as_deref(),
-                );
-                inject_skill_files(&mut messages).await;
-                tracing::debug!(
-                    hot_tail = trimmed.len(),
-                    "pre-flight token trim: history reduced to hot tail"
-                );
-                true
-            } else {
-                false
-            };
-
-            // Snapshot the token count before messages is moved into the loop.
-            // Used as a fallback when the API returns prompt_tokens = 0.
-            let pre_send_tokens = count_message_tokens(&messages);
-
-            match run_agentic_loop(&state, &model, messages, &mut writer, &mut steer_rx, true).await
-            {
-                Ok((response_text, prompt_tokens)) => {
-                    let user_text = truncate_chars(prompt.clone(), MAX_PROMPT_CHARS);
-                    let assistant_text = truncate_chars(response_text.clone(), MAX_RESPONSE_CHARS);
-
-                    // Persist to SQLite memory store.
-                    store_conversation(&state, &sid, &user_text, &assistant_text).await;
-
-                    // Within-session compaction: trigger when the context is large enough.
-                    // Two signals both warrant compaction:
-                    //   1. pre_flight_trimmed — the full history already exceeded the
-                    //      threshold before we sent the request; the API's prompt_tokens
-                    //      reflects only the trimmed slice and would never cross the
-                    //      threshold on its own.
-                    //   2. effective_tokens > threshold — the API confirmed the request
-                    //      consumed more than the compaction threshold.  Fall back to the
-                    //      pre-send tiktoken estimate when the server returns 0.
-                    let effective_tokens = if prompt_tokens > 0 {
-                        prompt_tokens
-                    } else {
-                        pre_send_tokens
-                    };
-                    tracing::debug!(
-                        effective_tokens,
-                        threshold,
-                        pre_flight_trimmed,
-                        prompt_tokens,
-                        pre_send_tokens,
-                        "compaction check"
-                    );
-                    // Compact whenever the context is over budget.  After compaction,
-                    // the archived turns are excluded from future history loads, so
-                    // the loaded window shrinks and this condition naturally goes false
-                    // until enough new turns accumulate to push past the threshold again.
-                    if pre_flight_trimmed || effective_tokens > threshold {
-                        tracing::info!(
-                            session = %sid,
-                            effective_tokens,
-                            threshold,
-                            pre_flight_trimmed,
-                            "compacting conversation history"
-                        );
-                        let _ = write_frame(&mut writer, &Response::Compacting).await;
-                        // Guard against overlapping compactions for the same session.
-                        let already_compacting = {
-                            let mut guard = state
-                                .compacting_sessions
-                                .lock()
-                                .unwrap_or_else(|p| p.into_inner());
-                            !guard.insert(sid.clone())
+                // First turn: load history from DB.  Subsequent turns: extend carried messages.
+                // Apply token-budget trim either way so long-lived connections stay bounded (comment 6).
+                let (messages, pre_flight_trimmed) = if let Some(mut prev) = carried_messages.take()
+                {
+                    prev.push(Message::user(prompt.clone()));
+                    // Do NOT re-inject skill files — they were injected on the
+                    // first turn and are already in `prev`.  Re-injecting every
+                    // turn duplicates system messages and grows context unboundedly.
+                    let threshold_inner = compaction_threshold_tokens(&model);
+                    let trimmed = if count_message_tokens(&prev) > threshold_inner {
+                        // Rebuild from persisted history when over budget
+                        let db2 = Arc::clone(&state.db);
+                        let sid2 = sid.clone();
+                        let (hist2, sum2, own2) =
+                            tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+                                let conn = db2.lock().unwrap_or_else(|p| p.into_inner());
+                                Ok((
+                                    memory_db::get_session_history(&conn, &sid2)?,
+                                    memory_db::get_recent_summaries(&conn, &sid2, MAX_SUMMARIES)?,
+                                    memory_db::get_session_own_summary(&conn, &sid2)?,
+                                ))
+                            })
+                            .await
+                            .unwrap_or_else(|_| Ok((vec![], vec![], None)))
+                            .unwrap_or((vec![], vec![], None));
+                        let hot = HOT_TAIL_PAIRS * 2;
+                        let trimmed_hist = if hist2.len() > hot {
+                            &hist2[hist2.len() - hot..]
+                        } else {
+                            &hist2[..]
                         };
-                        if !already_compacting {
+                        let mut rebuilt = build_messages(
+                            &prompt,
+                            tmux_pane.as_deref(),
+                            trimmed_hist,
+                            &sum2,
+                            own2.as_deref(),
+                        );
+                        inject_skill_files(&mut rebuilt).await;
+                        (rebuilt, true)
+                    } else {
+                        (prev, false)
+                    };
+                    trimmed
+                } else {
+                    let db = Arc::clone(&state.db);
+                    let sid_c = sid.clone();
+                    let (history, summaries, own_summary) =
+                        tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+                            let conn = db.lock().unwrap_or_else(|p| p.into_inner());
+                            Ok((
+                                memory_db::get_session_history(&conn, &sid_c)?,
+                                memory_db::get_recent_summaries(&conn, &sid_c, MAX_SUMMARIES)?,
+                                memory_db::get_session_own_summary(&conn, &sid_c)?,
+                            ))
+                        })
+                        .await
+                        .unwrap_or_else(|e| {
+                            tracing::warn!(error=%e,"chat history load panicked");
+                            Ok((vec![], vec![], None))
+                        })
+                        .unwrap_or_else(|e| {
+                            tracing::warn!(error=%e,"failed to load chat history");
+                            (vec![], vec![], None)
+                        });
+
+                    if history.is_empty() {
+                        let db = Arc::clone(&state.db);
+                        let sid_c = sid.clone();
+                        let old = tokio::task::spawn_blocking(move || {
+                            let conn = db.lock().unwrap_or_else(|p| p.into_inner());
+                            memory_db::get_sessions_without_summary(&conn, &sid_c, MAX_SUMMARIES)
+                        })
+                        .await
+                        .unwrap_or_else(|_| Ok(vec![]))
+                        .unwrap_or_default();
+                        for old_sid in old {
                             tokio::spawn(compact_session(
                                 Arc::clone(&state),
-                                sid.clone(),
+                                old_sid,
                                 model.clone(),
-                                HOT_TAIL_PAIRS * 2, // keep hot tail out of the summary
+                                0,
                             ));
                         }
                     }
-                    write_frame(&mut writer, &Response::Done).await?;
-                }
-                Err(e) => {
-                    tracing::error!(error = %e, "agentic loop error");
-                    let _ = write_frame(
-                        &mut writer,
-                        &Response::Error {
-                            message: format!("agent error: {e:#}"),
-                        },
+
+                    let mut msgs = build_messages(
+                        &prompt,
+                        tmux_pane.as_deref(),
+                        &history,
+                        &summaries,
+                        own_summary.as_deref(),
+                    );
+                    inject_skill_files(&mut msgs).await;
+                    let threshold_inner = compaction_threshold_tokens(&model);
+                    let pft = if count_message_tokens(&msgs) > threshold_inner {
+                        let hot = HOT_TAIL_PAIRS * 2;
+                        let trimmed = if history.len() > hot {
+                            &history[history.len() - hot..]
+                        } else {
+                            &history[..]
+                        };
+                        msgs = build_messages(
+                            &prompt,
+                            tmux_pane.as_deref(),
+                            trimmed,
+                            &summaries,
+                            own_summary.as_deref(),
+                        );
+                        inject_skill_files(&mut msgs).await;
+                        true
+                    } else {
+                        false
+                    };
+                    (msgs, pft)
+                };
+
+                let pre_send_tokens = count_message_tokens(&messages);
+                let threshold = compaction_threshold_tokens(&model);
+                // pre_flight_trimmed restores the original compaction trigger (comment 7):
+                // if we had to trim, compact even if prompt_tokens stays below threshold.
+                let (steer_tx, mut steer_rx) = tokio::sync::mpsc::channel::<Option<String>>(16);
+                let expected_chat_sid = sid.clone();
+
+                let writer_loop = Arc::clone(&writer);
+                let state_loop = Arc::clone(&state);
+                let model_loop = model.clone();
+                let mut loop_handle = tokio::spawn(async move {
+                    let mut w = writer_loop.lock().await;
+                    run_agentic_loop(
+                        &state_loop,
+                        &model_loop,
+                        messages,
+                        &mut *w,
+                        &mut steer_rx,
+                        true,
                     )
-                    .await;
+                    .await
+                });
+
+                let loop_result = loop {
+                    tokio::select! { biased;
+                        r = &mut loop_handle => { break r.unwrap_or_else(|e| Err(anyhow::anyhow!("loop panicked: {e}"))); }
+                        f = frame_rx.recv() => { match f {
+                            None => { loop_handle.abort(); break 'connection; }
+                            Some(line) => { if let Ok(req) = serde_json::from_str::<Request>(&line) { match req {
+                                Request::Steer { session_id: sid, message } if sid == expected_chat_sid => { if !message.is_empty() { let _ = steer_tx.send(Some(message)).await; } }
+                                Request::Interrupt { session_id: sid } if sid == expected_chat_sid => { let _ = steer_tx.send(None).await; }
+                                // Steer/Interrupt for a different session: silently ignore per IPC contract.
+                                Request::Steer { .. } | Request::Interrupt { .. } => {
+                                    tracing::debug!("ignoring steer/interrupt for non-active session");
+                                }
+                                _ => {
+                                    tracing::warn!("dropping unsolicited frame during active chat loop");
+                                    // Defer the error reply (same reason as Resume path above).
+                                    pending_unsolicited += 1;
+                                }
+                            }}}
+                        }}
+                    }
+                };
+
+                // Flush deferred busy-errors now that the writer lock is free.
+                if pending_unsolicited > 0 {
+                    let mut w = writer.lock().await;
+                    for _ in 0..pending_unsolicited {
+                        let _ = write_frame(&mut *w, &Response::Error {
+                            message: "busy: another request is already in progress on this connection".into(),
+                        }).await;
+                    }
+                    pending_unsolicited = 0;
+                }
+
+                match loop_result {
+                    Ok((response_text, prompt_tokens, final_messages)) => {
+                        store_conversation(
+                            &state,
+                            &sid,
+                            &truncate_chars(prompt.clone(), MAX_PROMPT_CHARS),
+                            &truncate_chars(response_text.clone(), MAX_RESPONSE_CHARS),
+                        )
+                        .await;
+                        let effective_tokens = if prompt_tokens > 0 {
+                            prompt_tokens
+                        } else {
+                            pre_send_tokens
+                        };
+                        let mut w = writer.lock().await;
+                        if pre_flight_trimmed || effective_tokens > threshold {
+                            tracing::info!(session=%sid, effective_tokens, threshold, "compacting conversation history");
+                            let _ = write_frame(&mut *w, &Response::Compacting).await;
+                            let already = {
+                                let mut g = state
+                                    .compacting_sessions
+                                    .lock()
+                                    .unwrap_or_else(|p| p.into_inner());
+                                !g.insert(sid.clone())
+                            };
+                            if !already {
+                                tokio::spawn(compact_session(
+                                    Arc::clone(&state),
+                                    sid.clone(),
+                                    model.clone(),
+                                    HOT_TAIL_PAIRS * 2,
+                                ));
+                            }
+                        }
+                        write_frame(&mut *w, &Response::Done).await?;
+                        drop(w);
+                        // Carry messages and session_id for the next turn on this connection.
+                        carried_messages = Some(final_messages);
+                        carried_session_id = Some(sid.clone());
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "agentic loop error");
+                        let mut w = writer.lock().await;
+                        let _ = write_frame(
+                            &mut *w,
+                            &Response::Error {
+                                message: format!("agent error: {e:#}"),
+                            },
+                        )
+                        .await;
+                        carried_messages = None;
+                        carried_session_id = None;
+                    }
                 }
             }
         }
@@ -982,6 +1040,44 @@ impl Drop for CompactingGuard {
             .unwrap_or_else(|p| p.into_inner())
             .remove(&self.session_id);
     }
+}
+
+/// RAII guard that releases a session from `active_sessions` when dropped.
+///
+/// Held for the lifetime of a Chat connection or an Ask/Resume agentic loop.
+/// Ensures concurrent connections to the same session are rejected.
+struct ActiveSessionGuard {
+    active_sessions: Arc<Mutex<HashSet<String>>>,
+    session_id: String,
+}
+
+impl Drop for ActiveSessionGuard {
+    fn drop(&mut self) {
+        self.active_sessions
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&self.session_id);
+    }
+}
+
+/// Try to claim `session_id` in `active_sessions`.
+///
+/// Returns `Ok(guard)` on success.  Returns `Err` when the session is already
+/// held by another connection — the caller should send `Response::Error` and
+/// skip processing.
+fn claim_session(
+    active_sessions: &Arc<Mutex<HashSet<String>>>,
+    session_id: &str,
+) -> Result<ActiveSessionGuard, ()> {
+    let mut guard = active_sessions.lock().unwrap_or_else(|p| p.into_inner());
+    if guard.contains(session_id) {
+        return Err(());
+    }
+    guard.insert(session_id.to_owned());
+    Ok(ActiveSessionGuard {
+        active_sessions: Arc::clone(active_sessions),
+        session_id: session_id.to_owned(),
+    })
 }
 
 async fn compact_session(
@@ -1312,7 +1408,7 @@ pub(crate) async fn run_agentic_loop<W>(
     writer: &mut W,
     steer_rx: &mut tokio::sync::mpsc::Receiver<Option<String>>,
     include_spawn_agent: bool,
-) -> Result<(String, usize)>
+) -> Result<(String, usize, Vec<Message>)>
 where
     W: AsyncWriteExt + Unpin,
 {
@@ -1404,34 +1500,44 @@ where
 
                     // Block until the user replies via the steering channel.
                     // Timeout after 5 minutes to avoid infinite hangs.
-                    // A bare interrupt (Ctrl-C / None) is ignored while the
-                    // session is already waiting for input — keep waiting.
-                    let steer_result = 'wait_input: loop {
-                        match tokio::time::timeout(
-                            std::time::Duration::from_secs(300),
-                            steer_rx.recv(),
-                        )
-                        .await
-                        {
-                            Ok(Some(Some(reply))) => break 'wait_input Ok(Some(reply)),
-                            Ok(Some(None)) => {
-                                tracing::debug!(
-                                    context = "waiting_for_input_reply",
-                                    "interrupt ignored while waiting for input"
-                                );
-                                continue 'wait_input;
-                            }
-                            Ok(None) => break 'wait_input Ok(None),
-                            Err(e) => break 'wait_input Err(e),
+                    enum WaitInputOutcome {
+                        Reply(String),
+                        UserCancelled,
+                        Disconnected,
+                    }
+                    let outcome = match tokio::time::timeout(
+                        std::time::Duration::from_secs(300),
+                        steer_rx.recv(),
+                    )
+                    .await
+                    {
+                        Ok(Some(Some(reply))) => Ok(WaitInputOutcome::Reply(reply)),
+                        Ok(Some(None)) => {
+                            // Interrupt: user cancelled the reply prompt.
+                            tracing::debug!(
+                                context = "waiting_for_input_reply",
+                                "interrupt received; aborting waiting-for-input"
+                            );
+                            Ok(WaitInputOutcome::UserCancelled)
                         }
+                        Ok(None) => Ok(WaitInputOutcome::Disconnected),
+                        Err(e) => Err(e),
                     };
-                    match steer_result {
-                        Ok(Some(user_reply)) => {
+                    match outcome {
+                        Ok(WaitInputOutcome::Reply(user_reply)) => {
                             messages.push(Message::user(user_reply));
                             write_frame(writer, &Response::SteerAck).await?;
                             continue;
                         }
-                        Ok(None) => {
+                        Ok(WaitInputOutcome::UserCancelled) => {
+                            // User cancelled — resume the loop; session stays open.
+                            tracing::debug!(
+                                context = "waiting_for_input_reply",
+                                "user cancelled waiting-for-input; resuming session"
+                            );
+                            continue;
+                        }
+                        Ok(WaitInputOutcome::Disconnected) => {
                             // Channel closed — client disconnected.
                             tracing::debug!(
                                 reason = "client_disconnected",
@@ -1581,6 +1687,9 @@ where
                 }
 
                 final_text = resp.text;
+                if !final_text.is_empty() {
+                    messages.push(Message::assistant(Some(final_text.clone()), vec![]));
+                }
                 break;
             }
 
@@ -1829,12 +1938,15 @@ where
                 let warning = format!("\n[stopped: unexpected finish reason '{reason}']");
                 write_frame(writer, &Response::Text { chunk: warning }).await?;
                 final_text = resp.text;
+                if !final_text.is_empty() {
+                    messages.push(Message::assistant(Some(final_text.clone()), vec![]));
+                }
                 break;
             }
         }
     }
 
-    Ok((final_text, last_prompt_tokens))
+    Ok((final_text, last_prompt_tokens, messages))
 }
 
 // ---------------------------------------------------------------------------
@@ -2080,7 +2192,7 @@ async fn run_cron_job(state: Arc<DaemonState>, job: &cron::CronJob) {
     let result = run_agentic_loop(&state, &model, messages, &mut sink, &mut steer_rx, true).await;
 
     let (output, run_ok) = match result {
-        Ok((final_text, _)) => {
+        Ok((final_text, _, _)) => {
             store_conversation(&state, &session_id, &job.description, &final_text).await;
             (final_text, true)
         }

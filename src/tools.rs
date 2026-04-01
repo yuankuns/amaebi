@@ -413,6 +413,9 @@ async fn spawn_agent(args: serde_json::Value, ctx: &SpawnContext) -> Result<Stri
         executor: Box::new(child_executor),
         db: Arc::clone(&ctx.db),
         compacting_sessions: Arc::clone(&ctx.compacting_sessions),
+        // Child agents get their own active_sessions set; they are ephemeral
+        // and don't share the parent's session-lock namespace.
+        active_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
     };
 
     let messages = vec![
@@ -431,7 +434,7 @@ async fn spawn_agent(args: serde_json::Value, ctx: &SpawnContext) -> Result<Stri
 
     // Fix 5: child agents do not get spawn_agent in their tool schema to
     // prevent unbounded recursion at the schema level.
-    let (final_text, _) = crate::daemon::run_agentic_loop(
+    let (final_text, _, _) = crate::daemon::run_agentic_loop(
         &child_state,
         &model,
         messages,

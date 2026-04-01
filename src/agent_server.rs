@@ -257,7 +257,9 @@ impl acp::Agent for AmaebiAgent {
         let state = Arc::clone(&self.state);
         let model = Arc::clone(&self.model);
 
-        // Oneshot to receive the loop's final text.
+        // Oneshot to receive the loop's final text and token count.
+        // The messages Vec is discarded immediately after the loop completes —
+        // ACP does not use it and retaining it wastes memory (tool outputs, etc.).
         let (result_tx, result_rx) = oneshot::channel::<Result<(String, usize), String>>();
 
         // Run the agentic loop in a background local task.
@@ -275,6 +277,7 @@ impl acp::Agent for AmaebiAgent {
                 true,
             )
             .await
+            .map(|(text, tokens, _messages)| (text, tokens)) // discard messages Vec
             .map_err(|e| format!("{e:#}"));
             let _ = result_tx.send(outcome);
             // Dropping write_half closes the pipe, signalling EOF to the reader.
@@ -332,7 +335,7 @@ impl acp::Agent for AmaebiAgent {
 
         // Await the loop outcome; propagate any error to the ACP client.
         let final_text = match result_rx.await {
-            Ok(Ok((text, _))) => text,
+            Ok(Ok((text, _tokens))) => text,
             Ok(Err(e)) => return Err(acp::Error::internal_error().data(e)),
             Err(_) => return Err(acp::Error::internal_error()),
         };
