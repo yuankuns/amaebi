@@ -579,10 +579,16 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                                 }
                                 _ => {
                                     tracing::warn!("dropping unsolicited frame during active agentic loop");
-                                    let mut w = writer.lock().await;
-                                    let _ = write_frame(&mut *w, &Response::Error {
-                                        message: "busy: another request is already in progress on this connection".into(),
-                                    }).await;
+                                    // Use try_lock to avoid blocking Steer/Interrupt routing:
+                                    // the agentic loop holds the writer lock for most of the
+                                    // turn; awaiting it here would stall the select loop and
+                                    // delay steering frames.  If we can't acquire it immediately
+                                    // we skip the error reply rather than blocking.
+                                    if let Ok(mut w) = writer.try_lock() {
+                                        let _ = write_frame(&mut *w, &Response::Error {
+                                            message: "busy: another request is already in progress on this connection".into(),
+                                        }).await;
+                                    }
                                 }
                             }}}
                         }}
@@ -793,10 +799,16 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                                 }
                                 _ => {
                                     tracing::warn!("dropping unsolicited frame during active chat loop");
-                                    let mut w = writer.lock().await;
-                                    let _ = write_frame(&mut *w, &Response::Error {
-                                        message: "busy: another request is already in progress on this connection".into(),
-                                    }).await;
+                                    // Use try_lock to avoid blocking Steer/Interrupt routing:
+                                    // the agentic loop holds the writer lock for most of the
+                                    // turn; awaiting it here would stall the select loop and
+                                    // delay steering frames.  If we can't acquire it immediately
+                                    // we skip the error reply rather than blocking.
+                                    if let Ok(mut w) = writer.try_lock() {
+                                        let _ = write_frame(&mut *w, &Response::Error {
+                                            message: "busy: another request is already in progress on this connection".into(),
+                                        }).await;
+                                    }
                                 }
                             }}}
                         }}
@@ -1309,6 +1321,10 @@ where
         // and the next iteration).
         while let Ok(steer_msg) = steer_rx.try_recv() {
             if let Some(msg) = steer_msg {
+                if msg.is_empty() {
+                    // Empty steer = cancel signal from client; skip silently.
+                    continue;
+                }
                 messages.push(Message::user(msg));
                 write_frame(writer, &Response::SteerAck).await?;
             }
@@ -1394,7 +1410,16 @@ where
                         )
                         .await
                         {
-                            Ok(Some(Some(reply))) => break 'wait_input Ok(Some(reply)),
+                            Ok(Some(Some(reply))) if !reply.is_empty() => {
+                                break 'wait_input Ok(Some(reply))
+                            }
+                            Ok(Some(Some(_))) => {
+                                // Empty steer = client cancelled; keep waiting.
+                                tracing::debug!(
+                                    "empty steer received while waiting for input; continuing"
+                                );
+                                continue 'wait_input;
+                            }
                             Ok(Some(None)) => {
                                 tracing::debug!(
                                     context = "waiting_for_input_reply",
