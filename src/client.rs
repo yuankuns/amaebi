@@ -299,6 +299,153 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
 }
 
 // ---------------------------------------------------------------------------
+// Interactive chat REPL
+// ---------------------------------------------------------------------------
+
+/// Run a persistent multi-turn chat session.
+///
+/// Sends `initial_prompt` (if provided), streams the response, then keeps
+/// the session alive: after each `Done` frame a `> ` cursor is shown so the
+/// user can type the next message.  The session ends on Ctrl-D (EOF) or a
+/// blank line.
+///
+/// Every turn reuses the same `session_id` so the daemon's `session_turns`
+/// table accumulates the full conversation; the model always receives the
+/// complete history.
+pub async fn run_chat_loop(
+    socket: PathBuf,
+    initial_prompt: Option<String>,
+    model: Option<String>,
+) -> Result<()> {
+    let model = model
+        .or_else(|| std::env::var("AMAEBI_MODEL").ok())
+        .unwrap_or_else(|| "gpt-4o".to_string());
+
+    let cwd = std::env::current_dir().context("getting current directory")?;
+    let session_id = tokio::task::spawn_blocking(move || session::get_or_create(&cwd))
+        .await
+        .context("session::get_or_create panicked")?
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "failed to resolve session id; using \"global\"");
+            "global".to_string()
+        });
+
+    let mut stdout = tokio::io::stdout();
+    let mut stderr = tokio::io::stderr();
+
+    if std::io::stderr().is_terminal() {
+        let _ = stderr
+            .write_all(
+                format!(
+                    "Chat session started. ID: {session_id}\nCtrl-D or empty line to exit.\n\n"
+                )
+                .as_bytes(),
+            )
+            .await;
+        let _ = stderr.flush().await;
+    }
+
+    // The first prompt comes from the CLI argument; subsequent ones from stdin.
+    let mut next_prompt: Option<String> = initial_prompt;
+
+    loop {
+        // If no prompt queued, read one from stdin.
+        let prompt = match next_prompt.take() {
+            Some(p) => p,
+            None => {
+                if std::io::stderr().is_terminal() {
+                    let _ = stderr.write_all(b"> ").await;
+                    let _ = stderr.flush().await;
+                }
+                let mut line = String::new();
+                let n = tokio::io::AsyncBufReadExt::read_line(
+                    &mut BufReader::new(tokio::io::stdin()),
+                    &mut line,
+                )
+                .await
+                .unwrap_or(0);
+                if n == 0 {
+                    // EOF (Ctrl-D)
+                    break;
+                }
+                let trimmed = line
+                    .trim_end_matches('\n')
+                    .trim_end_matches('\r')
+                    .to_owned();
+                if trimmed.is_empty() {
+                    break;
+                }
+                trimmed
+            }
+        };
+
+        // Send a single Chat turn and stream the response.
+        let stream = connect_or_start_daemon(&socket).await?;
+        let (reader, mut writer) = tokio::io::split(stream);
+        let req = Request::Chat {
+            prompt,
+            tmux_pane: std::env::var("TMUX_PANE").ok(),
+            session_id: Some(session_id.clone()),
+            model: model.clone(),
+        };
+        let mut req_line = serde_json::to_string(&req).context("serializing request")?;
+        req_line.push('\n');
+        writer
+            .write_all(req_line.as_bytes())
+            .await
+            .context("sending request")?;
+
+        let mut lines = BufReader::new(reader).lines();
+        loop {
+            let line = match lines.next_line().await.context("reading response")? {
+                Some(l) => l,
+                None => break,
+            };
+            let resp: Response = serde_json::from_str(&line).context("parsing response")?;
+            match resp {
+                Response::Text { chunk } => {
+                    stdout.write_all(chunk.as_bytes()).await?;
+                    stdout.flush().await?;
+                }
+                Response::Done => {
+                    stdout.write_all(b"\n").await?;
+                    break;
+                }
+                Response::Error { message } => {
+                    anyhow::bail!("{message}");
+                }
+                Response::ToolUse { name, detail } => {
+                    if std::io::stderr().is_terminal() {
+                        match name.as_str() {
+                            "shell_command" => eprintln!("```bash\n$ {detail}\n```"),
+                            "read_file" => eprintln!("📄 {detail}"),
+                            "edit_file" => eprintln!("✏️  {detail}"),
+                            _ => eprintln!("🔧 {name}: {detail}"),
+                        }
+                    }
+                }
+                Response::WaitingForInput { .. } => {
+                    // The model asked a question; the next REPL iteration will read the reply.
+                    stdout.write_all(b"\n").await?;
+                    break;
+                }
+                Response::Compacting => {
+                    if std::io::stderr().is_terminal() {
+                        eprintln!("\n[compacting…]");
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if std::io::stderr().is_terminal() {
+        eprintln!("\nSession ended. ID: {session_id}");
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Detach mode
 // ---------------------------------------------------------------------------
 
