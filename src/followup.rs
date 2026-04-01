@@ -81,8 +81,10 @@ pub fn parse_relative_time(when: &str) -> Result<DateTime<Utc>> {
     }
 
     let now = Utc::now();
+    let minutes_i64 = i64::try_from(minutes)
+        .map_err(|_| anyhow::anyhow!("follow-up delay too large: {minutes} minutes"))?;
     let target = now
-        + chrono::Duration::try_minutes(minutes as i64)
+        + chrono::Duration::try_minutes(minutes_i64)
             .ok_or_else(|| anyhow::anyhow!("duration overflow"))?;
 
     // Ceil to next whole minute: advance if any sub-minute component is set.

@@ -154,21 +154,45 @@ impl ToolExecutor for LocalExecutor {
                      (child agents cannot spawn further agents)"
                 ),
             },
-            "schedule_followup" => match &self.followup_ctx {
-                Some(ctx) => schedule_followup(args, ctx, session_id).await,
-                None => anyhow::bail!(
-                    "schedule_followup is not available in this context \
-                     (follow-up loops and child agents cannot schedule further follow-ups)"
-                ),
-            },
-            "cancel_followup" => match &self.followup_ctx {
-                Some(ctx) => cancel_followup(args, ctx).await,
-                None => anyhow::bail!("cancel_followup is not available in this context"),
-            },
-            "list_followups" => match &self.followup_ctx {
-                Some(ctx) => list_followups(args, ctx).await,
-                None => anyhow::bail!("list_followups is not available in this context"),
-            },
+            "schedule_followup" => {
+                if !enable_followup {
+                    anyhow::bail!(
+                        "schedule_followup is not available in this context \
+                         (cron jobs and child agents cannot schedule follow-ups)"
+                    );
+                }
+                match &self.followup_ctx {
+                    Some(ctx) => schedule_followup(args, ctx, session_id).await,
+                    None => anyhow::bail!(
+                        "schedule_followup is not available in this context \
+                         (follow-up loops and child agents cannot schedule further follow-ups)"
+                    ),
+                }
+            }
+            "cancel_followup" => {
+                if !enable_followup {
+                    anyhow::bail!(
+                        "cancel_followup is not available in this context \
+                         (cron jobs and child agents cannot manage follow-ups)"
+                    );
+                }
+                match &self.followup_ctx {
+                    Some(ctx) => cancel_followup(args, ctx).await,
+                    None => anyhow::bail!("cancel_followup is not available in this context"),
+                }
+            }
+            "list_followups" => {
+                if !enable_followup {
+                    anyhow::bail!(
+                        "list_followups is not available in this context \
+                         (cron jobs and child agents cannot manage follow-ups)"
+                    );
+                }
+                match &self.followup_ctx {
+                    Some(ctx) => list_followups(args, ctx).await,
+                    None => anyhow::bail!("list_followups is not available in this context"),
+                }
+            }
             other => anyhow::bail!("unknown tool: {other}"),
         }
     }

@@ -23,7 +23,7 @@
 //! CLI collide on the same row.
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, Datelike, Timelike, Utc};
+use chrono::{DateTime, Datelike, TimeZone as _, Utc};
 use rusqlite::{params, Connection};
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
@@ -524,14 +524,24 @@ pub fn due_jobs(jobs: &[CronJob], now: &chrono::DateTime<chrono::Utc>) -> Vec<Cr
 
             // Compute fires_at using the creation year so that a job missed
             // in 2020 does not get a fresh grace window based on today's year.
+            //
+            // Build from explicit components rather than chaining with_month →
+            // with_day … which returns None for month-rollover cases like
+            // "Jan 31 → Feb 1" (February has no 31st day).
             let anchor: DateTime<Utc> = job.created_at.parse().unwrap_or(*now);
-            let fires_at: Option<DateTime<Utc>> = anchor
-                .with_month(month)
-                .and_then(|dt: DateTime<Utc>| dt.with_day(day))
-                .and_then(|dt: DateTime<Utc>| dt.with_hour(hour))
-                .and_then(|dt: DateTime<Utc>| dt.with_minute(minute))
-                .and_then(|dt: DateTime<Utc>| dt.with_second(0))
-                .and_then(|dt: DateTime<Utc>| dt.with_nanosecond(0));
+            let build_ymd = |year: i32| -> Option<DateTime<Utc>> {
+                match chrono::Utc.with_ymd_and_hms(year, month, day, hour, minute, 0) {
+                    chrono::LocalResult::Single(dt) => Some(dt),
+                    _ => None,
+                }
+            };
+            let fires_at: Option<DateTime<Utc>> = match build_ymd(anchor.year()) {
+                // fires_at is before the job was created — the schedule crosses
+                // a year boundary (e.g. "Jan 15" job created in December): try
+                // the next year.
+                Some(dt) if dt < anchor => build_ymd(anchor.year() + 1),
+                other => other,
+            };
             match fires_at {
                 Some(fires_at) => {
                     is_due(&sched, now)
