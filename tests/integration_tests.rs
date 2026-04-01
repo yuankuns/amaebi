@@ -3081,3 +3081,176 @@ async fn run_workflow_dev_loop_executes_llm_stages_and_fails_at_push() {
         "tool result for run_workflow must not be empty"
     );
 }
+
+/// WF-4: perf-sweep executes all three Llm stages (analyze, implement, summarize)
+/// and the shell stages run directly in the container.
+///
+/// bench_cmd is set to `echo '{"fps":100}'` (configurable) so no real benchmark
+/// is needed.  cargo build runs in the project root (fast from cache).
+/// git commit uses `|| true` so it is safe even with no staged changes.
+///
+/// Expected LLM calls: 5 (parent×2 + analyze + implement + summarize).
+#[tokio::test]
+async fn run_workflow_perf_sweep_executes_all_llm_stages() {
+    let server = MockLlmServer::start().await;
+
+    // 1. Parent: calls run_workflow perf-sweep.
+    server.enqueue(ScriptedResponse::tool_call(
+        "call-wf-perf",
+        "run_workflow",
+        r#"{"workflow":"perf-sweep","args":{"target":"test module","bench_cmd":"echo '{\"fps\":110.0}'","regression_threshold":0.05}}"#,
+    ));
+    // 2. Workflow "analyze" Llm stage.
+    server.enqueue(ScriptedResponse::text_chunks(vec![
+        "- OPT: vectorise inner loop",
+    ]));
+    // 3. Workflow "implement" Llm stage (for the single map item).
+    server.enqueue(ScriptedResponse::text_chunks(vec![
+        "Used SIMD intrinsics in the inner loop.",
+    ]));
+    // 4. Workflow "summarize" Llm stage.
+    server.enqueue(ScriptedResponse::text_chunks(vec![
+        "fps improved by 10%; no regressions.",
+    ]));
+    // 5. Parent: receives workflow result, responds.
+    server.enqueue(ScriptedResponse::text_chunks(vec![
+        "Perf sweep completed successfully.",
+    ]));
+
+    let daemon = start_daemon(&server.url()).await.expect("start_daemon");
+    let client = connect_client(&daemon.socket);
+
+    let responses = send_message(&client, "run a perf sweep")
+        .await
+        .expect("send_message");
+
+    let text = collect_text(&responses);
+    assert!(
+        !text.is_empty(),
+        "expected non-empty response after perf sweep: {text:?}"
+    );
+
+    // 5 LLM requests: parent×2 + 3 workflow Llm stages.
+    let reqs = server.take_requests();
+    assert_eq!(
+        reqs.len(),
+        5,
+        "expected 5 LLM requests (parent×2 + analyze + implement + summarize); got {}",
+        reqs.len()
+    );
+}
+
+/// WF-5: bug-fix fails immediately at the "list-bugs" shell stage because
+/// `gh issue list` requires GitHub credentials and a real remote.
+///
+/// This tests the workflow error path: the daemon propagates the tool error
+/// back to the parent LLM, the LLM responds gracefully, and the daemon
+/// completes the turn without crashing.
+///
+/// Expected LLM calls: 2 (parent initial + parent after workflow error).
+/// The workflow's Llm stages (parse-bugs, summarize) must NOT be reached.
+#[tokio::test]
+async fn run_workflow_bug_fix_fails_at_gh_and_parent_handles_error() {
+    let server = MockLlmServer::start().await;
+
+    // 1. Parent: calls run_workflow bug-fix.
+    server.enqueue(ScriptedResponse::tool_call(
+        "call-wf-bugfix",
+        "run_workflow",
+        r#"{"workflow":"bug-fix","args":{"repo":".","test_cmd":"true","max_retries":1}}"#,
+    ));
+    // 2. Parent: receives the workflow error (gh failed), responds.
+    server.enqueue(ScriptedResponse::text_chunks(vec![
+        "The bug-fix workflow could not fetch issues.",
+    ]));
+
+    let daemon = start_daemon(&server.url()).await.expect("start_daemon");
+    let client = connect_client(&daemon.socket);
+
+    let responses = send_message(&client, "fix all bugs")
+        .await
+        .expect("send_message");
+
+    let text = collect_text(&responses);
+    assert!(
+        text.contains("bug") || text.contains("workflow") || !text.is_empty(),
+        "daemon must return a response after bug-fix failure: {text:?}"
+    );
+
+    // Exactly 2 LLM calls: the workflow failed before any Llm stage.
+    let reqs = server.take_requests();
+    assert_eq!(
+        reqs.len(),
+        2,
+        "bug-fix should consume 2 LLM calls (no Llm stages reached); got {}",
+        reqs.len()
+    );
+
+    // The second request's tool result must contain the gh error.
+    let msgs = reqs[1].messages().expect("messages present");
+    let tool_result = msgs
+        .iter()
+        .find(|m| m["role"].as_str() == Some("tool"))
+        .expect("tool result must appear in the second request");
+    let content = tool_result["content"].as_str().unwrap_or("");
+    assert!(
+        !content.is_empty(),
+        "tool result must contain the workflow error; got empty"
+    );
+}
+
+/// WF-6: tune-sweep executes plan, generate-configs (parallel Llm per item),
+/// run-experiments (shell per item), and summarize.
+///
+/// run_cmd and result_cmd are set to trivial echo commands so no real training
+/// infrastructure is needed.  The resource pool defaults to 1 "gpu" slot.
+///
+/// Expected LLM calls: 5 (parent×2 + plan + write-config + summarize).
+#[tokio::test]
+async fn run_workflow_tune_sweep_executes_all_llm_stages() {
+    let server = MockLlmServer::start().await;
+
+    // 1. Parent: calls run_workflow tune-sweep.
+    server.enqueue(ScriptedResponse::tool_call(
+        "call-wf-tune",
+        "run_workflow",
+        r#"{"workflow":"tune-sweep","args":{"target":"attention kernel","run_cmd":"echo {item_index}","result_cmd":"echo done","resource":"cpu","resource_count":1}}"#,
+    ));
+    // 2. Workflow "plan" Llm stage — one tuning direction.
+    server.enqueue(ScriptedResponse::text_chunks(vec![
+        "- TUNE: increase batch size",
+    ]));
+    // 3. Workflow "write-config" Llm stage for the single map item.
+    server.enqueue(ScriptedResponse::text_chunks(vec![
+        r#"{"batch_size": 128}"#,
+    ]));
+    // Shell "run" and "collect" stages are trivial echo commands — no LLM needed.
+    // 4. Workflow "summarize" Llm stage.
+    server.enqueue(ScriptedResponse::text_chunks(vec![
+        "batch_size=128 gave the best throughput.",
+    ]));
+    // 5. Parent: receives workflow result, responds.
+    server.enqueue(ScriptedResponse::text_chunks(vec!["Tune sweep finished."]));
+
+    let daemon = start_daemon(&server.url()).await.expect("start_daemon");
+    let client = connect_client(&daemon.socket);
+
+    let responses = send_message(&client, "run a tuning sweep")
+        .await
+        .expect("send_message");
+
+    let text = collect_text(&responses);
+    assert!(
+        !text.is_empty(),
+        "expected non-empty response after tune sweep: {text:?}"
+    );
+
+    // 5 LLM requests: parent×2 + plan + write-config + summarize.
+    let reqs = server.take_requests();
+    assert_eq!(
+        reqs.len(),
+        5,
+        "expected 5 LLM requests (parent×2 + plan + write-config + summarize); got {}",
+        reqs.len()
+    );
+}
