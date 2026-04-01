@@ -398,7 +398,7 @@ async fn send_with_retry(
     model: &str,
     messages: &[Message],
     tools: &[serde_json::Value],
-    max_tokens: usize,
+    max_completion_tokens: usize,
     endpoint_url: &str,
     use_copilot_headers: bool,
 ) -> Result<reqwest::Response> {
@@ -407,7 +407,7 @@ async fn send_with_retry(
         "messages": messages,
         "tools": tools,
         "stream": true,
-        "max_completion_tokens": max_tokens,
+        "max_completion_tokens": max_completion_tokens,
         "stream_options": { "include_usage": true },
     });
 
@@ -548,7 +548,7 @@ pub async fn stream_chat<W>(
     model: &str,
     messages: &[Message],
     tools: &[serde_json::Value],
-    max_tokens: usize,
+    max_completion_tokens: usize,
     writer: &mut W,
 ) -> Result<CopilotResponse>
 where
@@ -557,7 +557,7 @@ where
     let endpoint = chat_endpoint(base_url);
     tracing::debug!(messages = messages.len(), endpoint = %endpoint, model, "sending chat request");
     let resp = send_with_retry(
-        http, token, model, messages, tools, max_tokens, &endpoint, true,
+        http, token, model, messages, tools, max_completion_tokens, &endpoint, true,
     )
     .await?;
     parse_sse_stream(resp, writer).await

@@ -1243,7 +1243,7 @@ async fn invoke_model<W>(
     model: &str,
     messages: &[Message],
     tools: &[serde_json::Value],
-    max_tokens: usize,
+    max_completion_tokens: usize,
     writer: &mut W,
 ) -> Result<copilot::CopilotResponse>
 where
@@ -1262,7 +1262,7 @@ where
         model,
         messages,
         tools,
-        max_tokens,
+        max_completion_tokens,
         writer,
     )
     .await;
@@ -1284,7 +1284,7 @@ where
                 model,
                 messages,
                 tools,
-                max_tokens,
+                max_completion_tokens,
                 writer,
             )
             .await;
@@ -1314,7 +1314,7 @@ where
                             model,
                             messages,
                             tools,
-                            max_tokens,
+                            max_completion_tokens,
                             writer,
                         )
                         .await
@@ -1347,7 +1347,7 @@ where
                     model,
                     messages,
                     tools,
-                    max_tokens,
+                    max_completion_tokens,
                     writer,
                 )
                 .await;
@@ -1361,7 +1361,7 @@ where
                             model,
                             messages,
                             tools,
-                            max_tokens,
+                            max_completion_tokens,
                             writer,
                         )
                         .await

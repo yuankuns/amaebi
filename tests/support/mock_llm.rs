@@ -174,7 +174,7 @@ impl CapturedRequest {
     ///
     /// Checks `max_completion_tokens` (Chat Completions) and `max_output_tokens`
     /// (Responses API) so helpers work for both request formats.
-    pub fn max_tokens(&self) -> Option<u64> {
+    pub fn max_completion_tokens(&self) -> Option<u64> {
         self.body
             .get("max_completion_tokens")
             .or_else(|| self.body.get("max_output_tokens"))
@@ -655,7 +655,7 @@ mod tests {
 
         let reqs = server.take_requests();
         assert_eq!(reqs.len(), 1);
-        assert_eq!(reqs[0].max_tokens(), Some(1234));
+        assert_eq!(reqs[0].max_completion_tokens(), Some(1234));
         assert_eq!(reqs[0].model(), Some("gpt-4o"));
         assert!(reqs[0].is_streaming());
     }
