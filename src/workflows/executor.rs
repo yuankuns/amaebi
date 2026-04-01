@@ -24,6 +24,12 @@ pub async fn execute(
     initial_ctx: Context,
     resources: &ResourcePool,
 ) -> Result<String> {
+    tracing::info!(
+        name = %workflow.name,
+        stages = workflow.stages.len(),
+        model = %model,
+        "workflow: starting"
+    );
     step(&format!("Workflow: {}", workflow.name));
 
     let mut messages: Vec<Message> = {
@@ -47,9 +53,14 @@ pub async fn execute(
         &mut ctx,
         resources,
     )
-    .await?;
+    .await;
 
-    Ok(result.unwrap_or_else(|| "Workflow completed.".to_owned()))
+    match &result {
+        Ok(_) => tracing::info!(name = %workflow.name, "workflow: completed successfully"),
+        Err(e) => tracing::info!(name = %workflow.name, error = %e, "workflow: failed"),
+    }
+
+    Ok(result?.unwrap_or_else(|| "Workflow completed.".to_owned()))
 }
 
 // ---------------------------------------------------------------------------

@@ -420,14 +420,26 @@ async fn run_workflow_tool(args: serde_json::Value, ctx: &SpawnContext) -> Resul
                 .unwrap_or(1) as usize;
             let wf = builtins::tune_sweep(target, "", run_cmd, result_cmd, resource);
             let pool = ResourcePool::new([(resource, count)]);
-            return executor::execute(&wf, &state, &model, ctx, &pool).await;
+            let result = executor::execute(&wf, &state, &model, ctx, &pool).await;
+            tracing::info!(
+                workflow = %workflow_name,
+                success = result.is_ok(),
+                "run_workflow: completed"
+            );
+            return result;
         }
         other => anyhow::bail!(
             "unknown workflow: {other:?}. Valid: dev-loop, bug-fix, perf-sweep, tune-sweep"
         ),
     };
 
-    executor::execute(&workflow, &state, &model, ctx, &ResourcePool::empty()).await
+    let result = executor::execute(&workflow, &state, &model, ctx, &ResourcePool::empty()).await;
+    tracing::info!(
+        workflow = %workflow_name,
+        success = result.is_ok(),
+        "run_workflow: completed"
+    );
+    result
 }
 
 /// Spawn a child agent session to complete a task in an isolated sandbox.
