@@ -339,13 +339,26 @@ pub async fn run_chat_loop(
     // Single BufReader for stdin — reused across all steer reads so buffered
     // bytes are never dropped between reads.
     //
-    // Note: the outer prompt loop reads stdin via `prompt_input::read_line_raw`
-    // (a spawn_blocking call that reads std::io::stdin() byte-by-byte in raw
-    // mode), while this BufReader reads the same fd in cooked mode for steer
-    // corrections.  The two paths are strictly sequential — the prompt reader
-    // runs only when no turn is in flight, and this BufReader is only polled
-    // inside the inner select! loop while a turn is active — so they never
-    // overlap and no bytes are stranded between the two readers in practice.
+    // Stdin-mixing note: the outer prompt loop reads stdin via
+    // `prompt_input::read_line_raw` (a spawn_blocking call that reads
+    // std::io::stdin() byte-by-byte in raw mode), while this tokio BufReader
+    // reads the same underlying fd in cooked mode for steer corrections.
+    //
+    // In theory, the BufReader could read ahead and buffer bytes that belong
+    // to the *next* prompt — stranding them inside the BufReader and making
+    // the raw-mode reader see a truncated line.  In practice this does not
+    // happen because:
+    //   1. The two readers are strictly sequential: the raw-mode prompt reader
+    //      only runs when no agent turn is active, and this BufReader is only
+    //      polled inside the inner select! loop while a turn is in flight.
+    //      They never run concurrently.
+    //   2. Steer corrections are line-oriented: the BufReader calls read_line
+    //      and returns exactly one newline-terminated line.  In canonical
+    //      (cooked) mode the kernel delivers exactly one line per read, so the
+    //      BufReader's internal buffer is always empty after read_line returns.
+    //   3. Even if the user types ahead during a turn, the kernel buffers those
+    //      bytes in the line-discipline, not in our BufReader.  They become
+    //      available on the next read_exact call in the raw-mode reader.
     let mut stdin = BufReader::new(tokio::io::stdin());
     let mut next_prompt = initial_prompt;
     let mut last_ctrl_c: Option<Instant> = None;
@@ -1100,6 +1113,9 @@ mod prompt_input {
             match input.read_exact(&mut byte) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+                // EINTR (Interrupted) is raised by signals such as SIGWINCH
+                // (terminal resize).  It is not a fatal error — just retry.
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(e) => return Err(e),
             }
 
@@ -1142,6 +1158,14 @@ mod prompt_input {
                     }
                 }
                 // Escape sequences (arrows, function keys) — consume and discard.
+                //
+                // Limitation: a bare ESC press (no following byte) will block
+                // here until the next character arrives because we read the
+                // second byte unconditionally.  Resolving this correctly
+                // requires either a VTIME-based read timeout (termios VMIN=0
+                // VTIME=1) or non-blocking I/O with a short poll, which adds
+                // significant complexity for a rarely-used key.  Users who
+                // need bare ESC can press Ctrl-C instead.
                 0x1b => {
                     let mut eb = [0u8; 1];
                     if input.read_exact(&mut eb).is_ok() && eb[0] == b'[' {

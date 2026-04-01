@@ -1699,6 +1699,11 @@ async fn subagent_chain_session_remains_usable_after_recursion_block() {
             break;
         }
     }
+    assert_eq!(
+        server.pending_response_count(),
+        0,
+        "drain deadline elapsed before all Round 1 responses were consumed"
+    );
     // Snapshot the Round 1 request log before starting Round 2.
     let reqs_r1 = server.take_requests();
 
