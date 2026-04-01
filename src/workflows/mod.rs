@@ -331,19 +331,21 @@ mod tests {
 
     #[test]
     fn no_regression_within_threshold() {
-        let baseline = r#"{"latency_ms": 100.0}"#;
-        let current = r#"{"latency_ms": 104.0}"#; // +4%, within 5% threshold
+        // detect_regression treats all metrics as "higher is better".
+        // A small drop within the threshold must not fire.
+        let baseline = r#"{"throughput": 100.0}"#;
+        let current = r#"{"throughput": 96.0}"#; // -4%, within 5% threshold
         let result = executor::detect_regression_pub(baseline, current, 0.05).unwrap();
         assert!(
             result.is_none(),
-            "4% change within 5% threshold should not trigger"
+            "4% drop within 5% threshold should not trigger"
         );
     }
 
     #[test]
     fn empty_baseline_never_triggers_regression() {
         let result =
-            executor::detect_regression_pub("{}", r#"{"latency_ms": 200.0}"#, 0.05).unwrap();
+            executor::detect_regression_pub("{}", r#"{"throughput": 200.0}"#, 0.05).unwrap();
         assert!(result.is_none());
     }
 }

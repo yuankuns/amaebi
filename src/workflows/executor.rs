@@ -348,8 +348,8 @@ async fn run_map_parallel(
     Ok(())
 }
 
-/// Run stages for one parallel Map item.  Mirrors `run_stages` but takes
-/// `&[&Stage]` because the parallel closure can't borrow the owned Vec.
+/// Run stages for one parallel Map item.  Mirrors `run_stages` on an owned
+/// `Vec<Stage>` that was cloned into the spawned task.
 #[async_recursion]
 async fn run_parallel_item_stages(
     stages: &[Stage],
@@ -469,8 +469,8 @@ pub async fn llm_turn(
     )
     .await
     .context("LLM turn failed")?;
-    // Note: messages are not returned by run_agentic_loop on this branch;
-    // push the user message manually so context accumulates.
+    // run_agentic_loop does not return the updated message list; append the
+    // assistant reply manually so the conversation context accumulates.
     messages.push(crate::copilot::Message::assistant(
         Some(text.clone()),
         vec![],
@@ -520,7 +520,7 @@ fn detect_regression(
             current_obj.get(key).and_then(|v| v.as_f64()),
         ) {
             if b > 0.0 {
-                let change = (c - b) / b; // negative = regression (lower is better for latency)
+                let change = (c - b) / b; // assumes higher is better; a drop flags regression
                 if change < -threshold {
                     regressions.push(format!("{key}: {b:.4} → {c:.4} ({:+.1}%)", change * 100.0));
                 }
@@ -833,8 +833,8 @@ mod tests {
 
     #[test]
     fn benchmark_regression_fires_on_drop() {
-        let baseline = r#"{"fps": 100.0, "latency_ms": 10.0}"#;
-        let regressed = r#"{"fps": 70.0, "latency_ms": 10.0}"#; // -30% fps
+        let baseline = r#"{"fps": 100.0, "throughput": 10.0}"#;
+        let regressed = r#"{"fps": 70.0, "throughput": 10.0}"#; // -30% fps
 
         let result = detect_regression(baseline, regressed, 0.05).unwrap();
         assert!(result.is_some(), "30% fps drop should trigger regression");
@@ -888,7 +888,7 @@ mod shell_regression_tests {
                 },
             )
             .with_check(Check::BenchmarkNoRegression {
-                command: r#"echo '{"fps": 100.0, "latency_ms": 10.0}'"#.into(),
+                command: r#"echo '{"fps": 100.0, "throughput": 10.0}'"#.into(),
                 threshold: f64::INFINITY,
             })
             .with_on_fail(FailStrategy::Abort)],
@@ -928,7 +928,8 @@ mod shell_regression_tests {
                 Stage::new(
                     "dump",
                     Action::Shell {
-                        command: format!("printf '%s' '{{benchmark_baseline}}' > {path}"),
+                        // No manual quoting — render_shell will single-quote {benchmark_baseline}.
+                        command: format!("printf '%s' {{benchmark_baseline}} > {path}"),
                     },
                 )
                 .with_on_fail(FailStrategy::Abort),
@@ -1231,9 +1232,9 @@ mod llm_tests {
 
     // ---- Tests ----------------------------------------------------------
 
-    /// Action::Llm must write its output to `/tmp/amaebi_llm_output.txt` and
-    /// set ctx["last_llm_output_file"] so that downstream Shell stages can
-    /// safely read the commit message / analysis without shell injection.
+    /// Action::Llm must write its output to a unique temp file of the form
+    /// `/tmp/amaebi_llm_{pid}_{seq}.txt` and set ctx["last_llm_output_file"]
+    /// so that downstream Shell stages can read it safely.
     #[tokio::test]
     #[serial]
     async fn llm_stage_writes_output_file() {
@@ -1265,13 +1266,27 @@ mod llm_tests {
             summary.contains("fix: add caching layer"),
             "summary: {summary}"
         );
-        // The executor must persist the output so Shell stages can use it.
-        let content = tokio::fs::read_to_string("/tmp/amaebi_llm_output.txt")
-            .await
-            .unwrap();
+        // The executor writes to /tmp/amaebi_llm_{pid}_{seq}.txt (unique per call).
+        // Find the file by scanning /tmp for the PID prefix.
+        let pid = std::process::id();
+        let prefix = format!("amaebi_llm_{pid}_");
+        let found = std::fs::read_dir("/tmp")
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| {
+                let name = e.file_name();
+                let name = name.to_string_lossy();
+                if name.starts_with(&prefix) && name.ends_with(".txt") {
+                    std::fs::read_to_string(e.path())
+                        .unwrap_or_default()
+                        .contains("fix: add caching layer")
+                } else {
+                    false
+                }
+            });
         assert!(
-            content.contains("fix: add caching layer"),
-            "output file content: {content}"
+            found,
+            "LLM output file with expected content not found in /tmp"
         );
         assert_eq!(mock.request_count(), 1);
     }
