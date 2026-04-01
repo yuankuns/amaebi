@@ -40,6 +40,7 @@ async fn main() -> Result<()> {
     if matches!(
         &cli.command,
         cli::Command::Ask { .. }
+            | cli::Command::Chat { .. }
             | cli::Command::Session { .. }
             | cli::Command::Memory { .. }
             | cli::Command::Cache { .. }
@@ -79,6 +80,11 @@ async fn main() -> Result<()> {
             let http = reqwest::Client::new();
             auth_flow::ensure_authenticated(&http, &client_id, skip_validate).await
         }
+        cli::Command::Chat {
+            prompt,
+            socket,
+            model,
+        } => client::run_chat_loop(socket, prompt, model).await,
         cli::Command::Acp { model, socket } => agent_server::run(model, socket).await,
         cli::Command::Models => models::run().await,
         cli::Command::Memory { action, socket } => run_memory(action, socket).await,

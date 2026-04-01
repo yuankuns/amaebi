@@ -42,6 +42,25 @@ pub enum Command {
         #[arg(long, conflicts_with = "detach")]
         resume: Option<String>,
     },
+    /// Start an interactive multi-turn chat session.
+    ///
+    /// Sends the optional initial prompt, streams the reply, then keeps the
+    /// session alive: after each response a `>` prompt is shown so you can
+    /// type the next message without re-invoking `amaebi ask`.  Full turn
+    /// history is preserved across turns (consistent chat).
+    ///
+    /// Type an empty line or press Ctrl-D to exit.
+    Chat {
+        /// Optional opening message.  If omitted, the session starts empty
+        /// and you are immediately shown the `>` prompt.
+        prompt: Option<String>,
+        /// Path to the Unix socket.
+        #[arg(long, default_value = DEFAULT_SOCKET)]
+        socket: PathBuf,
+        /// Model to use (overrides AMAEBI_MODEL env var; default: gpt-4o).
+        #[arg(long)]
+        model: Option<String>,
+    },
     /// Authenticate with GitHub Copilot via the device flow.
     Auth {
         /// GitHub OAuth App client ID (defaults to the public neovim copilot.vim ID).
