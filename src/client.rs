@@ -1111,13 +1111,21 @@ mod prompt_input {
                 // Backspace (DEL = 0x7f on most terminals; BS = 0x08 on some)
                 0x7f | 0x08 => {
                     if let (Some(_), Some(w)) = (chars.pop(), widths.pop()) {
-                        // Erase exactly `w` display columns:
-                        // move cursor back w, write w spaces, move back w again.
-                        let back = vec![b'\x08'; w];
-                        let spaces = vec![b' '; w];
-                        output.write_all(&back)?;
-                        output.write_all(&spaces)?;
-                        output.write_all(&back)?;
+                        // ESC[wD moves the cursor left exactly w columns.
+                        // Raw \x08 bytes are unreliable for wide characters: some
+                        // terminals "snap" the cursor to the left boundary of a wide
+                        // char on the first \x08, so two \x08s overshoot by one
+                        // column when the character starts at an odd column position
+                        // (e.g. after an odd count of ASCII chars).  That leaves the
+                        // right-half cell of the CJK glyph visible on screen even
+                        // though the character was correctly removed from the buffer.
+                        //
+                        // ESC[K (erase to end of line) then clears all remaining
+                        // visual cells without needing to know the exact cell layout.
+                        // This is safe here because the cursor is always at the very
+                        // end of the user's input in this editor.
+                        let seq = format!("\x1b[{w}D\x1b[K");
+                        output.write_all(seq.as_bytes())?;
                         output.flush()?;
                     }
                 }
@@ -1263,12 +1271,15 @@ mod prompt_input {
 
         #[test]
         fn backspace_ascii_emits_one_column_erase() {
-            // After "a", DEL should emit: \x08, space, \x08
+            // After "a", DEL should emit ESC[1D ESC[K (CSI cursor-back 1 + erase EOL).
             let (_, echo) = run(b"a\x7f\r");
-            // "a" is echoed first, then the three-byte erase sequence, then \r\n
-            let erase_pos = echo.iter().position(|&b| b == b'\x08').unwrap();
-            let erase_seq = &echo[erase_pos..erase_pos + 3];
-            assert_eq!(erase_seq, b"\x08 \x08");
+            // "a" is echoed first (1 byte), then the CSI erase sequence, then \r\n.
+            let after_a = &echo[1..];
+            assert!(
+                after_a.starts_with(b"\x1b[1D\x1b[K"),
+                "expected ESC[1D ESC[K, got: {:?}",
+                after_a
+            );
         }
 
         #[test]
@@ -1276,8 +1287,13 @@ mod prompt_input {
             // DEL on empty buffer — no erase, just Enter result
             let (res, echo) = run(b"\x7f\r");
             assert_eq!(res.unwrap(), Some(String::new()));
-            // Only echo should be the CRLF from Enter; no backspace bytes before it
-            assert!(!echo[..echo.len().saturating_sub(2)].contains(&b'\x08'));
+            // Only echo should be the CRLF from Enter; no erase sequences emitted.
+            let before_crlf = &echo[..echo.len().saturating_sub(2)];
+            assert!(
+                !before_crlf.contains(&b'\x1b'),
+                "no erase sequence expected on empty backspace, got: {:?}",
+                before_crlf
+            );
         }
 
         #[test]
@@ -1309,38 +1325,37 @@ mod prompt_input {
         }
 
         #[test]
-        fn backspace_after_cjk_emits_two_column_erase() {
-            // "中" is 2 columns wide → erase sequence must be \x08\x08  \x08\x08
+        fn backspace_after_cjk_emits_csi_two_column_erase() {
+            // "中" is 2 columns wide → erase sequence must be ESC[2D ESC[K
+            // (CSI cursor-back 2 + erase-to-EOL), NOT raw \x08 pairs.
             let mut input = "中".as_bytes().to_vec();
             input.push(0x7f);
             input.push(b'\r');
             let (_, echo) = run(&input);
 
-            // Find first \x08 in echo (after the CJK char bytes themselves).
-            let cjk_bytes = "中".len(); // 3 bytes for this char
+            let cjk_bytes = "中".len(); // 3 UTF-8 bytes
             let after_cjk = &echo[cjk_bytes..];
-            // Expect: \x08\x08 (move back 2) + "  " (2 spaces) + \x08\x08 (move back 2)
             assert!(
-                after_cjk.starts_with(b"\x08\x08  \x08\x08"),
-                "expected 2-column erase, got: {:?}",
+                after_cjk.starts_with(b"\x1b[2D\x1b[K"),
+                "expected CSI 2-column erase (ESC[2D ESC[K), got: {:?}",
                 after_cjk
             );
         }
 
         #[test]
-        fn backspace_after_ascii_emits_one_column_erase_not_two() {
-            // "a" is 1 column wide → erase sequence must be \x08 (×1) + " " (×1) + \x08 (×1)
+        fn backspace_after_ascii_emits_csi_one_column_erase() {
+            // "a" is 1 column wide → erase sequence must be ESC[1D ESC[K
             let (_, echo) = run(b"a\x7f\r");
             let after_a = &echo[1..]; // skip echoed 'a'
             assert!(
-                after_a.starts_with(b"\x08 \x08"),
-                "expected 1-column erase, got: {:?}",
+                after_a.starts_with(b"\x1b[1D\x1b[K"),
+                "expected CSI 1-column erase (ESC[1D ESC[K), got: {:?}",
                 after_a
             );
-            // Must NOT start with double-backspace
+            // Must NOT use the 2-column variant
             assert!(
-                !after_a.starts_with(b"\x08\x08"),
-                "should not be 2-column erase"
+                !after_a.starts_with(b"\x1b[2D"),
+                "ASCII backspace must not use 2-column erase"
             );
         }
 
@@ -1351,6 +1366,105 @@ mod prompt_input {
             input.extend_from_slice(b"\x7f\x7f\r");
             let (res, _) = run(&input);
             assert_eq!(res.unwrap(), Some("a".to_string()));
+        }
+
+        // ------------------------------------------------------------------ //
+        // Regression: odd-ASCII-count + CJK backspace (the ghost-cell bug)
+        //
+        // When an odd number of ASCII chars precede a CJK character, the CJK
+        // glyph starts at an odd terminal column.  Some terminals "snap" the
+        // cursor to the left boundary of a wide char on the first raw \x08,
+        // making two \x08s overshoot by one column and leaving the right-half
+        // cell of the glyph visible.  Using ESC[wD instead avoids the snap.
+        // ------------------------------------------------------------------ //
+
+        /// Deleting CJK after 1 ASCII char must emit ESC[2D (not raw \x08\x08).
+        #[test]
+        fn odd_ascii_then_cjk_backspace_uses_csi_not_raw_bs() {
+            // "a中" + DEL → "a"
+            let mut input = "a中".as_bytes().to_vec();
+            input.push(0x7f);
+            input.push(b'\r');
+            let (res, echo) = run(&input);
+            assert_eq!(res.unwrap(), Some("a".to_string()));
+
+            // Locate the erase sequence (after "a" echo + "中" echo bytes).
+            let prefix_len = 1 + "中".len(); // 'a' + '中'
+            let after_cjk = &echo[prefix_len..];
+
+            // Must use CSI cursor-back 2, not two raw \x08 bytes.
+            assert!(
+                after_cjk.starts_with(b"\x1b[2D\x1b[K"),
+                "expected ESC[2D ESC[K after odd-column CJK, got: {:?}",
+                after_cjk
+            );
+            assert!(
+                !after_cjk.starts_with(b"\x08\x08"),
+                "must not use raw \\x08 pairs — they overshoot at odd column positions"
+            );
+        }
+
+        /// Deleting CJK after 3 ASCII chars (another odd count) works correctly.
+        #[test]
+        fn three_ascii_then_cjk_backspace_uses_csi() {
+            let mut input = "abc中".as_bytes().to_vec();
+            input.push(0x7f);
+            input.push(b'\r');
+            let (res, echo) = run(&input);
+            assert_eq!(res.unwrap(), Some("abc".to_string()));
+
+            let prefix_len = 3 + "中".len();
+            let after_cjk = &echo[prefix_len..];
+            assert!(
+                after_cjk.starts_with(b"\x1b[2D\x1b[K"),
+                "expected ESC[2D ESC[K, got: {:?}",
+                after_cjk
+            );
+        }
+
+        /// Deleting CJK after 2 ASCII chars (even count) also uses CSI.
+        #[test]
+        fn even_ascii_then_cjk_backspace_uses_csi() {
+            let mut input = "ab中".as_bytes().to_vec();
+            input.push(0x7f);
+            input.push(b'\r');
+            let (res, echo) = run(&input);
+            assert_eq!(res.unwrap(), Some("ab".to_string()));
+
+            let prefix_len = 2 + "中".len();
+            let after_cjk = &echo[prefix_len..];
+            assert!(
+                after_cjk.starts_with(b"\x1b[2D\x1b[K"),
+                "expected ESC[2D ESC[K, got: {:?}",
+                after_cjk
+            );
+        }
+
+        /// Mixed delete: "a中b" + 2×DEL checks buffer is "a" AND second erase
+        /// (for 'b', width=1) uses ESC[1D.
+        #[test]
+        fn odd_ascii_cjk_ascii_two_backspaces_erase_sequence() {
+            let mut input = "a中b".as_bytes().to_vec();
+            input.extend_from_slice(b"\x7f\x7f\r");
+            let (res, echo) = run(&input);
+            assert_eq!(res.unwrap(), Some("a".to_string()));
+
+            // First erase: 'b' (width 1) → ESC[1D ESC[K
+            let prefix = 1 + "中".len() + 1; // "a" + "中" + "b"
+            let after_b = &echo[prefix..];
+            assert!(
+                after_b.starts_with(b"\x1b[1D\x1b[K"),
+                "erase of 'b' should be ESC[1D ESC[K, got: {:?}",
+                after_b
+            );
+
+            // Second erase: '中' (width 2) → ESC[2D ESC[K
+            let after_b_erase = &after_b[b"\x1b[1D\x1b[K".len()..];
+            assert!(
+                after_b_erase.starts_with(b"\x1b[2D\x1b[K"),
+                "erase of '中' should be ESC[2D ESC[K, got: {:?}",
+                after_b_erase
+            );
         }
 
         #[test]
