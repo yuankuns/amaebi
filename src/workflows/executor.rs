@@ -158,6 +158,11 @@ async fn run_single_stage(
             let rendered = ctx.render(prompt);
             let text = llm_turn(state, model, messages, &rendered).await?;
             ctx.set("last_llm_output", &text);
+            // Write to a temp file so Shell stages can reference LLM output safely
+            // without shell-injection risk from inlining it into a command string.
+            let tmp = "/tmp/amaebi_llm_output.txt";
+            let _ = tokio::fs::write(tmp, &text).await;
+            ctx.set("last_llm_output_file", tmp);
             run_check(&stage.check, ctx).await?;
             Ok(Some(text))
         }

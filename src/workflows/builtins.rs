@@ -75,8 +75,10 @@ pub fn dev_loop(
             Stage::new(
                 "push-pr",
                 Action::Shell {
+                    // Use -F to read the commit message from the file written by the
+                    // preceding Llm stage (last_llm_output_file), avoiding shell injection.
                     command: "git add -A && \
-                              git commit -m \"$(cat /tmp/amaebi_commit_msg.txt)\" && \
+                              git commit -F {last_llm_output_file} && \
                               git push && \
                               gh pr create --fill"
                         .into(),
@@ -93,14 +95,19 @@ pub fn dev_loop(
                 },
             )
             .with_check(Check::Contains {
-                command: "gh pr view --json reviews -q '.reviews[-1].state'".into(),
+                // Output format: "APPROVED: " or "CHANGES_REQUESTED: <body text>"
+                // The check passes when stdout contains "APPROVED".
+                // On failure, {stdout} in inject_prompt contains the actual review comments.
+                command: "gh pr view --json reviews --jq \
+                          '.reviews[-1] | .state + \": \" + (.body // \"\")'"
+                    .into(),
                 pattern: "APPROVED".into(),
             })
             .with_on_fail(FailStrategy::Retry {
                 max: max_review_retries,
                 inject_prompt:
-                    "The Copilot reviewer left the following comments. Please address them:\n\n\
-                     {stdout}"
+                    "The code review requires changes. Review feedback:\n\n{stdout}\n\n\
+                     Please address the comments and push an updated commit."
                         .into(),
             }),
         ],
@@ -139,13 +146,20 @@ pub fn perf_sweep(
                 },
             )
             .with_on_fail(FailStrategy::Abort),
-            // Phase 2: capture baseline benchmark (code-guaranteed)
+            // Phase 2: capture baseline benchmark (code-guaranteed).
+            // The Check runs bench_cmd once and saves the result to ctx["benchmark_baseline"]
+            // so that later BenchmarkNoRegression checks have a real baseline to compare against.
+            // threshold=f64::INFINITY means this check never fails — it only initialises the baseline.
             Stage::new(
                 "baseline",
                 Action::Shell {
-                    command: bench_cmd.to_owned(),
+                    command: "true".into(), // noop; benchmark is run exactly once by the check below
                 },
             )
+            .with_check(Check::BenchmarkNoRegression {
+                command: bench_cmd.to_owned(),
+                threshold: f64::INFINITY,
+            })
             .with_on_fail(FailStrategy::Abort),
             // Phase 3: try each optimization point serially
             Stage::new(
@@ -173,11 +187,15 @@ pub fn perf_sweep(
                             },
                         )
                         .with_on_fail(FailStrategy::RevertAndSkip),
-                        // 3c: benchmark with regression check (code-guaranteed)
+                        // 3c: benchmark with regression check (code-guaranteed).
+                        // The action is a noop; bench_cmd runs exactly once inside the
+                        // BenchmarkNoRegression check.  Previously the action also ran
+                        // bench_cmd, which caused two runs per optimization and compared
+                        // the check's run against itself rather than against the baseline.
                         Stage::new(
                             "benchmark",
                             Action::Shell {
-                                command: bench_cmd.to_owned(),
+                                command: "true".into(), // noop; benchmark runs via the check below
                             },
                         )
                         .with_check(Check::BenchmarkNoRegression {
@@ -426,5 +444,111 @@ pub fn tune_sweep(
             )
             .with_on_fail(FailStrategy::Abort),
         ],
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dev_loop_push_pr_uses_llm_output_file() {
+        let wf = dev_loop("test task", "cargo test", 3, 3);
+        let stage = wf
+            .stages
+            .iter()
+            .find(|s| s.name == "push-pr")
+            .expect("push-pr stage missing");
+        if let Action::Shell { command } = &stage.action {
+            assert!(
+                command.contains("{last_llm_output_file}"),
+                "push-pr must use {{last_llm_output_file}} to avoid shell injection; got: {command}"
+            );
+            assert!(
+                !command.contains("/tmp/amaebi_commit_msg.txt"),
+                "push-pr must not reference the old hard-coded temp path"
+            );
+        } else {
+            panic!("push-pr must be a Shell action");
+        }
+    }
+
+    #[test]
+    fn dev_loop_review_check_includes_body() {
+        let wf = dev_loop("test task", "cargo test", 3, 3);
+        let stage = wf
+            .stages
+            .iter()
+            .find(|s| s.name == "review")
+            .expect("review stage missing");
+        if let Some(Check::Contains { command, pattern }) = &stage.check {
+            assert_eq!(pattern, "APPROVED");
+            // The check command must output the review body so that inject_prompt
+            // has useful content when the check fails.
+            assert!(
+                command.contains("body"),
+                "review check command must include .body to surface review comments; got: {command}"
+            );
+        } else {
+            panic!("review stage must have a Contains check");
+        }
+    }
+
+    #[test]
+    fn perf_sweep_baseline_initialises_benchmark_baseline() {
+        let wf = perf_sweep("target", "", "bench --output json", 0.05);
+        let stage = wf
+            .stages
+            .iter()
+            .find(|s| s.name == "baseline")
+            .expect("baseline stage missing");
+        // Action must be a noop so bench_cmd only runs once (inside the check).
+        if let Action::Shell { command } = &stage.action {
+            assert_eq!(
+                command, "true",
+                "baseline action must be noop; benchmark runs via the check"
+            );
+        } else {
+            panic!("baseline must be a Shell action");
+        }
+        // Must have a BenchmarkNoRegression check to initialise ctx["benchmark_baseline"].
+        assert!(
+            matches!(stage.check, Some(Check::BenchmarkNoRegression { .. })),
+            "baseline stage must have BenchmarkNoRegression check to initialise the baseline"
+        );
+    }
+
+    #[test]
+    fn perf_sweep_benchmark_runs_only_via_check() {
+        let wf = perf_sweep("target", "", "bench --output json", 0.05);
+        let optimize_each = wf
+            .stages
+            .iter()
+            .find(|s| s.name == "optimize-each")
+            .expect("optimize-each stage missing");
+        if let Action::Map { stages, .. } = &optimize_each.action {
+            let benchmark = stages
+                .iter()
+                .find(|s| s.name == "benchmark")
+                .expect("benchmark sub-stage missing");
+            if let Action::Shell { command } = &benchmark.action {
+                assert_eq!(
+                    command, "true",
+                    "benchmark stage action must be noop to avoid running bench_cmd twice"
+                );
+            } else {
+                panic!("benchmark must be a Shell action");
+            }
+            assert!(
+                matches!(benchmark.check, Some(Check::BenchmarkNoRegression { .. })),
+                "benchmark stage must have BenchmarkNoRegression check"
+            );
+        } else {
+            panic!("optimize-each must be a Map action");
+        }
     }
 }

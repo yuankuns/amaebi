@@ -396,6 +396,19 @@ pub async fn run_chat_loop(
             }
         };
 
+        // /workflow slash command: run workflow directly without sending to LLM.
+        if prompt.trim_start().starts_with("/workflow") {
+            let summary = run_workflow_slash(&prompt, &model).await;
+            match summary {
+                Ok(text) => {
+                    eprintln!();
+                    println!("{text}");
+                }
+                Err(e) => eprintln!("workflow error: {e:#}"),
+            }
+            continue 'session;
+        }
+
         let req = Request::Chat {
             prompt: prompt.clone(),
             tmux_pane: std::env::var("TMUX_PANE").ok(),
@@ -1887,4 +1900,109 @@ mod tests {
         assert_eq!(frames[frames.len() - 2], "new-1");
         assert_eq!(frames[frames.len() - 1], "new-2");
     }
+}
+
+// ---------------------------------------------------------------------------
+// /workflow slash command handler
+// ---------------------------------------------------------------------------
+
+/// Parse and execute a `/workflow` slash command from `amaebi chat`.
+///
+/// Syntax mirrors `amaebi workflow` subcommands:
+///   /workflow dev-loop implement the new cache layer --test-cmd cargo test
+///   /workflow bug-fix --repo owner/repo
+///   /workflow perf-sweep SDPA backward kernel --bench-cmd python bench.py
+///   /workflow tune-sweep attention hyperparams --run-cmd ./train.sh --resource gpu
+///
+/// Positional arguments (task/target) are collected as all whitespace-separated
+/// tokens between the subcommand and the first `--flag`.
+async fn run_workflow_slash(prompt: &str, model: &str) -> anyhow::Result<String> {
+    use crate::workflows::{builtins, executor, Context, ResourcePool};
+    use std::sync::Arc;
+
+    let tokens: Vec<&str> = prompt.trim_start_matches('/').split_whitespace().collect();
+    // tokens[0] = "workflow", tokens[1] = subcommand, tokens[2..] = args
+    if tokens.len() < 2 {
+        anyhow::bail!("usage: /workflow <dev-loop|bug-fix|perf-sweep|tune-sweep> [args]");
+    }
+
+    let state = Arc::new(
+        crate::daemon::DaemonState::new()
+            .await
+            .context("initialising workflow state")?,
+    );
+    let ctx = Context::new();
+
+    // Collect all positional tokens from `start` until the first `--flag`.
+    let positional = |start: usize| -> String {
+        let end = tokens[start..]
+            .iter()
+            .position(|t| t.starts_with("--"))
+            .map(|p| p + start)
+            .unwrap_or(tokens.len());
+        tokens.get(start..end).unwrap_or(&[]).join(" ")
+    };
+
+    // Find the value for a `--flag value` pair.
+    let flag =
+        |flag: &str| -> Option<&str> { tokens.windows(2).find(|w| w[0] == flag).map(|w| w[1]) };
+
+    let workflow = match tokens[1] {
+        "dev-loop" => {
+            let task = positional(2);
+            let task = if task.is_empty() {
+                "complete the task".to_owned()
+            } else {
+                task
+            };
+            let test_cmd = flag("--test-cmd").unwrap_or("cargo test");
+            let max_retries = flag("--max-retries")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(5);
+            builtins::dev_loop(&task, test_cmd, max_retries, max_retries)
+        }
+        "bug-fix" => {
+            let repo = flag("--repo").unwrap_or(".");
+            let test_cmd = flag("--test-cmd").unwrap_or("cargo test");
+            let max_retries = flag("--max-retries")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(3);
+            builtins::bug_fix(repo, test_cmd, max_retries)
+        }
+        "perf-sweep" => {
+            let target = positional(2);
+            let target = if target.is_empty() {
+                "the target".to_owned()
+            } else {
+                target
+            };
+            let bench_cmd = flag("--bench-cmd").unwrap_or("make bench");
+            let threshold = flag("--regression-threshold")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0.05);
+            builtins::perf_sweep(&target, "", bench_cmd, threshold)
+        }
+        "tune-sweep" => {
+            let target = positional(2);
+            let target = if target.is_empty() {
+                "the target".to_owned()
+            } else {
+                target
+            };
+            let run_cmd = flag("--run-cmd").unwrap_or("echo {item_index}");
+            let result_cmd = flag("--result-cmd").unwrap_or("echo done");
+            let resource = flag("--resource").unwrap_or("gpu");
+            let count = flag("--resource-count")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1usize);
+            let wf = builtins::tune_sweep(&target, "", run_cmd, result_cmd, resource);
+            let pool = ResourcePool::new([(resource, count)]);
+            return executor::execute(&wf, &state, model, ctx, &pool).await;
+        }
+        other => anyhow::bail!(
+            "unknown workflow: '{other}'. Valid: dev-loop, bug-fix, perf-sweep, tune-sweep"
+        ),
+    };
+
+    executor::execute(&workflow, &state, model, ctx, &ResourcePool::empty()).await
 }
