@@ -42,6 +42,21 @@ pub enum Command {
         #[arg(long, conflicts_with = "detach")]
         resume: Option<String>,
     },
+    /// Start an interactive multi-turn chat session.
+    ///
+    /// Stays open after each response: type the next message at the `>` prompt.
+    /// Uses the same per-directory session UUID as `amaebi ask`, so history is
+    /// shared and the existing compaction mechanism applies.
+    /// Empty line or Ctrl-D exits.
+    Chat {
+        /// Optional opening message.
+        prompt: Option<String>,
+        #[arg(long, default_value = DEFAULT_SOCKET)]
+        socket: PathBuf,
+        /// Model to use (overrides AMAEBI_MODEL env var; default: gpt-4o).
+        #[arg(long)]
+        model: Option<String>,
+    },
     /// Authenticate with GitHub Copilot via the device flow.
     Auth {
         /// GitHub OAuth App client ID (defaults to the public neovim copilot.vim ID).

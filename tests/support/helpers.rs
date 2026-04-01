@@ -478,6 +478,97 @@ pub async fn send_request(client: &ClientHandle, req: &Request) -> Result<Vec<Re
     Ok(responses)
 }
 
+// ---------------------------------------------------------------------------
+// Long-connection helper for amaebi chat tests
+// ---------------------------------------------------------------------------
+
+/// A persistent daemon connection that can send multiple Chat requests on the
+/// same socket, simulating what `amaebi chat` does (long connection).
+pub struct LongChatConnection {
+    writer: tokio::io::WriteHalf<UnixStream>,
+    reader: BufReader<tokio::io::ReadHalf<UnixStream>>,
+}
+
+impl LongChatConnection {
+    /// Open a persistent connection to the daemon.
+    pub async fn connect(socket: &Path) -> Result<Self> {
+        let stream = UnixStream::connect(socket)
+            .await
+            .context("connecting to daemon")?;
+        let (reader, writer) = tokio::io::split(stream);
+        Ok(Self {
+            writer,
+            reader: BufReader::new(reader),
+        })
+    }
+
+    /// Read one newline-delimited response frame from the connection.
+    async fn read_frame(&mut self) -> Result<Option<Response>> {
+        let mut line = String::new();
+        let n = self.reader.read_line(&mut line).await?;
+        if n == 0 {
+            return Ok(None); // EOF
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            return Ok(None);
+        }
+        let frame: Response = serde_json::from_str(trimmed)
+            .with_context(|| format!("parsing response: {trimmed:?}"))?;
+        Ok(Some(frame))
+    }
+
+    /// Send a Chat request and collect all response frames until Done/Error.
+    pub async fn chat(
+        &mut self,
+        prompt: &str,
+        session_id: &str,
+        model: &str,
+    ) -> Result<Vec<Response>> {
+        let req = Request::Chat {
+            prompt: prompt.to_string(),
+            tmux_pane: None,
+            session_id: Some(session_id.to_string()),
+            model: model.to_string(),
+        };
+        let mut line = serde_json::to_string(&req)?;
+        line.push('\n');
+        self.writer.write_all(line.as_bytes()).await?;
+
+        let mut responses = Vec::new();
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                match self.read_frame().await? {
+                    None => break,
+                    Some(frame) => {
+                        let done = matches!(frame, Response::Done | Response::Error { .. });
+                        responses.push(frame);
+                        if done {
+                            break;
+                        }
+                    }
+                }
+            }
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .context("chat turn timed out after 30 s")??;
+        Ok(responses)
+    }
+
+    /// Send a Steer request on this connection (same socket as the Chat).
+    pub async fn steer(&mut self, session_id: &str, message: &str) -> Result<()> {
+        let req = Request::Steer {
+            session_id: session_id.to_string(),
+            message: message.to_string(),
+        };
+        let mut line = serde_json::to_string(&req)?;
+        line.push('\n');
+        self.writer.write_all(line.as_bytes()).await?;
+        Ok(())
+    }
+}
+
 /// Collect all text chunks from a list of responses into a single string.
 pub fn collect_text(responses: &[Response]) -> String {
     responses
