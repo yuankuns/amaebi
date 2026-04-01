@@ -342,6 +342,9 @@ pub async fn run_chat_loop(
     let mut next_prompt = initial_prompt;
     let mut last_ctrl_c: Option<Instant> = None;
     let mut steer_pending = false;
+    // Text chunks buffered while a steer correction is being typed so that
+    // streaming output does not interleave with user input.
+    let mut steer_text_buf: Vec<String> = Vec::new();
 
     'session: loop {
         let prompt = match next_prompt.take() {
@@ -412,11 +415,23 @@ pub async fn run_chat_loop(
                     let resp: Response = serde_json::from_str(&line)?;
                     match resp {
                         Response::Text { chunk } => {
-                            stdout.write_all(chunk.as_bytes()).await?;
-                            stdout.flush().await?;
+                            if steer_pending {
+                                // Buffer text while the user is typing a steer
+                                // correction so streaming output does not
+                                // interleave with the correction prompt.
+                                steer_text_buf.push(chunk);
+                            } else {
+                                stdout.write_all(chunk.as_bytes()).await?;
+                                stdout.flush().await?;
+                            }
                         }
                         Response::Done => {
+                            // Flush any text that arrived while steer was pending.
+                            for chunk in steer_text_buf.drain(..) {
+                                stdout.write_all(chunk.as_bytes()).await?;
+                            }
                             stdout.write_all(b"\n").await?;
+                            stdout.flush().await?;
                             break;
                         }
                         Response::Error { message } => anyhow::bail!("{message}"),
@@ -471,6 +486,11 @@ pub async fn run_chat_loop(
                         if trimmed.is_empty() {
                             steer_pending = false;
                             last_ctrl_c = None; // cancelling steer resets the double-Ctrl-C window
+                            // Flush buffered text now that steer is cancelled.
+                            for chunk in steer_text_buf.drain(..) {
+                                let _ = stdout.write_all(chunk.as_bytes()).await;
+                            }
+                            let _ = stdout.flush().await;
                         } else {
                             let steer_req = Request::Steer {
                                 session_id: session_id.clone(),

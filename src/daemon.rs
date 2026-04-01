@@ -323,7 +323,15 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
         let req: Request = match serde_json::from_str(&line) {
             Ok(r) => r,
             Err(e) => {
-                tracing::warn!(error = %e, "ignoring unparseable request frame");
+                tracing::warn!(error = %e, "unparseable request frame; sending error to client");
+                let mut w = writer.lock().await;
+                let _ = write_frame(
+                    &mut *w,
+                    &Response::Error {
+                        message: format!("invalid request: {e}"),
+                    },
+                )
+                .await;
                 continue;
             }
         };
@@ -565,6 +573,10 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                             Some(line) => { if let Ok(req) = serde_json::from_str::<Request>(&line) { match req {
                                 Request::Steer { session_id: sid, message } if sid == expected_sid => { let _ = steer_tx.send(Some(message)).await; }
                                 Request::Interrupt { session_id: sid } if sid == expected_sid => { let _ = steer_tx.send(None).await; }
+                                // Steer/Interrupt for a different session: silently ignore per IPC contract.
+                                Request::Steer { .. } | Request::Interrupt { .. } => {
+                                    tracing::debug!("ignoring steer/interrupt for non-active session");
+                                }
                                 _ => {
                                     tracing::warn!("dropping unsolicited frame during active agentic loop");
                                     let mut w = writer.lock().await;
@@ -775,6 +787,10 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                             Some(line) => { if let Ok(req) = serde_json::from_str::<Request>(&line) { match req {
                                 Request::Steer { session_id: sid, message } if sid == expected_chat_sid => { let _ = steer_tx.send(Some(message)).await; }
                                 Request::Interrupt { session_id: sid } if sid == expected_chat_sid => { let _ = steer_tx.send(None).await; }
+                                // Steer/Interrupt for a different session: silently ignore per IPC contract.
+                                Request::Steer { .. } | Request::Interrupt { .. } => {
+                                    tracing::debug!("ignoring steer/interrupt for non-active session");
+                                }
                                 _ => {
                                     tracing::warn!("dropping unsolicited frame during active chat loop");
                                     let mut w = writer.lock().await;

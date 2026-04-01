@@ -1004,14 +1004,16 @@ async fn spawn_agent_workspace_passed_to_sandbox() {
 /// When the LLM returns two spawn_agent tool calls in a single response, the
 /// daemon must execute them concurrently rather than sequentially.
 ///
-/// Each child runs `shell_command("sleep 1")` before returning its final text.
-/// If the children ran sequentially the wall-clock time would be ≥ 2 s; the
-/// assert of elapsed < 1.8 s proves they ran concurrently.
+/// Each child runs `shell_command("sleep 2")` before returning its final text.
+/// If the children ran sequentially the wall-clock time would be ≥ 4 s; the
+/// assert of elapsed < 3.5 s proves they ran concurrently.  The 1.5 s gap
+/// between the parallel ceiling (~2 s + overhead) and the sequential floor
+/// (~4 s) is wide enough to be reliable on loaded CI runners.
 ///
 /// Mock LLM sequence (6 requests total):
 ///   1. Parent turn 1  → multi_tool_calls: two spawn_agent with parallel=true
-///   2. Child 1 turn 1 → tool_call shell_command("sleep 1")
-///   3. Child 2 turn 1 → tool_call shell_command("sleep 1")
+///   2. Child 1 turn 1 → tool_call shell_command("sleep 2")
+///   3. Child 2 turn 1 → tool_call shell_command("sleep 2")
 ///   4. Child 1 turn 2 → text "child1 done"
 ///   5. Child 2 turn 2 → text "child2 done"
 ///   6. Parent turn 2  → text "all done"
@@ -1034,17 +1036,17 @@ async fn spawn_agent_parallel_calls() {
             r#"{"task":"task B","workspace":"/tmp","parallel":true}"#,
         ),
     ]));
-    // 2 & 3. First two child requests each get a shell_command that sleeps 1 s.
+    // 2 & 3. First two child requests each get a shell_command that sleeps 2 s.
     //        Order is non-deterministic; the mock queue serves them FIFO.
     server.enqueue(ScriptedResponse::tool_call(
         "sc-parallel-1",
         "shell_command",
-        r#"{"command":"sleep 1"}"#,
+        r#"{"command":"sleep 2"}"#,
     ));
     server.enqueue(ScriptedResponse::tool_call(
         "sc-parallel-2",
         "shell_command",
-        r#"{"command":"sleep 1"}"#,
+        r#"{"command":"sleep 2"}"#,
     ));
     // 4 & 5. Final text for each child (order is non-deterministic).
     server.enqueue(ScriptedResponse::text_chunks(vec!["child1 done"]));
@@ -1057,9 +1059,11 @@ async fn spawn_agent_parallel_calls() {
         .expect("start_daemon");
     let client = connect_client(&daemon.socket);
 
+    let start = std::time::Instant::now();
     let responses = send_message(&client, "run two child tasks in parallel")
         .await
         .expect("send_message");
+    let elapsed = start.elapsed();
 
     let text = collect_text(&responses);
     assert!(
@@ -1067,9 +1071,13 @@ async fn spawn_agent_parallel_calls() {
         "expected parent final text 'all done' in response: {text:?}"
     );
 
-    // No wall-clock assertion: with 1s sleeps the sequential floor is ~2s,
-    // which would pass any practical CI threshold.  Concurrency is proven
-    // by spawn_agent_parallel_timing (#[ignore], 5s sleeps, assert < 8s).
+    // Parallel: ~2 s wall-clock + overhead.  Sequential floor ≥ 4 s.
+    // < 3.5 s is only reachable via concurrent execution, giving ~0.5 s
+    // headroom above the parallel ceiling and ~0.5 s below the sequential floor.
+    assert!(
+        elapsed.as_millis() < 3500,
+        "expected parallel execution in < 3.5 s, took {elapsed:?}"
+    );
 
     // 6 LLM requests: 1 parent + 2×(shell_command + text) + 1 parent final.
     let reqs = server.take_requests();
