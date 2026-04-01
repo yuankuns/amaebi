@@ -338,6 +338,8 @@ async fn run_workflow_tool(args: serde_json::Value, ctx: &SpawnContext) -> Resul
 
     let model = std::env::var("AMAEBI_MODEL").unwrap_or_else(|_| "gpt-4o".to_string());
 
+    tracing::info!(workflow = %workflow_name, model = %model, "run_workflow: starting");
+
     // Build a minimal DaemonState from the SpawnContext so the workflow's
     // LLM stages can call run_agentic_loop.
     let state = Arc::new(crate::daemon::DaemonState {
