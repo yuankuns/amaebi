@@ -23,7 +23,7 @@
 //! CLI collide on the same row.
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, Datelike, TimeZone as _, Utc};
+use chrono::{DateTime, Datelike, TimeZone as _, Timelike, Utc};
 use rusqlite::{params, Connection};
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
@@ -540,11 +540,19 @@ pub fn due_jobs(jobs: &[CronJob], now: &chrono::DateTime<chrono::Utc>) -> Vec<Cr
                     _ => None,
                 }
             };
+            // Truncate anchor to minute precision before comparing: the cron
+            // expression has no seconds component (fires_at always has seconds=0),
+            // so comparing against a sub-second anchor would falsely push an
+            // "April 1 09:34" job created at "09:34:47" to the next year.
+            let anchor_minute = anchor
+                .with_second(0)
+                .and_then(|dt: DateTime<Utc>| dt.with_nanosecond(0))
+                .unwrap_or(anchor);
             let fires_at: Option<DateTime<Utc>> = match build_ymd(anchor.year()) {
                 // fires_at is before the job was created — the schedule crosses
                 // a year boundary (e.g. "Jan 15" job created in December): try
                 // the next year.
-                Some(dt) if dt < anchor => build_ymd(anchor.year() + 1),
+                Some(dt) if dt < anchor_minute => build_ymd(anchor.year() + 1),
                 other => other,
             };
             match fires_at {
