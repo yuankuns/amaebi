@@ -33,53 +33,21 @@ pub enum Request {
         session_id: String,
         model: String,
     },
-    HeartbeatAdd {
-        session_id: String,
-        description: String,
-    },
-    HeartbeatList {
-        session_id: String,
-        all: bool,
-    },
-    HeartbeatDismiss {
-        id: i64,
-    },
-    HeartbeatTrigger,
 }
 
 /// A single frame streamed from the daemon back to the client.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Response {
-    Text {
-        chunk: String,
-    },
+    Text { chunk: String },
     Done,
-    Error {
-        message: String,
-    },
-    ToolUse {
-        name: String,
-        detail: String,
-    },
+    Error { message: String },
+    ToolUse { name: String, detail: String },
     SteerAck,
-    DetachAccepted {
-        session_id: String,
-    },
-    MemoryEntry {
-        role: String,
-        content: String,
-    },
+    DetachAccepted { session_id: String },
+    MemoryEntry { role: String, content: String },
     Compacting,
-    WaitingForInput {
-        prompt: String,
-    },
-    HeartbeatEntry {
-        id: i64,
-        description: String,
-        status: String,
-        created_at: String,
-    },
+    WaitingForInput { prompt: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -508,61 +476,6 @@ pub async fn send_request(client: &ClientHandle, req: &Request) -> Result<Vec<Re
     .await
     .context("send_request timed out after 30 s waiting for Done/Error frame")??;
     Ok(responses)
-}
-
-/// Write a `config.json` with heartbeat enabled into `home_path/.amaebi/`.
-///
-/// The daemon reads this on every scheduler tick, so heartbeat will be active.
-pub fn write_heartbeat_config(home_path: &Path) -> Result<()> {
-    let amaebi_dir = home_path.join(".amaebi");
-    std::fs::create_dir_all(&amaebi_dir).context("creating .amaebi dir")?;
-    // interval_minutes: 1 so the scheduler doesn't skip on elapsed-time guard
-    // (actual triggering is done via HeartbeatTrigger IPC, not the ticker).
-    std::fs::write(
-        amaebi_dir.join("config.json"),
-        r#"{"heartbeat":{"interval_minutes":1}}"#,
-    )
-    .context("writing config.json")?;
-    Ok(())
-}
-
-/// Send a `HeartbeatAdd` IPC request and drain the `Done` response.
-pub async fn send_heartbeat_add(
-    client: &ClientHandle,
-    session_id: &str,
-    description: &str,
-) -> Result<()> {
-    send_request(
-        client,
-        &Request::HeartbeatAdd {
-            session_id: session_id.to_string(),
-            description: description.to_string(),
-        },
-    )
-    .await?;
-    Ok(())
-}
-
-/// Send a `HeartbeatList` IPC request and return the entries.
-pub async fn send_heartbeat_list(
-    client: &ClientHandle,
-    session_id: &str,
-    all: bool,
-) -> Result<Vec<Response>> {
-    send_request(
-        client,
-        &Request::HeartbeatList {
-            session_id: session_id.to_string(),
-            all,
-        },
-    )
-    .await
-}
-
-/// Send a `HeartbeatTrigger` IPC request and drain the `Done` response.
-pub async fn send_heartbeat_trigger(client: &ClientHandle) -> Result<()> {
-    send_request(client, &Request::HeartbeatTrigger).await?;
-    Ok(())
 }
 
 /// Collect all text chunks from a list of responses into a single string.

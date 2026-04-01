@@ -117,10 +117,6 @@ impl ToolExecutor for LocalExecutor {
                      (child agents cannot spawn further agents)"
                 ),
             },
-            "heartbeat_note" => match &self.spawn_ctx {
-                Some(ctx) => heartbeat_note(args, &ctx.db).await,
-                None => anyhow::bail!("heartbeat_note is not available in this context"),
-            },
             other => anyhow::bail!("unknown tool: {other}"),
         }
     }
@@ -239,31 +235,6 @@ async fn read_file(args: serde_json::Value) -> Result<String> {
     tokio::fs::read_to_string(path)
         .await
         .with_context(|| format!("read_file: reading '{path}'"))
-}
-
-/// Record a heartbeat item for the given session.
-async fn heartbeat_note(
-    args: serde_json::Value,
-    db: &Arc<Mutex<rusqlite::Connection>>,
-) -> Result<String> {
-    let description = args["description"]
-        .as_str()
-        .context("heartbeat_note: missing string argument 'description'")?;
-    // session_id is optional: provided in interactive chat contexts via the
-    // system prompt but unavailable in cron/detach contexts.
-    let session_id = args["session_id"].as_str().unwrap_or("global");
-
-    let db = Arc::clone(db);
-    let desc = description.to_owned();
-    let sid = session_id.to_owned();
-    tokio::task::spawn_blocking(move || {
-        let conn = db.lock().unwrap_or_else(|p| p.into_inner());
-        crate::memory_db::add_heartbeat_item(&conn, &sid, &desc, "agent")
-    })
-    .await
-    .unwrap_or_else(|e| Err(anyhow::anyhow!("heartbeat write panicked: {e}")))?;
-
-    Ok(format!("Heartbeat item recorded: {description}"))
 }
 
 /// Spawn a child agent session to complete a task in an isolated sandbox.
@@ -442,8 +413,6 @@ async fn spawn_agent(args: serde_json::Value, ctx: &SpawnContext) -> Result<Stri
         executor: Box::new(child_executor),
         db: Arc::clone(&ctx.db),
         compacting_sessions: Arc::clone(&ctx.compacting_sessions),
-        heartbeat_notify: Arc::new(tokio::sync::Notify::new()),
-        active_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
     };
 
     let messages = vec![
@@ -462,7 +431,7 @@ async fn spawn_agent(args: serde_json::Value, ctx: &SpawnContext) -> Result<Stri
 
     // Fix 5: child agents do not get spawn_agent in their tool schema to
     // prevent unbounded recursion at the schema level.
-    let (final_text, _, _) = crate::daemon::run_agentic_loop(
+    let (final_text, _) = crate::daemon::run_agentic_loop(
         &child_state,
         &model,
         messages,
@@ -602,35 +571,6 @@ pub fn tool_schemas(include_spawn_agent: bool) -> Vec<serde_json::Value> {
             }
         }),
     ];
-    // heartbeat_note is always included when the executor has a spawn_ctx
-    // (i.e. a database connection), regardless of the spawn_agent gate.
-    // Child agents that run with include_spawn_agent=false should still be
-    // able to record follow-up items.
-    schemas.push(serde_json::json!({
-        "type": "function",
-        "function": {
-            "name": "heartbeat_note",
-            "description": "Record a pending follow-up item for the heartbeat checker \
-                            to review later. Use this when you identify something that \
-                            should be checked after this conversation ends (e.g. a test \
-                            to re-run, a deployment to verify, a file to check after a \
-                            cron job completes).",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "description": {
-                        "type": "string",
-                        "description": "What should be checked or done later."
-                    },
-                    "session_id": {
-                        "type": "string",
-                        "description": "The session UUID. Provided in the system prompt for interactive chat sessions; omit if not available (e.g. in cron contexts)."
-                    }
-                },
-                "required": ["description"]
-            }
-        }
-    }));
     if include_spawn_agent {
         schemas.push(serde_json::json!({
             "type": "function",
@@ -1040,29 +980,6 @@ mod tests {
         // Core tools must still be present.
         for name in ["shell_command", "read_file", "edit_file"] {
             assert!(names.contains(&name), "missing core tool: {name}");
-        }
-        // heartbeat_note must be present even when spawn_agent is disabled —
-        // it is decoupled from the spawn_agent gate (comment 22 regression).
-        assert!(
-            names.contains(&"heartbeat_note"),
-            "heartbeat_note must be present when include_spawn_agent=false"
-        );
-    }
-
-    #[test]
-    fn heartbeat_note_present_in_both_schema_variants() {
-        // heartbeat_note must be available in child-agent contexts (false) AND
-        // in the full parent context (true).
-        for include in [false, true] {
-            let schemas = tool_schemas(include);
-            let count = schemas
-                .iter()
-                .filter(|s| s["function"]["name"].as_str() == Some("heartbeat_note"))
-                .count();
-            assert_eq!(
-                count, 1,
-                "include_spawn_agent={include}: expected exactly 1 heartbeat_note schema, got {count}"
-            );
         }
     }
 

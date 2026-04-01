@@ -24,74 +24,6 @@ use crate::auth::amaebi_home;
 /// Default session TTL when no configuration is present.
 const DEFAULT_TTL_MINUTES: u64 = 30;
 
-/// Default heartbeat interval when present in config but no interval specified.
-const DEFAULT_HEARTBEAT_INTERVAL_MINUTES: u64 = 30;
-
-/// Heartbeat configuration.  When present in `config.json`, the daemon
-/// periodically reviews pending heartbeat items and surfaces actionable
-/// ones via the inbox.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HeartbeatConfig {
-    /// How often (in minutes) the heartbeat scheduler fires.
-    #[serde(default = "default_heartbeat_interval")]
-    pub interval_minutes: u64,
-
-    /// Active hours window `[start, end)` in UTC (0–23).
-    /// Heartbeat only fires when the current UTC hour is within this range.
-    /// If absent, heartbeat fires at any hour.
-    #[serde(default)]
-    pub active_hours: Option<(u8, u8)>,
-
-    /// Model override for heartbeat LLM calls.
-    /// Falls back to `AMAEBI_MODEL` / `"gpt-4o"` when absent.
-    #[serde(default)]
-    pub model: Option<String>,
-}
-
-fn default_heartbeat_interval() -> u64 {
-    DEFAULT_HEARTBEAT_INTERVAL_MINUTES
-}
-
-impl Default for HeartbeatConfig {
-    fn default() -> Self {
-        Self {
-            interval_minutes: DEFAULT_HEARTBEAT_INTERVAL_MINUTES,
-            active_hours: None,
-            model: None,
-        }
-    }
-}
-
-impl HeartbeatConfig {
-    /// Check whether the current UTC hour is within the active window.
-    pub fn is_active_now(&self) -> bool {
-        let Some((start, end)) = self.active_hours else {
-            return true;
-        };
-        // Treat out-of-range values as misconfigured — log and treat as always active.
-        if start > 23 || end > 23 {
-            tracing::warn!(
-                start,
-                end,
-                "heartbeat active_hours values must be in 0–23; treating as always active"
-            );
-            return true;
-        }
-        let hour = chrono::Utc::now()
-            .format("%H")
-            .to_string()
-            .parse::<u8>()
-            .unwrap_or(0);
-        if start <= end {
-            // Normal range: e.g. [9, 21) means 09:00–20:59
-            hour >= start && hour < end
-        } else {
-            // Wrap-around: e.g. [22, 8) means 22:00–07:59
-            hour >= start || hour < end
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
     /// TTL overrides keyed by one of three kinds of identifier (minutes):
@@ -111,11 +43,6 @@ pub struct Config {
     /// 5. built-in 30-minute fallback
     #[serde(default)]
     pub ttl_minutes: HashMap<String, u64>,
-
-    /// Heartbeat configuration.  When absent (`null` or omitted), the
-    /// heartbeat scheduler is disabled entirely.
-    #[serde(default)]
-    pub heartbeat: Option<HeartbeatConfig>,
 }
 
 impl Config {
@@ -306,94 +233,5 @@ mod tests {
         let cfg2: Config = serde_json::from_str(&json).unwrap();
         assert_eq!(cfg2.ttl_minutes.get("default"), Some(&30));
         assert_eq!(cfg2.ttl_minutes.get("/projectX"), Some(&120));
-    }
-
-    // ---- HeartbeatConfig ---------------------------------------------------
-
-    #[test]
-    fn heartbeat_absent_means_disabled() {
-        let cfg: Config = serde_json::from_str(r#"{"ttl_minutes":{}}"#).unwrap();
-        assert!(cfg.heartbeat.is_none());
-    }
-
-    #[test]
-    fn heartbeat_empty_object_uses_defaults() {
-        let cfg: Config = serde_json::from_str(r#"{"heartbeat":{}}"#).unwrap();
-        let hb = cfg.heartbeat.unwrap();
-        assert_eq!(hb.interval_minutes, 30);
-        assert!(hb.active_hours.is_none());
-        assert!(hb.model.is_none());
-    }
-
-    #[test]
-    fn heartbeat_full_config_round_trip() {
-        let json = r#"{
-            "heartbeat": {
-                "interval_minutes": 15,
-                "active_hours": [9, 21],
-                "model": "gpt-4o-mini"
-            }
-        }"#;
-        let cfg: Config = serde_json::from_str(json).unwrap();
-        let hb = cfg.heartbeat.unwrap();
-        assert_eq!(hb.interval_minutes, 15);
-        assert_eq!(hb.active_hours, Some((9, 21)));
-        assert_eq!(hb.model.as_deref(), Some("gpt-4o-mini"));
-    }
-
-    #[test]
-    fn heartbeat_is_active_no_restriction() {
-        let hb = HeartbeatConfig::default();
-        assert!(hb.is_active_now());
-    }
-
-    #[test]
-    fn heartbeat_active_hours_out_of_range_treats_as_always_active() {
-        // Values outside 0-23 are invalid; is_active_now must return true
-        // (always-active) rather than producing wrong results silently.
-        let hb = HeartbeatConfig {
-            active_hours: Some((25, 10)), // start=25 is invalid
-            ..Default::default()
-        };
-        assert!(
-            hb.is_active_now(),
-            "out-of-range active_hours should be treated as always active"
-        );
-
-        let hb2 = HeartbeatConfig {
-            active_hours: Some((9, 200)), // end=200 is invalid
-            ..Default::default()
-        };
-        assert!(
-            hb2.is_active_now(),
-            "out-of-range active_hours end should be treated as always active"
-        );
-    }
-
-    #[test]
-    fn heartbeat_active_hours_valid_boundary_values() {
-        // 0 and 23 are valid boundary values; must not be rejected.
-        let hb = HeartbeatConfig {
-            active_hours: Some((0, 23)),
-            ..Default::default()
-        };
-        // Just verify it doesn't panic and returns a bool.
-        let _ = hb.is_active_now();
-    }
-
-    #[test]
-    fn heartbeat_interval_saturating_mul_does_not_overflow() {
-        // u64::MAX / 60 + 1 overflows with plain multiplication.
-        // saturating_mul must not panic and must cap at u64::MAX.
-        let hb = HeartbeatConfig {
-            interval_minutes: u64::MAX,
-            ..Default::default()
-        };
-        // This exercises the saturating_mul path in the scheduler.
-        // We can't call the scheduler directly, but we can verify the
-        // arithmetic produces a valid Duration rather than panicking.
-        let secs = hb.interval_minutes.saturating_mul(60);
-        let _dur = std::time::Duration::from_secs(secs);
-        // If we reach here without panicking, the overflow is handled.
     }
 }
