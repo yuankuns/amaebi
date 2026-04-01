@@ -233,7 +233,20 @@ async fn test_compaction_triggered_at_threshold() {
             "unexpected Compacting during seeding at turn {i}"
         );
     }
-    server.take_requests(); // drain seed requests
+
+    // Wait until every seed response has been consumed from the mock queue
+    // before killing the seed daemon.  On slow CI runners there is a window
+    // between the client receiving Done and the daemon's HTTP response being
+    // fully read; if we kill the daemon inside that window the mock server may
+    // not have drained the response, leaving it in the queue for Phase 2.
+    let drain_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        if server.pending_response_count() == 0 || std::time::Instant::now() > drain_deadline {
+            break;
+        }
+    }
+    server.take_requests(); // drain seed request log
 
     // --- Phase 2: restart daemon with low threshold ---
     // Destructure seed_daemon to keep home_dir alive (preserving the SQLite DB)
@@ -277,11 +290,16 @@ async fn test_compaction_triggered_at_threshold() {
         "expected Compacting frame in responses: {responses:?}"
     );
 
-    // Wait for background summary call to arrive.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    // Wait until both responses (chat reply + background summary) have been
+    // consumed from the mock queue.  Using pending_response_count() == 0 is
+    // more reliable than counting captured requests: it directly confirms that
+    // the background compact_session task fetched its response, eliminating the
+    // race where a slow CI runner times out and the summary response is still
+    // queued when the assertion runs.
+    let summary_deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
     loop {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        if server.peek_request_count() >= 2 || std::time::Instant::now() > deadline {
+        if server.pending_response_count() == 0 || std::time::Instant::now() > summary_deadline {
             break;
         }
     }
