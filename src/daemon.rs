@@ -82,16 +82,6 @@ pub struct DaemonState {
     /// insert the session ID.  The task removes itself on completion.  If the
     /// ID is already present, skip the spawn to prevent overlapping compactions.
     pub compacting_sessions: Arc<Mutex<HashSet<String>>>,
-    /// Notify handle to trigger an immediate heartbeat check.
-    pub heartbeat_notify: Arc<tokio::sync::Notify>,
-    /// Currently active interactive sessions mapped to their steer channel.
-    ///
-    /// Registered when a Chat/Resume connection opens; removed when it closes.
-    /// The heartbeat scheduler uses this to inject follow-up messages directly
-    /// into the running agentic loop.  Heartbeat items are only considered
-    /// pending while the session is open; they are auto-dismissed on close.
-    pub active_sessions:
-        Arc<Mutex<std::collections::HashMap<String, tokio::sync::mpsc::Sender<Option<String>>>>>,
 }
 
 impl DaemonState {
@@ -128,39 +118,7 @@ impl DaemonState {
             executor: Box::new(executor),
             db,
             compacting_sessions,
-            heartbeat_notify: Arc::new(tokio::sync::Notify::new()),
-            active_sessions: Arc::new(Mutex::new(std::collections::HashMap::new())),
         })
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Active session helpers
-// ---------------------------------------------------------------------------
-
-/// Register a session as active, storing the steer sender so the heartbeat
-/// scheduler can inject follow-up messages into the running agentic loop.
-/// Deregister a session and auto-dismiss its pending heartbeat items.
-///
-/// Called when a Chat/Resume connection closes (both success and error paths).
-async fn deregister_active_session(state: &DaemonState, session_id: &str) {
-    state
-        .active_sessions
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .remove(session_id);
-
-    let db = Arc::clone(&state.db);
-    let sid = session_id.to_owned();
-    let result = tokio::task::spawn_blocking(move || {
-        let conn = db.lock().unwrap_or_else(|p| p.into_inner());
-        memory_db::dismiss_pending_heartbeat_items(&conn, &sid)
-    })
-    .await
-    .unwrap_or_else(|e| Err(anyhow::anyhow!("heartbeat dismiss panicked: {e}")));
-
-    if let Err(e) = result {
-        tracing::warn!(error = %e, session_id, "failed to dismiss heartbeat items on session close");
     }
 }
 
@@ -303,14 +261,6 @@ pub async fn run(socket: PathBuf) -> Result<()> {
         let state = Arc::clone(&state);
         tokio::spawn(async move {
             run_cron_scheduler(state).await;
-        });
-    }
-
-    // Spawn the heartbeat scheduler (if configured).
-    {
-        let state = Arc::clone(&state);
-        tokio::spawn(async move {
-            run_heartbeat_scheduler(state).await;
         });
     }
 
@@ -473,7 +423,6 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
 
                 let mut messages =
                     build_messages(&prompt, tmux_pane.as_deref(), &history, &[], None);
-                inject_session_id(&mut messages, &sid);
                 inject_skill_files(&mut messages).await;
 
                 // Pre-flight token check: trim to hot tail if over budget.
@@ -486,7 +435,6 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                         &history[..]
                     };
                     messages = build_messages(&prompt, tmux_pane.as_deref(), trimmed, &[], None);
-                    inject_session_id(&mut messages, &sid);
                     inject_skill_files(&mut messages).await;
                 }
 
@@ -501,7 +449,7 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                 match run_agentic_loop(&state, &model, messages, &mut sink, &mut steer_rx, true)
                     .await
                 {
-                    Ok((final_text, _, _)) => {
+                    Ok((final_text, _)) => {
                         let user_text = truncate_chars(prompt.clone(), MAX_PROMPT_CHARS);
                         let assistant_text = truncate_chars(final_text.clone(), MAX_RESPONSE_CHARS);
 
@@ -564,36 +512,6 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
             }
 
             let (steer_tx, mut steer_rx) = tokio::sync::mpsc::channel::<Option<String>>(16);
-
-            // Atomic check+insert: same guard as Chat, same TOCTOU fix.
-            // The MutexGuard is dropped before the .await so the future stays Send.
-            let session_already_active = {
-                let mut sessions = state
-                    .active_sessions
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner());
-                if sessions.contains_key(&session_id) {
-                    true
-                } else {
-                    sessions.insert(session_id.clone(), steer_tx.clone());
-                    false
-                }
-            };
-            if session_already_active {
-                write_frame(
-                    &mut writer,
-                    &Response::Error {
-                        message: format!(
-                            "session {session_id} already has an active chat; \
-                             wait for it to finish or run `amaebi session new` \
-                             to start a fresh session"
-                        ),
-                    },
-                )
-                .await?;
-                return Ok(());
-            }
-
             let expected_resume_sid = session_id.clone();
             tokio::spawn(async move {
                 while let Ok(Some(frame)) = lines.next_line().await {
@@ -668,7 +586,6 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                 &summaries,
                 own_summary.as_deref(),
             );
-            inject_session_id(&mut messages, &session_id);
             inject_skill_files(&mut messages).await;
 
             // Pre-flight token check.
@@ -687,22 +604,19 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                     &summaries,
                     own_summary.as_deref(),
                 );
-                inject_session_id(&mut messages, &session_id);
                 inject_skill_files(&mut messages).await;
             }
 
             match run_agentic_loop(&state, &model, messages, &mut writer, &mut steer_rx, true).await
             {
-                Ok((response_text, _, _)) => {
+                Ok((response_text, _)) => {
                     let user_text = truncate_chars(prompt.clone(), MAX_PROMPT_CHARS);
                     let assistant_text = truncate_chars(response_text.clone(), MAX_RESPONSE_CHARS);
 
                     store_conversation(&state, &session_id, &user_text, &assistant_text).await;
-                    deregister_active_session(&state, &session_id).await;
                     write_frame(&mut writer, &Response::Done).await?;
                 }
                 Err(e) => {
-                    deregister_active_session(&state, &session_id).await;
                     tracing::error!(error = %e, "resume agentic loop error");
                     let _ = write_frame(
                         &mut writer,
@@ -751,35 +665,6 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
             // Steering channel: the spawned reader task sends user corrections
             // here; the agentic loop drains them between model turns.
             let (steer_tx, mut steer_rx) = tokio::sync::mpsc::channel::<Option<String>>(16);
-
-            // Enforce one active chat per session and register atomically.
-            // Drop the MutexGuard before the .await so the future stays Send.
-            let session_already_active = {
-                let mut sessions = state
-                    .active_sessions
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner());
-                if sessions.contains_key(&sid) {
-                    true
-                } else {
-                    sessions.insert(sid.clone(), steer_tx.clone());
-                    false
-                }
-            };
-            if session_already_active {
-                write_frame(
-                    &mut writer,
-                    &Response::Error {
-                        message: format!(
-                            "session {sid} already has an active chat; \
-                             wait for it to finish or run `amaebi session new` \
-                             to start a fresh session"
-                        ),
-                    },
-                )
-                .await?;
-                return Ok(());
-            }
 
             // Spawn a task that reads subsequent frames from the client on
             // this connection.  Any Steer frames are forwarded to steer_tx so
@@ -830,34 +715,32 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                 }
             });
 
-            // Load full-turn JSON history (openclaw/pi approach) AND text-only
-            // history.  The JSON turns provide richer context (tool calls
-            // included); the text-only rows drive compaction and FTS search.
+            // Load full session history, past-session summaries, and the session's own
+            // running summary (if any) for token-budget-driven compaction decisions.
             let db = Arc::clone(&state.db);
             let sid_clone = sid.clone();
-            let (turns_json, history, past_summaries, own_summary) =
+            let (history, past_summaries, own_summary) =
                 tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
                     let conn = db.lock().unwrap_or_else(|p| p.into_inner());
-                    let turns_json = memory_db::get_session_turns_json(&conn, &sid_clone)?;
                     let history = memory_db::get_session_history(&conn, &sid_clone)?;
                     let past_summaries =
                         memory_db::get_recent_summaries(&conn, &sid_clone, MAX_SUMMARIES)?;
                     let own_summary = memory_db::get_session_own_summary(&conn, &sid_clone)?;
-                    Ok((turns_json, history, past_summaries, own_summary))
+                    Ok((history, past_summaries, own_summary))
                 })
                 .await
                 .unwrap_or_else(|e| {
                     tracing::warn!(error = %e, "session history load panicked");
-                    Ok((vec![], vec![], vec![], None))
+                    Ok((vec![], vec![], None))
                 })
                 .unwrap_or_else(|e| {
                     tracing::warn!(error = %e, "failed to load session history");
-                    (vec![], vec![], vec![], None)
+                    (vec![], vec![], None)
                 });
 
             // Cross-session: if this is the first turn of a new session, compact any
             // old sessions that have never been summarised.
-            if history.is_empty() && turns_json.is_empty() {
+            if history.is_empty() {
                 let db = Arc::clone(&state.db);
                 let sid_clone = sid.clone();
                 let old_sessions = tokio::task::spawn_blocking(move || {
@@ -879,44 +762,13 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                 }
             }
 
-            // Build the initial messages array.  When full JSON turns are
-            // available, use them to include complete tool-call context from
-            // prior turns (the openclaw/pi approach).  Fall back to text-only
-            // history for older sessions that pre-date this feature.
-            let mut messages = if turns_json.is_empty() {
-                build_messages(
-                    &prompt,
-                    tmux_pane.as_deref(),
-                    &history,
-                    &past_summaries,
-                    own_summary.as_deref(),
-                )
-            } else {
-                build_messages_from_turns(
-                    &prompt,
-                    tmux_pane.as_deref(),
-                    &turns_json,
-                    &past_summaries,
-                    own_summary.as_deref(),
-                )
-                .unwrap_or_else(|e| {
-                    tracing::warn!(error = %e, "failed to build messages from turns; falling back to text-only history");
-                    build_messages(
-                        &prompt,
-                        tmux_pane.as_deref(),
-                        &history,
-                        &past_summaries,
-                        own_summary.as_deref(),
-                    )
-                })
-            };
-            inject_session_id(&mut messages, &sid);
-            // Record where the current user prompt sits BEFORE inject_skill_files,
-            // which may append extra system messages after the user turn.
-            // Capturing here ensures the stored turn delta starts at the user
-            // prompt and never includes the injected skill-file system messages
-            // (which would otherwise be replayed as history on subsequent turns).
-            let mut user_prompt_idx = messages.len() - 1;
+            let mut messages = build_messages(
+                &prompt,
+                tmux_pane.as_deref(),
+                &history,
+                &past_summaries,
+                own_summary.as_deref(),
+            );
             inject_skill_files(&mut messages).await;
 
             // Pre-flight token check: if over the compaction threshold, trim to hot tail.
@@ -924,8 +776,6 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
             // compaction even if the API does not return usage data.
             let threshold = compaction_threshold_tokens(&model);
             let pre_flight_trimmed = if count_message_tokens(&messages) > threshold {
-                // When trimming, always fall back to the text-only hot tail to
-                // guarantee the messages fit — JSON turns may be much larger.
                 let hot = HOT_TAIL_PAIRS * 2;
                 let trimmed = if history.len() > hot {
                     &history[history.len() - hot..]
@@ -939,9 +789,6 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                     &past_summaries,
                     own_summary.as_deref(),
                 );
-                inject_session_id(&mut messages, &sid);
-                // Update before inject so the index stays correct after inject.
-                user_prompt_idx = messages.len() - 1;
                 inject_skill_files(&mut messages).await;
                 tracing::debug!(
                     hot_tail = trimmed.len(),
@@ -958,41 +805,11 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
 
             match run_agentic_loop(&state, &model, messages, &mut writer, &mut steer_rx, true).await
             {
-                Ok((response_text, prompt_tokens, final_messages)) => {
-                    // Persist the full turn delta as JSON (openclaw/pi approach).
-                    // This includes the user prompt, every tool call/result pair,
-                    // and the final assistant reply — giving subsequent turns
-                    // the complete reasoning context, not just the final text.
-                    let turn_delta: Vec<Message> = final_messages[user_prompt_idx..]
-                        .iter()
-                        .filter(|m| m.role != "system")
-                        .cloned()
-                        .collect();
-                    match serde_json::to_string(&turn_delta) {
-                        Ok(turn_json) => {
-                            let db_t = Arc::clone(&state.db);
-                            let sid_t = sid.clone();
-                            let ts_t = chrono::Utc::now().to_rfc3339();
-                            let result = tokio::task::spawn_blocking(move || {
-                                let conn = db_t.lock().unwrap_or_else(|p| p.into_inner());
-                                memory_db::store_session_turn(&conn, &sid_t, &ts_t, &turn_json)
-                            })
-                            .await
-                            .unwrap_or_else(|e| {
-                                Err(anyhow::anyhow!("store_session_turn panicked: {e}"))
-                            });
-                            if let Err(e) = result {
-                                tracing::warn!(error = %e, "failed to persist session turn delta");
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!(error = %e, "failed to serialize session turn delta");
-                        }
-                    }
-
-                    // Also persist text-only summary for FTS search and compaction.
+                Ok((response_text, prompt_tokens)) => {
                     let user_text = truncate_chars(prompt.clone(), MAX_PROMPT_CHARS);
                     let assistant_text = truncate_chars(response_text.clone(), MAX_RESPONSE_CHARS);
+
+                    // Persist to SQLite memory store.
                     store_conversation(&state, &sid, &user_text, &assistant_text).await;
 
                     // Within-session compaction: trigger when the context is large enough.
@@ -1047,11 +864,9 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                             ));
                         }
                     }
-                    deregister_active_session(&state, &sid).await;
                     write_frame(&mut writer, &Response::Done).await?;
                 }
                 Err(e) => {
-                    deregister_active_session(&state, &sid).await;
                     tracing::error!(error = %e, "agentic loop error");
                     let _ = write_frame(
                         &mut writer,
@@ -1062,102 +877,6 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                     .await;
                 }
             }
-        }
-
-        Request::HeartbeatAdd {
-            session_id,
-            description,
-        } => {
-            let db = Arc::clone(&state.db);
-            let result = tokio::task::spawn_blocking(move || {
-                let conn = db.lock().unwrap_or_else(|p| p.into_inner());
-                memory_db::add_heartbeat_item(&conn, &session_id, &description, "user")
-            })
-            .await
-            .unwrap_or_else(|e| Err(anyhow::anyhow!("heartbeat add panicked: {e}")));
-            match result {
-                Ok(id) => {
-                    tracing::debug!(id, "heartbeat item added");
-                    write_frame(&mut writer, &Response::Done).await?;
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "failed to add heartbeat item");
-                    write_frame(
-                        &mut writer,
-                        &Response::Error {
-                            message: format!("failed to add heartbeat item: {e:#}"),
-                        },
-                    )
-                    .await?;
-                }
-            }
-        }
-
-        Request::HeartbeatList { session_id, all } => {
-            let db = Arc::clone(&state.db);
-            let result = tokio::task::spawn_blocking(move || {
-                let conn = db.lock().unwrap_or_else(|p| p.into_inner());
-                memory_db::list_heartbeat_items(&conn, &session_id, all)
-            })
-            .await
-            .unwrap_or_else(|e| Err(anyhow::anyhow!("heartbeat list panicked: {e}")));
-            match result {
-                Ok(items) => {
-                    for item in items {
-                        write_frame(
-                            &mut writer,
-                            &Response::HeartbeatEntry {
-                                id: item.id,
-                                description: item.description,
-                                status: item.status,
-                                created_at: item.created_at,
-                            },
-                        )
-                        .await?;
-                    }
-                    write_frame(&mut writer, &Response::Done).await?;
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "failed to list heartbeat items");
-                    write_frame(
-                        &mut writer,
-                        &Response::Error {
-                            message: format!("failed to list heartbeat items: {e:#}"),
-                        },
-                    )
-                    .await?;
-                }
-            }
-        }
-
-        Request::HeartbeatDismiss { id } => {
-            let db = Arc::clone(&state.db);
-            let result = tokio::task::spawn_blocking(move || {
-                let conn = db.lock().unwrap_or_else(|p| p.into_inner());
-                memory_db::dismiss_heartbeat_item(&conn, id)
-            })
-            .await
-            .unwrap_or_else(|e| Err(anyhow::anyhow!("heartbeat dismiss panicked: {e}")));
-            match result {
-                Ok(()) => {
-                    write_frame(&mut writer, &Response::Done).await?;
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "failed to dismiss heartbeat item");
-                    write_frame(
-                        &mut writer,
-                        &Response::Error {
-                            message: format!("failed to dismiss heartbeat item: {e:#}"),
-                        },
-                    )
-                    .await?;
-                }
-            }
-        }
-
-        Request::HeartbeatTrigger => {
-            state.heartbeat_notify.notify_one();
-            write_frame(&mut writer, &Response::Done).await?;
         }
     }
 
@@ -1382,11 +1101,6 @@ async fn compact_session(
                     .context("compact_session: begin transaction")?;
                 memory_db::store_session_summary(&conn, &sid, &summary, &ts)?;
                 memory_db::archive_session_turns(&conn, &ids_to_archive)?;
-                // Clear full-turn JSON history: the compacted turns are now
-                // captured in the session summary.  New turns accumulate fresh
-                // after this point; old turns would otherwise inflate context
-                // beyond the compaction threshold again on the very next request.
-                memory_db::delete_session_turns(&conn, &sid)?;
                 tx.commit().context("compact_session: commit transaction")
             })
             .await
@@ -1598,7 +1312,7 @@ pub(crate) async fn run_agentic_loop<W>(
     writer: &mut W,
     steer_rx: &mut tokio::sync::mpsc::Receiver<Option<String>>,
     include_spawn_agent: bool,
-) -> Result<(String, usize, Vec<Message>)>
+) -> Result<(String, usize)>
 where
     W: AsyncWriteExt + Unpin,
 {
@@ -1867,12 +1581,6 @@ where
                 }
 
                 final_text = resp.text;
-                // Push the final assistant turn into messages so that
-                // run_agentic_loop returns a complete history — the caller
-                // uses this to persist the full turn delta (consistent chat).
-                if !final_text.is_empty() {
-                    messages.push(Message::assistant(Some(final_text.clone()), vec![]));
-                }
                 break;
             }
 
@@ -2121,15 +1829,12 @@ where
                 let warning = format!("\n[stopped: unexpected finish reason '{reason}']");
                 write_frame(writer, &Response::Text { chunk: warning }).await?;
                 final_text = resp.text;
-                if !final_text.is_empty() {
-                    messages.push(Message::assistant(Some(final_text.clone()), vec![]));
-                }
                 break;
             }
         }
     }
 
-    Ok((final_text, last_prompt_tokens, messages))
+    Ok((final_text, last_prompt_tokens))
 }
 
 // ---------------------------------------------------------------------------
@@ -2238,18 +1943,6 @@ async fn inject_skill_files_from(messages: &mut Vec<Message>, amaebi_home: &std:
 /// All `history` rows are included without a sliding-window cap.  Callers are
 /// responsible for trimming the history slice to a token budget before calling
 /// (see the pre-flight check in `Request::Chat` / `Request::Resume` handlers).
-/// Append the session UUID to the system message so the agent can reference it
-/// in tool calls (e.g. `heartbeat_note`).
-fn inject_session_id(messages: &mut [Message], session_id: &str) {
-    if let Some(sys) = messages.first_mut() {
-        if sys.role == "system" {
-            if let Some(ref mut content) = sys.content {
-                content.push_str(&format!(" Your session ID is {session_id}."));
-            }
-        }
-    }
-}
-
 pub(crate) fn build_messages(
     prompt: &str,
     tmux_pane: Option<&str>,
@@ -2300,62 +1993,6 @@ pub(crate) fn build_messages(
 
     messages.push(Message::user(prompt.to_owned()));
     messages
-}
-
-/// Build the messages array from full JSON turn history (consistent-chat path).
-///
-/// Each element of `turns_json` is a serialized `Vec<Message>` representing one
-/// complete agentic-loop turn: [user, (tool_call, tool_result)*, assistant].
-/// Concatenating all turns gives the full conversation context including every
-/// tool-call exchange — the same approach used by openclaw/pi's `SessionManager`.
-///
-/// Falls back to logging a warning (and returning `Err`) if any turn cannot be
-/// deserialized; the caller should fall back to `build_messages` in that case.
-pub(crate) fn build_messages_from_turns(
-    prompt: &str,
-    tmux_pane: Option<&str>,
-    turns_json: &[String],
-    past_summaries: &[String],
-    own_summary: Option<&str>,
-) -> anyhow::Result<Vec<Message>> {
-    let mut system = "You are a helpful, concise AI assistant embedded in a tmux terminal. \
-                      Answer in plain text; avoid markdown unless the user asks for it. \
-                      You have tools available to inspect the terminal, run commands, \
-                      and read or edit files — use them when they help you answer accurately. \
-                      After using any tool, you MUST always follow up with a text response \
-                      summarising what you did and the outcome — never end silently after a tool call."
-        .to_owned();
-
-    if let Some(pane) = tmux_pane {
-        system.push_str(&format!(" The user's active tmux pane is {pane}."));
-    }
-
-    if !past_summaries.is_empty() {
-        system.push_str("\n\nSummaries from past sessions (oldest first):\n");
-        for s in past_summaries {
-            system.push_str(&truncate_chars(s.clone(), MAX_SUMMARY_CHARS));
-            system.push('\n');
-        }
-    }
-
-    let mut messages = vec![Message::system(system)];
-
-    if let Some(summary) = own_summary {
-        let summary = truncate_chars(summary.to_owned(), MAX_SUMMARY_CHARS * 2);
-        messages.push(Message::user(
-            "[Summary of earlier in this session]".to_owned(),
-        ));
-        messages.push(Message::assistant(Some(summary), vec![]));
-    }
-
-    for (i, blob) in turns_json.iter().enumerate() {
-        let turn: Vec<Message> = serde_json::from_str(blob)
-            .with_context(|| format!("deserializing session turn {i}"))?;
-        messages.extend(turn);
-    }
-
-    messages.push(Message::user(prompt.to_owned()));
-    Ok(messages)
 }
 
 // ---------------------------------------------------------------------------
@@ -2434,7 +2071,6 @@ async fn run_cron_job(state: Arc<DaemonState>, job: &cron::CronJob) {
     let model = std::env::var("AMAEBI_MODEL").unwrap_or_else(|_| "gpt-4o".to_string());
 
     let mut messages = build_messages(&job.description, None, &[], &[], None);
-    inject_session_id(&mut messages, &session_id);
     inject_skill_files(&mut messages).await;
     // Cron jobs are non-interactive: drop the sender immediately so steer_rx.recv()
     // returns None at once if the model ends with '?', rather than timing out.
@@ -2444,7 +2080,7 @@ async fn run_cron_job(state: Arc<DaemonState>, job: &cron::CronJob) {
     let result = run_agentic_loop(&state, &model, messages, &mut sink, &mut steer_rx, true).await;
 
     let (output, run_ok) = match result {
-        Ok((final_text, _, _)) => {
+        Ok((final_text, _)) => {
             store_conversation(&state, &session_id, &job.description, &final_text).await;
             (final_text, true)
         }
@@ -2478,222 +2114,12 @@ async fn run_cron_job(state: Arc<DaemonState>, job: &cron::CronJob) {
 }
 
 // ---------------------------------------------------------------------------
-// Heartbeat scheduler
-// ---------------------------------------------------------------------------
-
-/// Background task: checks pending heartbeat items on a configurable interval.
-///
-/// Reads `config.json` on every tick so interval/active-hours changes take
-/// effect without a daemon restart.  Only sessions that are currently open
-/// (registered in `active_sessions`) are considered — heartbeat items are
-/// session-scoped and meaningless after the chat closes.
-///
-/// A manual trigger via [`Request::HeartbeatTrigger`] is supported through the
-/// `heartbeat_notify` handle on `DaemonState`.
-async fn run_heartbeat_scheduler(state: Arc<DaemonState>) {
-    let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-    let mut last_run = tokio::time::Instant::now()
-        .checked_sub(std::time::Duration::from_secs(3600))
-        .unwrap_or_else(tokio::time::Instant::now);
-
-    loop {
-        let manual_triggered;
-        tokio::select! {
-            _ = interval.tick() => { manual_triggered = false; }
-            _ = state.heartbeat_notify.notified() => {
-                tracing::info!("heartbeat: manual trigger received");
-                manual_triggered = true;
-            }
-        }
-
-        let config = crate::config::Config::load();
-        let hb_config = match config.heartbeat {
-            Some(ref hb) => hb.clone(),
-            None => continue, // heartbeat disabled
-        };
-
-        // Interval guard — skip if not enough time has elapsed, unless this
-        // was an explicit manual trigger (which always bypasses the guard).
-        let interval_secs = hb_config.interval_minutes.saturating_mul(60);
-        let interval_dur = std::time::Duration::from_secs(interval_secs);
-        if !manual_triggered && last_run.elapsed() < interval_dur {
-            continue;
-        }
-
-        // Active hours check.
-        if !hb_config.is_active_now() {
-            tracing::debug!("heartbeat: outside active hours, skipping");
-            continue;
-        }
-
-        // Snapshot active sessions — clone the steer senders so we can release
-        // the lock before doing any async work.
-        let active: Vec<(String, tokio::sync::mpsc::Sender<Option<String>>)> = state
-            .active_sessions
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-
-        if active.is_empty() {
-            tracing::debug!("heartbeat: no active sessions");
-            last_run = tokio::time::Instant::now();
-            continue;
-        }
-
-        let model = hb_config.model.unwrap_or_else(|| {
-            std::env::var("AMAEBI_MODEL").unwrap_or_else(|_| "gpt-4o".to_string())
-        });
-
-        for (session_id, steer_tx) in &active {
-            run_heartbeat_for_session(&state, session_id, &model, steer_tx).await;
-        }
-
-        last_run = tokio::time::Instant::now();
-    }
-}
-
-/// Run a single heartbeat check for one active session.
-///
-/// Queries pending items from SQLite, asks the LLM whether anything is
-/// actionable, and if so injects the report as a user message into the
-/// running agentic loop via `steer_tx`.  The message is also logged at
-/// debug level for diagnostics.
-///
-/// Items are auto-resolved after being surfaced so they are not re-checked
-/// on the next tick.
-async fn run_heartbeat_for_session(
-    state: &DaemonState,
-    session_id: &str,
-    model: &str,
-    steer_tx: &tokio::sync::mpsc::Sender<Option<String>>,
-) {
-    // Load pending items from SQLite.
-    let db = Arc::clone(&state.db);
-    let sid = session_id.to_owned();
-    let loaded = tokio::task::spawn_blocking(move || {
-        let conn = db.lock().unwrap_or_else(|p| p.into_inner());
-        let items = memory_db::get_pending_heartbeat_items(&conn, &sid)?;
-        let summary = memory_db::get_session_own_summary(&conn, &sid)?;
-        Ok::<_, anyhow::Error>((items, summary))
-    })
-    .await
-    .unwrap_or_else(|e| Err(anyhow::anyhow!("heartbeat DB read panicked: {e}")));
-
-    let (items, summary) = match loaded {
-        Ok((items, _)) if items.is_empty() => return, // nothing to check
-        Ok(pair) => pair,
-        Err(e) => {
-            tracing::warn!(error = %e, session_id, "heartbeat: failed to load items");
-            return;
-        }
-    };
-
-    // Build lightweight prompt.
-    let mut item_list = String::new();
-    for (i, item) in items.iter().enumerate() {
-        item_list.push_str(&format!("{}. {}\n", i + 1, item.description));
-    }
-
-    let system =
-        "You are a heartbeat checker reviewing pending follow-up items for an AI agent session. \
-        For each item, determine if it needs attention or action right now. \
-        If nothing needs attention, reply with exactly HEARTBEAT_OK and nothing else. \
-        If any item needs attention, provide a concise plain-text report of what should be done.";
-
-    let mut user_prompt = format!("Pending items:\n{item_list}");
-    if let Some(ref s) = summary {
-        user_prompt.push_str(&format!("\nSession context:\n{s}"));
-    }
-
-    let messages = vec![Message::system(system), Message::user(&user_prompt)];
-
-    tracing::info!(
-        session_id,
-        items = items.len(),
-        "heartbeat: checking session"
-    );
-
-    // Call LLM — no tools, lightweight.
-    let token = match state.tokens.get(&state.http).await {
-        Ok(t) => t,
-        Err(e) => {
-            tracing::warn!(error = %e, "heartbeat: failed to get Copilot token");
-            return;
-        }
-    };
-
-    let mut sink = tokio::io::sink();
-    let result = copilot::stream_chat(
-        &state.http,
-        &token.value,
-        &token.base_url,
-        model,
-        &messages,
-        &[],
-        1024,
-        &mut sink,
-    )
-    .await;
-
-    let response_text = match result {
-        Ok(resp) => resp.text,
-        Err(e) => {
-            tracing::warn!(error = %e, session_id, "heartbeat: LLM call failed");
-            return;
-        }
-    };
-
-    let report = response_text.trim();
-
-    if report == "HEARTBEAT_OK" {
-        tracing::debug!(session_id, "heartbeat: nothing actionable");
-        return;
-    }
-
-    // Actionable — inject into the running conversation as a user message.
-    tracing::debug!(
-        session_id,
-        report,
-        "heartbeat: injecting follow-up into session"
-    );
-
-    if let Err(e) = steer_tx.send(Some(report.to_string())).await {
-        // Session closed between our snapshot and now — that's fine.
-        tracing::debug!(session_id, error = %e, "heartbeat: session closed before inject");
-        return;
-    }
-
-    // Auto-resolve surfaced items so they aren't re-checked next tick.
-    let db = Arc::clone(&state.db);
-    let ids: Vec<i64> = items.iter().map(|i| i.id).collect();
-    let timestamp = chrono::Utc::now().to_rfc3339();
-    let resolve_result = tokio::task::spawn_blocking(move || {
-        let conn = db.lock().unwrap_or_else(|p| p.into_inner());
-        for id in &ids {
-            memory_db::resolve_heartbeat_item(&conn, *id, &timestamp)?;
-        }
-        Ok::<_, anyhow::Error>(())
-    })
-    .await
-    .unwrap_or_else(|e| Err(anyhow::anyhow!("heartbeat resolve panicked: {e}")));
-
-    if let Err(e) = resolve_result {
-        tracing::warn!(error = %e, session_id, "heartbeat: failed to auto-resolve items");
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::copilot;
 
     fn make_db_entry(id: i64, role: &str, content: &str) -> memory_db::DbMemoryEntry {
         memory_db::DbMemoryEntry {
@@ -2850,87 +2276,6 @@ mod tests {
             summary_placeholder.contains("Summary of earlier"),
             "summary label must appear before history"
         );
-    }
-
-    // ---- build_messages_from_turns tests --------------------------------
-
-    #[test]
-    fn build_messages_from_turns_empty_produces_system_and_user() {
-        let msgs = build_messages_from_turns("hello", None, &[], &[], None).unwrap();
-        assert_eq!(msgs.len(), 2);
-        assert_eq!(msgs[0].role, "system");
-        assert_eq!(msgs[1].role, "user");
-        assert_eq!(msgs[1].content.as_deref(), Some("hello"));
-    }
-
-    #[test]
-    fn build_messages_from_turns_single_turn_injects_all_messages() {
-        // A turn with user + tool-call assistant + tool result + final assistant.
-        let turn: Vec<Message> = vec![
-            Message::user("what files?"),
-            Message::assistant(
-                None,
-                vec![copilot::ApiToolCall {
-                    id: "c1".into(),
-                    kind: "function".into(),
-                    function: copilot::ApiToolCallFunction {
-                        name: "shell_command".into(),
-                        arguments: r#"{"command":"ls"}"#.into(),
-                    },
-                }],
-            ),
-            Message::tool_result("c1", "file1.txt\nfile2.txt"),
-            Message::assistant(Some("There are two files.".into()), vec![]),
-        ];
-        let turn_json = serde_json::to_string(&turn).unwrap();
-
-        let msgs = build_messages_from_turns("follow-up", None, &[turn_json], &[], None).unwrap();
-        // system + 4 turn messages + new user prompt
-        assert_eq!(msgs.len(), 6);
-        assert_eq!(msgs[0].role, "system");
-        assert_eq!(msgs[1].role, "user");
-        assert_eq!(msgs[1].content.as_deref(), Some("what files?"));
-        assert_eq!(msgs[2].role, "assistant");
-        assert_eq!(msgs[3].role, "tool");
-        assert_eq!(msgs[4].role, "assistant");
-        assert_eq!(msgs[5].role, "user");
-        assert_eq!(msgs[5].content.as_deref(), Some("follow-up"));
-    }
-
-    #[test]
-    fn build_messages_from_turns_two_turns_concatenated() {
-        let turn1 = serde_json::to_string(&vec![
-            Message::user("q1"),
-            Message::assistant(Some("a1".into()), vec![]),
-        ])
-        .unwrap();
-        let turn2 = serde_json::to_string(&vec![
-            Message::user("q2"),
-            Message::assistant(Some("a2".into()), vec![]),
-        ])
-        .unwrap();
-
-        let msgs = build_messages_from_turns("q3", None, &[turn1, turn2], &[], None).unwrap();
-        // system + q1 + a1 + q2 + a2 + q3
-        assert_eq!(msgs.len(), 6);
-        assert_eq!(msgs[1].content.as_deref(), Some("q1"));
-        assert_eq!(msgs[4].content.as_deref(), Some("a2"));
-        assert_eq!(msgs[5].content.as_deref(), Some("q3"));
-    }
-
-    #[test]
-    fn build_messages_from_turns_injects_own_summary() {
-        let msgs = build_messages_from_turns("hi", None, &[], &[], Some("- did X")).unwrap();
-        // system + summary user label + summary assistant + user
-        assert_eq!(msgs.len(), 4);
-        assert!(msgs[1].content.as_deref().unwrap_or("").contains("Summary"));
-        assert!(msgs[2].content.as_deref().unwrap_or("").contains("did X"));
-    }
-
-    #[test]
-    fn build_messages_from_turns_invalid_json_returns_err() {
-        let result = build_messages_from_turns("hi", None, &["not-json".to_string()], &[], None);
-        assert!(result.is_err(), "invalid JSON should return Err");
     }
 
     // ---- token budget tests -----

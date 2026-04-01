@@ -216,8 +216,8 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
                         // Should never arrive in a normal foreground Chat loop.
                         tracing::debug!("unexpected DetachAccepted in foreground loop");
                     }
-                    Response::MemoryEntry { .. } | Response::HeartbeatEntry { .. } => {
-                        // Not sent to the CLI client in this path.
+                    Response::MemoryEntry { .. } => {
+                        // Not sent to the CLI client — daemon-internal only.
                     }
                     Response::WaitingForInput { prompt } => {
                         // Daemon signals it needs a reply.  When prompt is
@@ -504,8 +504,8 @@ pub async fn run_resume(
                     Response::DetachAccepted { .. } => {
                         tracing::debug!("unexpected DetachAccepted in resume loop");
                     }
-                    Response::MemoryEntry { .. } | Response::HeartbeatEntry { .. } => {
-                        // Not sent to the CLI client in this path.
+                    Response::MemoryEntry { .. } => {
+                        // Not sent to the CLI client — daemon-internal only.
                     }
                     Response::WaitingForInput { prompt } => {
                         // Buffer while steer is pending (user is typing).
