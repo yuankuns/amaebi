@@ -372,6 +372,12 @@ async fn test_compaction_preserves_summary() {
             break;
         }
     }
+    let remaining = server.pending_response_count();
+    assert!(
+        remaining == 0,
+        "expected mock queue to be empty after waiting for background summary, \
+         but {remaining} response(s) remain — background summary task did not fire in time"
+    );
     server.take_requests();
     // Extra wait for the daemon to write the summary to SQLite after receiving
     // the LLM response.  Increased to 1 s to give slow CI runners more headroom.

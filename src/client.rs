@@ -336,8 +336,16 @@ pub async fn run_chat_loop(
     let mut lines = BufReader::new(read_half).lines();
 
     let mut stdout = tokio::io::stdout();
-    // Single BufReader for stdin — reused across all prompt/steer reads so
-    // buffered bytes are never dropped between reads.
+    // Single BufReader for stdin — reused across all steer reads so buffered
+    // bytes are never dropped between reads.
+    //
+    // Note: the outer prompt loop reads stdin via `prompt_input::read_line_raw`
+    // (a spawn_blocking call that reads std::io::stdin() byte-by-byte in raw
+    // mode), while this BufReader reads the same fd in cooked mode for steer
+    // corrections.  The two paths are strictly sequential — the prompt reader
+    // runs only when no turn is in flight, and this BufReader is only polled
+    // inside the inner select! loop while a turn is active — so they never
+    // overlap and no bytes are stranded between the two readers in practice.
     let mut stdin = BufReader::new(tokio::io::stdin());
     let mut next_prompt = initial_prompt;
     let mut last_ctrl_c: Option<Instant> = None;
@@ -1043,6 +1051,16 @@ mod prompt_input {
         read_line_cooked()
     }
 
+    /// Strip one trailing `\n` (and an optional preceding `\r`) from `s` in place.
+    fn strip_trailing_newline(s: &mut String) {
+        if s.ends_with('\n') {
+            s.pop();
+        }
+        if s.ends_with('\r') {
+            s.pop();
+        }
+    }
+
     /// Cooked-mode fallback used when stdin is not a TTY or raw mode fails.
     fn read_line_cooked() -> std::io::Result<Option<String>> {
         use std::io::BufRead as _;
@@ -1050,12 +1068,7 @@ mod prompt_input {
         match std::io::stdin().lock().read_line(&mut s) {
             Ok(0) => Ok(None),
             Ok(_) => {
-                if s.ends_with('\n') {
-                    s.pop();
-                }
-                if s.ends_with('\r') {
-                    s.pop();
-                }
+                strip_trailing_newline(&mut s);
                 Ok(Some(s))
             }
             Err(e) => Err(e),
@@ -1124,8 +1137,7 @@ mod prompt_input {
                         // visual cells without needing to know the exact cell layout.
                         // This is safe here because the cursor is always at the very
                         // end of the user's input in this editor.
-                        let seq = format!("\x1b[{w}D\x1b[K");
-                        output.write_all(seq.as_bytes())?;
+                        write!(output, "\x1b[{w}D\x1b[K")?;
                         output.flush()?;
                     }
                 }
@@ -1172,7 +1184,10 @@ mod prompt_input {
                     }
                     if let Ok(s) = std::str::from_utf8(&utf8_buf) {
                         if let Some(ch) = s.chars().next() {
-                            let w = ch.width().unwrap_or(1);
+                            // width() returns Some(0) for zero-width combining marks.
+                            // Clamp to 1 so the backspace erase emits at least ESC[1D,
+                            // which is well-defined on all VT100-compatible terminals.
+                            let w = ch.width().unwrap_or(1).max(1);
                             output.write_all(s.as_bytes())?;
                             output.flush()?;
                             chars.push(ch);
@@ -1526,31 +1541,35 @@ mod prompt_input {
         }
 
         // ------------------------------------------------------------------ //
-        // Cooked-fallback newline-stripping logic
+        // strip_trailing_newline helper
         // ------------------------------------------------------------------ //
 
         #[test]
-        fn cooked_logic_strips_lf() {
+        fn strip_newline_lf() {
             let mut s = "hello\n".to_string();
-            if s.ends_with('\n') {
-                s.pop();
-            }
-            if s.ends_with('\r') {
-                s.pop();
-            }
+            super::strip_trailing_newline(&mut s);
             assert_eq!(s, "hello");
         }
 
         #[test]
-        fn cooked_logic_strips_crlf() {
+        fn strip_newline_crlf() {
             let mut s = "hello\r\n".to_string();
-            if s.ends_with('\n') {
-                s.pop();
-            }
-            if s.ends_with('\r') {
-                s.pop();
-            }
+            super::strip_trailing_newline(&mut s);
             assert_eq!(s, "hello");
+        }
+
+        #[test]
+        fn strip_newline_no_newline_unchanged() {
+            let mut s = "hello".to_string();
+            super::strip_trailing_newline(&mut s);
+            assert_eq!(s, "hello");
+        }
+
+        #[test]
+        fn strip_newline_empty_unchanged() {
+            let mut s = String::new();
+            super::strip_trailing_newline(&mut s);
+            assert_eq!(s, "");
         }
     }
 }

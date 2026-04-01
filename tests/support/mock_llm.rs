@@ -316,9 +316,10 @@ impl MockLlmServer {
         self.state.captured.lock().unwrap().len()
     }
 
-    /// Return the number of scripted responses still waiting to be served.
+    /// Return the number of queued items (scripted responses **and** injected
+    /// errors) still waiting to be served.
     ///
-    /// Use this to wait until all enqueued responses have been consumed by the
+    /// Use this to wait until all enqueued items have been consumed by the
     /// daemon before sending follow-up requests, avoiding races where a slow
     /// background task hasn't yet consumed its response when the next request
     /// fires.
