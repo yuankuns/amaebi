@@ -377,7 +377,8 @@ async fn run_workflow_tool(args: serde_json::Value, ctx: &SpawnContext) -> Resul
                 .get("max_retries")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(3) as usize;
-            builtins::bug_fix(repo, test_cmd, max_retries)
+            let list_cmd = wf_args.get("list_cmd").and_then(|v| v.as_str());
+            builtins::bug_fix(repo, test_cmd, max_retries, list_cmd)
         }
         "perf-sweep" => {
             let target = wf_args

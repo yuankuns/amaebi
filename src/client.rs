@@ -1967,7 +1967,7 @@ async fn run_workflow_slash(prompt: &str, model: &str) -> anyhow::Result<String>
             let max_retries = flag("--max-retries")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(3);
-            builtins::bug_fix(repo, test_cmd, max_retries)
+            builtins::bug_fix(repo, test_cmd, max_retries, None)
         }
         "perf-sweep" => {
             let target = positional(2);

@@ -246,11 +246,22 @@ pub fn perf_sweep(
 
 /// Supervise Claude fixing a list of bugs in parallel.
 /// Each bug is independent: fix → test → PR → review.
+///
+/// `list_cmd` is the shell command used to fetch open bugs.  It defaults to
+/// `gh issue list -R {repo} --label bug …` for real use but can be overridden
+/// in tests (e.g. `echo '- BUG #1: test bug'`) to avoid requiring GitHub auth.
 pub fn bug_fix(
-    repo: &str, // e.g. "yuankuns/amaebi"
+    repo: &str, // e.g. "yuankun/amaebi"
     test_cmd: &str,
     max_retries: usize,
+    list_cmd: Option<&str>,
 ) -> Workflow {
+    let list_command = list_cmd.map(|s| s.to_owned()).unwrap_or_else(|| {
+        format!(
+            "gh issue list -R {repo} --label bug --json number,title,body \
+             --jq '.[] | \"- BUG #\" + (.number|tostring) + \": \" + .title'"
+        )
+    });
     Workflow {
         name: "bug-fix".into(),
         stages: vec![
@@ -258,10 +269,7 @@ pub fn bug_fix(
             Stage::new(
                 "list-bugs",
                 Action::Shell {
-                    command: format!(
-                        "gh issue list -R {repo} --label bug --json number,title,body \
-                         --jq '.[] | \"- BUG #\" + (.number|tostring) + \": \" + .title'"
-                    ),
+                    command: list_command,
                 },
             )
             .with_on_fail(FailStrategy::Abort),

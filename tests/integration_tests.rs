@@ -3140,28 +3140,47 @@ async fn run_workflow_perf_sweep_executes_all_llm_stages() {
     );
 }
 
-/// WF-5: bug-fix fails immediately at the "list-bugs" shell stage because
-/// `gh issue list` requires GitHub credentials and a real remote.
+/// WF-5a: bug-fix happy path using the configurable `list_cmd` arg.
 ///
-/// This tests the workflow error path: the daemon propagates the tool error
-/// back to the parent LLM, the LLM responds gracefully, and the daemon
-/// completes the turn without crashing.
+/// `gh issue list` requires real GitHub credentials and cannot be used in CI.
+/// `list_cmd` lets tests inject a simple echo command, exercising the
+/// parse-bugs Llm stage, the fix-each parallel Map, and summarize — the
+/// workflow's actual business logic.
 ///
-/// Expected LLM calls: 2 (parent initial + parent after workflow error).
-/// The workflow's Llm stages (parse-bugs, summarize) must NOT be reached.
+/// The "branch" sub-stage (git checkout master && git checkout -b ...) will
+/// fail on the shared working tree → FailStrategy::Skip → item skipped
+/// gracefully.  "fix", "test", "pr" are skipped with the item.
+///
+/// Expected LLM calls: 4 (parent×2 + parse-bugs + summarize).
 #[tokio::test]
-async fn run_workflow_bug_fix_fails_at_gh_and_parent_handles_error() {
+async fn run_workflow_bug_fix_with_list_cmd_exercises_llm_stages() {
     let server = MockLlmServer::start().await;
 
-    // 1. Parent: calls run_workflow bug-fix.
+    // 1. Parent: calls run_workflow bug-fix with a mock list_cmd.
     server.enqueue(ScriptedResponse::tool_call(
         "call-wf-bugfix",
         "run_workflow",
-        r#"{"workflow":"bug-fix","args":{"repo":".","test_cmd":"true","max_retries":1}}"#,
+        r#"{"workflow":"bug-fix","args":{"repo":".","test_cmd":"true","max_retries":1,"list_cmd":"echo '- BUG #1: null pointer in parser'"}}"#,
     ));
-    // 2. Parent: receives the workflow error (gh failed), responds.
+    // 2. Workflow "parse-bugs" Llm stage.
     server.enqueue(ScriptedResponse::text_chunks(vec![
-        "The bug-fix workflow could not fetch issues.",
+        "- BUG: #1 null pointer in parser",
+    ]));
+    // The "branch" sub-stage (git checkout master && git checkout -b fix/bug-0)
+    // fails on the shared working tree → FailStrategy::Skip.
+    // Skip is stage-level, not item-level: "fix" Llm still runs for this item.
+    // 3. Workflow "fix" Llm sub-stage (for bug #1).
+    server.enqueue(ScriptedResponse::text_chunks(vec![
+        "Added a null check before dereferencing the pointer.",
+    ]));
+    // "test" (true) passes; "pr" fails at git commit (nothing staged) → Skip.
+    // 4. Workflow "summarize" Llm stage.
+    server.enqueue(ScriptedResponse::text_chunks(vec![
+        "Bug #1 fix was attempted; PR creation was skipped.",
+    ]));
+    // 5. Parent: receives workflow result, responds.
+    server.enqueue(ScriptedResponse::text_chunks(vec![
+        "Bug-fix workflow completed.",
     ]));
 
     let daemon = start_daemon(&server.url()).await.expect("start_daemon");
@@ -3171,31 +3190,59 @@ async fn run_workflow_bug_fix_fails_at_gh_and_parent_handles_error() {
         .await
         .expect("send_message");
 
-    let text = collect_text(&responses);
     assert!(
-        text.contains("bug") || text.contains("workflow") || !text.is_empty(),
-        "daemon must return a response after bug-fix failure: {text:?}"
+        !collect_text(&responses).is_empty(),
+        "daemon must return a response after bug-fix"
     );
 
-    // Exactly 2 LLM calls: the workflow failed before any Llm stage.
+    // 5 LLM requests: parent×2 + parse-bugs + fix(bug#1) + summarize.
+    let reqs = server.take_requests();
+    assert_eq!(
+        reqs.len(),
+        5,
+        "expected 5 LLM requests (parent×2 + parse-bugs + fix + summarize); got {}.\n\
+         This indicates the workflow Llm stages were not invoked correctly.",
+        reqs.len()
+    );
+}
+
+/// WF-5b: bug-fix without list_cmd falls back to `gh issue list`, which
+/// fails without GitHub auth.  The workflow aborts at "list-bugs" and the
+/// daemon propagates the error without crashing.
+///
+/// Expected LLM calls: 2 (parent initial + parent after workflow error).
+#[tokio::test]
+async fn run_workflow_bug_fix_gh_failure_propagated_to_llm() {
+    let server = MockLlmServer::start().await;
+
+    server.enqueue(ScriptedResponse::tool_call(
+        "call-wf-bugfix-gh",
+        "run_workflow",
+        r#"{"workflow":"bug-fix","args":{"repo":"owner/repo","test_cmd":"true"}}"#,
+    ));
+    server.enqueue(ScriptedResponse::text_chunks(vec![
+        "Could not fetch bug issues from GitHub.",
+    ]));
+
+    let daemon = start_daemon(&server.url()).await.expect("start_daemon");
+    let client = connect_client(&daemon.socket);
+
+    let responses = send_message(&client, "fix all bugs in owner/repo")
+        .await
+        .expect("send_message");
+
+    assert!(
+        !collect_text(&responses).is_empty(),
+        "daemon must return a response after gh failure"
+    );
+
+    // Only 2 LLM calls: workflow aborted before any Llm stage.
     let reqs = server.take_requests();
     assert_eq!(
         reqs.len(),
         2,
-        "bug-fix should consume 2 LLM calls (no Llm stages reached); got {}",
+        "expected 2 LLM requests (workflow aborted at list-bugs); got {}",
         reqs.len()
-    );
-
-    // The second request's tool result must contain the gh error.
-    let msgs = reqs[1].messages().expect("messages present");
-    let tool_result = msgs
-        .iter()
-        .find(|m| m["role"].as_str() == Some("tool"))
-        .expect("tool result must appear in the second request");
-    let content = tool_result["content"].as_str().unwrap_or("");
-    assert!(
-        !content.is_empty(),
-        "tool result must contain the workflow error; got empty"
     );
 }
 

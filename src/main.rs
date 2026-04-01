@@ -701,7 +701,7 @@ async fn run_workflow(
             test_cmd,
             max_retries,
         } => {
-            let wf = builtins::bug_fix(&repo, &test_cmd, max_retries);
+            let wf = builtins::bug_fix(&repo, &test_cmd, max_retries, None);
             let summary =
                 executor::execute(&wf, &state, &model, ctx, &ResourcePool::empty()).await?;
             println!("{summary}");
