@@ -345,7 +345,9 @@ pub fn clear(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "DELETE FROM memories;
          INSERT INTO memories_fts(memories_fts) VALUES ('rebuild');
-         DELETE FROM session_summaries;",
+         DELETE FROM session_summaries;
+         DELETE FROM session_turns;
+         DELETE FROM heartbeat_items;",
     )
     .context("clearing memories")
 }
@@ -653,7 +655,21 @@ pub fn dismiss_heartbeat_item(conn: &Connection, id: i64) -> Result<()> {
     Ok(())
 }
 
-/// Delete all heartbeat items for a session.
+/// Dismiss only the *pending* heartbeat items for a session.
+///
+/// Called when a session closes (auto-dismiss on close).  Resolved and
+/// dismissed items are preserved so `heartbeat list --all` keeps its history.
+pub fn dismiss_pending_heartbeat_items(conn: &Connection, session_id: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE heartbeat_items SET status = 'dismissed'
+         WHERE session_id = ?1 AND status = 'pending'",
+        params![session_id],
+    )
+    .context("dismissing pending heartbeat items")?;
+    Ok(())
+}
+
+/// Delete all heartbeat items for a session (used only in full memory clear).
 #[allow(dead_code)]
 pub fn clear_heartbeat_items(conn: &Connection, session_id: &str) -> Result<()> {
     conn.execute(

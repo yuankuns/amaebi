@@ -2230,8 +2230,7 @@ async fn consistent_chat_tool_call_context() {
 ///    on a separate connection.
 /// 3. Heartbeat LLM returns an actionable report; it is injected as a steer.
 /// 4. The agentic loop receives it and produces a final text reply.
-/// 5. Assert the heartbeat LLM call contained the item description and that
-///    the injected report appears in the third LLM turn's context.
+/// 5. Assert the heartbeat LLM call contained the item description.
 #[tokio::test]
 async fn heartbeat_injects_into_active_session() {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};

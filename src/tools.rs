@@ -241,15 +241,6 @@ async fn read_file(args: serde_json::Value) -> Result<String> {
         .with_context(|| format!("read_file: reading '{path}'"))
 }
 
-/// Spawn a child agent session to complete a task in an isolated sandbox.
-///
-/// # Sandbox selection
-///
-/// - When `AMAEBI_SPAWN_SANDBOX=noop` is set, a [`NoopSandbox`] is used
-///   (runs commands directly on the host). Intended for tests.
-/// - Otherwise a [`DockerSandbox`] is created with `--network none`.
-///   If Docker is not available, an error is returned.
-///
 /// Record a heartbeat item for the given session.
 async fn heartbeat_note(
     args: serde_json::Value,
@@ -258,9 +249,9 @@ async fn heartbeat_note(
     let description = args["description"]
         .as_str()
         .context("heartbeat_note: missing string argument 'description'")?;
-    let session_id = args["session_id"]
-        .as_str()
-        .context("heartbeat_note: missing string argument 'session_id'")?;
+    // session_id is optional: provided in interactive chat contexts via the
+    // system prompt but unavailable in cron/detach contexts.
+    let session_id = args["session_id"].as_str().unwrap_or("global");
 
     let db = Arc::clone(db);
     let desc = description.to_owned();
@@ -275,6 +266,15 @@ async fn heartbeat_note(
     Ok(format!("Heartbeat item recorded: {description}"))
 }
 
+/// Spawn a child agent session to complete a task in an isolated sandbox.
+///
+/// # Sandbox selection
+///
+/// - When `AMAEBI_SPAWN_SANDBOX=noop` is set, a [`NoopSandbox`] is used
+///   (runs commands directly on the host). Intended for tests.
+/// - Otherwise a [`DockerSandbox`] is created with `--network none`.
+///   If Docker is not available, an error is returned.
+///
 /// # Recursion prevention
 ///
 /// The child executor is created with `spawn_ctx: None` so it cannot
@@ -621,10 +621,10 @@ pub fn tool_schemas(include_spawn_agent: bool) -> Vec<serde_json::Value> {
                         },
                         "session_id": {
                             "type": "string",
-                            "description": "The session UUID (provided in the system prompt)."
+                            "description": "The session UUID. Provided in the system prompt for interactive chat sessions; omit if not available (e.g. in cron contexts)."
                         }
                     },
-                    "required": ["description", "session_id"]
+                    "required": ["description"]
                 }
             }
         }));

@@ -166,7 +166,7 @@ async fn deregister_active_session(state: &DaemonState, session_id: &str) {
     let sid = session_id.to_owned();
     let result = tokio::task::spawn_blocking(move || {
         let conn = db.lock().unwrap_or_else(|p| p.into_inner());
-        memory_db::clear_heartbeat_items(&conn, &sid)
+        memory_db::dismiss_pending_heartbeat_items(&conn, &sid)
     })
     .await
     .unwrap_or_else(|e| Err(anyhow::anyhow!("heartbeat dismiss panicked: {e}")));
@@ -978,7 +978,7 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                             let db_t = Arc::clone(&state.db);
                             let sid_t = sid.clone();
                             let ts_t = chrono::Utc::now().to_rfc3339();
-                            let _ = tokio::task::spawn_blocking(move || {
+                            let result = tokio::task::spawn_blocking(move || {
                                 let conn = db_t.lock().unwrap_or_else(|p| p.into_inner());
                                 memory_db::store_session_turn(&conn, &sid_t, &ts_t, &turn_json)
                             })
@@ -986,6 +986,9 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                             .unwrap_or_else(|e| {
                                 Err(anyhow::anyhow!("store_session_turn panicked: {e}"))
                             });
+                            if let Err(e) = result {
+                                tracing::warn!(error = %e, "failed to persist session turn delta");
+                            }
                         }
                         Err(e) => {
                             tracing::warn!(error = %e, "failed to serialize session turn delta");
@@ -2472,10 +2475,12 @@ async fn run_heartbeat_scheduler(state: Arc<DaemonState>) {
         .unwrap_or_else(tokio::time::Instant::now);
 
     loop {
+        let manual_triggered;
         tokio::select! {
-            _ = interval.tick() => {}
+            _ = interval.tick() => { manual_triggered = false; }
             _ = state.heartbeat_notify.notified() => {
                 tracing::info!("heartbeat: manual trigger received");
+                manual_triggered = true;
             }
         }
 
@@ -2485,12 +2490,10 @@ async fn run_heartbeat_scheduler(state: Arc<DaemonState>) {
             None => continue, // heartbeat disabled
         };
 
-        // Interval guard — skip unless enough time has elapsed or this was a
-        // manual trigger (heuristic: elapsed < 2 s → manual).
+        // Interval guard — skip if not enough time has elapsed, unless this
+        // was an explicit manual trigger (which always bypasses the guard).
         let interval_dur = std::time::Duration::from_secs(hb_config.interval_minutes * 60);
-        if last_run.elapsed() < interval_dur
-            && last_run.elapsed() > std::time::Duration::from_secs(2)
-        {
+        if !manual_triggered && last_run.elapsed() < interval_dur {
             continue;
         }
 

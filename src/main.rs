@@ -524,9 +524,15 @@ async fn run_heartbeat(action: cli::HeartbeatAction, socket: std::path::PathBuf)
             let mut line = serde_json::to_string(&req)?;
             line.push('\n');
             writer.write_all(line.as_bytes()).await?;
-            // Drain Done.
             let mut lines = BufReader::new(reader).lines();
-            let _ = lines.next_line().await;
+            while let Some(frame) = lines.next_line().await? {
+                let resp: ipc::Response = serde_json::from_str(&frame)?;
+                match resp {
+                    ipc::Response::Done => break,
+                    ipc::Response::Error { message } => anyhow::bail!("{message}"),
+                    _ => {}
+                }
+            }
             println!("Heartbeat item added for session {session_id}.");
         }
         cli::HeartbeatAction::List { all } => {
@@ -583,7 +589,14 @@ async fn run_heartbeat(action: cli::HeartbeatAction, socket: std::path::PathBuf)
             line.push('\n');
             writer.write_all(line.as_bytes()).await?;
             let mut lines = BufReader::new(reader).lines();
-            let _ = lines.next_line().await;
+            while let Some(frame) = lines.next_line().await? {
+                let resp: ipc::Response = serde_json::from_str(&frame)?;
+                match resp {
+                    ipc::Response::Done => break,
+                    ipc::Response::Error { message } => anyhow::bail!("{message}"),
+                    _ => {}
+                }
+            }
             println!("Heartbeat item #{id} dismissed.");
         }
         cli::HeartbeatAction::Trigger => {
@@ -596,7 +609,14 @@ async fn run_heartbeat(action: cli::HeartbeatAction, socket: std::path::PathBuf)
             line.push('\n');
             writer.write_all(line.as_bytes()).await?;
             let mut lines = BufReader::new(reader).lines();
-            let _ = lines.next_line().await;
+            while let Some(frame) = lines.next_line().await? {
+                let resp: ipc::Response = serde_json::from_str(&frame)?;
+                match resp {
+                    ipc::Response::Done => break,
+                    ipc::Response::Error { message } => anyhow::bail!("{message}"),
+                    _ => {}
+                }
+            }
             println!("Heartbeat check triggered.");
         }
     }
