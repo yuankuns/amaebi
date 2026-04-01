@@ -1064,15 +1064,27 @@ mod prompt_input {
 
     #[cfg(unix)]
     fn read_line_raw_inner(_guard: RawModeGuard) -> std::io::Result<Option<String>> {
+        process_input(&mut std::io::stdin(), &mut std::io::stderr())
+    }
+
+    /// Core line-editor loop.  Separated from the raw-mode setup so it can be
+    /// driven by in-memory byte slices in unit tests without needing a real TTY.
+    ///
+    /// Reads bytes from `input`, echoes/erases via `output`, and returns:
+    /// * `Ok(Some(s))` on Enter — `s` contains no trailing newline.
+    /// * `Ok(None)` on EOF (Ctrl-D or exhausted reader).
+    /// * `Err` with `ErrorKind::Interrupted` on Ctrl-C.
+    fn process_input<R: Read, W: Write>(
+        input: &mut R,
+        output: &mut W,
+    ) -> std::io::Result<Option<String>> {
         let mut chars: Vec<char> = Vec::new();
         // Display width (columns) of each char, matched by index to `chars`.
         let mut widths: Vec<usize> = Vec::new();
-        let mut stdin = std::io::stdin();
-        let mut out = std::io::stderr();
 
         loop {
             let mut byte = [0u8; 1];
-            match stdin.read_exact(&mut byte) {
+            match input.read_exact(&mut byte) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
                 Err(e) => return Err(e),
@@ -1081,16 +1093,16 @@ mod prompt_input {
             match byte[0] {
                 // Enter (CR in raw mode; some environments send LF)
                 b'\r' | b'\n' => {
-                    out.write_all(b"\r\n")?;
-                    out.flush()?;
+                    output.write_all(b"\r\n")?;
+                    output.flush()?;
                     return Ok(Some(chars.iter().collect()));
                 }
                 // Ctrl-D
                 4 => return Ok(None),
                 // Ctrl-C
                 3 => {
-                    out.write_all(b"^C\r\n")?;
-                    out.flush()?;
+                    output.write_all(b"^C\r\n")?;
+                    output.flush()?;
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::Interrupted,
                         "ctrl-c",
@@ -1103,20 +1115,20 @@ mod prompt_input {
                         // move cursor back w, write w spaces, move back w again.
                         let back = vec![b'\x08'; w];
                         let spaces = vec![b' '; w];
-                        out.write_all(&back)?;
-                        out.write_all(&spaces)?;
-                        out.write_all(&back)?;
-                        out.flush()?;
+                        output.write_all(&back)?;
+                        output.write_all(&spaces)?;
+                        output.write_all(&back)?;
+                        output.flush()?;
                     }
                 }
                 // Escape sequences (arrows, function keys) — consume and discard.
                 0x1b => {
                     let mut eb = [0u8; 1];
-                    if stdin.read_exact(&mut eb).is_ok() && eb[0] == b'[' {
+                    if input.read_exact(&mut eb).is_ok() && eb[0] == b'[' {
                         // CSI sequence: read until final byte in 0x40–0x7E.
                         loop {
                             let mut fb = [0u8; 1];
-                            if stdin.read_exact(&mut fb).is_err() {
+                            if input.read_exact(&mut fb).is_err() {
                                 break;
                             }
                             if (0x40..=0x7e).contains(&fb[0]) {
@@ -1128,8 +1140,8 @@ mod prompt_input {
                 }
                 // ASCII printable
                 b @ 0x20..=0x7e => {
-                    out.write_all(&[b])?;
-                    out.flush()?;
+                    output.write_all(&[b])?;
+                    output.flush()?;
                     chars.push(b as char);
                     widths.push(1);
                 }
@@ -1145,7 +1157,7 @@ mod prompt_input {
                     let mut utf8_buf: Vec<u8> = vec![b];
                     for _ in 0..n_extra {
                         let mut cb = [0u8; 1];
-                        if stdin.read_exact(&mut cb).is_err() {
+                        if input.read_exact(&mut cb).is_err() {
                             break;
                         }
                         utf8_buf.push(cb[0]);
@@ -1153,8 +1165,8 @@ mod prompt_input {
                     if let Ok(s) = std::str::from_utf8(&utf8_buf) {
                         if let Some(ch) = s.chars().next() {
                             let w = ch.width().unwrap_or(1);
-                            out.write_all(s.as_bytes())?;
-                            out.flush()?;
+                            output.write_all(s.as_bytes())?;
+                            output.flush()?;
                             chars.push(ch);
                             widths.push(w);
                         }
@@ -1169,13 +1181,242 @@ mod prompt_input {
 
     #[cfg(test)]
     mod tests {
-        use std::io::Write as _;
+        use super::process_input;
+        use std::io::Cursor;
+        use unicode_width::UnicodeWidthChar as _;
 
-        /// Verify cooked fallback strips exactly one trailing newline.
+        // ------------------------------------------------------------------ //
+        // Helpers
+        // ------------------------------------------------------------------ //
+
+        /// Run `process_input` on a raw byte sequence and return `(result, echoed)`.
+        fn run(input: &[u8]) -> (std::io::Result<Option<String>>, Vec<u8>) {
+            let mut reader = Cursor::new(input.to_vec());
+            let mut output: Vec<u8> = Vec::new();
+            let result = process_input(&mut reader, &mut output);
+            (result, output)
+        }
+
+        // ------------------------------------------------------------------ //
+        // Enter / EOF / Ctrl-C
+        // ------------------------------------------------------------------ //
+
         #[test]
-        fn cooked_strips_newline() {
-            // We can't easily invoke read_line_cooked() against a real stdin in a
-            // unit test, so we test the trimming logic directly.
+        fn enter_cr_returns_accumulated_text() {
+            let (res, echo) = run(b"hello\r");
+            assert_eq!(res.unwrap(), Some("hello".to_string()));
+            // Echo ends with CRLF
+            assert!(echo.ends_with(b"\r\n"));
+        }
+
+        #[test]
+        fn enter_lf_also_accepted() {
+            let (res, _) = run(b"hi\n");
+            assert_eq!(res.unwrap(), Some("hi".to_string()));
+        }
+
+        #[test]
+        fn empty_enter_returns_empty_string() {
+            let (res, _) = run(b"\r");
+            assert_eq!(res.unwrap(), Some(String::new()));
+        }
+
+        #[test]
+        fn ctrl_d_returns_none() {
+            let (res, echo) = run(&[4]);
+            assert_eq!(res.unwrap(), None);
+            // Ctrl-D produces no echo output.
+            assert!(echo.is_empty());
+        }
+
+        #[test]
+        fn eof_on_empty_reader_returns_none() {
+            let (res, _) = run(b"");
+            assert_eq!(res.unwrap(), None);
+        }
+
+        #[test]
+        fn ctrl_c_returns_interrupted_error() {
+            let (res, echo) = run(&[3]);
+            let err = res.unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::Interrupted);
+            // Echo should contain "^C\r\n"
+            assert_eq!(echo, b"^C\r\n");
+        }
+
+        // ------------------------------------------------------------------ //
+        // ASCII backspace
+        // ------------------------------------------------------------------ //
+
+        #[test]
+        fn backspace_del_removes_last_ascii_char() {
+            // "ab" + DEL + Enter → "a"
+            let (res, _) = run(b"ab\x7f\r");
+            assert_eq!(res.unwrap(), Some("a".to_string()));
+        }
+
+        #[test]
+        fn backspace_bs_also_removes_last_ascii_char() {
+            let (res, _) = run(b"ab\x08\r");
+            assert_eq!(res.unwrap(), Some("a".to_string()));
+        }
+
+        #[test]
+        fn backspace_ascii_emits_one_column_erase() {
+            // After "a", DEL should emit: \x08, space, \x08
+            let (_, echo) = run(b"a\x7f\r");
+            // "a" is echoed first, then the three-byte erase sequence, then \r\n
+            let erase_pos = echo.iter().position(|&b| b == b'\x08').unwrap();
+            let erase_seq = &echo[erase_pos..erase_pos + 3];
+            assert_eq!(erase_seq, b"\x08 \x08");
+        }
+
+        #[test]
+        fn backspace_on_empty_buffer_does_nothing() {
+            // DEL on empty buffer — no erase, just Enter result
+            let (res, echo) = run(b"\x7f\r");
+            assert_eq!(res.unwrap(), Some(String::new()));
+            // Only echo should be the CRLF from Enter; no backspace bytes before it
+            assert!(!echo[..echo.len().saturating_sub(2)].contains(&b'\x08'));
+        }
+
+        #[test]
+        fn multiple_backspaces_empty_buffer() {
+            // Three chars then three DELs → empty
+            let (res, _) = run(b"abc\x7f\x7f\x7f\r");
+            assert_eq!(res.unwrap(), Some(String::new()));
+        }
+
+        // ------------------------------------------------------------------ //
+        // CJK / wide-character backspace — the bug this PR fixes
+        // ------------------------------------------------------------------ //
+
+        #[test]
+        fn cjk_char_is_accepted() {
+            let input = "中\r".as_bytes();
+            let (res, _) = run(input);
+            assert_eq!(res.unwrap(), Some("中".to_string()));
+        }
+
+        #[test]
+        fn backspace_after_cjk_removes_char() {
+            // "中" + DEL + Enter → empty
+            let mut input = "中".as_bytes().to_vec();
+            input.push(0x7f); // DEL
+            input.push(b'\r');
+            let (res, _) = run(&input);
+            assert_eq!(res.unwrap(), Some(String::new()));
+        }
+
+        #[test]
+        fn backspace_after_cjk_emits_two_column_erase() {
+            // "中" is 2 columns wide → erase sequence must be \x08\x08  \x08\x08
+            let mut input = "中".as_bytes().to_vec();
+            input.push(0x7f);
+            input.push(b'\r');
+            let (_, echo) = run(&input);
+
+            // Find first \x08 in echo (after the CJK char bytes themselves).
+            let cjk_bytes = "中".len(); // 3 bytes for this char
+            let after_cjk = &echo[cjk_bytes..];
+            // Expect: \x08\x08 (move back 2) + "  " (2 spaces) + \x08\x08 (move back 2)
+            assert!(
+                after_cjk.starts_with(b"\x08\x08  \x08\x08"),
+                "expected 2-column erase, got: {:?}",
+                after_cjk
+            );
+        }
+
+        #[test]
+        fn backspace_after_ascii_emits_one_column_erase_not_two() {
+            // "a" is 1 column wide → erase sequence must be \x08 (×1) + " " (×1) + \x08 (×1)
+            let (_, echo) = run(b"a\x7f\r");
+            let after_a = &echo[1..]; // skip echoed 'a'
+            assert!(
+                after_a.starts_with(b"\x08 \x08"),
+                "expected 1-column erase, got: {:?}",
+                after_a
+            );
+            // Must NOT start with double-backspace
+            assert!(
+                !after_a.starts_with(b"\x08\x08"),
+                "should not be 2-column erase"
+            );
+        }
+
+        #[test]
+        fn mixed_ascii_and_cjk_backspace_sequence() {
+            // "a中b" + 2×DEL → "a"
+            let mut input = "a中b".as_bytes().to_vec();
+            input.extend_from_slice(b"\x7f\x7f\r");
+            let (res, _) = run(&input);
+            assert_eq!(res.unwrap(), Some("a".to_string()));
+        }
+
+        #[test]
+        fn cjk_hiragana_has_width_2() {
+            assert_eq!('あ'.width(), Some(2));
+        }
+
+        #[test]
+        fn cjk_hangul_has_width_2() {
+            assert_eq!('한'.width(), Some(2));
+        }
+
+        #[test]
+        fn latin_ascii_has_width_1() {
+            assert_eq!('a'.width(), Some(1));
+            assert_eq!('Z'.width(), Some(1));
+        }
+
+        // ------------------------------------------------------------------ //
+        // Escape / CSI sequences — must be silently discarded
+        // ------------------------------------------------------------------ //
+
+        #[test]
+        fn arrow_up_csi_sequence_discarded() {
+            // ESC [ A = cursor up — should be ignored
+            let (res, _) = run(b"\x1b[Ahello\r");
+            assert_eq!(res.unwrap(), Some("hello".to_string()));
+        }
+
+        #[test]
+        fn arrow_right_csi_sequence_discarded() {
+            let (res, _) = run(b"hi\x1b[Cthere\r");
+            assert_eq!(res.unwrap(), Some("hithere".to_string()));
+        }
+
+        #[test]
+        fn multi_param_csi_sequence_discarded() {
+            // ESC [ 1 ; 2 H — cursor position with two params
+            let (res, _) = run(b"\x1b[1;2Hok\r");
+            assert_eq!(res.unwrap(), Some("ok".to_string()));
+        }
+
+        #[test]
+        fn non_csi_esc_sequence_discarded() {
+            // ESC M (reverse index) — 2-byte, not CSI
+            let (res, _) = run(b"\x1bMok\r");
+            assert_eq!(res.unwrap(), Some("ok".to_string()));
+        }
+
+        // ------------------------------------------------------------------ //
+        // Control characters (other than the named ones) — silently ignored
+        // ------------------------------------------------------------------ //
+
+        #[test]
+        fn control_chars_other_than_special_are_ignored() {
+            // Ctrl-A (0x01), Ctrl-E (0x05), Ctrl-K (0x0b) — not inserted into buffer
+            let (res, _) = run(b"\x01hello\x05\x0bworld\r");
+            assert_eq!(res.unwrap(), Some("helloworld".to_string()));
+        }
+
+        // ------------------------------------------------------------------ //
+        // Cooked-fallback newline-stripping logic
+        // ------------------------------------------------------------------ //
+
+        #[test]
+        fn cooked_logic_strips_lf() {
             let mut s = "hello\n".to_string();
             if s.ends_with('\n') {
                 s.pop();
@@ -1186,9 +1427,8 @@ mod prompt_input {
             assert_eq!(s, "hello");
         }
 
-        /// Verify CRLF is trimmed by the cooked fallback logic.
         #[test]
-        fn cooked_strips_crlf() {
+        fn cooked_logic_strips_crlf() {
             let mut s = "hello\r\n".to_string();
             if s.ends_with('\n') {
                 s.pop();
@@ -1197,30 +1437,6 @@ mod prompt_input {
                 s.pop();
             }
             assert_eq!(s, "hello");
-        }
-
-        /// CJK characters should have display width 2.
-        #[test]
-        fn cjk_char_has_width_2() {
-            use unicode_width::UnicodeWidthChar as _;
-            assert_eq!('中'.width(), Some(2));
-            assert_eq!('あ'.width(), Some(2));
-            assert_eq!('한'.width(), Some(2));
-        }
-
-        /// ASCII characters have display width 1.
-        #[test]
-        fn ascii_char_has_width_1() {
-            use unicode_width::UnicodeWidthChar as _;
-            assert_eq!('a'.width(), Some(1));
-            assert_eq!('Z'.width(), Some(1));
-        }
-
-        // Ensure the module compiles cleanly on non-unix targets (write to
-        // stderr so the import is exercised).
-        #[test]
-        fn prompt_input_smoke() {
-            let _ = std::io::stderr().write_all(b"");
         }
     }
 }
