@@ -336,6 +336,9 @@ pub async fn run_chat_loop(
     let mut lines = BufReader::new(read_half).lines();
 
     let mut stdout = tokio::io::stdout();
+    // Single BufReader for stdin — reused across all prompt/steer reads so
+    // buffered bytes are never dropped between reads.
+    let mut stdin = BufReader::new(tokio::io::stdin());
     let mut next_prompt = initial_prompt;
     let mut last_ctrl_c: Option<Instant> = None;
     let mut steer_pending = false;
@@ -349,12 +352,9 @@ pub async fn run_chat_loop(
                     let _ = tokio::io::stderr().flush().await;
                 }
                 let mut line = String::new();
-                let n = tokio::io::AsyncBufReadExt::read_line(
-                    &mut BufReader::new(tokio::io::stdin()),
-                    &mut line,
-                )
-                .await
-                .unwrap_or(0);
+                let n = tokio::io::AsyncBufReadExt::read_line(&mut stdin, &mut line)
+                    .await
+                    .unwrap_or(0);
                 if n == 0 {
                     break 'session;
                 }
@@ -436,7 +436,7 @@ pub async fn run_chat_loop(
                             let _ = tokio::io::stderr().flush().await;
                             let mut reply = String::new();
                             if tokio::io::AsyncBufReadExt::read_line(
-                                &mut BufReader::new(tokio::io::stdin()), &mut reply
+                                &mut stdin, &mut reply
                             ).await.unwrap_or(0) == 0 { break 'session; }
                             let trimmed = reply.trim_end_matches('\n').trim_end_matches('\r').to_owned();
                             if !trimmed.is_empty() {
@@ -459,7 +459,7 @@ pub async fn run_chat_loop(
                     if steer_pending {
                         let mut buf = String::new();
                         let n = tokio::io::AsyncBufReadExt::read_line(
-                            &mut BufReader::new(tokio::io::stdin()), &mut buf
+                            &mut stdin, &mut buf
                         ).await.unwrap_or(0);
                         if n > 0 { Some(buf) } else { None }
                     } else {

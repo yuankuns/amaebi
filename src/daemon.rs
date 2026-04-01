@@ -308,7 +308,9 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
 
     // Carries the messages array across Chat turns on this connection.
     // None → first turn (load from DB). Some → subsequent turns (extend).
+    // Tracks the session_id so context is reset when the client switches sessions.
     let mut carried_messages: Option<Vec<Message>> = None;
+    let mut carried_session_id: Option<String> = None;
 
     'connection: loop {
         let line = match frame_rx.recv().await {
@@ -614,10 +616,53 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                 }
                 let sid = session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
+                // If the session_id changed, discard carried context (comment 5).
+                if carried_session_id.as_deref() != Some(&sid) {
+                    carried_messages = None;
+                }
+
                 // First turn: load history from DB.  Subsequent turns: extend carried messages.
-                let messages = if let Some(mut prev) = carried_messages.take() {
+                // Apply token-budget trim either way so long-lived connections stay bounded (comment 6).
+                let (messages, pre_flight_trimmed) = if let Some(mut prev) = carried_messages.take()
+                {
                     prev.push(Message::user(prompt.clone()));
-                    prev
+                    inject_skill_files(&mut prev).await;
+                    let threshold_inner = compaction_threshold_tokens(&model);
+                    let trimmed = if count_message_tokens(&prev) > threshold_inner {
+                        // Rebuild from persisted history when over budget
+                        let db2 = Arc::clone(&state.db);
+                        let sid2 = sid.clone();
+                        let (hist2, sum2, own2) =
+                            tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+                                let conn = db2.lock().unwrap_or_else(|p| p.into_inner());
+                                Ok((
+                                    memory_db::get_session_history(&conn, &sid2)?,
+                                    memory_db::get_recent_summaries(&conn, &sid2, MAX_SUMMARIES)?,
+                                    memory_db::get_session_own_summary(&conn, &sid2)?,
+                                ))
+                            })
+                            .await
+                            .unwrap_or_else(|_| Ok((vec![], vec![], None)))
+                            .unwrap_or((vec![], vec![], None));
+                        let hot = HOT_TAIL_PAIRS * 2;
+                        let trimmed_hist = if hist2.len() > hot {
+                            &hist2[hist2.len() - hot..]
+                        } else {
+                            &hist2[..]
+                        };
+                        let mut rebuilt = build_messages(
+                            &prompt,
+                            tmux_pane.as_deref(),
+                            trimmed_hist,
+                            &sum2,
+                            own2.as_deref(),
+                        );
+                        inject_skill_files(&mut rebuilt).await;
+                        (rebuilt, true)
+                    } else {
+                        (prev, false)
+                    };
+                    trimmed
                 } else {
                     let db = Arc::clone(&state.db);
                     let sid_c = sid.clone();
@@ -668,8 +713,8 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                         own_summary.as_deref(),
                     );
                     inject_skill_files(&mut msgs).await;
-                    let threshold = compaction_threshold_tokens(&model);
-                    if count_message_tokens(&msgs) > threshold {
+                    let threshold_inner = compaction_threshold_tokens(&model);
+                    let pft = if count_message_tokens(&msgs) > threshold_inner {
                         let hot = HOT_TAIL_PAIRS * 2;
                         let trimmed = if history.len() > hot {
                             &history[history.len() - hot..]
@@ -684,12 +729,17 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                             own_summary.as_deref(),
                         );
                         inject_skill_files(&mut msgs).await;
-                    }
-                    msgs
+                        true
+                    } else {
+                        false
+                    };
+                    (msgs, pft)
                 };
 
                 let pre_send_tokens = count_message_tokens(&messages);
                 let threshold = compaction_threshold_tokens(&model);
+                // pre_flight_trimmed restores the original compaction trigger (comment 7):
+                // if we had to trim, compact even if prompt_tokens stays below threshold.
                 let (steer_tx, mut steer_rx) = tokio::sync::mpsc::channel::<Option<String>>(16);
                 let expected_chat_sid = sid.clone();
 
@@ -738,7 +788,7 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                             pre_send_tokens
                         };
                         let mut w = writer.lock().await;
-                        if effective_tokens > threshold {
+                        if pre_flight_trimmed || effective_tokens > threshold {
                             tracing::info!(session=%sid, effective_tokens, threshold, "compacting conversation history");
                             let _ = write_frame(&mut *w, &Response::Compacting).await;
                             let already = {
@@ -759,8 +809,9 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                         }
                         write_frame(&mut *w, &Response::Done).await?;
                         drop(w);
-                        // Carry messages for the next turn on this connection.
+                        // Carry messages and session_id for the next turn on this connection.
                         carried_messages = Some(final_messages);
+                        carried_session_id = Some(sid.clone());
                     }
                     Err(e) => {
                         tracing::error!(error = %e, "agentic loop error");
@@ -773,6 +824,7 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                         )
                         .await;
                         carried_messages = None;
+                        carried_session_id = None;
                     }
                 }
             }

@@ -503,18 +503,20 @@ impl LongChatConnection {
 
     /// Read one newline-delimited response frame from the connection.
     async fn read_frame(&mut self) -> Result<Option<Response>> {
-        let mut line = String::new();
-        let n = self.reader.read_line(&mut line).await?;
-        if n == 0 {
-            return Ok(None); // EOF
+        loop {
+            let mut line = String::new();
+            let n = self.reader.read_line(&mut line).await?;
+            if n == 0 {
+                return Ok(None); // real EOF
+            }
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue; // blank line — keep reading
+            }
+            let frame: Response = serde_json::from_str(trimmed)
+                .with_context(|| format!("parsing response: {trimmed:?}"))?;
+            return Ok(Some(frame));
         }
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            return Ok(None);
-        }
-        let frame: Response = serde_json::from_str(trimmed)
-            .with_context(|| format!("parsing response: {trimmed:?}"))?;
-        Ok(Some(frame))
     }
 
     /// Send a Chat request and collect all response frames until Done/Error.
