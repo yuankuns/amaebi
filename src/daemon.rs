@@ -2246,19 +2246,29 @@ async fn run_cron_job(state: Arc<DaemonState>, job: &cron::CronJob) {
     let model = std::env::var("AMAEBI_MODEL").unwrap_or_else(|_| "gpt-4o".to_string());
 
     // If this job has a parent session, inject its summary as context.
+    // Wrap the sync SQLite call in spawn_blocking so the async reactor is
+    // not blocked while the DB is read.
     let own_summary: Option<String> = if let Some(ref sid) = job.parent_session_id {
-        let db = state.db.lock().expect("db lock poisoned");
-        match memory_db::get_session_own_summary(&db, sid) {
-            Ok(summary_opt) => summary_opt.map(|s| format!("[Context from previous session]\n{s}")),
-            Err(e) => {
-                tracing::error!(
-                    error = %e,
-                    parent_session_id = %sid,
-                    "cron: failed to load parent session summary"
-                );
-                None
-            }
-        }
+        let db = Arc::clone(&state.db);
+        let sid_c = sid.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = db.lock().expect("db lock poisoned");
+            memory_db::get_session_own_summary(&conn, &sid_c)
+        })
+        .await
+        .unwrap_or_else(|e| {
+            tracing::error!(error = %e, "cron: spawn_blocking panicked loading parent summary");
+            Ok(None)
+        })
+        .unwrap_or_else(|e| {
+            tracing::error!(
+                error = %e,
+                parent_session_id = %sid,
+                "cron: failed to load parent session summary"
+            );
+            None
+        })
+        .map(|s| format!("[Context from previous session]\n{s}"))
     } else {
         None
     };
