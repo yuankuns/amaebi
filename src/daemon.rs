@@ -82,6 +82,13 @@ pub struct DaemonState {
     /// insert the session ID.  The task removes itself on completion.  If the
     /// ID is already present, skip the spawn to prevent overlapping compactions.
     pub compacting_sessions: Arc<Mutex<HashSet<String>>>,
+    /// Sessions currently held by an active connection (Chat, Ask, or Resume).
+    ///
+    /// A session may only be used by one connection at a time.  Before processing
+    /// any Chat/Ask/Resume request, the daemon inserts the session ID here.  If
+    /// it is already present the request is rejected with a Response::Error so
+    /// concurrent clients cannot interleave writes to the same session history.
+    pub active_sessions: Arc<Mutex<HashSet<String>>>,
 }
 
 impl DaemonState {
@@ -99,6 +106,7 @@ impl DaemonState {
 
         let db = Arc::new(Mutex::new(conn));
         let compacting_sessions: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+        let active_sessions: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
 
         let tokens = Arc::new(TokenCache::new());
 
@@ -118,6 +126,7 @@ impl DaemonState {
             executor: Box::new(executor),
             db,
             compacting_sessions,
+            active_sessions,
         })
     }
 }
@@ -311,6 +320,9 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
     // Tracks the session_id so context is reset when the client switches sessions.
     let mut carried_messages: Option<Vec<Message>> = None;
     let mut carried_session_id: Option<String> = None;
+    // Held for the lifetime of a Chat connection once a session is claimed.
+    // Ensures a second connection cannot use the same session concurrently.
+    let mut chat_session_guard: Option<ActiveSessionGuard> = None;
 
     'connection: loop {
         let line = match frame_rx.recv().await {
@@ -492,6 +504,23 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                 session_id,
             } => {
                 tracing::info!(model = %model, session_id = %session_id, prompt_len = prompt.len(), "received resume request");
+                let _resume_session_guard = match claim_session(&state.active_sessions, &session_id)
+                {
+                    Ok(g) => g,
+                    Err(()) => {
+                        let mut w = writer.lock().await;
+                        write_frame(
+                            &mut *w,
+                            &Response::Error {
+                                message: format!(
+                                    "session {session_id} is already in use by another connection"
+                                ),
+                            },
+                        )
+                        .await?;
+                        continue 'connection;
+                    }
+                };
                 if let Err(e) = state.tokens.get(&state.http).await {
                     let mut w = writer.lock().await;
                     write_frame(
@@ -627,6 +656,37 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                 session_id,
             } => {
                 tracing::info!(pane = ?tmux_pane, model = %model, prompt_len = prompt.len(), "received chat request");
+                let sid = session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+                // If the session_id changed, release any prior session claim and
+                // discard carried context before claiming the new session.
+                if carried_session_id.as_deref() != Some(&sid) {
+                    chat_session_guard = None; // releases old claim if any
+                    carried_messages = None;
+                }
+
+                // Claim the session on the first turn (or after a session change).
+                // A second connection that tries to use the same session will get
+                // an error instead of corrupting the shared SQLite history.
+                if chat_session_guard.is_none() {
+                    match claim_session(&state.active_sessions, &sid) {
+                        Ok(g) => chat_session_guard = Some(g),
+                        Err(()) => {
+                            let mut w = writer.lock().await;
+                            write_frame(
+                                &mut *w,
+                                &Response::Error {
+                                    message: format!(
+                                        "session {sid} is already in use by another connection"
+                                    ),
+                                },
+                            )
+                            .await?;
+                            continue 'connection;
+                        }
+                    }
+                }
+
                 if let Err(e) = state.tokens.get(&state.http).await {
                     let mut w = writer.lock().await;
                     write_frame(
@@ -637,12 +697,6 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                     )
                     .await?;
                     break 'connection;
-                }
-                let sid = session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-
-                // If the session_id changed, discard carried context (comment 5).
-                if carried_session_id.as_deref() != Some(&sid) {
-                    carried_messages = None;
                 }
 
                 // First turn: load history from DB.  Subsequent turns: extend carried messages.
@@ -975,6 +1029,44 @@ impl Drop for CompactingGuard {
             .unwrap_or_else(|p| p.into_inner())
             .remove(&self.session_id);
     }
+}
+
+/// RAII guard that releases a session from `active_sessions` when dropped.
+///
+/// Held for the lifetime of a Chat connection or an Ask/Resume agentic loop.
+/// Ensures concurrent connections to the same session are rejected.
+struct ActiveSessionGuard {
+    active_sessions: Arc<Mutex<HashSet<String>>>,
+    session_id: String,
+}
+
+impl Drop for ActiveSessionGuard {
+    fn drop(&mut self) {
+        self.active_sessions
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&self.session_id);
+    }
+}
+
+/// Try to claim `session_id` in `active_sessions`.
+///
+/// Returns `Ok(guard)` on success.  Returns `Err` when the session is already
+/// held by another connection — the caller should send `Response::Error` and
+/// skip processing.
+fn claim_session(
+    active_sessions: &Arc<Mutex<HashSet<String>>>,
+    session_id: &str,
+) -> Result<ActiveSessionGuard, ()> {
+    let mut guard = active_sessions.lock().unwrap_or_else(|p| p.into_inner());
+    if guard.contains(session_id) {
+        return Err(());
+    }
+    guard.insert(session_id.to_owned());
+    Ok(ActiveSessionGuard {
+        active_sessions: Arc::clone(active_sessions),
+        session_id: session_id.to_owned(),
+    })
 }
 
 async fn compact_session(
