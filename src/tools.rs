@@ -18,9 +18,10 @@ use crate::sandbox::{docker::DockerSandboxConfig, DockerSandbox, NoopSandbox, Sa
 /// Set to `None` in child agents and in follow-up-triggered loops to prevent
 /// recursive scheduling.
 pub struct FollowupContext {
-    /// The session UUID of the currently-running agentic loop, used as the
-    /// default `parent_session_id` when not explicitly supplied by the model.
-    pub current_session_id: String,
+    /// Optional session UUID of the currently-running agentic loop, used as
+    /// the default `parent_session_id` when the caller does not pass an
+    /// explicit `session_id` argument.
+    pub current_session_id: Option<String>,
     /// Override path for `cron.db`.  `None` uses `~/.amaebi/cron.db`.
     /// Inject a temp path in tests for isolation.
     pub cron_db_path: Option<std::path::PathBuf>,
@@ -53,7 +54,13 @@ pub struct SpawnContext {
 /// `DockerExecutor` without touching the agentic loop.
 #[async_trait::async_trait]
 pub trait ToolExecutor: Send + Sync {
-    async fn execute(&self, name: &str, args: serde_json::Value) -> Result<String>;
+    async fn execute(
+        &self,
+        name: &str,
+        args: serde_json::Value,
+        session_id: Option<&str>,
+        enable_followup: bool,
+    ) -> Result<String>;
 }
 
 // ---------------------------------------------------------------------------
@@ -124,8 +131,14 @@ impl LocalExecutor {
 
 #[async_trait::async_trait]
 impl ToolExecutor for LocalExecutor {
-    async fn execute(&self, name: &str, args: serde_json::Value) -> Result<String> {
-        tracing::debug!(tool = %name, "executing tool");
+    async fn execute(
+        &self,
+        name: &str,
+        args: serde_json::Value,
+        session_id: Option<&str>,
+        enable_followup: bool,
+    ) -> Result<String> {
+        tracing::debug!(tool = %name, session_id, enable_followup, "executing tool");
         match name {
             "shell_command" => {
                 shell_command(args, self.sandbox.as_deref(), self.default_cwd.as_deref()).await
@@ -142,7 +155,7 @@ impl ToolExecutor for LocalExecutor {
                 ),
             },
             "schedule_followup" => match &self.followup_ctx {
-                Some(ctx) => schedule_followup(args, ctx).await,
+                Some(ctx) => schedule_followup(args, ctx, session_id).await,
                 None => anyhow::bail!(
                     "schedule_followup is not available in this context \
                      (follow-up loops and child agents cannot schedule further follow-ups)"
@@ -474,6 +487,7 @@ async fn spawn_agent(args: serde_json::Value, ctx: &SpawnContext) -> Result<Stri
 
     // Fix 5: child agents do not get spawn_agent in their tool schema to
     // prevent unbounded recursion at the schema level.
+    let child_session_id = uuid::Uuid::new_v4().to_string();
     let (final_text, _, _) = crate::daemon::run_agentic_loop(
         &child_state,
         &model,
@@ -482,6 +496,7 @@ async fn spawn_agent(args: serde_json::Value, ctx: &SpawnContext) -> Result<Stri
         &mut steer_rx,
         false, // child agents cannot spawn further agents
         false, // child agents cannot schedule follow-ups
+        &child_session_id,
     )
     .await?;
 
@@ -513,9 +528,9 @@ async fn edit_file(args: serde_json::Value) -> Result<String> {
 ///
 /// - `include_spawn_agent`: `true` for the parent daemon context; `false` in
 ///   child agents to prevent unbounded recursion.
-/// - `include_followup`: `true` for normal interactive/cron parent loops;
-///   `false` in child agents and in follow-up-triggered loops to prevent
-///   recursive scheduling.
+/// - `include_followup`: `true` for normal interactive parent loops;
+///   `false` in child agents, cron parent loops, and in follow-up-triggered
+///   loops to prevent recursive scheduling.
 pub fn tool_schemas(include_spawn_agent: bool, include_followup: bool) -> Vec<serde_json::Value> {
     let mut schemas = vec![
         serde_json::json!({
@@ -749,7 +764,7 @@ pub fn tool_schemas(include_spawn_agent: bool, include_followup: bool) -> Vec<se
 }
 
 // ---------------------------------------------------------------------------
-// Followup tool implementations (stubs — filled in during Phase 4)
+// Followup tool implementations
 // ---------------------------------------------------------------------------
 
 /// Open the cron store, using the context's override path if set.
@@ -761,24 +776,45 @@ fn open_cron_store(ctx: &FollowupContext) -> Result<crate::cron::CronStore> {
 }
 
 /// Schedule a one-shot follow-up task via the cron subsystem.
-async fn schedule_followup(args: serde_json::Value, ctx: &FollowupContext) -> Result<String> {
+///
+/// `caller_session_id` is the session that invoked the tool (from `execute`'s
+/// `session_id` parameter).  It is used as the fallback `parent_session_id`
+/// when the model does not supply an explicit `session_id` argument.
+async fn schedule_followup(
+    args: serde_json::Value,
+    ctx: &FollowupContext,
+    caller_session_id: Option<&str>,
+) -> Result<String> {
     let description = args["description"]
         .as_str()
         .context("schedule_followup: missing string argument 'description'")?;
     let when = args["when"]
         .as_str()
         .context("schedule_followup: missing string argument 'when'")?;
-    let session_id = args["session_id"].as_str();
+    let arg_session_id = match args.get("session_id") {
+        Some(serde_json::Value::Null) | None => None,
+        Some(value) => Some(
+            value
+                .as_str()
+                .context("schedule_followup: optional argument 'session_id' must be a string")?,
+        ),
+    };
 
     let (cron_expr, fires_at) = crate::followup::resolve_when(when)
         .with_context(|| format!("schedule_followup: invalid 'when' value {when:?}"))?;
 
-    // Use caller-provided session_id or fall back to the current session.
-    let parent = session_id.unwrap_or(&ctx.current_session_id);
+    // Priority: explicit arg > caller session (from execute) > ctx fallback.
+    // Empty / whitespace-only values are treated as absent so we never store
+    // an empty string as parent_session_id in the DB.
+    let parent = arg_session_id
+        .or(caller_session_id)
+        .or(ctx.current_session_id.as_deref())
+        .map(str::trim)
+        .filter(|sid| !sid.is_empty());
 
     let store = open_cron_store(ctx)?;
     let id = store
-        .add_oneshot(description, &cron_expr, Some(parent))
+        .add_oneshot(description, &cron_expr, parent)
         .context("schedule_followup: writing to cron store")?;
 
     Ok(format!(
@@ -955,6 +991,8 @@ mod tests {
             .execute(
                 "shell_command",
                 serde_json::json!({"command": "echo hello"}),
+                None,
+                false,
             )
             .await
             .unwrap();
@@ -968,6 +1006,8 @@ mod tests {
             .execute(
                 "shell_command",
                 serde_json::json!({"command": "echo bad && exit 2"}),
+                None,
+                false,
             )
             .await
             .unwrap();
@@ -979,7 +1019,12 @@ mod tests {
     async fn shell_command_empty_output_shows_exit_zero() {
         let exec = LocalExecutor::new();
         let out = exec
-            .execute("shell_command", serde_json::json!({"command": "true"}))
+            .execute(
+                "shell_command",
+                serde_json::json!({"command": "true"}),
+                None,
+                false,
+            )
             .await
             .unwrap();
         assert_eq!(out, "[exit 0]");
@@ -988,7 +1033,9 @@ mod tests {
     #[tokio::test]
     async fn shell_command_missing_arg_returns_err() {
         let exec = LocalExecutor::new();
-        let result = exec.execute("shell_command", serde_json::json!({})).await;
+        let result = exec
+            .execute("shell_command", serde_json::json!({}), None, false)
+            .await;
         assert!(result.is_err());
         let msg = format!("{}", result.unwrap_err());
         assert!(
@@ -1010,6 +1057,8 @@ mod tests {
             .execute(
                 "read_file",
                 serde_json::json!({"path": path.to_str().unwrap()}),
+                None,
+                false,
             )
             .await
             .unwrap();
@@ -1025,6 +1074,8 @@ mod tests {
             .execute(
                 "read_file",
                 serde_json::json!({"path": path.to_str().unwrap()}),
+                None,
+                false,
             )
             .await;
         assert!(result.is_err());
@@ -1033,7 +1084,9 @@ mod tests {
     #[tokio::test]
     async fn read_file_missing_path_arg_returns_err() {
         let exec = LocalExecutor::new();
-        let result = exec.execute("read_file", serde_json::json!({})).await;
+        let result = exec
+            .execute("read_file", serde_json::json!({}), None, false)
+            .await;
         assert!(result.is_err());
     }
 
@@ -1049,6 +1102,8 @@ mod tests {
             .execute(
                 "edit_file",
                 serde_json::json!({"path": path.to_str().unwrap(), "content": "written"}),
+                None,
+                false,
             )
             .await
             .unwrap();
@@ -1069,6 +1124,8 @@ mod tests {
         exec.execute(
             "edit_file",
             serde_json::json!({"path": path.to_str().unwrap(), "content": "new"}),
+            None,
+            false,
         )
         .await
         .unwrap();
@@ -1131,7 +1188,10 @@ mod tests {
             default_cwd: None,
         };
         let args = serde_json::json!({"command": "echo hello"});
-        let result = exec.execute("shell_command", args).await.unwrap();
+        let result = exec
+            .execute("shell_command", args, None, false)
+            .await
+            .unwrap();
         assert!(result.contains("hello"));
     }
 
@@ -1146,7 +1206,12 @@ mod tests {
         };
         // pwd should print the default_cwd, not the daemon process cwd.
         let result = exec
-            .execute("shell_command", serde_json::json!({"command": "pwd"}))
+            .execute(
+                "shell_command",
+                serde_json::json!({"command": "pwd"}),
+                None,
+                false,
+            )
             .await
             .unwrap();
         assert!(
@@ -1252,7 +1317,7 @@ mod tests {
     async fn unknown_tool_returns_descriptive_error() {
         let exec = LocalExecutor::new();
         let result = exec
-            .execute("nonexistent_tool", serde_json::json!({}))
+            .execute("nonexistent_tool", serde_json::json!({}), None, false)
             .await;
         assert!(result.is_err());
         let msg = format!("{}", result.unwrap_err());
@@ -1341,6 +1406,8 @@ mod tests {
             .execute(
                 "schedule_followup",
                 serde_json::json!({"description": "check logs", "when": "in 30 minutes"}),
+                None,
+                false,
             )
             .await;
         assert!(result.is_err());
@@ -1355,7 +1422,12 @@ mod tests {
     async fn cancel_followup_without_context_returns_error() {
         let exec = LocalExecutor::new();
         let result = exec
-            .execute("cancel_followup", serde_json::json!({"id": "some-id"}))
+            .execute(
+                "cancel_followup",
+                serde_json::json!({"id": "some-id"}),
+                None,
+                false,
+            )
             .await;
         assert!(result.is_err());
         let msg = format!("{}", result.unwrap_err());
@@ -1365,7 +1437,9 @@ mod tests {
     #[tokio::test]
     async fn list_followups_without_context_returns_error() {
         let exec = LocalExecutor::new();
-        let result = exec.execute("list_followups", serde_json::json!({})).await;
+        let result = exec
+            .execute("list_followups", serde_json::json!({}), None, false)
+            .await;
         assert!(result.is_err());
         let msg = format!("{}", result.unwrap_err());
         assert!(msg.contains("not available"), "got: {msg}");
@@ -1379,7 +1453,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let cron_path = dir.path().join("cron.db");
         let ctx = FollowupContext {
-            current_session_id: "test-session".to_string(),
+            current_session_id: Some("test-session".to_string()),
             cron_db_path: Some(cron_path),
         };
         (ctx, dir)
@@ -1391,7 +1465,8 @@ mod tests {
     async fn schedule_followup_missing_description_returns_error() {
         let (ctx_inner, _dir) = make_followup_ctx();
         let ctx = Arc::new(ctx_inner);
-        let result = schedule_followup(serde_json::json!({"when": "in 30 minutes"}), &ctx).await;
+        let result =
+            schedule_followup(serde_json::json!({"when": "in 30 minutes"}), &ctx, None).await;
         assert!(result.is_err());
         let msg = format!("{}", result.unwrap_err());
         assert!(
@@ -1405,7 +1480,7 @@ mod tests {
         let (ctx_inner, _dir) = make_followup_ctx();
         let ctx = Arc::new(ctx_inner);
         let result =
-            schedule_followup(serde_json::json!({"description": "check logs"}), &ctx).await;
+            schedule_followup(serde_json::json!({"description": "check logs"}), &ctx, None).await;
         assert!(result.is_err());
         let msg = format!("{}", result.unwrap_err());
         assert!(msg.contains("when"), "error should mention 'when': {msg}");
@@ -1418,9 +1493,57 @@ mod tests {
         let result = schedule_followup(
             serde_json::json!({"description": "check logs", "when": "next tuesday"}),
             &ctx,
+            None,
         )
         .await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn schedule_followup_without_any_session_context_stores_no_parent() {
+        let dir = TempDir::new().unwrap();
+        let cron_path = dir.path().join("cron.db");
+        let ctx = FollowupContext {
+            current_session_id: None,
+            cron_db_path: Some(cron_path.clone()),
+        };
+        let output = schedule_followup(
+            serde_json::json!({"description": "check deploy", "when": "in 30 minutes"}),
+            &ctx,
+            None,
+        )
+        .await
+        .expect("schedule_followup should succeed without a session id");
+        assert!(output.contains("Follow-up scheduled"));
+
+        let jobs = crate::cron::CronStore::open_at(cron_path)
+            .unwrap()
+            .list()
+            .unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert!(jobs[0].parent_session_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn schedule_followup_rejects_non_string_session_id() {
+        let (ctx_inner, _dir) = make_followup_ctx();
+        let ctx = Arc::new(ctx_inner);
+        let result = schedule_followup(
+            serde_json::json!({
+                "description": "check deploy",
+                "when": "in 30 minutes",
+                "session_id": 123
+            }),
+            &ctx,
+            None,
+        )
+        .await;
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("session_id"),
+            "error should mention session_id: {msg}"
+        );
     }
 
     #[tokio::test]
@@ -1430,6 +1553,7 @@ mod tests {
         let result = schedule_followup(
             serde_json::json!({"description": "check deploy", "when": "in 30 minutes"}),
             &ctx,
+            None,
         )
         .await;
         let output = result.expect("schedule_followup should succeed");

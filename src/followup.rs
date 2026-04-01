@@ -5,6 +5,8 @@
 //! `schedule_followup` tool.
 
 use anyhow::{bail, Result};
+const ONE_SHOT_GRACE_YEARS: i64 = 5;
+
 use chrono::{DateTime, Datelike, Timelike, Utc};
 
 /// Minimum follow-up delay in minutes.
@@ -125,6 +127,25 @@ pub fn resolve_when(when: &str) -> Result<(String, DateTime<Utc>)> {
     Ok((cron, fires_at))
 }
 
+/// Decide whether a one-shot job should fire at `now`, even if the daemon
+/// missed the exact scheduled minute.
+///
+/// The generated cron expression pins minute/hour/day/month but not year, so a
+/// strict cron match would defer a missed one-shot until the next yearly
+/// occurrence. Instead, once the scheduled wall-clock time for the current year
+/// has passed, we continue treating the job as due until it is executed (or
+/// until an upper-bound grace window elapses to avoid resurrecting stale jobs
+/// from many years ago).
+pub fn oneshot_due_after_missed_window(fires_at: &DateTime<Utc>, now: &DateTime<Utc>) -> bool {
+    if now < fires_at {
+        return false;
+    }
+    let grace_deadline = fires_at
+        .checked_add_signed(chrono::Duration::days(366 * ONE_SHOT_GRACE_YEARS))
+        .unwrap_or(*fires_at);
+    now <= &grace_deadline
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -132,7 +153,7 @@ pub fn resolve_when(when: &str) -> Result<(String, DateTime<Utc>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Utc;
+    use chrono::{TimeZone, Utc};
 
     // ---- parse_relative_time: valid inputs ----
 
@@ -274,6 +295,29 @@ mod tests {
             parse_relative_time("in -5 minutes").is_err(),
             "negative duration must be rejected"
         );
+    }
+
+    // ---- oneshot_due_after_missed_window ----
+
+    #[test]
+    fn oneshot_due_after_missed_window_false_before_fire_time() {
+        let fires_at = Utc.with_ymd_and_hms(2026, 4, 1, 14, 35, 0).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 4, 1, 14, 34, 0).unwrap();
+        assert!(!oneshot_due_after_missed_window(&fires_at, &now));
+    }
+
+    #[test]
+    fn oneshot_due_after_missed_window_true_after_missed_minute() {
+        let fires_at = Utc.with_ymd_and_hms(2026, 4, 1, 14, 35, 0).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 4, 1, 14, 50, 0).unwrap();
+        assert!(oneshot_due_after_missed_window(&fires_at, &now));
+    }
+
+    #[test]
+    fn oneshot_due_after_missed_window_expires_after_grace_period() {
+        let fires_at = Utc.with_ymd_and_hms(2020, 4, 1, 14, 35, 0).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 4, 2, 14, 35, 0).unwrap();
+        assert!(!oneshot_due_after_missed_window(&fires_at, &now));
     }
 
     // ---- datetime_to_cron_expr ----

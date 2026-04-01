@@ -267,6 +267,9 @@ impl acp::Agent for AmaebiAgent {
         // drop the sender so the receiver observes a closed channel.
         let (steer_tx, mut steer_rx) = tokio::sync::mpsc::channel::<Option<String>>(1);
         drop(steer_tx);
+        // Capture session_id before the spawn so it can be passed into the loop.
+        let session_id = args.session_id.clone();
+        let sid_loop = session_id.0.to_string();
         tokio::task::spawn_local(async move {
             let outcome = run_agentic_loop(
                 &state,
@@ -276,6 +279,7 @@ impl acp::Agent for AmaebiAgent {
                 &mut steer_rx,
                 true,
                 true,
+                &sid_loop,
             )
             .await
             .map(|(text, tokens, _messages)| (text, tokens)) // discard messages Vec
@@ -285,7 +289,6 @@ impl acp::Agent for AmaebiAgent {
         });
 
         // Forward text chunks as ACP session notifications.
-        let session_id = args.session_id.clone();
         let tx = self.session_update_tx.clone();
         let mut lines = BufReader::new(read_half).lines();
 

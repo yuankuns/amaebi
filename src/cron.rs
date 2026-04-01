@@ -23,6 +23,7 @@
 //! CLI collide on the same row.
 
 use anyhow::{Context, Result};
+use chrono::{DateTime, Datelike, Timelike, Utc};
 use rusqlite::{params, Connection};
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
@@ -195,9 +196,9 @@ impl CronStore {
                     schedule: row.get(2)?,
                     created_at: row.get(3)?,
                     last_run: row.get(4)?,
-                    one_shot: row.get::<_, i64>(5).unwrap_or(0) != 0,
-                    created_by_model: row.get::<_, i64>(6).unwrap_or(0) != 0,
-                    parent_session_id: row.get(7).unwrap_or(None),
+                    one_shot: row.get::<_, i64>(5).map(|v| v != 0)?,
+                    created_by_model: row.get::<_, i64>(6).map(|v| v != 0)?,
+                    parent_session_id: row.get(7)?,
                 })
             })
             .context("executing cron list query")?;
@@ -291,9 +292,9 @@ impl CronStore {
                     schedule: row.get(2)?,
                     created_at: row.get(3)?,
                     last_run: row.get(4)?,
-                    one_shot: row.get::<_, i64>(5).unwrap_or(0) != 0,
-                    created_by_model: row.get::<_, i64>(6).unwrap_or(0) != 0,
-                    parent_session_id: row.get(7).unwrap_or(None),
+                    one_shot: row.get::<_, i64>(5).map(|v| v != 0)?,
+                    created_by_model: row.get::<_, i64>(6).map(|v| v != 0)?,
+                    parent_session_id: row.get(7)?,
                 })
             })
             .context("executing model jobs query")?;
@@ -387,6 +388,13 @@ impl FieldSpec {
         match self {
             FieldSpec::Any => true,
             FieldSpec::Values(vals) => vals.contains(&value),
+        }
+    }
+
+    pub fn exact_value(&self) -> Option<u32> {
+        match self {
+            FieldSpec::Values(vals) if vals.len() == 1 => Some(vals[0]),
+            _ => None,
         }
     }
 }
@@ -499,7 +507,49 @@ pub fn due_jobs(jobs: &[CronJob], now: &chrono::DateTime<chrono::Utc>) -> Vec<Cr
                 continue;
             }
         };
-        if !is_due(&sched, now) {
+        let due_now = if job.one_shot {
+            let (Some(month), Some(day), Some(hour), Some(minute)) = (
+                sched.month.exact_value(),
+                sched.dom.exact_value(),
+                sched.hour.exact_value(),
+                sched.minute.exact_value(),
+            ) else {
+                tracing::warn!(
+                    id = %job.id,
+                    schedule = %job.schedule,
+                    "skipping one-shot cron job with non-specific schedule"
+                );
+                continue;
+            };
+
+            // Compute fires_at using the creation year so that a job missed
+            // in 2020 does not get a fresh grace window based on today's year.
+            let anchor: DateTime<Utc> = job.created_at.parse().unwrap_or(*now);
+            let fires_at: Option<DateTime<Utc>> = anchor
+                .with_month(month)
+                .and_then(|dt: DateTime<Utc>| dt.with_day(day))
+                .and_then(|dt: DateTime<Utc>| dt.with_hour(hour))
+                .and_then(|dt: DateTime<Utc>| dt.with_minute(minute))
+                .and_then(|dt: DateTime<Utc>| dt.with_second(0))
+                .and_then(|dt: DateTime<Utc>| dt.with_nanosecond(0));
+            match fires_at {
+                Some(fires_at) => {
+                    is_due(&sched, now)
+                        || crate::followup::oneshot_due_after_missed_window(&fires_at, now)
+                }
+                None => {
+                    tracing::warn!(
+                        id = %job.id,
+                        schedule = %job.schedule,
+                        "skipping one-shot cron job with invalid scheduled timestamp"
+                    );
+                    false
+                }
+            }
+        } else {
+            is_due(&sched, now)
+        };
+        if !due_now {
             continue;
         }
         // Guard: don't re-fire within the same minute.
@@ -692,6 +742,47 @@ mod tests {
         assert!(!ids.contains(&"a"), "recently-run job must be skipped");
         assert!(ids.contains(&"b"), "old job must be due");
         assert!(ids.contains(&"c"), "never-run job must be due");
+    }
+
+    #[test]
+    fn due_jobs_runs_missed_one_shot_later_same_year() {
+        let now = utc(2026, 4, 1, 14, 50);
+        let jobs = vec![CronJob {
+            id: "oneshot".into(),
+            description: "follow up".into(),
+            schedule: "35 14 1 4 *".into(),
+            created_at: "2026-04-01T14:00:00Z".into(),
+            last_run: None,
+            one_shot: true,
+            created_by_model: true,
+            parent_session_id: Some("sid".into()),
+        }];
+        let due = due_jobs(&jobs, &now);
+        assert_eq!(
+            due.len(),
+            1,
+            "missed one-shot should still be due later that year"
+        );
+    }
+
+    #[test]
+    fn due_jobs_skips_stale_one_shot_beyond_grace_window() {
+        let now = utc(2026, 4, 2, 14, 35);
+        let jobs = vec![CronJob {
+            id: "stale-oneshot".into(),
+            description: "follow up".into(),
+            schedule: "35 14 1 4 *".into(),
+            created_at: "2020-04-01T14:00:00Z".into(),
+            last_run: None,
+            one_shot: true,
+            created_by_model: true,
+            parent_session_id: Some("sid".into()),
+        }];
+        let due = due_jobs(&jobs, &now);
+        assert!(
+            due.is_empty(),
+            "stale one-shot should not remain due forever"
+        );
     }
 
     #[test]
