@@ -2042,3 +2042,85 @@ async fn gemini_models_route_via_copilot_and_succeed() {
 // Verifies that when /chat/completions returns 400 unsupported_api_for_model
 // the daemon automatically retries via /v1/responses and delivers the
 // response to the client.
+
+// ---------------------------------------------------------------------------
+// Regression: one active chat per session
+// ---------------------------------------------------------------------------
+
+/// A second `amaebi ask` in the same directory (same session UUID) while the
+/// first is still running must receive an immediate Error, not silently race
+/// on history writes.
+#[tokio::test]
+async fn second_chat_on_same_session_is_rejected() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::UnixStream;
+
+    let server = MockLlmServer::start().await;
+
+    // First chat: slow tool call keeps the session alive.
+    server.enqueue(ScriptedResponse::tool_call(
+        "lock-tool-1",
+        "shell_command",
+        r#"{"command":"sleep 0.5"}"#,
+    ));
+    server.enqueue(ScriptedResponse::text_chunks(vec!["done"]));
+
+    let daemon = start_daemon(&server.url()).await.expect("start_daemon");
+    let session_id = uuid::Uuid::new_v4().to_string();
+
+    // Open first chat (stays alive during the slow tool).
+    let stream1 = UnixStream::connect(&daemon.socket)
+        .await
+        .expect("connect 1");
+    let (read1, mut write1) = stream1.into_split();
+    let req1 = Request::Chat {
+        prompt: "run slow tool".to_string(),
+        tmux_pane: None,
+        session_id: Some(session_id.clone()),
+        model: "gpt-4o".to_string(),
+    };
+    let mut line = serde_json::to_string(&req1).unwrap();
+    line.push('\n');
+    write1.write_all(line.as_bytes()).await.unwrap();
+
+    // Wait until the tool is executing (ToolUse frame arrives).
+    let mut lines1 = BufReader::new(read1).lines();
+    let tool_use_seen = tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(raw) = lines1.next_line().await.unwrap() {
+            let frame: Response = serde_json::from_str(&raw).unwrap();
+            if matches!(frame, Response::ToolUse { .. }) {
+                return true;
+            }
+        }
+        false
+    })
+    .await
+    .expect("timed out waiting for ToolUse");
+    assert!(tool_use_seen, "ToolUse never arrived on first chat");
+
+    // Now try to open a second chat on the same session — must be rejected.
+    let client2 = connect_client(&daemon.socket);
+    let responses2 = send_message_with_session(&client2, "hello", &session_id, "gpt-4o")
+        .await
+        .expect("send second chat");
+
+    assert!(
+        responses2
+            .iter()
+            .any(|r| matches!(r, Response::Error { .. })),
+        "expected Error for second chat on same session; got: {responses2:?}"
+    );
+    let error_msg = responses2.iter().find_map(|r| {
+        if let Response::Error { message } = r {
+            Some(message.as_str())
+        } else {
+            None
+        }
+    });
+    assert!(
+        error_msg
+            .unwrap_or("")
+            .contains("already has an active chat"),
+        "error message must mention 'already has an active chat'; got: {error_msg:?}"
+    );
+}

@@ -413,6 +413,7 @@ async fn spawn_agent(args: serde_json::Value, ctx: &SpawnContext) -> Result<Stri
         executor: Box::new(child_executor),
         db: Arc::clone(&ctx.db),
         compacting_sessions: Arc::clone(&ctx.compacting_sessions),
+        active_chats: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
     };
 
     let messages = vec![

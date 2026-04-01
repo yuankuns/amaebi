@@ -82,6 +82,12 @@ pub struct DaemonState {
     /// insert the session ID.  The task removes itself on completion.  If the
     /// ID is already present, skip the spawn to prevent overlapping compactions.
     pub compacting_sessions: Arc<Mutex<HashSet<String>>>,
+    /// Sessions that currently have an active interactive chat or resume loop.
+    ///
+    /// Prevents two concurrent `amaebi ask` invocations in the same directory
+    /// from racing on session history writes.  Inserted before the agentic loop
+    /// starts; removed when the connection closes (both success and error paths).
+    pub active_chats: Arc<Mutex<HashSet<String>>>,
 }
 
 impl DaemonState {
@@ -118,6 +124,7 @@ impl DaemonState {
             executor: Box::new(executor),
             db,
             compacting_sessions,
+            active_chats: Arc::new(Mutex::new(HashSet::new())),
         })
     }
 }
@@ -511,6 +518,31 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                 return Ok(());
             }
 
+            if !state
+                .active_chats
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(session_id.clone())
+            {
+                write_frame(
+                    &mut writer,
+                    &Response::Error {
+                        message: format!(
+                            "session {session_id} already has an active chat; \
+                             wait for it to finish or run `amaebi session new` \
+                             to start a fresh session"
+                        ),
+                    },
+                )
+                .await?;
+                return Ok(());
+            }
+            // Guard ensures the slot is freed on every exit path.
+            let _active_guard = ActiveChatGuard {
+                active_chats: Arc::clone(&state.active_chats),
+                session_id: session_id.clone(),
+            };
+
             let (steer_tx, mut steer_rx) = tokio::sync::mpsc::channel::<Option<String>>(16);
             let expected_resume_sid = session_id.clone();
             tokio::spawn(async move {
@@ -661,6 +693,31 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
             // Older clients that omit session_id get a fresh UUID so their
             // history and steer lookups are isolated (not all lumped under "").
             let sid = session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+            if !state
+                .active_chats
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(sid.clone())
+            {
+                write_frame(
+                    &mut writer,
+                    &Response::Error {
+                        message: format!(
+                            "session {sid} already has an active chat; \
+                             wait for it to finish or run `amaebi session new` \
+                             to start a fresh session"
+                        ),
+                    },
+                )
+                .await?;
+                return Ok(());
+            }
+            // Guard ensures the slot is freed on every exit path.
+            let _active_guard = ActiveChatGuard {
+                active_chats: Arc::clone(&state.active_chats),
+                session_id: sid.clone(),
+            };
 
             // Steering channel: the spawned reader task sends user corrections
             // here; the agentic loop drains them between model turns.
@@ -978,6 +1035,22 @@ struct CompactingGuard {
 impl Drop for CompactingGuard {
     fn drop(&mut self) {
         self.compacting_sessions
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&self.session_id);
+    }
+}
+
+/// RAII guard that removes `session_id` from `active_chats` when dropped,
+/// ensuring the slot is freed on every exit path including panics and `?` returns.
+struct ActiveChatGuard {
+    active_chats: Arc<Mutex<HashSet<String>>>,
+    session_id: String,
+}
+
+impl Drop for ActiveChatGuard {
+    fn drop(&mut self) {
+        self.active_chats
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .remove(&self.session_id);
