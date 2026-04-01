@@ -85,7 +85,8 @@ pub fn dev_loop(
                     command: "git add -A && \
                               git commit -F {last_llm_output_file} && \
                               git push && \
-                              (gh pr create --fill 2>/dev/null || gh pr view --json url -q '.url')"
+                              (gh pr create --fill 2>/dev/null || gh pr view --json url -q '.url') && \
+                              gh pr edit --add-reviewer \"@github-copilot[bot]\" 2>/dev/null || true"
                         .into(),
                 },
             )
