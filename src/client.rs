@@ -299,6 +299,204 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
 }
 
 // ---------------------------------------------------------------------------
+// Interactive chat REPL (long connection)
+// ---------------------------------------------------------------------------
+
+/// Run a persistent multi-turn chat session on a single socket connection.
+///
+/// Ctrl-C mid-generation → interrupt + steer prompt (same as `amaebi ask`).
+/// Double Ctrl-C within 2 s → exit. Empty line or Ctrl-D → exit.
+#[allow(unused_assignments)] // steer_pending is read inside select! async blocks
+pub async fn run_chat_loop(
+    socket: PathBuf,
+    initial_prompt: Option<String>,
+    model: Option<String>,
+) -> Result<()> {
+    let mut sigint = signal(SignalKind::interrupt()).context("setting up SIGINT handler")?;
+
+    let model = model
+        .or_else(|| std::env::var("AMAEBI_MODEL").ok())
+        .unwrap_or_else(|| "gpt-4o".to_string());
+
+    let cwd = std::env::current_dir().context("getting current directory")?;
+    let session_id = tokio::task::spawn_blocking(move || session::get_or_create(&cwd))
+        .await
+        .context("session::get_or_create panicked")?
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "failed to resolve session id; using \"global\"");
+            "global".to_string()
+        });
+
+    if std::io::stderr().is_terminal() {
+        eprintln!("Chat session started (ID: {session_id}). Empty line or Ctrl-D to exit.\n");
+    }
+
+    let stream = connect_or_start_daemon(&socket).await?;
+    let (read_half, mut write_half) = stream.into_split();
+    let mut lines = BufReader::new(read_half).lines();
+
+    let mut stdout = tokio::io::stdout();
+    let mut next_prompt = initial_prompt;
+    let mut last_ctrl_c: Option<Instant> = None;
+    let mut steer_pending = false;
+
+    'session: loop {
+        let prompt = match next_prompt.take() {
+            Some(p) => p,
+            None => {
+                if std::io::stderr().is_terminal() {
+                    eprint!("> ");
+                    let _ = tokio::io::stderr().flush().await;
+                }
+                let mut line = String::new();
+                let n = tokio::io::AsyncBufReadExt::read_line(
+                    &mut BufReader::new(tokio::io::stdin()),
+                    &mut line,
+                )
+                .await
+                .unwrap_or(0);
+                if n == 0 {
+                    break 'session;
+                }
+                let trimmed = line
+                    .trim_end_matches('\n')
+                    .trim_end_matches('\r')
+                    .to_owned();
+                if trimmed.is_empty() {
+                    break 'session;
+                }
+                trimmed
+            }
+        };
+
+        let req = Request::Chat {
+            prompt: prompt.clone(),
+            tmux_pane: std::env::var("TMUX_PANE").ok(),
+            session_id: Some(session_id.clone()),
+            model: model.clone(),
+        };
+        let mut req_line = serde_json::to_string(&req)?;
+        req_line.push('\n');
+        write_half.write_all(req_line.as_bytes()).await?;
+        steer_pending = false;
+
+        loop {
+            tokio::select! {
+                biased;
+
+                result = sigint.recv() => {
+                    let Some(_) = result else { break 'session; };
+                    let now = Instant::now();
+                    if is_within_window(last_ctrl_c, now, DOUBLE_CTRLC_WINDOW) {
+                        eprintln!();
+                        let _ = stdout.flush().await;
+                        return Err(anyhow::Error::new(Interrupted));
+                    }
+                    steer_pending = true;
+                    if std::io::stderr().is_terminal() {
+                        eprintln!("\n^C interrupted. Enter correction (empty line to cancel): ");
+                        eprint!(">");
+                        let _ = tokio::io::stderr().flush().await;
+                    }
+                    let interrupt_req = Request::Interrupt { session_id: session_id.clone() };
+                    if let Ok(mut frame) = serde_json::to_string(&interrupt_req) {
+                        frame.push('\n');
+                        let _ = write_half.write_all(frame.as_bytes()).await;
+                    }
+                    last_ctrl_c = Some(now);
+                }
+
+                result = lines.next_line() => {
+                    let line = result.context("reading response")?;
+                    let Some(line) = line else { break 'session; };
+                    let resp: Response = serde_json::from_str(&line)?;
+                    match resp {
+                        Response::Text { chunk } => {
+                            stdout.write_all(chunk.as_bytes()).await?;
+                            stdout.flush().await?;
+                        }
+                        Response::Done => {
+                            stdout.write_all(b"\n").await?;
+                            break;
+                        }
+                        Response::Error { message } => anyhow::bail!("{message}"),
+                        Response::ToolUse { name, detail } => {
+                            if std::io::stderr().is_terminal() {
+                                match name.as_str() {
+                                    "shell_command" => eprintln!("```bash\n$ {detail}\n```"),
+                                    "read_file"     => eprintln!("📄 {detail}"),
+                                    "edit_file"     => eprintln!("✏️  {detail}"),
+                                    _ => eprintln!("🔧 {name}: {detail}"),
+                                }
+                            }
+                        }
+                        Response::WaitingForInput { prompt: extra } => {
+                            if !extra.is_empty() { eprintln!("\n{extra}"); }
+                            eprint!(">");
+                            let _ = tokio::io::stderr().flush().await;
+                            let mut reply = String::new();
+                            if tokio::io::AsyncBufReadExt::read_line(
+                                &mut BufReader::new(tokio::io::stdin()), &mut reply
+                            ).await.unwrap_or(0) == 0 { break 'session; }
+                            let trimmed = reply.trim_end_matches('\n').trim_end_matches('\r').to_owned();
+                            if !trimmed.is_empty() {
+                                let steer_req = Request::Steer { session_id: session_id.clone(), message: trimmed };
+                                if let Ok(mut frame) = serde_json::to_string(&steer_req) {
+                                    frame.push('\n');
+                                    let _ = write_half.write_all(frame.as_bytes()).await;
+                                }
+                            }
+                        }
+                        Response::SteerAck => { steer_pending = false; }
+                        Response::Compacting => {
+                            if std::io::stderr().is_terminal() { eprintln!("\n[compacting…]"); }
+                        }
+                        _ => {}
+                    }
+                }
+
+                line = async {
+                    if steer_pending {
+                        let mut buf = String::new();
+                        let n = tokio::io::AsyncBufReadExt::read_line(
+                            &mut BufReader::new(tokio::io::stdin()), &mut buf
+                        ).await.unwrap_or(0);
+                        if n > 0 { Some(buf) } else { None }
+                    } else {
+                        std::future::pending::<Option<String>>().await
+                    }
+                } => {
+                    if let Some(text) = line {
+                        let trimmed = text.trim_end_matches('\n').trim_end_matches('\r');
+                        if trimmed.is_empty() {
+                            steer_pending = false;
+                        } else {
+                            let steer_req = Request::Steer {
+                                session_id: session_id.clone(),
+                                message: trimmed.to_owned(),
+                            };
+                            if let Ok(mut frame) = serde_json::to_string(&steer_req) {
+                                frame.push('\n');
+                                let _ = write_half.write_all(frame.as_bytes()).await;
+                            }
+                            steer_pending = false;
+                            last_ctrl_c = None;
+                        }
+                    } else {
+                        break 'session;
+                    }
+                }
+            }
+        }
+    }
+
+    if std::io::stderr().is_terminal() {
+        eprintln!("\nSession ended. ID: {session_id}");
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Detach mode
 // ---------------------------------------------------------------------------
 

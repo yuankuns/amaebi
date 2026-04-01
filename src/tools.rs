@@ -431,7 +431,7 @@ async fn spawn_agent(args: serde_json::Value, ctx: &SpawnContext) -> Result<Stri
 
     // Fix 5: child agents do not get spawn_agent in their tool schema to
     // prevent unbounded recursion at the schema level.
-    let (final_text, _) = crate::daemon::run_agentic_loop(
+    let (final_text, _, _) = crate::daemon::run_agentic_loop(
         &child_state,
         &model,
         messages,
