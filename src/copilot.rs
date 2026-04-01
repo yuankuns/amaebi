@@ -557,7 +557,14 @@ where
     let endpoint = chat_endpoint(base_url);
     tracing::debug!(messages = messages.len(), endpoint = %endpoint, model, "sending chat request");
     let resp = send_with_retry(
-        http, token, model, messages, tools, max_completion_tokens, &endpoint, true,
+        http,
+        token,
+        model,
+        messages,
+        tools,
+        max_completion_tokens,
+        &endpoint,
+        true,
     )
     .await?;
     parse_sse_stream(resp, writer).await
