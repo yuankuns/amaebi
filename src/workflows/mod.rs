@@ -83,9 +83,9 @@ pub enum Action {
         /// false = sequential (items depend on each other, e.g. perf_sweep).
         /// true  = parallel (items are independent, e.g. bug_fix, tune_sweep).
         parallel: bool,
-        /// Optional named resource that limits concurrency within parallel maps.
-        /// e.g. Some("gpu") with a pool of 2 → at most 2 items run simultaneously.
-        concurrency: Option<String>,
+        // NOTE: per-item resource constraints are declared with
+        // `Stage::with_requires(name)` on individual sub-stages, which lets
+        // ResourcePool semaphores limit how many items hold a resource at once.
     },
 }
 
@@ -181,6 +181,7 @@ impl Context {
     }
 
     /// Substitute all `{key}` occurrences in `template` with their values.
+    /// Use for Llm prompts where values are embedded as plain text.
     pub fn render(&self, template: &str) -> String {
         let mut out = template.to_owned();
         for (k, v) in &self.vars {
@@ -188,6 +189,29 @@ impl Context {
         }
         out
     }
+
+    /// Like `render`, but each substituted value is shell-quoted (POSIX
+    /// single-quote style) so that special characters in context variables
+    /// — semicolons, backticks, `$()`, etc. — cannot be interpreted by the
+    /// shell.  Use for `Action::Shell` commands.
+    pub fn render_shell(&self, template: &str) -> String {
+        let mut out = template.to_owned();
+        for (k, v) in &self.vars {
+            out = out.replace(&format!("{{{k}}}"), &shell_quote(v));
+        }
+        out
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shell quoting helper
+// ---------------------------------------------------------------------------
+
+/// POSIX-style shell quoting: wraps `s` in single quotes and escapes any
+/// single quotes inside using the `'\''` pattern.  The result can be used as
+/// a single token in any sh-compatible command without injection risk.
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
 }
 
 // ---------------------------------------------------------------------------

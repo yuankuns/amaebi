@@ -54,7 +54,9 @@ pub fn dev_loop(
             Stage::new(
                 "clippy",
                 Action::Shell {
-                    command: "cargo clippy -- -D warnings 2>&1".into(),
+                    // No 2>&1: cargo clippy writes diagnostics to stderr.
+                    // The inject_prompt references {stderr} so the LLM sees the warnings.
+                    command: "cargo clippy -- -D warnings".into(),
                 },
             )
             .with_on_fail(FailStrategy::Retry {
@@ -75,22 +77,33 @@ pub fn dev_loop(
             Stage::new(
                 "push-pr",
                 Action::Shell {
-                    // Use -F to read the commit message from the file written by the
-                    // preceding Llm stage (last_llm_output_file), avoiding shell injection.
+                    // -F reads the commit message from the file written by the preceding
+                    // Llm stage (last_llm_output_file), avoiding shell injection.
+                    // `gh pr create --fill` is idempotent: if a PR already exists for this
+                    // branch the command exits non-zero, so we fall back to printing the
+                    // existing PR URL instead.
                     command: "git add -A && \
                               git commit -F {last_llm_output_file} && \
                               git push && \
-                              gh pr create --fill"
+                              (gh pr create --fill 2>/dev/null || gh pr view --json url -q '.url')"
                         .into(),
                 },
             )
             .with_on_fail(FailStrategy::Abort),
-            // Phase 6: wait for @copilot review (code polls GitHub API)
+            // Phase 6: wait for @copilot review then act on the result.
+            // The action polls every 30 s (up to 60 retries = 30 min) until a
+            // review appears.  This prevents the stage from exiting early when
+            // Copilot has not yet finished reviewing.
             Stage::new(
                 "review",
                 Action::Shell {
-                    command: "sleep 30 && gh pr view --json reviews,state -q \
-                              '.reviews[-1].state // \"PENDING\"'"
+                    command: "for i in $(seq 60); do \
+                                state=$(gh pr view --json reviews \
+                                  -q '.reviews[-1].state // \"\"' 2>/dev/null); \
+                                [ -n \"$state\" ] && echo \"$state\" && break; \
+                                echo \"Waiting for review ($i/60)...\"; \
+                                sleep 30; \
+                              done"
                         .into(),
                 },
             )
@@ -167,7 +180,6 @@ pub fn perf_sweep(
                 Action::Map {
                     parse: r"- OPT: (.+)".into(),
                     parallel: false, // serial: each builds on previous
-                    concurrency: None,
                     stages: vec![
                         // 3a: Claude implements the optimization
                         Stage::new(
@@ -183,7 +195,8 @@ pub fn perf_sweep(
                         Stage::new(
                             "compile",
                             Action::Shell {
-                                command: "cargo build 2>&1".into(),
+                                // No 2>&1: build errors go to stderr, surfaced via {stderr}.
+                                command: "cargo build".into(),
                             },
                         )
                         .with_on_fail(FailStrategy::RevertAndSkip),
@@ -210,11 +223,13 @@ pub fn perf_sweep(
                                  If there is no viable fix, reply with SKIP."
                                     .into(),
                         }),
-                        // 3d: commit successful optimization
+                        // 3d: commit successful optimization.
+                        // printf safely builds the commit message, keeping {item} out of
+                        // the shell command string and preventing injection.
                         Stage::new(
                             "commit",
                             Action::Shell {
-                                command: "git add -A && git commit -m 'perf: {item}' || true"
+                                command: r#"git add -A && git commit -m "$(printf 'perf: %s' {item})" || true"#
                                     .into(),
                             },
                         )
@@ -290,13 +305,19 @@ pub fn bug_fix(
                 Action::Map {
                     parse: r"- BUG: (.+)".into(),
                     parallel: true, // bugs are independent
-                    concurrency: None,
                     stages: vec![
-                        // 3a: checkout a new branch for this bug
+                        // 3a: checkout a new branch for this bug.
+                        // Detects the default branch dynamically instead of
+                        // hardcoding "master" (repos may use "main" or other names).
+                        // NOTE: parallel workers share the same working tree; if
+                        // true isolation is needed, use per-bug git worktrees instead.
                         Stage::new(
                             "branch",
                             Action::Shell {
-                                command: "git checkout master && \
+                                command: "DEFAULT=$(git remote show origin 2>/dev/null \
+                                            | awk '/HEAD branch/{print $NF}'); \
+                                          DEFAULT=${DEFAULT:-main}; \
+                                          git checkout \"$DEFAULT\" && \
                                           git checkout -b fix/bug-{item_index}"
                                     .into(),
                             },
@@ -326,14 +347,16 @@ pub fn bug_fix(
                                  Please fix the code."
                                     .into(),
                         }),
-                        // 3d: push + PR (code-guaranteed)
+                        // 3d: push + PR (code-guaranteed).
+                        // printf builds the commit message safely so {item} is
+                        // never interpreted by the shell.
                         Stage::new(
                             "pr",
                             Action::Shell {
-                                command: "git add -A && \
-                                          git commit -m 'fix: {item}' && \
+                                command: r#"git add -A && \
+                                          git commit -m "$(printf 'fix: %s' {item})" && \
                                           git push -u origin HEAD && \
-                                          gh pr create --fill"
+                                          (gh pr create --fill 2>/dev/null || gh pr view --json url -q '.url')"#
                                     .into(),
                             },
                         )
@@ -395,7 +418,6 @@ pub fn tune_sweep(
                 Action::Map {
                     parse: r"- TUNE: (.+)".into(),
                     parallel: true,
-                    concurrency: None, // config generation is just LLM, no resource needed
                     stages: vec![Stage::new(
                         "write-config",
                         Action::Llm {
@@ -415,7 +437,6 @@ pub fn tune_sweep(
                 Action::Map {
                     parse: r"- TUNE: (.+)".into(),
                     parallel: true,
-                    concurrency: Some(resource.to_owned()), // e.g. "gpu" limits concurrency
                     stages: vec![
                         Stage::new(
                             "run",

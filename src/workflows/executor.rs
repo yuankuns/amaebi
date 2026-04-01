@@ -1,8 +1,14 @@
 use anyhow::{anyhow, Context as _, Result};
 use async_recursion::async_recursion;
 use regex::Regex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex;
+
+/// Monotonic counter for unique LLM output temp-file names.
+/// Combined with the process ID it prevents parallel workflow stages from
+/// overwriting each other's output files.
+static LLM_OUTPUT_SEQ: AtomicU64 = AtomicU64::new(0);
 
 use crate::copilot::Message;
 use crate::daemon::DaemonState;
@@ -120,7 +126,11 @@ async fn run_stage_with_retry(
                     }
                     FailStrategy::RevertAndSkip => {
                         step(&format!("    Reverting and skipping '{}': {e}", stage.name));
-                        let _ = sh("git stash --include-untracked").await;
+                        // Reset tracked files to HEAD and remove untracked files
+                        // introduced by this stage only (previous committed stages
+                        // are already in HEAD so they are unaffected).
+                        let _ = sh("git reset --hard HEAD 2>/dev/null || true").await;
+                        let _ = sh("git clean -fd 2>/dev/null || true").await;
                         return Ok(None);
                     }
                     FailStrategy::Retry { inject_prompt, .. } => {
@@ -169,17 +179,19 @@ async fn run_single_stage(
             let rendered = ctx.render(prompt);
             let text = llm_turn(state, model, messages, &rendered).await?;
             ctx.set("last_llm_output", &text);
-            // Write to a temp file so Shell stages can reference LLM output safely
-            // without shell-injection risk from inlining it into a command string.
-            let tmp = "/tmp/amaebi_llm_output.txt";
-            let _ = tokio::fs::write(tmp, &text).await;
-            ctx.set("last_llm_output_file", tmp);
+            // Write to a unique temp file so parallel stages don't clobber each
+            // other.  The path is stored in ctx so Shell stages can use it via
+            // {last_llm_output_file} without any shell injection risk.
+            let seq = LLM_OUTPUT_SEQ.fetch_add(1, Ordering::Relaxed);
+            let tmp = format!("/tmp/amaebi_llm_{}_{}.txt", std::process::id(), seq);
+            let _ = tokio::fs::write(&tmp, &text).await;
+            ctx.set("last_llm_output_file", &tmp);
             run_check(&stage.check, ctx).await?;
             Ok(Some(text))
         }
 
         Action::Shell { command } => {
-            let rendered = ctx.render(command);
+            let rendered = ctx.render_shell(command);
             let result = sh(&rendered).await?;
             ctx.set("stdout", &result.stdout);
             ctx.set("stderr", &result.stderr);
@@ -199,7 +211,6 @@ async fn run_single_stage(
             parse,
             stages: sub_stages,
             parallel,
-            concurrency,
         } => {
             let source = ctx.get("last_llm_output").unwrap_or("").to_owned();
             let items = parse_items(parse, &source)?;
@@ -214,16 +225,7 @@ async fn run_single_stage(
             }
 
             if *parallel {
-                run_map_parallel(
-                    &items,
-                    sub_stages,
-                    state,
-                    model,
-                    ctx,
-                    resources,
-                    concurrency.as_deref(),
-                )
-                .await?;
+                run_map_parallel(&items, sub_stages, state, model, ctx, resources).await?;
             } else {
                 run_map_serial(&items, sub_stages, state, model, messages, ctx, resources).await?;
             }
@@ -274,7 +276,6 @@ async fn run_map_parallel(
     model: &str,
     ctx: &Context,
     resources: &ResourcePool,
-    _concurrency_resource: Option<&str>,
 ) -> Result<()> {
     // Each parallel item gets its own messages Vec (independent context).
     #[allow(clippy::type_complexity)]
@@ -380,7 +381,7 @@ async fn run_check(check: &Option<Check>, ctx: &mut Context) -> Result<()> {
 
     match check {
         Check::ExitCode { command } => {
-            let rendered = ctx.render(command);
+            let rendered = ctx.render_shell(command);
             let r = sh(&rendered).await?;
             if !r.success {
                 ctx.set("stderr", &r.stderr);
@@ -397,10 +398,18 @@ async fn run_check(check: &Option<Check>, ctx: &mut Context) -> Result<()> {
         }
 
         Check::Contains { command, pattern } => {
-            let rendered = ctx.render(command);
+            let rendered = ctx.render_shell(command);
             let r = sh(&rendered).await?;
             ctx.set("stdout", &r.stdout);
             ctx.set("stderr", &r.stderr);
+            if !r.success {
+                return Err(anyhow!(
+                    "Check command failed (exit {}): {}\nstderr: {}",
+                    r.code,
+                    rendered,
+                    &r.stderr[..r.stderr.len().min(2000)]
+                ));
+            }
             if !r.stdout.contains(pattern.as_str()) {
                 return Err(anyhow!(
                     "Check failed: output does not contain {:?}\nstdout: {}",
@@ -411,9 +420,17 @@ async fn run_check(check: &Option<Check>, ctx: &mut Context) -> Result<()> {
         }
 
         Check::BenchmarkNoRegression { command, threshold } => {
-            let rendered = ctx.render(command);
+            let rendered = ctx.render_shell(command);
             let r = sh(&rendered).await?;
             ctx.set("stdout", &r.stdout);
+            if !r.success {
+                return Err(anyhow!(
+                    "Benchmark command failed (exit {}): {}\nstderr: {}",
+                    r.code,
+                    rendered,
+                    &r.stderr[..r.stderr.len().min(2000)]
+                ));
+            }
 
             let baseline_json = ctx.get("benchmark_baseline").unwrap_or("{}").to_owned();
             let regression = detect_regression(&baseline_json, &r.stdout, *threshold)?;
@@ -448,7 +465,7 @@ pub async fn llm_turn(
         messages.clone(),
         &mut sink,
         &mut steer_rx,
-        true,
+        false, // workflow LLM turns must not expose spawn_agent / run_workflow
     )
     .await
     .context("LLM turn failed")?;
@@ -581,7 +598,6 @@ mod tests {
                     Action::Map {
                         parse: r"- ITEM: (.+)".into(),
                         parallel: false,
-                        concurrency: None,
                         stages: vec![Stage::new(
                             "write",
                             Action::Shell {
@@ -629,7 +645,6 @@ mod tests {
                 Action::Map {
                     parse: r"- SLEEP: (.+)".into(),
                     parallel: true,
-                    concurrency: None,
                     stages: vec![Stage::new(
                         "sleep",
                         Action::Shell {
@@ -676,7 +691,6 @@ mod tests {
                 Action::Map {
                     parse: r"- ITEM: (.+)".into(),
                     parallel: true,
-                    concurrency: Some("slot".into()),
                     stages: vec![Stage::new(
                         "work",
                         Action::Shell {

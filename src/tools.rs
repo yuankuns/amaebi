@@ -351,7 +351,8 @@ async fn run_workflow_tool(args: serde_json::Value, ctx: &SpawnContext) -> Resul
         active_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
     });
 
-    let ctx = Context::new();
+    // Use `wf_ctx` to avoid shadowing the `ctx: &SpawnContext` parameter above.
+    let wf_ctx = Context::new();
 
     let workflow = match workflow_name {
         "dev-loop" => {
@@ -420,7 +421,7 @@ async fn run_workflow_tool(args: serde_json::Value, ctx: &SpawnContext) -> Resul
                 .unwrap_or(1) as usize;
             let wf = builtins::tune_sweep(target, "", run_cmd, result_cmd, resource);
             let pool = ResourcePool::new([(resource, count)]);
-            let result = executor::execute(&wf, &state, &model, ctx, &pool).await;
+            let result = executor::execute(&wf, &state, &model, wf_ctx, &pool).await;
             tracing::info!(
                 workflow = %workflow_name,
                 success = result.is_ok(),
@@ -433,7 +434,7 @@ async fn run_workflow_tool(args: serde_json::Value, ctx: &SpawnContext) -> Resul
         ),
     };
 
-    let result = executor::execute(&workflow, &state, &model, ctx, &ResourcePool::empty()).await;
+    let result = executor::execute(&workflow, &state, &model, wf_ctx, &ResourcePool::empty()).await;
     tracing::info!(
         workflow = %workflow_name,
         success = result.is_ok(),
