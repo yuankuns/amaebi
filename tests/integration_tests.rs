@@ -2530,3 +2530,147 @@ async fn heartbeat_ipc_add_list_dismiss_roundtrip() {
     let _ = child.kill().await;
     let _ = child.wait().await;
 }
+
+// ---------------------------------------------------------------------------
+// Consistent chat — critical gap tests
+// ---------------------------------------------------------------------------
+
+/// Turn history must survive a daemon restart: after killing and restarting the
+/// daemon at the same home directory, turn 2 must still see turn 1's context.
+///
+/// This is the most important regression for the consistent-chat feature:
+/// persistence lives in SQLite (`session_turns`), not in daemon memory, so
+/// a restart must be transparent to the conversation.
+#[tokio::test]
+async fn consistent_chat_persists_across_daemon_restart() {
+    let server = MockLlmServer::start().await;
+
+    // Phase 1 — seed one turn.
+    server.enqueue(ScriptedResponse::text_chunks(vec!["The capital is Paris."]));
+
+    let seed = start_daemon(&server.url()).await.expect("seed daemon");
+    let session_id = "restart-test-session-001";
+    let client1 = connect_client(&seed.socket);
+    let r1 = send_message_with_session(
+        &client1,
+        "what is the capital of France?",
+        session_id,
+        "gpt-4o",
+    )
+    .await
+    .expect("turn 1");
+    assert!(
+        collect_text(&r1).contains("Paris"),
+        "turn 1 failed: {:?}",
+        collect_text(&r1)
+    );
+
+    // Phase 2 — kill the daemon, restart at the same home dir, run turn 2.
+    let (home_path, _home_dir) = seed.kill_and_keep_home().await;
+
+    server.enqueue(ScriptedResponse::text_chunks(vec!["It is a famous city."]));
+    let (socket2, mut child2, _dir2) =
+        start_daemon_at_home_with_env(&home_path, &server.url(), &[])
+            .await
+            .expect("restarted daemon");
+
+    let client2 = connect_client(&socket2);
+    let _r2 = send_message_with_session(&client2, "tell me more about it", session_id, "gpt-4o")
+        .await
+        .expect("turn 2");
+
+    // The turn-2 LLM request must include the user message from turn 1.
+    let reqs = server.take_requests();
+    assert_eq!(reqs.len(), 2, "expected 2 requests, got {}", reqs.len());
+    let turn2_messages = reqs[1]
+        .body
+        .get("messages")
+        .and_then(|m| m.as_array())
+        .expect("messages in turn 2 request");
+    let has_turn1_user = turn2_messages.iter().any(|m| {
+        m.get("role").and_then(|r| r.as_str()) == Some("user")
+            && m.get("content")
+                .and_then(|c| c.as_str())
+                .map(|s| s.contains("capital of France"))
+                .unwrap_or(false)
+    });
+    assert!(
+        has_turn1_user,
+        "turn 2 (after restart) must include turn 1 user message; messages: {turn2_messages:#?}"
+    );
+
+    let _ = child2.kill().await;
+    let _ = child2.wait().await;
+}
+
+/// After `memory clear`, turn 2 must NOT see any context from turn 1.
+/// Regression for comment 8: `memory_db::clear()` must wipe `session_turns`
+/// so cleared history is truly gone.
+#[tokio::test]
+async fn consistent_chat_cleared_by_memory_clear() {
+    let server = MockLlmServer::start().await;
+    server.enqueue(ScriptedResponse::text_chunks(vec!["The answer is 42."]));
+    server.enqueue(ScriptedResponse::text_chunks(vec!["Fresh start."]));
+
+    let daemon = start_daemon(&server.url()).await.expect("daemon");
+    let session_id = "clear-test-session-001";
+
+    // Turn 1.
+    let client1 = connect_client(&daemon.socket);
+    send_message_with_session(&client1, "what is 6 times 7?", session_id, "gpt-4o")
+        .await
+        .expect("turn 1");
+
+    // Clear memory via raw IPC (ClearMemory is not in the test helpers' Request enum).
+    {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::UnixStream;
+        let stream = UnixStream::connect(&daemon.socket)
+            .await
+            .expect("connect for clear");
+        let (reader, mut writer) = tokio::io::split(stream);
+        let msg = r#"{"type":"clear_memory"}
+"#;
+        writer
+            .write_all(msg.as_bytes())
+            .await
+            .expect("send clear_memory");
+        let mut lines = BufReader::new(reader).lines();
+        let frame = lines
+            .next_line()
+            .await
+            .expect("clear_memory response")
+            .expect("frame");
+        assert!(
+            frame.contains("done"),
+            "ClearMemory must return done; got: {frame}"
+        );
+    }
+
+    // Turn 2 — history should be empty after clear.
+    let client2 = connect_client(&daemon.socket);
+    send_message_with_session(&client2, "what was that again?", session_id, "gpt-4o")
+        .await
+        .expect("turn 2");
+
+    let reqs = server.take_requests();
+    assert_eq!(reqs.len(), 2, "expected 2 LLM requests, got {}", reqs.len());
+
+    let turn2_messages = reqs[1]
+        .body
+        .get("messages")
+        .and_then(|m| m.as_array())
+        .expect("messages in turn 2");
+
+    // After clear, turn 2 must NOT include turn 1's user message.
+    let has_turn1_context = turn2_messages.iter().any(|m| {
+        m.get("content")
+            .and_then(|c| c.as_str())
+            .map(|s| s.contains("6 times 7") || s.contains("42"))
+            .unwrap_or(false)
+    });
+    assert!(
+        !has_turn1_context,
+        "after memory clear, turn 2 must not see turn 1 context; messages: {turn2_messages:#?}"
+    );
+}
