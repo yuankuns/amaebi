@@ -470,6 +470,7 @@ pub async fn run_chat_loop(
                         let trimmed = text.trim_end_matches('\n').trim_end_matches('\r');
                         if trimmed.is_empty() {
                             steer_pending = false;
+                            last_ctrl_c = None; // cancelling steer resets the double-Ctrl-C window
                         } else {
                             let steer_req = Request::Steer {
                                 session_id: session_id.clone(),

@@ -565,7 +565,13 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                             Some(line) => { if let Ok(req) = serde_json::from_str::<Request>(&line) { match req {
                                 Request::Steer { session_id: sid, message } if sid == expected_sid => { let _ = steer_tx.send(Some(message)).await; }
                                 Request::Interrupt { session_id: sid } if sid == expected_sid => { let _ = steer_tx.send(None).await; }
-                                _ => {}
+                                _ => {
+                                    tracing::warn!("dropping unsolicited frame during active agentic loop");
+                                    let mut w = writer.lock().await;
+                                    let _ = write_frame(&mut *w, &Response::Error {
+                                        message: "busy: another request is already in progress on this connection".into(),
+                                    }).await;
+                                }
                             }}}
                         }}
                     }
@@ -626,7 +632,9 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                 let (messages, pre_flight_trimmed) = if let Some(mut prev) = carried_messages.take()
                 {
                     prev.push(Message::user(prompt.clone()));
-                    inject_skill_files(&mut prev).await;
+                    // Do NOT re-inject skill files — they were injected on the
+                    // first turn and are already in `prev`.  Re-injecting every
+                    // turn duplicates system messages and grows context unboundedly.
                     let threshold_inner = compaction_threshold_tokens(&model);
                     let trimmed = if count_message_tokens(&prev) > threshold_inner {
                         // Rebuild from persisted history when over budget
@@ -767,7 +775,13 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                             Some(line) => { if let Ok(req) = serde_json::from_str::<Request>(&line) { match req {
                                 Request::Steer { session_id: sid, message } if sid == expected_chat_sid => { let _ = steer_tx.send(Some(message)).await; }
                                 Request::Interrupt { session_id: sid } if sid == expected_chat_sid => { let _ = steer_tx.send(None).await; }
-                                _ => {}
+                                _ => {
+                                    tracing::warn!("dropping unsolicited frame during active chat loop");
+                                    let mut w = writer.lock().await;
+                                    let _ = write_frame(&mut *w, &Response::Error {
+                                        message: "busy: another request is already in progress on this connection".into(),
+                                    }).await;
+                                }
                             }}}
                         }}
                     }

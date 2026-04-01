@@ -1057,11 +1057,9 @@ async fn spawn_agent_parallel_calls() {
         .expect("start_daemon");
     let client = connect_client(&daemon.socket);
 
-    let start = std::time::Instant::now();
     let responses = send_message(&client, "run two child tasks in parallel")
         .await
         .expect("send_message");
-    let elapsed = start.elapsed();
 
     let text = collect_text(&responses);
     assert!(
@@ -1069,12 +1067,9 @@ async fn spawn_agent_parallel_calls() {
         "expected parent final text 'all done' in response: {text:?}"
     );
 
-    // Parallel execution: ~1 s wall-clock + overhead.  Sequential would be
-    // ≥ 2 s of sleep alone, so < 5 s proves concurrency (generous for slow CI runners).
-    assert!(
-        elapsed.as_millis() < 5000,
-        "expected parallel execution to finish in < 5 s, took {elapsed:?}"
-    );
+    // No wall-clock assertion: with 1s sleeps the sequential floor is ~2s,
+    // which would pass any practical CI threshold.  Concurrency is proven
+    // by spawn_agent_parallel_timing (#[ignore], 5s sleeps, assert < 8s).
 
     // 6 LLM requests: 1 parent + 2×(shell_command + text) + 1 parent final.
     let reqs = server.take_requests();
