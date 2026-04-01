@@ -90,7 +90,21 @@ pub fn dev_loop(
                 },
             )
             .with_on_fail(FailStrategy::Abort),
-            // Phase 6: wait for @copilot review then act on the result.
+            // Phase 6: rename the current tmux window to "pr<N>" so the user
+            // can identify which PR this session is tracking at a glance.
+            // Uses FailStrategy::Skip so the workflow continues even when tmux
+            // is not available or gh cannot resolve the PR number.
+            Stage::new(
+                "rename-tmux",
+                Action::Shell {
+                    command: "PR=$(gh pr view --json number -q '.number' 2>/dev/null) && \
+                              [ -n \"$PR\" ] && \
+                              tmux rename-window \"pr${PR}\" 2>/dev/null"
+                        .into(),
+                },
+            )
+            .with_on_fail(FailStrategy::Skip),
+            // Phase 7: wait for @copilot review then act on the result.
             // The action polls every 30 s (up to 60 retries = 30 min) until a
             // review appears.  This prevents the stage from exiting early when
             // Copilot has not yet finished reviewing.
