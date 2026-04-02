@@ -5,6 +5,38 @@
 use super::{Action, Check, FailStrategy, Stage, Workflow};
 
 // ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Shell command that resolves all unresolved PR review conversations and
+/// re-requests a Copilot review.  Idempotent: safe to run when there are
+/// no unresolved threads or no PR yet.
+fn resolve_and_request_review_cmd() -> String {
+    // Step 1: resolve every unresolved review thread via GraphQL.
+    // Step 2: re-request @copilot review so it evaluates the new commit.
+    r#"
+REPO=$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null) || true
+PR_NUM=$(gh pr view --json number -q .number 2>/dev/null) || true
+if [ -n "$REPO" ] && [ -n "$PR_NUM" ]; then
+  OWNER=$(echo "$REPO" | cut -d/ -f1)
+  NAME=$(echo "$REPO" | cut -d/ -f2)
+  THREADS=$(gh api graphql -f query="
+    { repository(owner: \"$OWNER\", name: \"$NAME\") {
+        pullRequest(number: $PR_NUM) {
+          reviewThreads(first: 100) {
+            nodes { id isResolved }
+    } } } }" --jq '.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved == false) | .id' 2>/dev/null)
+  for tid in $THREADS; do
+    gh api graphql -f query="mutation { resolveReviewThread(input: {threadId: \"$tid\"}) { thread { isResolved } } }" >/dev/null 2>&1 || true
+  done
+  gh pr edit --add-reviewer "copilot-pull-request-reviewer[bot]" 2>/dev/null || true
+fi
+echo "resolve-and-request-review done"
+"#
+    .to_owned()
+}
+
+// ---------------------------------------------------------------------------
 // 1. dev_loop — develop → test → PR → review → loop
 // ---------------------------------------------------------------------------
 
@@ -65,19 +97,23 @@ pub fn dev_loop(
                 },
             )
             .with_on_fail(FailStrategy::Abort),
-            // Phase 4: wait for @copilot review (code polls GitHub API)
+            // Phase 4: resolve conversations + re-request review + poll.
+            //
+            // On the first run, resolve/re-request are no-ops.  On retries
+            // (after the LLM fixed code and pushed), this resolves the old
+            // CHANGES_REQUESTED conversations and re-requests review so
+            // Copilot evaluates the new commit before we poll.
             Stage::new(
                 "review",
                 Action::Shell {
-                    command: "sleep 30 && gh pr view --json reviews,state -q \
-                              '.reviews[-1].state // \"PENDING\"'"
-                        .into(),
+                    command: format!(
+                        "{} && sleep 60 && gh pr view --json reviews,state -q \
+                         '.reviews[-1].state // \"PENDING\"'",
+                        resolve_and_request_review_cmd().trim()
+                    ),
                 },
             )
             .with_check(Check::Contains {
-                // Output format: "APPROVED: " or "CHANGES_REQUESTED: <body text>"
-                // The check passes when stdout contains "APPROVED".
-                // On failure, {stdout} in inject_prompt contains the actual review comments.
                 command: "gh pr view --json reviews --jq \
                           '.reviews[-1] | .state + \": \" + (.body // \"\")'"
                     .into(),
@@ -87,7 +123,10 @@ pub fn dev_loop(
                 max: max_review_retries,
                 inject_prompt:
                     "The code review requires changes. Review feedback:\n\n{stdout}\n\n\
-                     Please address the comments and push an updated commit."
+                     Please address ALL the review comments, then:\n\
+                     1. Run the test suite to make sure everything passes\n\
+                     2. Commit and push the fixes\n\
+                     After you push, I will resolve the conversations and re-request review."
                         .into(),
             }),
         ],
