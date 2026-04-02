@@ -1928,11 +1928,31 @@ where
                             tracing::warn!(tool = %tc.name, "tool not advertised in schema");
                             format!("{} is not available in this context (not in the tool schema for this session)", tc.name)
                         } else {
-                            match state
+                            let is_workflow = tc.name == "run_workflow";
+                            let mut progress_rx: Option<
+                                tokio::sync::mpsc::UnboundedReceiver<String>,
+                            > = if is_workflow {
+                                let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+                                crate::workflows::set_progress(tx);
+                                Some(rx)
+                            } else {
+                                None
+                            };
+
+                            let raw = state
                                 .executor
                                 .execute(&tc.name, args, Some(session_id), include_followup)
-                                .await
-                            {
+                                .await;
+
+                            if let Some(ref mut rx) = progress_rx {
+                                crate::workflows::clear_progress();
+                                while let Ok(msg) = rx.try_recv() {
+                                    let chunk = format!("\n\x1b[1;36m==> {msg}\x1b[0m\n");
+                                    let _ = write_frame(writer, &Response::Text { chunk }).await;
+                                }
+                            }
+
+                            match raw {
                                 Ok(output) => {
                                     tracing::debug!(
                                         tool = %tc.name,

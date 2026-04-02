@@ -239,9 +239,33 @@ pub async fn sh(command: &str) -> anyhow::Result<ShellResult> {
     })
 }
 
+// ---------------------------------------------------------------------------
+// Progress channel — lets daemon forward step() output to the IPC stream
+// ---------------------------------------------------------------------------
+
+static PROGRESS_TX: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<String>>> =
+    std::sync::Mutex::new(None);
+
+pub fn set_progress(tx: tokio::sync::mpsc::UnboundedSender<String>) {
+    if let Ok(mut g) = PROGRESS_TX.lock() {
+        *g = Some(tx);
+    }
+}
+
+pub fn clear_progress() {
+    if let Ok(mut g) = PROGRESS_TX.lock() {
+        *g = None;
+    }
+}
+
 /// Print a workflow progress marker to stderr.
 pub fn step(name: &str) {
     eprintln!("\n\x1b[1;36m==> {name}\x1b[0m");
+    if let Ok(g) = PROGRESS_TX.lock() {
+        if let Some(tx) = g.as_ref() {
+            let _ = tx.send(name.to_owned());
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
