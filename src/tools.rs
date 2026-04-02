@@ -880,8 +880,8 @@ async fn list_followups(_args: serde_json::Value, ctx: &FollowupContext) -> Resu
             "user"
         };
         out.push_str(&format!(
-            "  [{}] {} (by: {})\n    cron: {}  created: {}  last_run: {}\n",
-            job.id, job.description, by, job.schedule, job.created_at, last
+            "  [{}] {} (by: {}, status: {})\n    cron: {}  created: {}  last_run: {}\n",
+            job.id, job.description, by, job.status, job.schedule, job.created_at, last
         ));
     }
     Ok(out)

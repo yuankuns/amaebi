@@ -2217,6 +2217,13 @@ async fn run_cron_scheduler(state: Arc<DaemonState>) {
             if let Err(e) = cron::update_last_run(&job.id, &now_str) {
                 tracing::warn!(error = %e, id = %job.id, "cron: failed to pre-stamp last_run");
             }
+            // Mark as 'running' so list_followups and cancel_followup can still
+            // find this job even after last_run has been stamped.
+            if job.one_shot && job.created_by_model {
+                if let Err(e) = cron::set_job_status(&job.id, "running") {
+                    tracing::warn!(error = %e, id = %job.id, "cron: failed to set status=running");
+                }
+            }
 
             let state = Arc::clone(&state);
             let running = Arc::clone(&running_jobs);

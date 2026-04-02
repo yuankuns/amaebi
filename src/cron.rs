@@ -35,7 +35,7 @@ use crate::auth::amaebi_home;
 // ---------------------------------------------------------------------------
 
 /// A registered cron job.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct CronJob {
     /// UUID v4 identifier.
     pub id: String,
@@ -55,6 +55,29 @@ pub struct CronJob {
     /// Session UUID whose summary is injected as context when this job fires.
     /// `None` means the job runs without any inherited session context.
     pub parent_session_id: Option<String>,
+    /// Lifecycle state of the job: `"pending"`, `"running"`, or `"completed"`.
+    ///
+    /// One-shot model-created jobs transition: pending → running (at scheduler
+    /// pre-stamp) → deleted (after execution).  The status column allows
+    /// `list_followups` to show in-flight jobs and `cancel_followup` to cancel
+    /// them even after the daemon has stamped `last_run`.
+    pub status: String,
+}
+
+impl Default for CronJob {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            description: String::new(),
+            schedule: String::new(),
+            created_at: String::new(),
+            last_run: None,
+            one_shot: false,
+            created_by_model: false,
+            parent_session_id: None,
+            status: "pending".to_string(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -156,6 +179,7 @@ impl CronStore {
     ///
     /// - version 0 (original): 5-column schema
     /// - version 1: adds `one_shot`, `created_by_model`, `parent_session_id`
+    /// - version 2: adds `status` (`pending` / `running` / `completed`)
     ///
     /// Each ALTER is guarded by a `PRAGMA table_info` column-existence check so
     /// the migration is idempotent: a crash between the ALTER statements and the
@@ -164,8 +188,9 @@ impl CronStore {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .context("reading user_version")?;
-        if version < 1 {
-            // Collect existing column names once.
+
+        if version < 1 || version < 2 {
+            // Collect existing column names once (used by both migrations).
             let existing_cols: std::collections::HashSet<String> = conn
                 .prepare("PRAGMA table_info(cron_jobs)")
                 .context("PRAGMA table_info")?
@@ -174,8 +199,6 @@ impl CronStore {
                 .collect::<rusqlite::Result<_>>()
                 .context("collecting column names")?;
 
-            // Wrap the whole migration in an explicit transaction so that a
-            // crash mid-way does not leave us with only some columns added.
             conn.execute_batch("BEGIN IMMEDIATE;")
                 .context("beginning migration transaction")?;
 
@@ -187,11 +210,17 @@ impl CronStore {
                 Ok(())
             };
 
-            add_if_missing("one_shot", "INTEGER NOT NULL DEFAULT 0")?;
-            add_if_missing("created_by_model", "INTEGER NOT NULL DEFAULT 0")?;
-            add_if_missing("parent_session_id", "TEXT")?;
+            // version 1 columns
+            if version < 1 {
+                add_if_missing("one_shot", "INTEGER NOT NULL DEFAULT 0")?;
+                add_if_missing("created_by_model", "INTEGER NOT NULL DEFAULT 0")?;
+                add_if_missing("parent_session_id", "TEXT")?;
+            }
 
-            conn.execute_batch("PRAGMA user_version = 1; COMMIT;")
+            // version 2 columns
+            add_if_missing("status", "TEXT NOT NULL DEFAULT 'pending'")?;
+
+            conn.execute_batch("PRAGMA user_version = 2; COMMIT;")
                 .context("committing migration")?;
         }
         Ok(())
@@ -207,7 +236,7 @@ impl CronStore {
         let mut stmt = conn
             .prepare(
                 "SELECT id, description, schedule, created_at, last_run,
-                        one_shot, created_by_model, parent_session_id
+                        one_shot, created_by_model, parent_session_id, status
                  FROM cron_jobs
                  ORDER BY created_at ASC",
             )
@@ -224,6 +253,9 @@ impl CronStore {
                     one_shot: row.get::<_, i64>(5).map(|v| v != 0)?,
                     created_by_model: row.get::<_, i64>(6).map(|v| v != 0)?,
                     parent_session_id: row.get(7)?,
+                    status: row
+                        .get::<_, String>(8)
+                        .unwrap_or_else(|_| "pending".to_string()),
                 })
             })
             .context("executing cron list query")?;
@@ -314,8 +346,8 @@ impl CronStore {
         conn.execute(
             "INSERT INTO cron_jobs
                 (id, description, schedule, created_at, last_run,
-                 one_shot, created_by_model, parent_session_id)
-             VALUES (?1, ?2, ?3, ?4, NULL, 1, 1, ?5)",
+                 one_shot, created_by_model, parent_session_id, status)
+             VALUES (?1, ?2, ?3, ?4, NULL, 1, 1, ?5, 'pending')",
             params![id, description, schedule, created_at, parent_session_id],
         )
         .context("inserting oneshot cron job")?;
@@ -330,11 +362,11 @@ impl CronStore {
         let mut stmt = conn
             .prepare(
                 "SELECT id, description, schedule, created_at, last_run,
-                        one_shot, created_by_model, parent_session_id
+                        one_shot, created_by_model, parent_session_id, status
                  FROM cron_jobs
                  WHERE created_by_model = 1
                    AND one_shot = 1
-                   AND last_run IS NULL
+                   AND status != 'completed'
                  ORDER BY created_at ASC",
             )
             .context("preparing model jobs query")?;
@@ -350,6 +382,9 @@ impl CronStore {
                     one_shot: row.get::<_, i64>(5).map(|v| v != 0)?,
                     created_by_model: row.get::<_, i64>(6).map(|v| v != 0)?,
                     parent_session_id: row.get(7)?,
+                    status: row
+                        .get::<_, String>(8)
+                        .unwrap_or_else(|_| "pending".to_string()),
                 })
             })
             .context("executing model jobs query")?;
@@ -369,13 +404,23 @@ impl CronStore {
             .execute(
                 "DELETE FROM cron_jobs WHERE id = ?1
                     AND created_by_model = 1
-                    AND one_shot = 1
-                    AND last_run IS NULL",
+                    AND one_shot = 1",
                 params![id],
             )
             .context("deleting model cron job")?;
         let _ = self.restrict_sidecar_permissions();
         Ok(n > 0)
+    }
+
+    /// Set the lifecycle `status` of a job (`"pending"`, `"running"`, etc.).
+    pub fn update_status(&self, id: &str, status: &str) -> Result<()> {
+        let conn = self.connect()?;
+        conn.execute(
+            "UPDATE cron_jobs SET status = ?1 WHERE id = ?2",
+            params![status, id],
+        )
+        .context("updating cron job status")?;
+        Ok(())
     }
 
     /// Record that job `id` ran at `timestamp` (RFC 3339).
@@ -416,6 +461,11 @@ pub fn delete_job(id: &str) -> Result<bool> {
 /// Update the `last_run` timestamp for a job.
 pub fn update_last_run(id: &str, timestamp: &str) -> Result<()> {
     CronStore::open()?.update_last_run(id, timestamp)
+}
+
+/// Set the lifecycle status of a job (`"pending"`, `"running"`, etc.).
+pub fn set_job_status(id: &str, status: &str) -> Result<()> {
+    CronStore::open()?.update_status(id, status)
 }
 
 // ---------------------------------------------------------------------------
@@ -843,6 +893,7 @@ mod tests {
             one_shot: true,
             created_by_model: true,
             parent_session_id: Some("sid".into()),
+            ..Default::default()
         }];
         let due = due_jobs(&jobs, &now);
         assert_eq!(
@@ -864,6 +915,7 @@ mod tests {
             one_shot: true,
             created_by_model: true,
             parent_session_id: Some("sid".into()),
+            ..Default::default()
         }];
         let due = due_jobs(&jobs, &now);
         assert!(
@@ -985,6 +1037,10 @@ mod tests {
         assert!(jobs[0].one_shot, "one_shot must be true");
         assert!(jobs[0].created_by_model, "created_by_model must be true");
         assert!(jobs[0].parent_session_id.is_none());
+        assert_eq!(
+            jobs[0].status, "pending",
+            "new oneshot must have status=pending"
+        );
     }
 
     #[test]
@@ -1117,5 +1173,54 @@ mod tests {
             jobs[0].parent_session_id.is_none(),
             "migrated row: parent_session_id default null"
         );
+        assert_eq!(
+            jobs[0].status, "pending",
+            "migrated row: status default 'pending'"
+        );
+    }
+
+    // ---- update_status -------------------------------------------------------
+
+    #[test]
+    fn update_status_changes_job_status() {
+        let (store, _dir) = open_temp();
+        let id = store.add_oneshot("task", "0 9 1 4 *", None).unwrap();
+        assert_eq!(store.list().unwrap()[0].status, "pending");
+
+        store.update_status(&id, "running").unwrap();
+        assert_eq!(store.list().unwrap()[0].status, "running");
+    }
+
+    #[test]
+    fn list_model_created_shows_running_jobs() {
+        // A job with status='running' (pre-stamped) must still appear in
+        // list_model_created so that list_followups shows in-flight jobs.
+        let (store, _dir) = open_temp();
+        let id = store
+            .add_oneshot("in-flight job", "0 9 1 4 *", None)
+            .unwrap();
+        store.update_status(&id, "running").unwrap();
+
+        let jobs = store.list_model_created().unwrap();
+        assert_eq!(
+            jobs.len(),
+            1,
+            "running job must appear in list_model_created"
+        );
+        assert_eq!(jobs[0].status, "running");
+    }
+
+    #[test]
+    fn delete_if_model_created_allows_running_job() {
+        // A job with status='running' must still be cancellable.
+        let (store, _dir) = open_temp();
+        let id = store
+            .add_oneshot("in-flight job", "0 9 1 4 *", None)
+            .unwrap();
+        store.update_status(&id, "running").unwrap();
+
+        let deleted = store.delete_if_model_created(&id).unwrap();
+        assert!(deleted, "running job must be cancellable");
+        assert!(store.list().unwrap().is_empty());
     }
 }

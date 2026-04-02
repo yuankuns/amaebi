@@ -2564,7 +2564,7 @@ async fn cancel_followup_tool_call_removes_pending_job() {
     let cron_db_path = home_dir.path().join(".amaebi/cron.db");
 
     // Seed a model-created one-shot job directly via SQLite.
-    // Set PRAGMA user_version=1 so the daemon's migration is skipped.
+    // Set PRAGMA user_version=2 so the daemon's migration is skipped.
     {
         let conn = rusqlite::Connection::open(&cron_db_path).expect("open cron.db for seeding");
         conn.execute_batch(
@@ -2573,14 +2573,15 @@ async fn cancel_followup_tool_call_removes_pending_job() {
                 created_at TEXT NOT NULL, last_run TEXT,
                 one_shot INTEGER NOT NULL DEFAULT 0,
                 created_by_model INTEGER NOT NULL DEFAULT 0,
-                parent_session_id TEXT
+                parent_session_id TEXT,
+                status TEXT NOT NULL DEFAULT 'pending'
             );
-            PRAGMA user_version = 1;
+            PRAGMA user_version = 2;
             INSERT INTO cron_jobs
-                (id, description, schedule, created_at, one_shot, created_by_model)
+                (id, description, schedule, created_at, one_shot, created_by_model, status)
             VALUES
-                ('test-cancel-id', 'job to cancel', '0 9 * * *',
-                 '2026-04-01T00:00:00Z', 1, 1);",
+                ('test-cancel-id', 'job to cancel', '0 0 1 1 *',
+                 '2099-01-01T00:00:00Z', 1, 1, 'pending');",
         )
         .expect("seed cron job");
     }
@@ -2663,19 +2664,20 @@ async fn list_followups_tool_call_returns_pending_jobs() {
                 created_at TEXT NOT NULL, last_run TEXT,
                 one_shot INTEGER NOT NULL DEFAULT 0,
                 created_by_model INTEGER NOT NULL DEFAULT 0,
-                parent_session_id TEXT
+                parent_session_id TEXT,
+                status TEXT NOT NULL DEFAULT 'pending'
             );
-            PRAGMA user_version = 1;
+            PRAGMA user_version = 2;
             -- model-created pending
             INSERT INTO cron_jobs
-                (id, description, schedule, created_at, one_shot, created_by_model)
-            VALUES ('model-job-1', 'list-marker-model-job', '0 9 1 1 *',
-                    '2026-04-01T00:00:00Z', 1, 1);
+                (id, description, schedule, created_at, one_shot, created_by_model, status)
+            VALUES ('model-job-1', 'list-marker-model-job', '0 0 1 1 *',
+                    '2099-01-01T00:00:00Z', 1, 1, 'pending');
             -- human-created (should NOT appear in list_followups)
             INSERT INTO cron_jobs
-                (id, description, schedule, created_at, one_shot, created_by_model)
+                (id, description, schedule, created_at, one_shot, created_by_model, status)
             VALUES ('human-job-1', 'list-marker-human-job', '0 10 * * *',
-                    '2026-04-01T00:00:00Z', 0, 0);",
+                    '2026-04-01T00:00:00Z', 0, 0, 'pending');",
         )
         .expect("seed cron jobs");
     }
@@ -2771,13 +2773,14 @@ async fn scheduled_followup_fires_and_deposits_inbox_report() {
                 created_at TEXT NOT NULL, last_run TEXT,
                 one_shot INTEGER NOT NULL DEFAULT 0,
                 created_by_model INTEGER NOT NULL DEFAULT 0,
-                parent_session_id TEXT
+                parent_session_id TEXT,
+                status TEXT NOT NULL DEFAULT 'pending'
             );
-            PRAGMA user_version = 1;
+            PRAGMA user_version = 2;
             INSERT INTO cron_jobs
-                (id, description, schedule, created_at, one_shot, created_by_model)
+                (id, description, schedule, created_at, one_shot, created_by_model, status)
             VALUES ('fire-test-id', 'followup-fire-unique-marker', '{cron_expr}',
-                    '{created_at}', 1, 1);"
+                    '{created_at}', 1, 1, 'pending');"
         ))
         .expect("seed oneshot job");
     }
