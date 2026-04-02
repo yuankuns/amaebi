@@ -85,7 +85,7 @@ pub fn dev_loop(
                               git push && \
                               (gh pr create --fill 2>/dev/null || \
                                gh pr view --json url -q '.url' 2>/dev/null || true) && \
-                              (gh pr comment --body '@github-copilot review' \
+                              (gh pr comment --body '@copilot review this pr, don\'t change this pr' \
                                2>/dev/null || true)"
                         .into(),
                 },
