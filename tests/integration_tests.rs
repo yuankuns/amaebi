@@ -358,17 +358,30 @@ async fn test_compaction_preserves_summary() {
         "expected Compacting in turn A: {ra:?}"
     );
 
-    // Wait for background summary to complete (2 requests: chat + summary).
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    // Wait until the mock server's response queue is empty, meaning both the
+    // chat response ("Turn A reply.") and the background summary response
+    // (SUMMARY_TEXT) have been consumed.  Checking the response queue is more
+    // reliable than counting received requests: it directly confirms that the
+    // background summary task has actually fetched its response, eliminating
+    // the race where a slow CI machine times out before the task fires and
+    // SUMMARY_TEXT is still queued when Turn B consumes it instead.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
     loop {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        if server.peek_request_count() >= 2 || std::time::Instant::now() > deadline {
+        if server.pending_response_count() == 0 || std::time::Instant::now() > deadline {
             break;
         }
     }
+    let remaining = server.pending_response_count();
+    assert!(
+        remaining == 0,
+        "expected mock queue to be empty after waiting for background summary, \
+         but {remaining} response(s) remain — background summary task did not fire in time"
+    );
     server.take_requests();
-    // Extra wait for SQLite write.
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    // Extra wait for the daemon to write the summary to SQLite after receiving
+    // the LLM response.  Increased to 1 s to give slow CI runners more headroom.
+    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
 
     // Phase 3: follow-up turn on same daemon — summary should appear in context.
     server.enqueue(ScriptedResponse::text_chunks(vec!["Turn B reply."]));
@@ -1652,9 +1665,6 @@ async fn subagent_chain_session_remains_usable_after_recursion_block() {
         "parent: child reported error",
     ]));
 
-    // Round 2 (verify session still usable) ----------------------------------
-    server.enqueue(ScriptedResponse::text_chunks(vec!["session still works"]));
-
     let session_id = uuid::Uuid::new_v4().to_string();
     let daemon = start_daemon_with_env(&server.url(), &[("AMAEBI_SPAWN_SANDBOX", "noop")])
         .await
@@ -1675,7 +1685,33 @@ async fn subagent_chain_session_remains_usable_after_recursion_block() {
         "no Error frames expected in round 1: {r1:?}"
     );
 
-    // Round 2: same session_id — daemon must still be functional.
+    // Wait until every Round 1 response has been consumed from the mock queue.
+    // On slow CI runners, transient 5xx retries inside the daemon can shift
+    // queue ordering: a retry of any Round 1 request would consume the next
+    // queued item, which — if Round 2's response was already in the queue —
+    // would be "session still works".  By waiting here and only enqueuing the
+    // Round 2 response after the queue is empty, we guarantee that response
+    // can only be consumed by Round 2's actual LLM request.
+    let drain_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        if server.pending_response_count() == 0 || std::time::Instant::now() > drain_deadline {
+            break;
+        }
+    }
+    assert_eq!(
+        server.pending_response_count(),
+        0,
+        "drain deadline elapsed before all Round 1 responses were consumed"
+    );
+    // Snapshot the Round 1 request log before starting Round 2.
+    let reqs_r1 = server.take_requests();
+
+    // Round 2 (verify session still usable) ----------------------------------
+    // Enqueue the Round 2 response only now — after Round 1 is fully drained —
+    // so it cannot be consumed by any in-flight Round 1 retry or background task.
+    server.enqueue(ScriptedResponse::text_chunks(vec!["session still works"]));
+
     let r2 = send_message_with_session(&client, "follow-up", &session_id, "gpt-4o")
         .await
         .expect("round 2");
@@ -1689,9 +1725,12 @@ async fn subagent_chain_session_remains_usable_after_recursion_block() {
         "no Error frames expected in round 2: {r2:?}"
     );
 
+    // Combine request logs from both rounds for the final structural checks.
+    let mut reqs = reqs_r1;
+    reqs.extend(server.take_requests());
+
     // The child's second LLM request (index 2) must include the explicit
     // "spawn_agent is not available" error in the tool result.
-    let reqs = server.take_requests();
     // 4 requests for round 1 (parent×2 + child×2) + 1 for round 2 = 5.
     assert_eq!(
         reqs.len(),
@@ -2301,7 +2340,6 @@ async fn chat_long_connection_steer_mid_turn() {
 async fn chat_long_connection_eof_exits_cleanly() {
     let server = MockLlmServer::start().await;
     server.enqueue(ScriptedResponse::text_chunks(vec!["hello"]));
-    server.enqueue(ScriptedResponse::text_chunks(vec!["world"]));
 
     let daemon = start_daemon(&server.url()).await.expect("start_daemon");
 
@@ -2321,6 +2359,26 @@ async fn chat_long_connection_eof_exits_cleanly() {
         assert!(collect_text(&r).contains("hello"));
         // conn dropped here → EOF
     }
+
+    // Wait for the mock queue to drain before enqueuing the Connection 2
+    // response.  A deferred follow-up or background summary may fire after
+    // Connection 1 drops and consume any remaining queued responses.
+    let drain_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        if server.pending_response_count() == 0 || std::time::Instant::now() > drain_deadline {
+            break;
+        }
+    }
+    assert_eq!(
+        server.pending_response_count(),
+        0,
+        "drain deadline elapsed before all Connection 1 responses were consumed"
+    );
+
+    // Enqueue the Connection 2 response only after drain so it cannot be
+    // consumed by any in-flight background task from Connection 1.
+    server.enqueue(ScriptedResponse::text_chunks(vec!["world"]));
 
     // Connection 2: daemon must still respond normally.
     let mut conn2 = LongChatConnection::connect(&daemon.socket)

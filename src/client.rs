@@ -336,8 +336,29 @@ pub async fn run_chat_loop(
     let mut lines = BufReader::new(read_half).lines();
 
     let mut stdout = tokio::io::stdout();
-    // Single BufReader for stdin — reused across all prompt/steer reads so
-    // buffered bytes are never dropped between reads.
+    // Single BufReader for stdin — reused across all steer reads so buffered
+    // bytes are never dropped between reads.
+    //
+    // Stdin-mixing note: the outer prompt loop reads stdin via
+    // `prompt_input::read_line_raw` (a spawn_blocking call that reads
+    // std::io::stdin() byte-by-byte in raw mode), while this tokio BufReader
+    // reads the same underlying fd in cooked mode for steer corrections.
+    //
+    // In theory, the BufReader could read ahead and buffer bytes that belong
+    // to the *next* prompt — stranding them inside the BufReader and making
+    // the raw-mode reader see a truncated line.  In practice this does not
+    // happen because:
+    //   1. The two readers are strictly sequential: the raw-mode prompt reader
+    //      only runs when no agent turn is active, and this BufReader is only
+    //      polled inside the inner select! loop while a turn is in flight.
+    //      They never run concurrently.
+    //   2. Steer corrections are line-oriented: the BufReader calls read_line
+    //      and returns exactly one newline-terminated line.  In canonical
+    //      (cooked) mode the kernel delivers exactly one line per read, so the
+    //      BufReader's internal buffer is always empty after read_line returns.
+    //   3. Even if the user types ahead during a turn, the kernel buffers those
+    //      bytes in the line-discipline, not in our BufReader.  They become
+    //      available on the next read_exact call in the raw-mode reader.
     let mut stdin = BufReader::new(tokio::io::stdin());
     let mut next_prompt = initial_prompt;
     let mut last_ctrl_c: Option<Instant> = None;
@@ -354,21 +375,24 @@ pub async fn run_chat_loop(
                     eprint!("> ");
                     let _ = tokio::io::stderr().flush().await;
                 }
-                let mut line = String::new();
-                let n = tokio::io::AsyncBufReadExt::read_line(&mut stdin, &mut line)
+                // Use the raw-mode reader so wide (CJK) characters are erased
+                // correctly on backspace: the terminal line-discipline only emits
+                // one `\b \b` per backspace, leaving a ghost column for 2-wide
+                // chars.  Our reader tracks display width and emits the right
+                // number of erase columns.
+                let raw_result = tokio::task::spawn_blocking(prompt_input::read_line_raw)
                     .await
-                    .context("reading prompt from stdin")?;
-                if n == 0 {
-                    break 'session;
+                    .context("prompt input task panicked")?;
+                match raw_result {
+                    Ok(None) => break 'session,
+                    Ok(Some(line)) if line.is_empty() => break 'session,
+                    Ok(Some(line)) => line,
+                    // Ctrl-C during prompt input — exit the session cleanly.
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => break 'session,
+                    Err(e) => {
+                        return Err(anyhow::Error::new(e).context("reading prompt from stdin"))
+                    }
                 }
-                let trimmed = line
-                    .trim_end_matches('\n')
-                    .trim_end_matches('\r')
-                    .to_owned();
-                if trimmed.is_empty() {
-                    break 'session;
-                }
-                trimmed
             }
         };
 
@@ -961,6 +985,764 @@ async fn start_daemon(socket: &std::path::Path) -> Result<()> {
         .spawn()
         .with_context(|| format!("spawning daemon from {}", exe.display()))?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Raw-mode prompt input — wide-character-aware line editor
+// ---------------------------------------------------------------------------
+
+/// Prompt input routines that handle CJK/wide characters correctly.
+///
+/// In the default cooked (canonical) terminal mode the kernel's line discipline
+/// emits `\b \b` on backspace, which only moves the cursor one column.  For
+/// two-column-wide CJK characters this leaves a ghost column on screen.
+///
+/// This module puts the terminal in raw mode for the duration of a single line
+/// read so it can track each character's display width and emit the correct
+/// number of erase columns on backspace.
+mod prompt_input {
+    use std::io::{Read, Write};
+    use unicode_width::UnicodeWidthChar as _;
+
+    /// RAII guard that restores the terminal to its saved settings on drop.
+    #[cfg(unix)]
+    struct RawModeGuard {
+        fd: std::os::unix::io::RawFd,
+        orig: libc::termios,
+    }
+
+    #[cfg(unix)]
+    impl RawModeGuard {
+        fn enter(fd: std::os::unix::io::RawFd) -> std::io::Result<Self> {
+            let mut orig = unsafe { std::mem::zeroed::<libc::termios>() };
+            if unsafe { libc::tcgetattr(fd, &mut orig) } != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let mut raw = orig;
+            unsafe { libc::cfmakeraw(&mut raw) };
+            // Keep output post-processing (OPOST) so "\r\n" renders correctly.
+            raw.c_oflag |= libc::OPOST;
+            if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw) } != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(Self { fd, orig })
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for RawModeGuard {
+        fn drop(&mut self) {
+            // Best-effort restore; ignore errors during drop.
+            unsafe { libc::tcsetattr(self.fd, libc::TCSANOW, &self.orig) };
+        }
+    }
+
+    /// Read one line from stdin with correct wide-character backspace handling.
+    ///
+    /// * `Ok(Some(s))` — user pressed Enter; `s` has no trailing newline.
+    /// * `Ok(None)` — Ctrl-D (EOF).
+    /// * `Err(e)` with `e.kind() == Interrupted` — Ctrl-C.
+    ///
+    /// Falls back to plain `read_line` when stdin is not a TTY.
+    pub fn read_line_raw() -> std::io::Result<Option<String>> {
+        use std::io::IsTerminal as _;
+
+        if !std::io::stdin().is_terminal() {
+            return read_line_cooked();
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd as _;
+            let fd = std::io::stdin().as_raw_fd();
+            // On failure (e.g. stdin is not a real tty), fall through to cooked.
+            if let Ok(guard) = RawModeGuard::enter(fd) {
+                return read_line_raw_inner(guard);
+            }
+        }
+
+        read_line_cooked()
+    }
+
+    /// Strip one trailing `\n` (and an optional preceding `\r`) from `s` in place.
+    fn strip_trailing_newline(s: &mut String) {
+        if s.ends_with('\n') {
+            s.pop();
+        }
+        if s.ends_with('\r') {
+            s.pop();
+        }
+    }
+
+    /// Cooked-mode fallback used when stdin is not a TTY or raw mode fails.
+    fn read_line_cooked() -> std::io::Result<Option<String>> {
+        use std::io::BufRead as _;
+        let mut s = String::new();
+        match std::io::stdin().lock().read_line(&mut s) {
+            Ok(0) => Ok(None),
+            Ok(_) => {
+                strip_trailing_newline(&mut s);
+                Ok(Some(s))
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    #[cfg(unix)]
+    fn read_line_raw_inner(_guard: RawModeGuard) -> std::io::Result<Option<String>> {
+        process_input(&mut std::io::stdin(), &mut std::io::stderr())
+    }
+
+    /// Core line-editor loop.  Separated from the raw-mode setup so it can be
+    /// driven by in-memory byte slices in unit tests without needing a real TTY.
+    ///
+    /// Reads bytes from `input`, echoes/erases via `output`, and returns:
+    /// * `Ok(Some(s))` on Enter — `s` contains no trailing newline.
+    /// * `Ok(None)` on EOF (Ctrl-D or exhausted reader).
+    /// * `Err` with `ErrorKind::Interrupted` on Ctrl-C.
+    fn process_input<R: Read, W: Write>(
+        input: &mut R,
+        output: &mut W,
+    ) -> std::io::Result<Option<String>> {
+        let mut chars: Vec<char> = Vec::new();
+        // Display width (columns) of each char, matched by index to `chars`.
+        let mut widths: Vec<usize> = Vec::new();
+
+        loop {
+            let mut byte = [0u8; 1];
+            match input.read_exact(&mut byte) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+                // EINTR (Interrupted) is raised by signals such as SIGWINCH
+                // (terminal resize).  It is not a fatal error — just retry.
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+
+            match byte[0] {
+                // Enter (CR in raw mode; some environments send LF)
+                b'\r' | b'\n' => {
+                    output.write_all(b"\r\n")?;
+                    output.flush()?;
+                    return Ok(Some(chars.iter().collect()));
+                }
+                // Ctrl-D
+                4 => return Ok(None),
+                // Ctrl-C
+                3 => {
+                    output.write_all(b"^C\r\n")?;
+                    output.flush()?;
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "ctrl-c",
+                    ));
+                }
+                // Backspace (DEL = 0x7f on most terminals; BS = 0x08 on some)
+                0x7f | 0x08 => {
+                    if let (Some(_), Some(w)) = (chars.pop(), widths.pop()) {
+                        if w > 0 {
+                            // Normal (non-zero-width) char: erase w display columns.
+                            //
+                            // ESC[wD (CUB) is used instead of w×\x08 (BS) because some
+                            // terminals snap the cursor to the left boundary of a wide
+                            // glyph on the first \x08, causing two \x08 to overshoot by
+                            // one column at odd column positions and leave the right-half
+                            // cell visible.  CUB always moves exactly w columns.
+                            //
+                            // Known limitation: CUB does not wrap to the previous visual
+                            // line on soft-wrapped input.  This editor targets single-line
+                            // prompts; multi-line soft-wrap support is out of scope.
+                            write!(output, "\x1b[{w}D\x1b[K")?;
+                        } else {
+                            // Zero-width combining mark: it was rendered on top of the
+                            // preceding base character without advancing the cursor.
+                            // Removing it from the buffer leaves its glyph visible;
+                            // repaint the base char (and any remaining combining marks
+                            // on it) to erase the deleted mark from the display.
+                            if let Some(base_idx) = widths.iter().rposition(|&bw| bw > 0) {
+                                let base_width = widths[base_idx];
+                                // Move back to start of base char, clear to EOL.
+                                write!(output, "\x1b[{base_width}D\x1b[K")?;
+                                // Re-echo base char + any remaining combining marks.
+                                let repaint: String = chars[base_idx..].iter().collect();
+                                output.write_all(repaint.as_bytes())?;
+                            }
+                            // No preceding base char (mark at start of buffer):
+                            // nothing to repaint.
+                        }
+                    }
+                }
+                // Escape sequences (arrows, function keys) — consume and discard.
+                //
+                // Limitation: a bare ESC press (no following byte) will block
+                // here until the next character arrives because we read the
+                // second byte unconditionally.  Resolving this correctly
+                // requires either a VTIME-based read timeout (termios VMIN=0
+                // VTIME=1) or non-blocking I/O with a short poll, which adds
+                // significant complexity for a rarely-used key.  Users who
+                // need bare ESC can press Ctrl-C instead.
+                0x1b => {
+                    let mut eb = [0u8; 1];
+                    if input.read_exact(&mut eb).is_ok() {
+                        match eb[0] {
+                            // CSI sequence (ESC [): read until final byte in
+                            // 0x40–0x7E.
+                            b'[' => loop {
+                                let mut fb = [0u8; 1];
+                                if input.read_exact(&mut fb).is_err() {
+                                    break;
+                                }
+                                if (0x40..=0x7e).contains(&fb[0]) {
+                                    break;
+                                }
+                            },
+                            // SS3 sequence (ESC O): used by some terminals for
+                            // function keys (F1–F4) and keypad.  Always exactly
+                            // 3 bytes total (ESC O <final>), so consume one more.
+                            b'O' => {
+                                let mut fb = [0u8; 1];
+                                let _ = input.read_exact(&mut fb);
+                            }
+                            // Other 2-byte ESC sequences (e.g. ESC M): the
+                            // second byte was already consumed by read_exact
+                            // above, so nothing more to discard.
+                            _ => {}
+                        }
+                    }
+                }
+                // ASCII printable
+                b @ 0x20..=0x7e => {
+                    output.write_all(&[b])?;
+                    chars.push(b as char);
+                    widths.push(1);
+                }
+                // Valid UTF-8 multi-byte lead bytes only.
+                //
+                // 0xC0/0xC1 produce "overlong" encodings of ASCII and are
+                // never valid in UTF-8; 0xF5..=0xFF exceed U+10FFFF and are
+                // also invalid.  Those bytes fall through to `_` (silently
+                // ignored) WITHOUT consuming any continuation bytes.
+                b @ 0xC2..=0xF4 => {
+                    let n_extra: usize = if b >= 0xF0 {
+                        3
+                    } else if b >= 0xE0 {
+                        2
+                    } else {
+                        1
+                    };
+                    let mut utf8_buf: Vec<u8> = vec![b];
+                    for _ in 0..n_extra {
+                        let mut cb = [0u8; 1];
+                        match input.read_exact(&mut cb) {
+                            // Valid continuation byte: collect it.
+                            Ok(()) if (0x80..=0xBF).contains(&cb[0]) => {
+                                utf8_buf.push(cb[0]);
+                            }
+                            // Invalid continuation or read error: stop.  The
+                            // byte has been consumed from the stream; discard
+                            // the whole sequence below.
+                            _ => break,
+                        }
+                    }
+                    if let Ok(s) = std::str::from_utf8(&utf8_buf) {
+                        if let Some(ch) = s.chars().next() {
+                            // width() returns Some(0) for zero-width combining
+                            // marks; we preserve that so backspace knows not to
+                            // move the cursor for them.  Control/format characters
+                            // return None — default those to 1.
+                            let w = ch.width().unwrap_or(1);
+                            output.write_all(s.as_bytes())?;
+                            chars.push(ch);
+                            widths.push(w);
+                        }
+                    }
+                    // Silently discard invalid or truncated UTF-8 sequences.
+                }
+                // Other control bytes — ignore silently.
+                _ => {}
+            }
+
+            // Flush once per iteration rather than after every individual
+            // write.  This batches output during fast input (e.g. pastes)
+            // while keeping the display responsive for single keystrokes.
+            output.flush()?;
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::process_input;
+        use std::io::Cursor;
+        use unicode_width::UnicodeWidthChar as _;
+
+        // ------------------------------------------------------------------ //
+        // Helpers
+        // ------------------------------------------------------------------ //
+
+        /// Run `process_input` on a raw byte sequence and return `(result, echoed)`.
+        fn run(input: &[u8]) -> (std::io::Result<Option<String>>, Vec<u8>) {
+            let mut reader = Cursor::new(input.to_vec());
+            let mut output: Vec<u8> = Vec::new();
+            let result = process_input(&mut reader, &mut output);
+            (result, output)
+        }
+
+        // ------------------------------------------------------------------ //
+        // Enter / EOF / Ctrl-C
+        // ------------------------------------------------------------------ //
+
+        #[test]
+        fn enter_cr_returns_accumulated_text() {
+            let (res, echo) = run(b"hello\r");
+            assert_eq!(res.unwrap(), Some("hello".to_string()));
+            // Echo ends with CRLF
+            assert!(echo.ends_with(b"\r\n"));
+        }
+
+        #[test]
+        fn enter_lf_also_accepted() {
+            let (res, _) = run(b"hi\n");
+            assert_eq!(res.unwrap(), Some("hi".to_string()));
+        }
+
+        #[test]
+        fn empty_enter_returns_empty_string() {
+            let (res, _) = run(b"\r");
+            assert_eq!(res.unwrap(), Some(String::new()));
+        }
+
+        #[test]
+        fn ctrl_d_returns_none() {
+            let (res, echo) = run(&[4]);
+            assert_eq!(res.unwrap(), None);
+            // Ctrl-D produces no echo output.
+            assert!(echo.is_empty());
+        }
+
+        #[test]
+        fn eof_on_empty_reader_returns_none() {
+            let (res, _) = run(b"");
+            assert_eq!(res.unwrap(), None);
+        }
+
+        #[test]
+        fn ctrl_c_returns_interrupted_error() {
+            let (res, echo) = run(&[3]);
+            let err = res.unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::Interrupted);
+            // Echo should contain "^C\r\n"
+            assert_eq!(echo, b"^C\r\n");
+        }
+
+        // ------------------------------------------------------------------ //
+        // ASCII backspace
+        // ------------------------------------------------------------------ //
+
+        #[test]
+        fn backspace_del_removes_last_ascii_char() {
+            // "ab" + DEL + Enter → "a"
+            let (res, _) = run(b"ab\x7f\r");
+            assert_eq!(res.unwrap(), Some("a".to_string()));
+        }
+
+        #[test]
+        fn backspace_bs_also_removes_last_ascii_char() {
+            let (res, _) = run(b"ab\x08\r");
+            assert_eq!(res.unwrap(), Some("a".to_string()));
+        }
+
+        #[test]
+        fn backspace_ascii_emits_one_column_erase() {
+            // After "a", DEL should emit ESC[1D ESC[K (CSI cursor-back 1 + erase EOL).
+            let (_, echo) = run(b"a\x7f\r");
+            // "a" is echoed first (1 byte), then the CSI erase sequence, then \r\n.
+            let after_a = &echo[1..];
+            assert!(
+                after_a.starts_with(b"\x1b[1D\x1b[K"),
+                "expected ESC[1D ESC[K, got: {:?}",
+                after_a
+            );
+        }
+
+        #[test]
+        fn backspace_on_empty_buffer_does_nothing() {
+            // DEL on empty buffer — no erase, just Enter result
+            let (res, echo) = run(b"\x7f\r");
+            assert_eq!(res.unwrap(), Some(String::new()));
+            // Only echo should be the CRLF from Enter; no erase sequences emitted.
+            let before_crlf = &echo[..echo.len().saturating_sub(2)];
+            assert!(
+                !before_crlf.contains(&b'\x1b'),
+                "no erase sequence expected on empty backspace, got: {:?}",
+                before_crlf
+            );
+        }
+
+        #[test]
+        fn multiple_backspaces_empty_buffer() {
+            // Three chars then three DELs → empty
+            let (res, _) = run(b"abc\x7f\x7f\x7f\r");
+            assert_eq!(res.unwrap(), Some(String::new()));
+        }
+
+        // ------------------------------------------------------------------ //
+        // CJK / wide-character backspace — the bug this PR fixes
+        // ------------------------------------------------------------------ //
+
+        #[test]
+        fn cjk_char_is_accepted() {
+            let input = "中\r".as_bytes();
+            let (res, _) = run(input);
+            assert_eq!(res.unwrap(), Some("中".to_string()));
+        }
+
+        #[test]
+        fn backspace_after_cjk_removes_char() {
+            // "中" + DEL + Enter → empty
+            let mut input = "中".as_bytes().to_vec();
+            input.push(0x7f); // DEL
+            input.push(b'\r');
+            let (res, _) = run(&input);
+            assert_eq!(res.unwrap(), Some(String::new()));
+        }
+
+        #[test]
+        fn backspace_after_cjk_emits_csi_two_column_erase() {
+            // "中" is 2 columns wide → erase sequence must be ESC[2D ESC[K
+            // (CSI cursor-back 2 + erase-to-EOL), NOT raw \x08 pairs.
+            let mut input = "中".as_bytes().to_vec();
+            input.push(0x7f);
+            input.push(b'\r');
+            let (_, echo) = run(&input);
+
+            let cjk_bytes = "中".len(); // 3 UTF-8 bytes
+            let after_cjk = &echo[cjk_bytes..];
+            assert!(
+                after_cjk.starts_with(b"\x1b[2D\x1b[K"),
+                "expected CSI 2-column erase (ESC[2D ESC[K), got: {:?}",
+                after_cjk
+            );
+        }
+
+        #[test]
+        fn backspace_after_ascii_emits_csi_one_column_erase() {
+            // "a" is 1 column wide → erase sequence must be ESC[1D ESC[K
+            let (_, echo) = run(b"a\x7f\r");
+            let after_a = &echo[1..]; // skip echoed 'a'
+            assert!(
+                after_a.starts_with(b"\x1b[1D\x1b[K"),
+                "expected CSI 1-column erase (ESC[1D ESC[K), got: {:?}",
+                after_a
+            );
+            // Must NOT use the 2-column variant
+            assert!(
+                !after_a.starts_with(b"\x1b[2D"),
+                "ASCII backspace must not use 2-column erase"
+            );
+        }
+
+        #[test]
+        fn mixed_ascii_and_cjk_backspace_sequence() {
+            // "a中b" + 2×DEL → "a"
+            let mut input = "a中b".as_bytes().to_vec();
+            input.extend_from_slice(b"\x7f\x7f\r");
+            let (res, _) = run(&input);
+            assert_eq!(res.unwrap(), Some("a".to_string()));
+        }
+
+        // ------------------------------------------------------------------ //
+        // Regression: odd-ASCII-count + CJK backspace (the ghost-cell bug)
+        //
+        // When an odd number of ASCII chars precede a CJK character, the CJK
+        // glyph starts at an odd terminal column.  Some terminals "snap" the
+        // cursor to the left boundary of a wide char on the first raw \x08,
+        // making two \x08s overshoot by one column and leaving the right-half
+        // cell of the glyph visible.  Using ESC[wD instead avoids the snap.
+        // ------------------------------------------------------------------ //
+
+        /// Deleting CJK after 1 ASCII char must emit ESC[2D (not raw \x08\x08).
+        #[test]
+        fn odd_ascii_then_cjk_backspace_uses_csi_not_raw_bs() {
+            // "a中" + DEL → "a"
+            let mut input = "a中".as_bytes().to_vec();
+            input.push(0x7f);
+            input.push(b'\r');
+            let (res, echo) = run(&input);
+            assert_eq!(res.unwrap(), Some("a".to_string()));
+
+            // Locate the erase sequence (after "a" echo + "中" echo bytes).
+            let prefix_len = 1 + "中".len(); // 'a' + '中'
+            let after_cjk = &echo[prefix_len..];
+
+            // Must use CSI cursor-back 2, not two raw \x08 bytes.
+            assert!(
+                after_cjk.starts_with(b"\x1b[2D\x1b[K"),
+                "expected ESC[2D ESC[K after odd-column CJK, got: {:?}",
+                after_cjk
+            );
+            assert!(
+                !after_cjk.starts_with(b"\x08\x08"),
+                "must not use raw \\x08 pairs — they overshoot at odd column positions"
+            );
+        }
+
+        /// Deleting CJK after 3 ASCII chars (another odd count) works correctly.
+        #[test]
+        fn three_ascii_then_cjk_backspace_uses_csi() {
+            let mut input = "abc中".as_bytes().to_vec();
+            input.push(0x7f);
+            input.push(b'\r');
+            let (res, echo) = run(&input);
+            assert_eq!(res.unwrap(), Some("abc".to_string()));
+
+            let prefix_len = 3 + "中".len();
+            let after_cjk = &echo[prefix_len..];
+            assert!(
+                after_cjk.starts_with(b"\x1b[2D\x1b[K"),
+                "expected ESC[2D ESC[K, got: {:?}",
+                after_cjk
+            );
+        }
+
+        /// Deleting CJK after 2 ASCII chars (even count) also uses CSI.
+        #[test]
+        fn even_ascii_then_cjk_backspace_uses_csi() {
+            let mut input = "ab中".as_bytes().to_vec();
+            input.push(0x7f);
+            input.push(b'\r');
+            let (res, echo) = run(&input);
+            assert_eq!(res.unwrap(), Some("ab".to_string()));
+
+            let prefix_len = 2 + "中".len();
+            let after_cjk = &echo[prefix_len..];
+            assert!(
+                after_cjk.starts_with(b"\x1b[2D\x1b[K"),
+                "expected ESC[2D ESC[K, got: {:?}",
+                after_cjk
+            );
+        }
+
+        /// Mixed delete: "a中b" + 2×DEL checks buffer is "a" AND second erase
+        /// (for 'b', width=1) uses ESC[1D.
+        #[test]
+        fn odd_ascii_cjk_ascii_two_backspaces_erase_sequence() {
+            let mut input = "a中b".as_bytes().to_vec();
+            input.extend_from_slice(b"\x7f\x7f\r");
+            let (res, echo) = run(&input);
+            assert_eq!(res.unwrap(), Some("a".to_string()));
+
+            // First erase: 'b' (width 1) → ESC[1D ESC[K
+            let prefix = 1 + "中".len() + 1; // "a" + "中" + "b"
+            let after_b = &echo[prefix..];
+            assert!(
+                after_b.starts_with(b"\x1b[1D\x1b[K"),
+                "erase of 'b' should be ESC[1D ESC[K, got: {:?}",
+                after_b
+            );
+
+            // Second erase: '中' (width 2) → ESC[2D ESC[K
+            let after_b_erase = &after_b[b"\x1b[1D\x1b[K".len()..];
+            assert!(
+                after_b_erase.starts_with(b"\x1b[2D\x1b[K"),
+                "erase of '中' should be ESC[2D ESC[K, got: {:?}",
+                after_b_erase
+            );
+        }
+
+        #[test]
+        fn cjk_hiragana_has_width_2() {
+            assert_eq!('あ'.width(), Some(2));
+        }
+
+        #[test]
+        fn cjk_hangul_has_width_2() {
+            assert_eq!('한'.width(), Some(2));
+        }
+
+        // ------------------------------------------------------------------ //
+        // Zero-width combining marks — backspace must not over-erase
+        // ------------------------------------------------------------------ //
+
+        #[test]
+        fn combining_mark_stored_with_zero_width() {
+            // U+0301 COMBINING ACUTE ACCENT — zero-width
+            // "e" + combining accent + Enter → "e\u{0301}"
+            // Build the input manually for clarity (U+0301 = 0xCC 0x81).
+            let input = {
+                let mut v = Vec::new();
+                v.push(b'e');
+                // U+0301 is 0xCC 0x81 in UTF-8
+                v.push(0xCC);
+                v.push(0x81);
+                v.push(b'\r');
+                v
+            };
+            let (res, _) = run(&input);
+            assert_eq!(res.unwrap(), Some("e\u{0301}".to_string()));
+        }
+
+        #[test]
+        fn backspace_combining_mark_repaints_base() {
+            // "e" + U+0301 + DEL + Enter → "e"
+            // Backspacing the combining mark must repaint the base char so the
+            // accent glyph is cleared from the terminal display.
+            let input = {
+                let mut v = Vec::new();
+                v.push(b'e');
+                v.push(0xCC); // U+0301 lead
+                v.push(0x81); // U+0301 cont
+                v.push(0x7f); // DEL
+                v.push(b'\r');
+                v
+            };
+            let (res, echo) = run(&input);
+            assert_eq!(res.unwrap(), Some("e".to_string()));
+
+            // Echo: 'e' (1) + U+0301 (2) = 3 bytes, then the repaint sequence.
+            let after_char = &echo[3..]; // skip 'e' + 2-byte combining mark
+                                         // Repaint: ESC[1D ESC[K (move back base_width=1, clear EOL) …
+            assert!(
+                after_char.starts_with(b"\x1b[1D\x1b[K"),
+                "zero-width backspace must repaint base with ESC[1D ESC[K; got: {:?}",
+                &after_char[..after_char.len().min(15)]
+            );
+            // … then re-echo 'e' to restore the base char without the accent.
+            let after_erase = &after_char[b"\x1b[1D\x1b[K".len()..];
+            assert!(
+                after_erase.starts_with(b"e"),
+                "base char 'e' must be re-echoed after combining mark erase; got: {:?}",
+                &after_erase[..after_erase.len().min(10)]
+            );
+        }
+
+        #[test]
+        fn backspace_second_combining_mark_repaints_base_with_first() {
+            // "e" + U+0301 + U+0302 + DEL + Enter → "e\u{0301}"
+            // Backspacing U+0302 repaints 'e' + U+0301 so only U+0302 is cleared.
+            let input = {
+                let mut v = Vec::new();
+                v.push(b'e');
+                v.extend_from_slice(&[0xCC, 0x81]); // U+0301
+                v.extend_from_slice(&[0xCC, 0x82]); // U+0302 combining circumflex
+                v.push(0x7f); // DEL
+                v.push(b'\r');
+                v
+            };
+            let (res, echo) = run(&input);
+            assert_eq!(res.unwrap(), Some("e\u{0301}".to_string()));
+
+            // Echo: 'e'(1) + U+0301(2) + U+0302(2) = 5 bytes, then repaint.
+            let after_chars = &echo[5..];
+            assert!(
+                after_chars.starts_with(b"\x1b[1D\x1b[K"),
+                "backspace of second mark should emit ESC[1D ESC[K; got: {:?}",
+                &after_chars[..after_chars.len().min(15)]
+            );
+            // Re-echo must include 'e' + U+0301 but not U+0302.
+            let after_erase = &after_chars[b"\x1b[1D\x1b[K".len()..];
+            let expected: &[u8] = "e\u{0301}".as_bytes(); // 'e' + 0xCC 0x81
+            assert!(
+                after_erase.starts_with(expected),
+                "repaint must include 'e' + U+0301 only; got: {:?}",
+                &after_erase[..after_erase.len().min(10)]
+            );
+        }
+
+        #[test]
+        fn latin_ascii_has_width_1() {
+            assert_eq!('a'.width(), Some(1));
+            assert_eq!('Z'.width(), Some(1));
+        }
+
+        // ------------------------------------------------------------------ //
+        // Escape / CSI sequences — must be silently discarded
+        // ------------------------------------------------------------------ //
+
+        #[test]
+        fn arrow_up_csi_sequence_discarded() {
+            // ESC [ A = cursor up — should be ignored
+            let (res, _) = run(b"\x1b[Ahello\r");
+            assert_eq!(res.unwrap(), Some("hello".to_string()));
+        }
+
+        #[test]
+        fn arrow_right_csi_sequence_discarded() {
+            let (res, _) = run(b"hi\x1b[Cthere\r");
+            assert_eq!(res.unwrap(), Some("hithere".to_string()));
+        }
+
+        #[test]
+        fn multi_param_csi_sequence_discarded() {
+            // ESC [ 1 ; 2 H — cursor position with two params
+            let (res, _) = run(b"\x1b[1;2Hok\r");
+            assert_eq!(res.unwrap(), Some("ok".to_string()));
+        }
+
+        #[test]
+        fn non_csi_esc_sequence_discarded() {
+            // ESC M (reverse index) — 2-byte, not CSI
+            let (res, _) = run(b"\x1bMok\r");
+            assert_eq!(res.unwrap(), Some("ok".to_string()));
+        }
+
+        #[test]
+        fn ss3_sequence_fully_consumed() {
+            // ESC O P = F1 key (SS3 sequence) — all 3 bytes must be consumed
+            // so the 'P' (0x50) does not leak into the input buffer.
+            let (res, _) = run(b"\x1bOPok\r");
+            assert_eq!(res.unwrap(), Some("ok".to_string()));
+        }
+
+        #[test]
+        fn ss3_f4_sequence_fully_consumed() {
+            // ESC O S = F4 key — another common SS3 sequence.
+            let (res, _) = run(b"hi\x1bOSthere\r");
+            assert_eq!(res.unwrap(), Some("hithere".to_string()));
+        }
+
+        // ------------------------------------------------------------------ //
+        // Control characters (other than the named ones) — silently ignored
+        // ------------------------------------------------------------------ //
+
+        #[test]
+        fn control_chars_other_than_special_are_ignored() {
+            // Ctrl-A (0x01), Ctrl-E (0x05), Ctrl-K (0x0b) — not inserted into buffer
+            let (res, _) = run(b"\x01hello\x05\x0bworld\r");
+            assert_eq!(res.unwrap(), Some("helloworld".to_string()));
+        }
+
+        // ------------------------------------------------------------------ //
+        // strip_trailing_newline helper
+        // ------------------------------------------------------------------ //
+
+        #[test]
+        fn strip_newline_lf() {
+            let mut s = "hello\n".to_string();
+            super::strip_trailing_newline(&mut s);
+            assert_eq!(s, "hello");
+        }
+
+        #[test]
+        fn strip_newline_crlf() {
+            let mut s = "hello\r\n".to_string();
+            super::strip_trailing_newline(&mut s);
+            assert_eq!(s, "hello");
+        }
+
+        #[test]
+        fn strip_newline_no_newline_unchanged() {
+            let mut s = "hello".to_string();
+            super::strip_trailing_newline(&mut s);
+            assert_eq!(s, "hello");
+        }
+
+        #[test]
+        fn strip_newline_empty_unchanged() {
+            let mut s = String::new();
+            super::strip_trailing_newline(&mut s);
+            assert_eq!(s, "");
+        }
+    }
 }
 
 /// Return `true` if `last_press` is `Some` and the duration from `last_press`
