@@ -194,12 +194,16 @@ impl<W: tokio::io::AsyncWrite + Unpin + Send> tokio::io::AsyncWrite for MutexWri
         cx: &mut std::task::Context<'_>,
         buf: &[u8],
     ) -> std::task::Poll<std::io::Result<usize>> {
-        let inner = &self.0;
-        // try_lock: if the mutex is contended, return Pending and wake
-        match inner.try_lock() {
+        match self.0.try_lock() {
             Ok(mut guard) => std::pin::Pin::new(&mut *guard).poll_write(cx, buf),
             Err(_) => {
-                cx.waker().wake_by_ref();
+                // Yield to the executor instead of busy-looping.  The next
+                // poll will re-attempt the lock after other tasks have run.
+                let waker = cx.waker().clone();
+                tokio::spawn(async move {
+                    tokio::task::yield_now().await;
+                    waker.wake();
+                });
                 std::task::Poll::Pending
             }
         }
@@ -209,11 +213,14 @@ impl<W: tokio::io::AsyncWrite + Unpin + Send> tokio::io::AsyncWrite for MutexWri
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
-        let inner = &self.0;
-        match inner.try_lock() {
+        match self.0.try_lock() {
             Ok(mut guard) => std::pin::Pin::new(&mut *guard).poll_flush(cx),
             Err(_) => {
-                cx.waker().wake_by_ref();
+                let waker = cx.waker().clone();
+                tokio::spawn(async move {
+                    tokio::task::yield_now().await;
+                    waker.wake();
+                });
                 std::task::Poll::Pending
             }
         }
@@ -223,11 +230,14 @@ impl<W: tokio::io::AsyncWrite + Unpin + Send> tokio::io::AsyncWrite for MutexWri
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
-        let inner = &self.0;
-        match inner.try_lock() {
+        match self.0.try_lock() {
             Ok(mut guard) => std::pin::Pin::new(&mut *guard).poll_shutdown(cx),
             Err(_) => {
-                cx.waker().wake_by_ref();
+                let waker = cx.waker().clone();
+                tokio::spawn(async move {
+                    tokio::task::yield_now().await;
+                    waker.wake();
+                });
                 std::task::Poll::Pending
             }
         }
