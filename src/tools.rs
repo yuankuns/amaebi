@@ -419,6 +419,9 @@ async fn run_workflow_tool(args: serde_json::Value, ctx: &SpawnContext) -> Resul
                 .get("resource_count")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(1) as usize;
+            if count == 0 {
+                anyhow::bail!("invalid resource_count for tune-sweep workflow: must be at least 1");
+            }
             let wf = builtins::tune_sweep(target, "", run_cmd, result_cmd, resource);
             let pool = ResourcePool::new([(resource, count)]);
             let result = executor::execute(&wf, &state, &model, wf_ctx, &pool).await;
