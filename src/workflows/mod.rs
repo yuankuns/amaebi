@@ -194,6 +194,10 @@ impl Context {
     ///
     /// Any embedded single quotes in the value are escaped as `'\''`
     /// (end-quote, escaped quote, re-open quote).
+    ///
+    /// Not used by built-in workflows (which reference LLM output via safe
+    /// file paths), but available for custom workflows with untrusted vars.
+    #[allow(dead_code)]
     pub fn render_shell(&self, template: &str) -> String {
         let mut out = template.to_owned();
         for (k, v) in &self.vars {
