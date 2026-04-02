@@ -616,15 +616,15 @@ pub fn due_jobs(jobs: &[CronJob], now: &chrono::DateTime<chrono::Utc>) -> Vec<Cr
             }
         };
         let due_now = if job.one_shot {
-            // Only fire one-shot jobs that are still pending.  A job whose
-            // status is 'running' or 'completed' has already been picked up;
-            // if delete_job() later fails the 'completed' status prevents
-            // the scheduler from re-executing the job on the next tick.
-            if job.status != "pending" {
+            // Skip one-shot jobs that have already completed.  Jobs in the
+            // 'running' state are eligible again: if the daemon crashed after
+            // setting status='running' but before execution, the in-memory
+            // running_jobs set (re-populated on restart) and the last_run
+            // guard (30-second window) prevent actual duplicate execution.
+            if job.status == "completed" {
                 tracing::debug!(
                     id = %job.id,
-                    status = %job.status,
-                    "skipping one-shot job that is no longer pending"
+                    "skipping completed one-shot job (waiting for deletion)"
                 );
                 continue;
             }
@@ -684,8 +684,10 @@ pub fn due_jobs(jobs: &[CronJob], now: &chrono::DateTime<chrono::Utc>) -> Vec<Cr
             };
             match fires_at {
                 Some(fires_at) => {
-                    is_due(&sched, now)
-                        || crate::followup::oneshot_due_after_missed_window(&fires_at, now)
+                    // Use only the missed-window function: is_due() could match
+                    // stale cron fields in a future year when the same
+                    // month/day/hour/minute recurs, causing spurious re-fires.
+                    crate::followup::oneshot_due_after_missed_window(&fires_at, now)
                 }
                 None => {
                     tracing::warn!(
@@ -934,6 +936,33 @@ mod tests {
         assert!(
             due.is_empty(),
             "stale one-shot should not remain due forever"
+        );
+    }
+
+    #[test]
+    fn due_jobs_skips_one_shot_when_cron_fields_match_but_grace_expired() {
+        // Regression: is_due() would have matched "35 14 2 4 *" on 2026-04-02
+        // 14:35, but this is a one-shot whose fires_at was 2020-04-02 14:35 —
+        // well beyond the 5-year grace window.  Now that one-shot due-ness is
+        // based solely on oneshot_due_after_missed_window, it must be skipped.
+        let now = utc(2026, 4, 2, 14, 35);
+        let jobs = vec![CronJob {
+            id: "cron-match-but-stale".into(),
+            description: "stale job whose cron fields match today".into(),
+            // Schedule that would match 'now' exactly via is_due.
+            schedule: "35 14 2 4 *".into(),
+            // Created in 2020 → fires_at 2020-04-02 14:35 → grace expires 2025.
+            created_at: "2020-04-02T14:00:00Z".into(),
+            last_run: None,
+            one_shot: true,
+            created_by_model: true,
+            parent_session_id: None,
+            ..Default::default()
+        }];
+        let due = due_jobs(&jobs, &now);
+        assert!(
+            due.is_empty(),
+            "one-shot job must not fire when cron fields match but grace window expired"
         );
     }
 
