@@ -10,6 +10,7 @@ mod config;
 mod copilot;
 mod cron;
 mod daemon;
+mod followup;
 mod inbox;
 mod ipc;
 mod memory_db;
@@ -495,8 +496,8 @@ fn run_cron(action: cli::CronAction) -> Result<()> {
                 for job in &jobs {
                     let last = job.last_run.as_deref().unwrap_or("never");
                     println!(
-                        "[{}] {}\n  schedule:   {}\n  created:    {}\n  last_run:   {}\n",
-                        job.id, job.description, job.schedule, job.created_at, last
+                        "[{}] {}\n  schedule:   {}\n  status:     {}\n  created:    {}\n  last_run:   {}\n",
+                        job.id, job.description, job.schedule, job.status, job.created_at, last
                     );
                 }
                 println!("{} job(s) total.", jobs.len());

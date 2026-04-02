@@ -8,6 +8,30 @@ use tokio::process::Command;
 use crate::sandbox::{docker::DockerSandboxConfig, DockerSandbox, NoopSandbox, Sandbox};
 
 // ---------------------------------------------------------------------------
+// FollowupContext — shared state injected by the daemon for followup tools
+// ---------------------------------------------------------------------------
+
+/// Context passed to `LocalExecutor` so the `schedule_followup`,
+/// `cancel_followup`, and `list_followups` tools can read/write `cron.db`.
+///
+/// Note: parent-session summary lookup is performed by `run_cron_job` at
+/// fire time using `state.db` directly; this struct does not carry a DB handle.
+///
+/// Recursive scheduling is prevented by passing `include_followup=false` to
+/// `run_agentic_loop` for child agents and cron-triggered loops, which omits
+/// the follow-up tools from the schema sent to the model.  The executor's
+/// `followup_ctx` may still be `Some` in those contexts.
+pub struct FollowupContext {
+    /// Optional session UUID of the currently-running agentic loop, used as
+    /// the default `parent_session_id` when the caller does not pass an
+    /// explicit `session_id` argument.
+    pub current_session_id: Option<String>,
+    /// Override path for `cron.db`.  `None` uses `~/.amaebi/cron.db`.
+    /// Inject a temp path in tests for isolation.
+    pub cron_db_path: Option<std::path::PathBuf>,
+}
+
+// ---------------------------------------------------------------------------
 // SpawnContext — shared state injected by the daemon for spawn_agent support
 // ---------------------------------------------------------------------------
 
@@ -34,7 +58,13 @@ pub struct SpawnContext {
 /// `DockerExecutor` without touching the agentic loop.
 #[async_trait::async_trait]
 pub trait ToolExecutor: Send + Sync {
-    async fn execute(&self, name: &str, args: serde_json::Value) -> Result<String>;
+    async fn execute(
+        &self,
+        name: &str,
+        args: serde_json::Value,
+        session_id: Option<&str>,
+        enable_followup: bool,
+    ) -> Result<String>;
 }
 
 // ---------------------------------------------------------------------------
@@ -63,6 +93,10 @@ pub struct LocalExecutor {
     /// Optional context for the `spawn_agent` tool.  Injected by the daemon
     /// at startup; `None` in child agents to prevent unbounded recursion.
     pub spawn_ctx: Option<Arc<SpawnContext>>,
+    /// Optional context for the `schedule_followup` / `cancel_followup` /
+    /// `list_followups` tools.  `None` in child agents and in follow-up loops
+    /// to prevent recursive scheduling.
+    pub followup_ctx: Option<Arc<FollowupContext>>,
     /// Default working directory for `shell_command` when a sandbox is active.
     /// Set to the agent's workspace in child executors so sandbox cwd matches
     /// the mounted workspace rather than the daemon process cwd.
@@ -93,6 +127,7 @@ impl LocalExecutor {
         Self {
             sandbox,
             spawn_ctx: None,
+            followup_ctx: None,
             default_cwd,
         }
     }
@@ -100,8 +135,14 @@ impl LocalExecutor {
 
 #[async_trait::async_trait]
 impl ToolExecutor for LocalExecutor {
-    async fn execute(&self, name: &str, args: serde_json::Value) -> Result<String> {
-        tracing::debug!(tool = %name, "executing tool");
+    async fn execute(
+        &self,
+        name: &str,
+        args: serde_json::Value,
+        session_id: Option<&str>,
+        enable_followup: bool,
+    ) -> Result<String> {
+        tracing::debug!(tool = %name, session_id, enable_followup, "executing tool");
         match name {
             "shell_command" => {
                 shell_command(args, self.sandbox.as_deref(), self.default_cwd.as_deref()).await
@@ -117,6 +158,45 @@ impl ToolExecutor for LocalExecutor {
                      (child agents cannot spawn further agents)"
                 ),
             },
+            "schedule_followup" => {
+                if !enable_followup {
+                    anyhow::bail!(
+                        "schedule_followup is not available in this context \
+                         (cron jobs and child agents cannot schedule follow-ups)"
+                    );
+                }
+                match &self.followup_ctx {
+                    Some(ctx) => schedule_followup(args, ctx, session_id).await,
+                    None => anyhow::bail!(
+                        "schedule_followup is not available in this context \
+                         (follow-up loops and child agents cannot schedule further follow-ups)"
+                    ),
+                }
+            }
+            "cancel_followup" => {
+                if !enable_followup {
+                    anyhow::bail!(
+                        "cancel_followup is not available in this context \
+                         (cron jobs and child agents cannot manage follow-ups)"
+                    );
+                }
+                match &self.followup_ctx {
+                    Some(ctx) => cancel_followup(args, ctx).await,
+                    None => anyhow::bail!("cancel_followup is not available in this context"),
+                }
+            }
+            "list_followups" => {
+                if !enable_followup {
+                    anyhow::bail!(
+                        "list_followups is not available in this context \
+                         (cron jobs and child agents cannot manage follow-ups)"
+                    );
+                }
+                match &self.followup_ctx {
+                    Some(ctx) => list_followups(args, ctx).await,
+                    None => anyhow::bail!("list_followups is not available in this context"),
+                }
+            }
             other => anyhow::bail!("unknown tool: {other}"),
         }
     }
@@ -401,6 +481,7 @@ async fn spawn_agent(args: serde_json::Value, ctx: &SpawnContext) -> Result<Stri
     let child_executor = LocalExecutor {
         sandbox: Some(child_sandbox),
         spawn_ctx: None,
+        followup_ctx: None, // child agents cannot schedule follow-ups
         default_cwd: Some(workspace.clone()),
     };
 
@@ -434,13 +515,16 @@ async fn spawn_agent(args: serde_json::Value, ctx: &SpawnContext) -> Result<Stri
 
     // Fix 5: child agents do not get spawn_agent in their tool schema to
     // prevent unbounded recursion at the schema level.
+    let child_session_id = uuid::Uuid::new_v4().to_string();
     let (final_text, _, _) = crate::daemon::run_agentic_loop(
         &child_state,
         &model,
         messages,
         &mut sink,
         &mut steer_rx,
-        false,
+        false, // child agents cannot spawn further agents
+        false, // child agents cannot schedule follow-ups
+        &child_session_id,
     )
     .await?;
 
@@ -470,9 +554,12 @@ async fn edit_file(args: serde_json::Value) -> Result<String> {
 
 /// Return the JSON schema array to include in a chat request.
 ///
-/// Pass `include_spawn_agent = true` for the parent (daemon) context.
-/// Pass `false` for child agent loops to prevent recursive spawning.
-pub fn tool_schemas(include_spawn_agent: bool) -> Vec<serde_json::Value> {
+/// - `include_spawn_agent`: `true` for the parent daemon context; `false` in
+///   child agents to prevent unbounded recursion.
+/// - `include_followup`: `true` for normal interactive parent loops;
+///   `false` in child agents, cron parent loops, and in follow-up-triggered
+///   loops to prevent recursive scheduling.
+pub fn tool_schemas(include_spawn_agent: bool, include_followup: bool) -> Vec<serde_json::Value> {
     let mut schemas = vec![
         serde_json::json!({
             "type": "function",
@@ -574,6 +661,73 @@ pub fn tool_schemas(include_spawn_agent: bool) -> Vec<serde_json::Value> {
             }
         }),
     ];
+    if include_followup {
+        schemas.push(serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "schedule_followup",
+                "description": "Schedule a one-shot autonomous follow-up task to run at a \
+                                future time via the daemon's cron scheduler. Use this when \
+                                you intend to check back, revisit, or monitor something later. \
+                                The task runs in the background and its output appears in the \
+                                inbox (`amaebi inbox list`).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "description": {
+                            "type": "string",
+                            "description": "What the follow-up task should do. This becomes \
+                                            the prompt for the autonomous run."
+                        },
+                        "when": {
+                            "type": "string",
+                            "description": "When to run the follow-up. Relative time only: \
+                                            e.g. 'in 30 minutes', 'in 2 hours', 'in 30m', 'in 2h'. \
+                                            Minimum: 5 minutes."
+                        },
+                        "session_id": {
+                            "type": "string",
+                            "description": "Optional session UUID. If provided, the follow-up \
+                                            will be given the session's summary as context."
+                        }
+                    },
+                    "required": ["description", "when"]
+                }
+            }
+        }));
+        schemas.push(serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "cancel_followup",
+                "description": "Cancel a previously scheduled follow-up task by its ID. \
+                                Only tasks created via schedule_followup can be cancelled \
+                                this way.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "id": {
+                            "type": "string",
+                            "description": "The job ID returned by schedule_followup."
+                        }
+                    },
+                    "required": ["id"]
+                }
+            }
+        }));
+        schemas.push(serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "list_followups",
+                "description": "List all pending follow-up tasks you have scheduled. \
+                                Does not include cron jobs added by the user via the CLI.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                    "required": []
+                }
+            }
+        }));
+    }
     if include_spawn_agent {
         schemas.push(serde_json::json!({
             "type": "function",
@@ -638,6 +792,107 @@ pub fn tool_schemas(include_spawn_agent: bool) -> Vec<serde_json::Value> {
 }
 
 // ---------------------------------------------------------------------------
+// Followup tool implementations
+// ---------------------------------------------------------------------------
+
+/// Open the cron store, using the context's override path if set.
+fn open_cron_store(ctx: &FollowupContext) -> Result<crate::cron::CronStore> {
+    match &ctx.cron_db_path {
+        Some(path) => crate::cron::CronStore::open_at(path.clone()),
+        None => crate::cron::CronStore::open(),
+    }
+}
+
+/// Schedule a one-shot follow-up task via the cron subsystem.
+///
+/// `caller_session_id` is the session that invoked the tool (from `execute`'s
+/// `session_id` parameter).  It is used as the fallback `parent_session_id`
+/// when the model does not supply an explicit `session_id` argument.
+async fn schedule_followup(
+    args: serde_json::Value,
+    ctx: &FollowupContext,
+    caller_session_id: Option<&str>,
+) -> Result<String> {
+    let description = args["description"]
+        .as_str()
+        .context("schedule_followup: missing string argument 'description'")?;
+    let when = args["when"]
+        .as_str()
+        .context("schedule_followup: missing string argument 'when'")?;
+    let arg_session_id = match args.get("session_id") {
+        Some(serde_json::Value::Null) | None => None,
+        Some(value) => Some(
+            value
+                .as_str()
+                .context("schedule_followup: optional argument 'session_id' must be a string")?,
+        ),
+    };
+
+    let (cron_expr, fires_at) = crate::followup::resolve_when(when)
+        .with_context(|| format!("schedule_followup: invalid 'when' value {when:?}"))?;
+
+    // Priority: explicit arg > caller session (from execute) > ctx fallback.
+    // Empty / whitespace-only values are treated as absent so we never store
+    // an empty string as parent_session_id in the DB.
+    let parent = arg_session_id
+        .or(caller_session_id)
+        .or(ctx.current_session_id.as_deref())
+        .map(str::trim)
+        .filter(|sid| !sid.is_empty());
+
+    let store = open_cron_store(ctx)?;
+    let id = store
+        .add_oneshot(description, &cron_expr, parent)
+        .context("schedule_followup: writing to cron store")?;
+
+    Ok(format!(
+        "Follow-up scheduled.\n  id:          {id}\n  fires_at:    {fires_at}\n  cron:        {cron_expr}\n  description: {description}"
+    ))
+}
+
+/// Cancel a model-created follow-up task by job ID.
+async fn cancel_followup(args: serde_json::Value, ctx: &FollowupContext) -> Result<String> {
+    let id = args["id"]
+        .as_str()
+        .context("cancel_followup: missing string argument 'id'")?;
+
+    let store = open_cron_store(ctx)?;
+    if store.delete_if_model_created(id)? {
+        Ok(format!(
+            "Follow-up {id} cancelled (best-effort: if status was 'running' \
+             the job may already be executing and will complete normally)."
+        ))
+    } else {
+        Ok(format!("No model-created follow-up found with id {id}."))
+    }
+}
+
+/// List all pending follow-up tasks created by the model.
+async fn list_followups(_args: serde_json::Value, ctx: &FollowupContext) -> Result<String> {
+    let store = open_cron_store(ctx)?;
+    let jobs = store.list_model_created()?;
+
+    if jobs.is_empty() {
+        return Ok("No scheduled follow-ups.".to_string());
+    }
+
+    let mut out = format!("{} scheduled follow-up(s):\n", jobs.len());
+    for job in &jobs {
+        let last = job.last_run.as_deref().unwrap_or("never");
+        let by = if job.created_by_model {
+            "model"
+        } else {
+            "user"
+        };
+        out.push_str(&format!(
+            "  [{}] {} (by: {}, status: {})\n    cron: {}  created: {}  last_run: {}\n",
+            job.id, job.description, by, job.status, job.schedule, job.created_at, last
+        ));
+    }
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -651,7 +906,7 @@ mod tests {
 
     #[test]
     fn tool_schemas_have_expected_names() {
-        let schemas = tool_schemas(true);
+        let schemas = tool_schemas(true, false);
         let names: Vec<&str> = schemas
             .iter()
             .map(|s| s["function"]["name"].as_str().unwrap())
@@ -670,7 +925,7 @@ mod tests {
 
     #[test]
     fn tool_schemas_all_have_type_function() {
-        for schema in tool_schemas(true) {
+        for schema in tool_schemas(true, true) {
             assert_eq!(
                 schema["type"].as_str().unwrap(),
                 "function",
@@ -682,7 +937,7 @@ mod tests {
 
     #[test]
     fn tool_schemas_all_have_parameters_with_required_array() {
-        for schema in tool_schemas(true) {
+        for schema in tool_schemas(true, true) {
             let name = schema["function"]["name"].as_str().unwrap();
             assert!(
                 schema["function"]["parameters"]["required"].is_array(),
@@ -695,7 +950,7 @@ mod tests {
 
     #[test]
     fn spawn_agent_schema_has_extra_mounts() {
-        let schemas = tool_schemas(true);
+        let schemas = tool_schemas(true, false);
         let spawn = schemas
             .iter()
             .find(|s| s["function"]["name"].as_str() == Some("spawn_agent"))
@@ -722,7 +977,7 @@ mod tests {
 
     #[test]
     fn spawn_agent_schema_has_env() {
-        let schemas = tool_schemas(true);
+        let schemas = tool_schemas(true, false);
         let spawn = schemas
             .iter()
             .find(|s| s["function"]["name"].as_str() == Some("spawn_agent"))
@@ -745,7 +1000,7 @@ mod tests {
 
     #[test]
     fn spawn_agent_schema_has_parallel() {
-        let schemas = tool_schemas(true);
+        let schemas = tool_schemas(true, false);
         let spawn = schemas
             .iter()
             .find(|s| s["function"]["name"].as_str() == Some("spawn_agent"))
@@ -767,6 +1022,8 @@ mod tests {
             .execute(
                 "shell_command",
                 serde_json::json!({"command": "echo hello"}),
+                None,
+                false,
             )
             .await
             .unwrap();
@@ -780,6 +1037,8 @@ mod tests {
             .execute(
                 "shell_command",
                 serde_json::json!({"command": "echo bad && exit 2"}),
+                None,
+                false,
             )
             .await
             .unwrap();
@@ -791,7 +1050,12 @@ mod tests {
     async fn shell_command_empty_output_shows_exit_zero() {
         let exec = LocalExecutor::new();
         let out = exec
-            .execute("shell_command", serde_json::json!({"command": "true"}))
+            .execute(
+                "shell_command",
+                serde_json::json!({"command": "true"}),
+                None,
+                false,
+            )
             .await
             .unwrap();
         assert_eq!(out, "[exit 0]");
@@ -800,7 +1064,9 @@ mod tests {
     #[tokio::test]
     async fn shell_command_missing_arg_returns_err() {
         let exec = LocalExecutor::new();
-        let result = exec.execute("shell_command", serde_json::json!({})).await;
+        let result = exec
+            .execute("shell_command", serde_json::json!({}), None, false)
+            .await;
         assert!(result.is_err());
         let msg = format!("{}", result.unwrap_err());
         assert!(
@@ -822,6 +1088,8 @@ mod tests {
             .execute(
                 "read_file",
                 serde_json::json!({"path": path.to_str().unwrap()}),
+                None,
+                false,
             )
             .await
             .unwrap();
@@ -837,6 +1105,8 @@ mod tests {
             .execute(
                 "read_file",
                 serde_json::json!({"path": path.to_str().unwrap()}),
+                None,
+                false,
             )
             .await;
         assert!(result.is_err());
@@ -845,7 +1115,9 @@ mod tests {
     #[tokio::test]
     async fn read_file_missing_path_arg_returns_err() {
         let exec = LocalExecutor::new();
-        let result = exec.execute("read_file", serde_json::json!({})).await;
+        let result = exec
+            .execute("read_file", serde_json::json!({}), None, false)
+            .await;
         assert!(result.is_err());
     }
 
@@ -861,6 +1133,8 @@ mod tests {
             .execute(
                 "edit_file",
                 serde_json::json!({"path": path.to_str().unwrap(), "content": "written"}),
+                None,
+                false,
             )
             .await
             .unwrap();
@@ -881,6 +1155,8 @@ mod tests {
         exec.execute(
             "edit_file",
             serde_json::json!({"path": path.to_str().unwrap(), "content": "new"}),
+            None,
+            false,
         )
         .await
         .unwrap();
@@ -939,10 +1215,14 @@ mod tests {
         let exec = LocalExecutor {
             sandbox: Some(Box::new(crate::sandbox::NoopSandbox)),
             spawn_ctx: None,
+            followup_ctx: None,
             default_cwd: None,
         };
         let args = serde_json::json!({"command": "echo hello"});
-        let result = exec.execute("shell_command", args).await.unwrap();
+        let result = exec
+            .execute("shell_command", args, None, false)
+            .await
+            .unwrap();
         assert!(result.contains("hello"));
     }
 
@@ -952,11 +1232,17 @@ mod tests {
         let exec = LocalExecutor {
             sandbox: Some(Box::new(crate::sandbox::NoopSandbox)),
             spawn_ctx: None,
+            followup_ctx: None,
             default_cwd: Some(tmp.path().to_path_buf()),
         };
         // pwd should print the default_cwd, not the daemon process cwd.
         let result = exec
-            .execute("shell_command", serde_json::json!({"command": "pwd"}))
+            .execute(
+                "shell_command",
+                serde_json::json!({"command": "pwd"}),
+                None,
+                false,
+            )
             .await
             .unwrap();
         assert!(
@@ -971,7 +1257,7 @@ mod tests {
 
     #[test]
     fn tool_schemas_false_excludes_spawn_agent() {
-        let schemas = tool_schemas(false);
+        let schemas = tool_schemas(false, false);
         let names: Vec<&str> = schemas
             .iter()
             .map(|s| s["function"]["name"].as_str().unwrap())
@@ -988,7 +1274,7 @@ mod tests {
 
     #[test]
     fn tool_schemas_true_includes_spawn_agent() {
-        let schemas = tool_schemas(true);
+        let schemas = tool_schemas(true, false);
         let names: Vec<&str> = schemas
             .iter()
             .map(|s| s["function"]["name"].as_str().unwrap())
@@ -1062,10 +1348,275 @@ mod tests {
     async fn unknown_tool_returns_descriptive_error() {
         let exec = LocalExecutor::new();
         let result = exec
-            .execute("nonexistent_tool", serde_json::json!({}))
+            .execute("nonexistent_tool", serde_json::json!({}), None, false)
             .await;
         assert!(result.is_err());
         let msg = format!("{}", result.unwrap_err());
         assert!(msg.contains("unknown tool"), "got: {msg}");
+    }
+
+    // ---- followup tool schemas ------------------------------------------
+
+    #[test]
+    fn tool_schemas_include_followup_adds_three_tools() {
+        let schemas = tool_schemas(false, true);
+        let names: Vec<&str> = schemas
+            .iter()
+            .map(|s| s["function"]["name"].as_str().unwrap())
+            .collect();
+        assert!(
+            names.contains(&"schedule_followup"),
+            "schedule_followup missing"
+        );
+        assert!(
+            names.contains(&"cancel_followup"),
+            "cancel_followup missing"
+        );
+        assert!(names.contains(&"list_followups"), "list_followups missing");
+    }
+
+    #[test]
+    fn tool_schemas_exclude_followup_hides_three_tools() {
+        let schemas = tool_schemas(true, false);
+        let names: Vec<&str> = schemas
+            .iter()
+            .map(|s| s["function"]["name"].as_str().unwrap())
+            .collect();
+        assert!(
+            !names.contains(&"schedule_followup"),
+            "schedule_followup must be absent"
+        );
+        assert!(
+            !names.contains(&"cancel_followup"),
+            "cancel_followup must be absent"
+        );
+        assert!(
+            !names.contains(&"list_followups"),
+            "list_followups must be absent"
+        );
+    }
+
+    #[test]
+    fn schedule_followup_schema_requires_description_and_when() {
+        let schemas = tool_schemas(false, true);
+        let schema = schemas
+            .iter()
+            .find(|s| s["function"]["name"].as_str() == Some("schedule_followup"))
+            .expect("schedule_followup schema missing");
+        let required = schema["function"]["parameters"]["required"]
+            .as_array()
+            .expect("required must be an array");
+        let req_names: Vec<&str> = required.iter().map(|v| v.as_str().unwrap()).collect();
+        assert!(
+            req_names.contains(&"description"),
+            "description must be required"
+        );
+        assert!(req_names.contains(&"when"), "when must be required");
+    }
+
+    #[test]
+    fn cancel_followup_schema_requires_id() {
+        let schemas = tool_schemas(false, true);
+        let schema = schemas
+            .iter()
+            .find(|s| s["function"]["name"].as_str() == Some("cancel_followup"))
+            .expect("cancel_followup schema missing");
+        let required = schema["function"]["parameters"]["required"]
+            .as_array()
+            .expect("required must be an array");
+        let req_names: Vec<&str> = required.iter().map(|v| v.as_str().unwrap()).collect();
+        assert!(req_names.contains(&"id"), "id must be required");
+    }
+
+    // ---- followup tool dispatch without context -------------------------
+
+    #[tokio::test]
+    async fn schedule_followup_without_context_returns_error() {
+        let exec = LocalExecutor::new(); // followup_ctx = None
+        let result = exec
+            .execute(
+                "schedule_followup",
+                serde_json::json!({"description": "check logs", "when": "in 30 minutes"}),
+                None,
+                false,
+            )
+            .await;
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("not available"),
+            "error should mention 'not available': {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_followup_without_context_returns_error() {
+        let exec = LocalExecutor::new();
+        let result = exec
+            .execute(
+                "cancel_followup",
+                serde_json::json!({"id": "some-id"}),
+                None,
+                false,
+            )
+            .await;
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("not available"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn list_followups_without_context_returns_error() {
+        let exec = LocalExecutor::new();
+        let result = exec
+            .execute("list_followups", serde_json::json!({}), None, false)
+            .await;
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("not available"), "got: {msg}");
+    }
+
+    /// Helper: build a minimal FollowupContext for unit tests.
+    ///
+    /// Returns `(ctx, _dir)` — keep `_dir` alive for the duration of the test
+    /// so the temp cron DB file is not deleted prematurely.
+    fn make_followup_ctx() -> (FollowupContext, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let cron_path = dir.path().join("cron.db");
+        let ctx = FollowupContext {
+            current_session_id: Some("test-session".to_string()),
+            cron_db_path: Some(cron_path),
+        };
+        (ctx, dir)
+    }
+
+    // ---- schedule_followup with context: argument validation ------------
+
+    #[tokio::test]
+    async fn schedule_followup_missing_description_returns_error() {
+        let (ctx_inner, _dir) = make_followup_ctx();
+        let ctx = Arc::new(ctx_inner);
+        let result =
+            schedule_followup(serde_json::json!({"when": "in 30 minutes"}), &ctx, None).await;
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("description"),
+            "error should mention 'description': {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn schedule_followup_missing_when_returns_error() {
+        let (ctx_inner, _dir) = make_followup_ctx();
+        let ctx = Arc::new(ctx_inner);
+        let result =
+            schedule_followup(serde_json::json!({"description": "check logs"}), &ctx, None).await;
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("when"), "error should mention 'when': {msg}");
+    }
+
+    #[tokio::test]
+    async fn schedule_followup_invalid_when_returns_error() {
+        let (ctx_inner, _dir) = make_followup_ctx();
+        let ctx = Arc::new(ctx_inner);
+        let result = schedule_followup(
+            serde_json::json!({"description": "check logs", "when": "next tuesday"}),
+            &ctx,
+            None,
+        )
+        .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn schedule_followup_without_any_session_context_stores_no_parent() {
+        let dir = TempDir::new().unwrap();
+        let cron_path = dir.path().join("cron.db");
+        let ctx = FollowupContext {
+            current_session_id: None,
+            cron_db_path: Some(cron_path.clone()),
+        };
+        let output = schedule_followup(
+            serde_json::json!({"description": "check deploy", "when": "in 30 minutes"}),
+            &ctx,
+            None,
+        )
+        .await
+        .expect("schedule_followup should succeed without a session id");
+        assert!(output.contains("Follow-up scheduled"));
+
+        let jobs = crate::cron::CronStore::open_at(cron_path)
+            .unwrap()
+            .list()
+            .unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert!(jobs[0].parent_session_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn schedule_followup_rejects_non_string_session_id() {
+        let (ctx_inner, _dir) = make_followup_ctx();
+        let ctx = Arc::new(ctx_inner);
+        let result = schedule_followup(
+            serde_json::json!({
+                "description": "check deploy",
+                "when": "in 30 minutes",
+                "session_id": 123
+            }),
+            &ctx,
+            None,
+        )
+        .await;
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("session_id"),
+            "error should mention session_id: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn schedule_followup_success_returns_job_id_and_fires_at() {
+        let (ctx_inner, _dir) = make_followup_ctx();
+        let ctx = Arc::new(ctx_inner);
+        let result = schedule_followup(
+            serde_json::json!({"description": "check deploy", "when": "in 30 minutes"}),
+            &ctx,
+            None,
+        )
+        .await;
+        let output = result.expect("schedule_followup should succeed");
+        // Output must mention an ID and a scheduled time.
+        assert!(
+            output.contains("id") || output.contains("scheduled"),
+            "output should mention the job id or scheduled time: {output}"
+        );
+    }
+
+    // ---- cancel_followup with context -----------------------------------
+
+    #[tokio::test]
+    async fn cancel_followup_nonexistent_id_returns_not_found() {
+        let (ctx_inner, _dir) = make_followup_ctx();
+        let ctx = Arc::new(ctx_inner);
+        let result = cancel_followup(serde_json::json!({"id": "nonexistent-id"}), &ctx).await;
+        // Should succeed (not error) but indicate job wasn't found.
+        let output = result.expect("cancel_followup should not hard-error on missing id");
+        assert!(
+            output.contains("not found") || output.contains("no"),
+            "output should indicate job was not found: {output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_followup_missing_id_returns_error() {
+        let (ctx_inner, _dir) = make_followup_ctx();
+        let ctx = Arc::new(ctx_inner);
+        let result = cancel_followup(serde_json::json!({}), &ctx).await;
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("id"), "error should mention 'id': {msg}");
     }
 }

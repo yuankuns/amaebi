@@ -23,11 +23,14 @@ mod support;
 
 use std::time::Duration;
 
+use chrono::{Datelike, Timelike};
+use rusqlite;
 use support::{
     helpers::{
-        collect_text, connect_client, seed_cron_job, send_message, send_message_with_session,
-        send_resume, setup_home, start_daemon, start_daemon_at_home_with_env,
-        start_daemon_with_env, LongChatConnection, Request, Response,
+        collect_text, connect_client, init_cron_db, seed_cron_job, seed_model_oneshot,
+        send_message, send_message_with_session, send_resume, setup_home, start_daemon,
+        start_daemon_at_home_with_env, start_daemon_with_env, LongChatConnection, Request,
+        Response,
     },
     mock_llm::{MockLlmServer, ScriptedResponse},
 };
@@ -233,7 +236,25 @@ async fn test_compaction_triggered_at_threshold() {
             "unexpected Compacting during seeding at turn {i}"
         );
     }
-    server.take_requests(); // drain seed requests
+
+    // Wait until every seed response has been dequeued by the mock server
+    // before killing the seed daemon.  On slow CI runners there is a window
+    // between the client receiving Done and the response being dequeued by the
+    // mock server; if we kill the daemon inside that window the mock server may
+    // not have drained the response, leaving it in the queue for Phase 2.
+    let drain_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        if server.pending_response_count() == 0 || std::time::Instant::now() > drain_deadline {
+            break;
+        }
+    }
+    assert_eq!(
+        server.pending_response_count(),
+        0,
+        "seed responses were not fully drained before Phase 2; possible race on slow CI"
+    );
+    server.take_requests(); // drain seed request log
 
     // --- Phase 2: restart daemon with low threshold ---
     // Destructure seed_daemon to keep home_dir alive (preserving the SQLite DB)
@@ -277,14 +298,24 @@ async fn test_compaction_triggered_at_threshold() {
         "expected Compacting frame in responses: {responses:?}"
     );
 
-    // Wait for background summary call to arrive.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    // Wait until both responses (chat reply + background summary) have been
+    // consumed from the mock queue.  Using pending_response_count() == 0 is
+    // more reliable than counting captured requests: it directly confirms that
+    // the background compact_session task fetched its response, eliminating the
+    // race where a slow CI runner times out and the summary response is still
+    // queued when the assertion runs.
+    let summary_deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
     loop {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        if server.peek_request_count() >= 2 || std::time::Instant::now() > deadline {
+        if server.pending_response_count() == 0 || std::time::Instant::now() > summary_deadline {
             break;
         }
     }
+    assert_eq!(
+        server.pending_response_count(),
+        0,
+        "compaction summary response was not consumed before assertion; possible race on slow CI"
+    );
 
     let reqs = server.take_requests();
     assert!(
@@ -2422,4 +2453,467 @@ async fn chat_long_connection_ask_still_single_turn() {
 
     let reqs = server.take_requests();
     assert_eq!(reqs.len(), 1, "exactly 1 LLM request for single turn");
+}
+
+// ===========================================================================
+// Deferred follow-up tool integration tests
+// ===========================================================================
+//
+// These tests exercise the three model-callable follow-up tools end-to-end
+// through the real daemon binary:
+//   schedule_followup  — writes a one-shot job to cron.db
+//   cancel_followup    — deletes a pending model-created job
+//   list_followups     — returns pending model-created jobs to the model
+//
+// Another test verifies that followup tools are blocked (not in schema)
+// when called from inside a cron job context.
+
+// ---------------------------------------------------------------------------
+// F1. schedule_followup tool call writes a pending job to cron.db
+// ---------------------------------------------------------------------------
+
+/// The model returns a `schedule_followup` tool call.  The daemon executes it
+/// and the resulting cron job must appear in cron.db with the correct flags.
+///
+/// Flow:
+///   1. LLM turn 1 → schedule_followup("check deploy", "in 5 minutes")
+///   2. LLM turn 2 (after tool result) → "Follow-up registered."
+///   3. Open cron.db directly and assert one_shot=1, created_by_model=1.
+#[tokio::test]
+async fn schedule_followup_tool_call_writes_cron_db() {
+    let server = MockLlmServer::start().await;
+
+    server.enqueue(ScriptedResponse::tool_call(
+        "sf-call-001",
+        "schedule_followup",
+        r#"{"description":"check-deploy-unique-marker","when":"in 5 minutes"}"#,
+    ));
+    server.enqueue(ScriptedResponse::text_chunks(vec!["Follow-up registered."]));
+
+    let daemon = start_daemon(&server.url()).await.expect("start daemon");
+    let client = connect_client(&daemon.socket);
+
+    let responses = send_message(&client, "schedule a follow-up")
+        .await
+        .expect("send_message");
+
+    let text = collect_text(&responses);
+    assert!(
+        text.contains("Follow-up registered."),
+        "expected final text, got: {text:?}"
+    );
+
+    // The LLM must have received 2 requests: initial prompt + tool result.
+    let reqs = server.take_requests();
+    assert_eq!(reqs.len(), 2, "expected 2 LLM requests, got {}", reqs.len());
+
+    // The tool result sent back to the LLM must confirm scheduling.
+    let tool_result_msg = reqs[1]
+        .messages()
+        .expect("messages in second request")
+        .into_iter()
+        .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("tool"))
+        .expect("no tool result message in second request");
+    let tool_content = tool_result_msg["content"].as_str().unwrap_or("");
+    assert!(
+        tool_content.contains("scheduled") || tool_content.contains("Follow-up"),
+        "tool result should confirm scheduling: {tool_content}"
+    );
+
+    // Verify the cron job was written to cron.db with the correct flags.
+    let cron_db = daemon.home.join(".amaebi/cron.db");
+    assert!(
+        cron_db.exists(),
+        "cron.db must exist after schedule_followup"
+    );
+
+    let conn = rusqlite::Connection::open(&cron_db).expect("open cron.db");
+    let (one_shot, created_by_model, description): (i64, i64, String) = conn
+        .query_row(
+            "SELECT one_shot, created_by_model, description FROM cron_jobs LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("query cron_jobs");
+
+    assert_eq!(one_shot, 1, "scheduled followup must be one_shot=1");
+    assert_eq!(
+        created_by_model, 1,
+        "scheduled followup must be created_by_model=1"
+    );
+    assert!(
+        description.contains("check-deploy-unique-marker"),
+        "description mismatch: {description}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// F2. cancel_followup tool call removes a pending model-created job
+// ---------------------------------------------------------------------------
+
+/// The model calls `cancel_followup` with a known job ID.  The daemon deletes
+/// the job from cron.db; subsequent SQL confirms the row is gone.
+///
+/// Flow:
+///   1. Seed a model-created one-shot job directly into cron.db with id="test-cancel-id".
+///   2. LLM turn 1 → cancel_followup("test-cancel-id")
+///   3. LLM turn 2 (after tool result) → "Cancelled."
+///   4. Assert cron.db has no row with that id.
+#[tokio::test]
+async fn cancel_followup_tool_call_removes_pending_job() {
+    let home_dir = setup_home().expect("setup_home");
+    let cron_db_path = home_dir.path().join(".amaebi/cron.db");
+
+    // Seed a model-created one-shot job using the shared DDL helper so the
+    // schema stays in sync with src/cron_ddl.sql automatically.
+    init_cron_db(&cron_db_path);
+    seed_model_oneshot(
+        &cron_db_path,
+        "test-cancel-id",
+        "job to cancel",
+        "0 0 1 1 *",
+        "2099-01-01T00:00:00Z",
+    );
+
+    let server = MockLlmServer::start().await;
+    server.enqueue(ScriptedResponse::tool_call(
+        "cf-call-001",
+        "cancel_followup",
+        r#"{"id":"test-cancel-id"}"#,
+    ));
+    server.enqueue(ScriptedResponse::text_chunks(vec!["Cancelled."]));
+
+    let (socket, mut child, _socket_dir) =
+        start_daemon_at_home_with_env(home_dir.path(), &server.url(), &[])
+            .await
+            .expect("start daemon");
+    let client = connect_client(&socket);
+
+    let responses = send_message(&client, "cancel my follow-up")
+        .await
+        .expect("send_message");
+
+    let text = collect_text(&responses);
+    assert!(text.contains("Cancelled."), "expected final text: {text:?}");
+
+    let reqs = server.take_requests();
+    assert_eq!(reqs.len(), 2, "expected 2 LLM requests, got {}", reqs.len());
+
+    // The tool result must confirm cancellation (not "not found").
+    let tool_result = reqs[1]
+        .messages()
+        .expect("messages")
+        .into_iter()
+        .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("tool"))
+        .expect("no tool result");
+    let content = tool_result["content"].as_str().unwrap_or("");
+    assert!(
+        content.contains("cancelled") || content.contains("Cancelled"),
+        "tool result should say cancelled: {content}"
+    );
+
+    // Confirm the row is gone.
+    let conn = rusqlite::Connection::open(&cron_db_path).expect("open cron.db");
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM cron_jobs WHERE id='test-cancel-id'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    assert_eq!(count, 0, "job must be deleted from cron.db after cancel");
+
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+}
+
+// ---------------------------------------------------------------------------
+// F3. list_followups tool call returns pending model-created jobs
+// ---------------------------------------------------------------------------
+
+/// The model calls `list_followups`.  The daemon must return a tool result
+/// that contains the description of every pending model-created one-shot job.
+///
+/// Flow:
+///   1. Seed two jobs: one model-created pending, one human-created (excluded).
+///   2. LLM turn 1 → list_followups()
+///   3. LLM turn 2 (after tool result) → "Listed."
+///   4. Assert the tool result contains the model-created description
+///      and does NOT contain the human-created description.
+#[tokio::test]
+async fn list_followups_tool_call_returns_pending_jobs() {
+    let home_dir = setup_home().expect("setup_home");
+    let cron_db_path = home_dir.path().join(".amaebi/cron.db");
+
+    // Use the shared DDL helper so the schema stays in sync with src/cron_ddl.sql.
+    init_cron_db(&cron_db_path);
+    // model-created pending — must appear in list_followups
+    seed_model_oneshot(
+        &cron_db_path,
+        "model-job-1",
+        "list-marker-model-job",
+        "0 0 1 1 *",
+        "2099-01-01T00:00:00Z",
+    );
+    // human-created — must NOT appear in list_followups
+    {
+        let conn = rusqlite::Connection::open(&cron_db_path).expect("open cron.db");
+        conn.execute(
+            "INSERT INTO cron_jobs
+                 (id, description, schedule, created_at, one_shot, created_by_model, status)
+             VALUES ('human-job-1', 'list-marker-human-job', '0 10 * * *',
+                     '2026-04-01T00:00:00Z', 0, 0, 'pending')",
+            [],
+        )
+        .expect("seed human cron job");
+    }
+
+    let server = MockLlmServer::start().await;
+    server.enqueue(ScriptedResponse::tool_call(
+        "lf-call-001",
+        "list_followups",
+        r#"{}"#,
+    ));
+    server.enqueue(ScriptedResponse::text_chunks(vec!["Listed."]));
+
+    let (socket, mut child, _socket_dir) =
+        start_daemon_at_home_with_env(home_dir.path(), &server.url(), &[])
+            .await
+            .expect("start daemon");
+    let client = connect_client(&socket);
+
+    let responses = send_message(&client, "list my follow-ups")
+        .await
+        .expect("send_message");
+
+    assert!(
+        collect_text(&responses).contains("Listed."),
+        "expected final text"
+    );
+
+    let reqs = server.take_requests();
+    assert_eq!(reqs.len(), 2, "expected 2 LLM requests, got {}", reqs.len());
+
+    let tool_result = reqs[1]
+        .messages()
+        .expect("messages")
+        .into_iter()
+        .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("tool"))
+        .expect("no tool result");
+    let content = tool_result["content"].as_str().unwrap_or("");
+
+    assert!(
+        content.contains("list-marker-model-job"),
+        "model-created job must appear in list_followups result: {content}"
+    );
+    assert!(
+        !content.contains("list-marker-human-job"),
+        "human-created job must NOT appear in list_followups result: {content}"
+    );
+
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+}
+
+// ---------------------------------------------------------------------------
+// F4. Scheduled followup fires autonomously and deposits an inbox report
+// ---------------------------------------------------------------------------
+
+/// A model-created one-shot job must be executed by the daemon's cron scheduler
+/// and its output stored in inbox.db.
+///
+/// The schedule is an exact `"min hour dom month *"` expression anchored 1 minute
+/// in the past, so `oneshot_due_after_missed_window` fires it immediately on the
+/// first cron tick without waiting for the exact scheduled minute to arrive.
+///
+/// Flow:
+///   1. Compute an exact cron expression for 1 minute ago; seed a model-created
+///      one-shot job with that schedule and `created_at` set to the same time.
+///   2. Start the daemon; the missed-window check fires it on the first tick.
+///   3. Poll up to 5 s for inbox.db to appear and contain a row.
+///   4. Assert the row contains the expected LLM output and is unread.
+#[tokio::test]
+async fn scheduled_followup_fires_and_deposits_inbox_report() {
+    let home_dir = setup_home().expect("setup_home");
+    let cron_db_path = home_dir.path().join(".amaebi/cron.db");
+
+    // Build a cron expression for 1 minute in the past so the
+    // oneshot_due_after_missed_window path fires it on the first scheduler tick.
+    // Use a fixed past datetime as both created_at and fires_at anchor so the
+    // grace window check is always satisfied.
+    let fires_at = chrono::Utc::now() - chrono::Duration::minutes(1);
+    let cron_expr = format!(
+        "{} {} {} {} *",
+        fires_at.minute(),
+        fires_at.hour(),
+        fires_at.day(),
+        fires_at.month()
+    );
+    let created_at = fires_at.to_rfc3339();
+
+    // Use the shared DDL helper so the schema stays in sync with src/cron_ddl.sql.
+    init_cron_db(&cron_db_path);
+    seed_model_oneshot(
+        &cron_db_path,
+        "fire-test-id",
+        "followup-fire-unique-marker",
+        &cron_expr,
+        &created_at,
+    );
+
+    let server = MockLlmServer::start().await;
+    server.enqueue(ScriptedResponse::text_chunks(vec![
+        "followup-fire-executed",
+    ]));
+
+    let (_socket, mut child, _socket_dir) =
+        start_daemon_at_home_with_env(home_dir.path(), &server.url(), &[])
+            .await
+            .expect("start daemon");
+
+    // Wait up to 5 s for the cron scheduler to call the LLM.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if server.peek_request_count() >= 1 || std::time::Instant::now() > deadline {
+            break;
+        }
+    }
+    assert!(
+        server.peek_request_count() >= 1,
+        "followup job did not fire within 5 s"
+    );
+
+    // Poll until BOTH inbox.db has a row AND the one-shot job is gone from
+    // cron.db (up to 10 s).  Both writes happen sequentially in run_cron_job
+    // after the LLM response; checking them together avoids a TOCTOU race
+    // where inbox appears but the delete hasn't committed yet.
+    let inbox_db = home_dir.path().join(".amaebi/inbox.db");
+    let post_deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let (inbox_output, inbox_read, cron_count) = loop {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let inbox_row: Option<(String, i64)> = if inbox_db.exists() {
+            rusqlite::Connection::open(&inbox_db).ok().and_then(|conn| {
+                conn.query_row(
+                    "SELECT output, read FROM inbox ORDER BY id DESC LIMIT 1",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .ok()
+            })
+        } else {
+            None
+        };
+
+        let cron_count: i64 = rusqlite::Connection::open(&cron_db_path)
+            .ok()
+            .and_then(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM cron_jobs WHERE id='fire-test-id'",
+                    [],
+                    |r| r.get(0),
+                )
+                .ok()
+            })
+            .unwrap_or(1); // default to 1 (not deleted) so we keep polling
+
+        if let Some((output, read)) = inbox_row {
+            if cron_count == 0 {
+                break (output, read, cron_count);
+            }
+        }
+
+        if std::time::Instant::now() > post_deadline {
+            panic!(
+                "followup post-conditions not met within 10 s: \
+                 inbox_exists={} cron_job_deleted={}",
+                inbox_db.exists(),
+                cron_count == 0,
+            );
+        }
+    };
+
+    assert!(
+        inbox_output.contains("followup-fire-executed"),
+        "inbox report should contain the LLM output: {inbox_output}"
+    );
+    assert_eq!(inbox_read, 0, "freshly deposited report must be unread");
+    assert_eq!(
+        cron_count, 0,
+        "one-shot job must be deleted from cron.db after firing"
+    );
+
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+}
+
+// ---------------------------------------------------------------------------
+// F5. followup tools are blocked when called from inside a cron job
+// ---------------------------------------------------------------------------
+
+/// Cron jobs run with `include_followup=false`, so `schedule_followup` is not
+/// in the advertised schema.  If the model inside a cron job tries to call it,
+/// the daemon must return a tool-not-available error, not execute the call.
+///
+/// Flow:
+///   1. Seed a regular cron job (human-created, "* * * * *").
+///   2. LLM inside cron tries to call `schedule_followup`.
+///   3. LLM turn 2 receives the "not available" tool result → says "blocked".
+///   4. Assert the tool result contains "not available".
+#[tokio::test]
+async fn followup_tools_blocked_in_cron_job_context() {
+    let server = MockLlmServer::start().await;
+
+    // Cron LLM turn 1: try to call schedule_followup (not in schema).
+    server.enqueue(ScriptedResponse::tool_call(
+        "cron-sf-attempt",
+        "schedule_followup",
+        r#"{"description":"recursive followup","when":"in 10 minutes"}"#,
+    ));
+    // Cron LLM turn 2: after receiving the "not available" error.
+    server.enqueue(ScriptedResponse::text_chunks(vec!["blocked-as-expected"]));
+
+    let home_dir = setup_home().expect("setup_home");
+    seed_cron_job(home_dir.path(), "cron task tries followup", "* * * * *")
+        .await
+        .expect("seed_cron_job");
+
+    let (_socket, mut child, _socket_dir) =
+        start_daemon_at_home_with_env(home_dir.path(), &server.url(), &[])
+            .await
+            .expect("start daemon");
+
+    // Wait up to 5 s for both cron LLM calls.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if server.peek_request_count() >= 2 || std::time::Instant::now() > deadline {
+            break;
+        }
+    }
+
+    let reqs = server.take_requests();
+    assert!(
+        reqs.len() >= 2,
+        "expected at least 2 cron LLM requests, got {}",
+        reqs.len()
+    );
+
+    // The second request (turn 2) must contain a tool result with "not available".
+    let messages = reqs[1].messages().expect("messages in cron turn 2");
+    let tool_content: String = messages
+        .iter()
+        .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("tool"))
+        .filter_map(|m| m.get("content").and_then(|c| c.as_str()))
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    assert!(
+        tool_content.contains("not available"),
+        "schedule_followup must be blocked in cron context, got: {tool_content}"
+    );
+
+    let _ = child.kill().await;
+    let _ = child.wait().await;
 }

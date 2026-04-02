@@ -23,6 +23,7 @@
 //! CLI collide on the same row.
 
 use anyhow::{Context, Result};
+use chrono::{DateTime, Datelike, TimeZone as _, Timelike, Utc};
 use rusqlite::{params, Connection};
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
@@ -46,6 +47,38 @@ pub struct CronJob {
     pub created_at: String,
     /// RFC 3339 timestamp of the last successful run, or `None`.
     pub last_run: Option<String>,
+    /// If `true`, the job is deleted automatically after its first execution.
+    pub one_shot: bool,
+    /// If `true`, this job was created via the `schedule_followup` tool by the
+    /// model (as opposed to being added by the user via `amaebi cron add`).
+    pub created_by_model: bool,
+    /// Session UUID whose summary is injected as context when this job fires.
+    /// `None` means the job runs without any inherited session context.
+    pub parent_session_id: Option<String>,
+    /// Lifecycle state of the job: `"pending"`, `"running"`, or `"completed"`.
+    ///
+    /// One-shot model-created jobs transition: pending → running (at scheduler
+    /// pre-stamp) → deleted (after execution).  The status column allows
+    /// `list_followups` to show in-flight jobs.  `cancel_followup` can delete
+    /// a job in any non-completed state, but cancellation of a 'running' job
+    /// is best-effort: if the agentic loop has already started, it will finish.
+    pub status: String,
+}
+
+impl Default for CronJob {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            description: String::new(),
+            schedule: String::new(),
+            created_at: String::new(),
+            last_run: None,
+            one_shot: false,
+            created_by_model: false,
+            parent_session_id: None,
+            status: "pending".to_string(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -69,8 +102,9 @@ impl CronStore {
         Ok(store)
     }
 
-    /// Open the cron database at an explicit path (used in tests).
-    #[cfg(test)]
+    /// Open the cron database at an explicit path.
+    ///
+    /// Used in tests and by components that manage their own DB path.
     pub fn open_at(db_path: PathBuf) -> Result<Self> {
         let store = Self { db_path };
         store.init()?;
@@ -128,16 +162,63 @@ impl CronStore {
 
     fn init(&self) -> Result<()> {
         let conn = self.connect()?;
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS cron_jobs (
-                id          TEXT PRIMARY KEY,
-                description TEXT NOT NULL,
-                schedule    TEXT NOT NULL,
-                created_at  TEXT NOT NULL,
-                last_run    TEXT
-            );",
-        )
-        .context("creating cron_jobs table")?;
+        // Create the table on a fresh install.  The DDL is shared with the
+        // test helper via include_str! so both always stay in sync.
+        conn.execute_batch(include_str!("cron_ddl.sql"))
+            .context("creating cron_jobs table")?;
+        // Upgrade existing databases that pre-date one or more schema versions.
+        self.migrate(&conn)?;
+        Ok(())
+    }
+
+    /// Incremental schema migration using `PRAGMA user_version`.
+    ///
+    /// - version 0 (original): 5-column schema
+    /// - version 1: adds `one_shot`, `created_by_model`, `parent_session_id`
+    /// - version 2: adds `status`
+    ///
+    /// Each column is added only when absent so the migration is safe to
+    /// re-run and survives crashes between individual ALTER statements.
+    fn migrate(&self, conn: &Connection) -> Result<()> {
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .context("reading user_version")?;
+        if version >= 2 {
+            return Ok(());
+        }
+
+        // Hold a write lock for the duration so concurrent processes don't
+        // race on the same ALTER TABLE calls.
+        conn.execute_batch("BEGIN IMMEDIATE;")
+            .context("beginning migration transaction")?;
+
+        // Re-read columns inside the lock; another writer may have added
+        // some of them between our version check and the BEGIN IMMEDIATE.
+        let existing: std::collections::HashSet<String> = conn
+            .prepare("PRAGMA table_info(cron_jobs)")
+            .context("PRAGMA table_info")?
+            .query_map([], |row| row.get::<_, String>(1))
+            .context("querying table_info")?
+            .collect::<rusqlite::Result<_>>()
+            .context("collecting column names")?;
+
+        let add_col = |col: &str, def: &str| -> Result<()> {
+            if !existing.contains(col) {
+                conn.execute_batch(&format!("ALTER TABLE cron_jobs ADD COLUMN {col} {def};"))
+                    .with_context(|| format!("adding column {col}"))?;
+            }
+            Ok(())
+        };
+
+        if version < 1 {
+            add_col("one_shot", "INTEGER NOT NULL DEFAULT 0")?;
+            add_col("created_by_model", "INTEGER NOT NULL DEFAULT 0")?;
+            add_col("parent_session_id", "TEXT")?;
+        }
+        add_col("status", "TEXT NOT NULL DEFAULT 'pending'")?;
+
+        conn.execute_batch("PRAGMA user_version = 2; COMMIT;")
+            .context("committing migration")?;
         Ok(())
     }
 
@@ -150,7 +231,8 @@ impl CronStore {
         let conn = self.connect()?;
         let mut stmt = conn
             .prepare(
-                "SELECT id, description, schedule, created_at, last_run
+                "SELECT id, description, schedule, created_at, last_run,
+                        one_shot, created_by_model, parent_session_id, status
                  FROM cron_jobs
                  ORDER BY created_at ASC",
             )
@@ -164,6 +246,12 @@ impl CronStore {
                     schedule: row.get(2)?,
                     created_at: row.get(3)?,
                     last_run: row.get(4)?,
+                    one_shot: row.get::<_, i64>(5).map(|v| v != 0)?,
+                    created_by_model: row.get::<_, i64>(6).map(|v| v != 0)?,
+                    parent_session_id: row.get(7)?,
+                    status: row
+                        .get::<_, String>(8)
+                        .unwrap_or_else(|_| "pending".to_string()),
                 })
             })
             .context("executing cron list query")?;
@@ -207,6 +295,130 @@ impl CronStore {
         Ok(n > 0)
     }
 
+    /// Register a one-shot follow-up job created by the model.
+    ///
+    /// Sets `one_shot = true` and `created_by_model = true`.  Optionally
+    /// records the `parent_session_id` whose summary will be injected as
+    /// context when the job fires.  Returns the new job's UUID.
+    pub fn add_oneshot(
+        &self,
+        description: &str,
+        schedule: &str,
+        parent_session_id: Option<&str>,
+    ) -> Result<String> {
+        let sched = parse_schedule(schedule)
+            .with_context(|| format!("invalid cron schedule: {schedule:?}"))?;
+
+        // One-shot jobs require exact single values for minute, hour, dom, and
+        // month so that due_jobs() can pin the fire time to a specific datetime.
+        // Wildcards, ranges, steps, and lists in any of these fields mean the
+        // job would be skipped (due_jobs calls exact_value() → None → warn +
+        // continue), and the follow-up would never execute.
+        if sched.minute.exact_value().is_none() {
+            anyhow::bail!(
+                "schedule_followup: 'minute' field must be a single exact value (got {schedule:?}); \
+                 wildcards, ranges, steps, and lists are not allowed for one-shot follow-ups"
+            );
+        }
+        if sched.hour.exact_value().is_none() {
+            anyhow::bail!(
+                "schedule_followup: 'hour' field must be a single exact value (got {schedule:?})"
+            );
+        }
+        if sched.dom.exact_value().is_none() {
+            anyhow::bail!(
+                "schedule_followup: 'dom' field must be a single exact value (got {schedule:?})"
+            );
+        }
+        if sched.month.exact_value().is_none() {
+            anyhow::bail!(
+                "schedule_followup: 'month' field must be a single exact value (got {schedule:?})"
+            );
+        }
+
+        let id = uuid::Uuid::new_v4().to_string();
+        let created_at = chrono::Utc::now().to_rfc3339();
+        let conn = self.connect()?;
+        conn.execute(
+            "INSERT INTO cron_jobs
+                (id, description, schedule, created_at, last_run,
+                 one_shot, created_by_model, parent_session_id, status)
+             VALUES (?1, ?2, ?3, ?4, NULL, 1, 1, ?5, 'pending')",
+            params![id, description, schedule, created_at, parent_session_id],
+        )
+        .context("inserting oneshot cron job")?;
+        let _ = self.restrict_sidecar_permissions();
+        Ok(id)
+    }
+
+    /// Return only the jobs that were created by the model
+    /// (`created_by_model = true`).
+    pub fn list_model_created(&self) -> Result<Vec<CronJob>> {
+        let conn = self.connect()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, description, schedule, created_at, last_run,
+                        one_shot, created_by_model, parent_session_id, status
+                 FROM cron_jobs
+                 WHERE created_by_model = 1
+                   AND one_shot = 1
+                   AND status != 'completed'
+                 ORDER BY created_at ASC",
+            )
+            .context("preparing model jobs query")?;
+
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(CronJob {
+                    id: row.get(0)?,
+                    description: row.get(1)?,
+                    schedule: row.get(2)?,
+                    created_at: row.get(3)?,
+                    last_run: row.get(4)?,
+                    one_shot: row.get::<_, i64>(5).map(|v| v != 0)?,
+                    created_by_model: row.get::<_, i64>(6).map(|v| v != 0)?,
+                    parent_session_id: row.get(7)?,
+                    status: row
+                        .get::<_, String>(8)
+                        .unwrap_or_else(|_| "pending".to_string()),
+                })
+            })
+            .context("executing model jobs query")?;
+
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("collecting model job rows")
+    }
+
+    /// Delete a model-created job by ID.
+    ///
+    /// Returns `Ok(true)` if the job existed and was deleted, `Ok(false)` if
+    /// no such job exists **or the job was not created by the model** (human
+    /// jobs are protected from deletion via this path).
+    pub fn delete_if_model_created(&self, id: &str) -> Result<bool> {
+        let conn = self.connect()?;
+        let n = conn
+            .execute(
+                "DELETE FROM cron_jobs WHERE id = ?1
+                    AND created_by_model = 1
+                    AND one_shot = 1",
+                params![id],
+            )
+            .context("deleting model cron job")?;
+        let _ = self.restrict_sidecar_permissions();
+        Ok(n > 0)
+    }
+
+    /// Set the lifecycle `status` of a job (`"pending"`, `"running"`, etc.).
+    pub fn update_status(&self, id: &str, status: &str) -> Result<()> {
+        let conn = self.connect()?;
+        conn.execute(
+            "UPDATE cron_jobs SET status = ?1 WHERE id = ?2",
+            params![status, id],
+        )
+        .context("updating cron job status")?;
+        Ok(())
+    }
+
     /// Record that job `id` ran at `timestamp` (RFC 3339).
     pub fn update_last_run(&self, id: &str, timestamp: &str) -> Result<()> {
         let conn = self.connect()?;
@@ -247,6 +459,11 @@ pub fn update_last_run(id: &str, timestamp: &str) -> Result<()> {
     CronStore::open()?.update_last_run(id, timestamp)
 }
 
+/// Set the lifecycle status of a job (`"pending"`, `"running"`, etc.).
+pub fn set_job_status(id: &str, status: &str) -> Result<()> {
+    CronStore::open()?.update_status(id, status)
+}
+
 // ---------------------------------------------------------------------------
 // Schedule parsing
 // ---------------------------------------------------------------------------
@@ -275,6 +492,13 @@ impl FieldSpec {
         match self {
             FieldSpec::Any => true,
             FieldSpec::Values(vals) => vals.contains(&value),
+        }
+    }
+
+    pub fn exact_value(&self) -> Option<u32> {
+        match self {
+            FieldSpec::Values(vals) if vals.len() == 1 => Some(vals[0]),
+            _ => None,
         }
     }
 }
@@ -387,7 +611,94 @@ pub fn due_jobs(jobs: &[CronJob], now: &chrono::DateTime<chrono::Utc>) -> Vec<Cr
                 continue;
             }
         };
-        if !is_due(&sched, now) {
+        let due_now = if job.one_shot {
+            // Skip one-shot jobs that have already completed.  Jobs in the
+            // 'running' state are eligible again: if the daemon crashed after
+            // setting status='running' but before execution, the last_run
+            // guard (30-second window) prevents immediate re-firing, and the
+            // in-memory running_jobs set (empty on a fresh restart) will be
+            // re-populated as the job is re-spawned on the next tick.
+            if job.status == "completed" {
+                tracing::debug!(
+                    id = %job.id,
+                    "skipping completed one-shot job (waiting for deletion)"
+                );
+                continue;
+            }
+
+            let (Some(month), Some(day), Some(hour), Some(minute)) = (
+                sched.month.exact_value(),
+                sched.dom.exact_value(),
+                sched.hour.exact_value(),
+                sched.minute.exact_value(),
+            ) else {
+                tracing::warn!(
+                    id = %job.id,
+                    schedule = %job.schedule,
+                    "skipping one-shot cron job with non-specific schedule"
+                );
+                continue;
+            };
+
+            // Compute fires_at using the creation year so that a job missed
+            // in 2020 does not get a fresh grace window based on today's year.
+            //
+            // Build from explicit components rather than chaining with_month →
+            // with_day … which returns None for month-rollover cases like
+            // "Jan 31 → Feb 1" (February has no 31st day).
+            let anchor: DateTime<Utc> = match job.created_at.parse() {
+                Ok(dt) => dt,
+                Err(e) => {
+                    tracing::warn!(
+                        id = %job.id,
+                        created_at = %job.created_at,
+                        error = %e,
+                        "skipping one-shot job: cannot parse created_at as RFC 3339"
+                    );
+                    continue;
+                }
+            };
+            let build_ymd = |year: i32| -> Option<DateTime<Utc>> {
+                match chrono::Utc.with_ymd_and_hms(year, month, day, hour, minute, 0) {
+                    chrono::LocalResult::Single(dt) => Some(dt),
+                    _ => None,
+                }
+            };
+            // Truncate anchor to minute precision before comparing: the cron
+            // expression has no seconds component (fires_at always has seconds=0),
+            // so comparing against a sub-second anchor would falsely push an
+            // "April 1 09:34" job created at "09:34:47" to the next year.
+            let anchor_minute = anchor
+                .with_second(0)
+                .and_then(|dt: DateTime<Utc>| dt.with_nanosecond(0))
+                .unwrap_or(anchor);
+            let fires_at: Option<DateTime<Utc>> = match build_ymd(anchor.year()) {
+                // fires_at is before the job was created — the schedule crosses
+                // a year boundary (e.g. "Jan 15" job created in December): try
+                // the next year.
+                Some(dt) if dt < anchor_minute => build_ymd(anchor.year() + 1),
+                other => other,
+            };
+            match fires_at {
+                Some(fires_at) => {
+                    // Use only the missed-window function: is_due() could match
+                    // stale cron fields in a future year when the same
+                    // month/day/hour/minute recurs, causing spurious re-fires.
+                    crate::followup::oneshot_due_after_missed_window(&fires_at, now)
+                }
+                None => {
+                    tracing::warn!(
+                        id = %job.id,
+                        schedule = %job.schedule,
+                        "skipping one-shot cron job with invalid scheduled timestamp"
+                    );
+                    false
+                }
+            }
+        } else {
+            is_due(&sched, now)
+        };
+        if !due_now {
             continue;
         }
         // Guard: don't re-fire within the same minute.
@@ -555,6 +866,7 @@ mod tests {
                 schedule: "30 9 * * *".into(),
                 created_at: "2026-01-01T00:00:00Z".into(),
                 last_run: Some(just_ran),
+                ..Default::default()
             },
             CronJob {
                 id: "b".into(),
@@ -562,6 +874,7 @@ mod tests {
                 schedule: "30 9 * * *".into(),
                 created_at: "2026-01-01T00:00:00Z".into(),
                 last_run: Some(long_ago),
+                ..Default::default()
             },
             CronJob {
                 id: "c".into(),
@@ -569,6 +882,7 @@ mod tests {
                 schedule: "30 9 * * *".into(),
                 created_at: "2026-01-01T00:00:00Z".into(),
                 last_run: None,
+                ..Default::default()
             },
         ];
 
@@ -580,6 +894,76 @@ mod tests {
     }
 
     #[test]
+    fn due_jobs_runs_missed_one_shot_later_same_year() {
+        let now = utc(2026, 4, 1, 14, 50);
+        let jobs = vec![CronJob {
+            id: "oneshot".into(),
+            description: "follow up".into(),
+            schedule: "35 14 1 4 *".into(),
+            created_at: "2026-04-01T14:00:00Z".into(),
+            last_run: None,
+            one_shot: true,
+            created_by_model: true,
+            parent_session_id: Some("sid".into()),
+            ..Default::default()
+        }];
+        let due = due_jobs(&jobs, &now);
+        assert_eq!(
+            due.len(),
+            1,
+            "missed one-shot should still be due later that year"
+        );
+    }
+
+    #[test]
+    fn due_jobs_skips_stale_one_shot_beyond_grace_window() {
+        let now = utc(2026, 4, 2, 14, 35);
+        let jobs = vec![CronJob {
+            id: "stale-oneshot".into(),
+            description: "follow up".into(),
+            schedule: "35 14 1 4 *".into(),
+            created_at: "2020-04-01T14:00:00Z".into(),
+            last_run: None,
+            one_shot: true,
+            created_by_model: true,
+            parent_session_id: Some("sid".into()),
+            ..Default::default()
+        }];
+        let due = due_jobs(&jobs, &now);
+        assert!(
+            due.is_empty(),
+            "stale one-shot should not remain due forever"
+        );
+    }
+
+    #[test]
+    fn due_jobs_skips_one_shot_when_cron_fields_match_but_grace_expired() {
+        // Regression: is_due() would have matched "35 14 2 4 *" on 2026-04-02
+        // 14:35, but this is a one-shot whose fires_at was 2020-04-02 14:35 —
+        // well beyond the 5-year grace window.  Now that one-shot due-ness is
+        // based solely on oneshot_due_after_missed_window, it must be skipped.
+        let now = utc(2026, 4, 2, 14, 35);
+        let jobs = vec![CronJob {
+            id: "cron-match-but-stale".into(),
+            description: "stale job whose cron fields match today".into(),
+            // Schedule that would match 'now' exactly via is_due.
+            schedule: "35 14 2 4 *".into(),
+            // Created in 2020 → fires_at 2020-04-02 14:35 → grace expires 2025.
+            created_at: "2020-04-02T14:00:00Z".into(),
+            last_run: None,
+            one_shot: true,
+            created_by_model: true,
+            parent_session_id: None,
+            ..Default::default()
+        }];
+        let due = due_jobs(&jobs, &now);
+        assert!(
+            due.is_empty(),
+            "one-shot job must not fire when cron fields match but grace window expired"
+        );
+    }
+
+    #[test]
     fn due_jobs_skips_non_matching_schedule() {
         let now = utc(2026, 3, 20, 9, 31); // 9:31, not 9:30
         let jobs = vec![CronJob {
@@ -588,6 +972,7 @@ mod tests {
             schedule: "30 9 * * *".into(),
             created_at: "2026-01-01T00:00:00Z".into(),
             last_run: None,
+            ..Default::default()
         }];
         assert!(due_jobs(&jobs, &now).is_empty());
     }
@@ -601,6 +986,7 @@ mod tests {
             schedule: "not a cron expression".into(),
             created_at: "2026-01-01T00:00:00Z".into(),
             last_run: None,
+            ..Default::default()
         }];
         // Must not panic; bad job is simply skipped.
         assert!(due_jobs(&jobs, &now).is_empty());
@@ -673,6 +1059,166 @@ mod tests {
     #[test]
     fn store_empty_list_when_no_jobs() {
         let (store, _dir) = open_temp();
+        assert!(store.list().unwrap().is_empty());
+    }
+
+    // ---- add_oneshot / list_model_created / delete_if_model_created ---------
+
+    #[test]
+    fn add_oneshot_stores_model_flags() {
+        let (store, _dir) = open_temp();
+        let id = store
+            .add_oneshot("check deploy", "0 9 1 4 *", None)
+            .unwrap();
+        let jobs = store.list().unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].id, id);
+        assert!(jobs[0].one_shot, "one_shot must be true");
+        assert!(jobs[0].created_by_model, "created_by_model must be true");
+        assert!(jobs[0].parent_session_id.is_none());
+        assert_eq!(
+            jobs[0].status, "pending",
+            "new oneshot must have status=pending"
+        );
+    }
+
+    #[test]
+    fn add_oneshot_stores_parent_session_id() {
+        let (store, _dir) = open_temp();
+        let sid = "test-session-uuid";
+        store
+            .add_oneshot("follow up on PR", "30 10 1 4 *", Some(sid))
+            .unwrap();
+        let jobs = store.list().unwrap();
+        assert_eq!(jobs[0].parent_session_id.as_deref(), Some(sid));
+    }
+
+    #[test]
+    fn add_oneshot_rejects_invalid_schedule() {
+        let (store, _dir) = open_temp();
+        assert!(store.add_oneshot("bad", "not-a-cron", None).is_err());
+        assert!(
+            store.list().unwrap().is_empty(),
+            "nothing should be written on error"
+        );
+    }
+
+    #[test]
+    fn add_oneshot_rejects_wildcard_fields() {
+        let (store, _dir) = open_temp();
+        // dom = * — would be skipped by due_jobs, so must be rejected up-front.
+        assert!(
+            store.add_oneshot("bad", "0 9 * * *", None).is_err(),
+            "wildcard dom must be rejected"
+        );
+        // month = * — same issue.
+        assert!(
+            store.add_oneshot("bad", "0 9 1 * *", None).is_err(),
+            "wildcard month must be rejected"
+        );
+        // step in minute — multiple values, not a single exact value.
+        assert!(
+            store.add_oneshot("bad", "*/5 9 1 4 *", None).is_err(),
+            "step in minute must be rejected"
+        );
+        // list in hour — multiple values.
+        assert!(
+            store.add_oneshot("bad", "0 9,10 1 4 *", None).is_err(),
+            "list in hour must be rejected"
+        );
+        // All exact values → must succeed.
+        assert!(
+            store.add_oneshot("good", "0 9 1 4 *", None).is_ok(),
+            "exact minute/hour/dom/month must be accepted"
+        );
+    }
+
+    #[test]
+    fn list_model_created_excludes_human_jobs() {
+        let (store, _dir) = open_temp();
+        // human-created via add()
+        store.add("human job", "0 8 * * *").unwrap();
+        // model-created via add_oneshot()
+        let model_id = store.add_oneshot("model job", "0 9 1 4 *", None).unwrap();
+
+        let model_jobs = store.list_model_created().unwrap();
+        assert_eq!(model_jobs.len(), 1, "only model-created job should appear");
+        assert_eq!(model_jobs[0].id, model_id);
+    }
+
+    #[test]
+    fn list_model_created_empty_when_no_model_jobs() {
+        let (store, _dir) = open_temp();
+        store.add("human job", "0 8 * * *").unwrap();
+        assert!(store.list_model_created().unwrap().is_empty());
+    }
+
+    #[test]
+    fn delete_if_model_created_removes_model_job() {
+        let (store, _dir) = open_temp();
+        let id = store.add_oneshot("model job", "0 9 1 4 *", None).unwrap();
+        let deleted = store.delete_if_model_created(&id).unwrap();
+        assert!(deleted, "delete_if_model_created should return true");
+        assert!(store.list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn delete_if_model_created_rejects_human_job() {
+        let (store, _dir) = open_temp();
+        let id = store.add("human job", "0 8 * * *").unwrap();
+        let deleted = store.delete_if_model_created(&id).unwrap();
+        assert!(!deleted, "human job must not be deleted via this method");
+        assert_eq!(store.list().unwrap().len(), 1, "human job must still exist");
+    }
+
+    #[test]
+    fn delete_if_model_created_nonexistent_returns_false() {
+        let (store, _dir) = open_temp();
+        assert!(!store.delete_if_model_created("no-such-id").unwrap());
+    }
+
+    // ---- update_status -------------------------------------------------------
+
+    #[test]
+    fn update_status_changes_job_status() {
+        let (store, _dir) = open_temp();
+        let id = store.add_oneshot("task", "0 9 1 4 *", None).unwrap();
+        assert_eq!(store.list().unwrap()[0].status, "pending");
+
+        store.update_status(&id, "running").unwrap();
+        assert_eq!(store.list().unwrap()[0].status, "running");
+    }
+
+    #[test]
+    fn list_model_created_shows_running_jobs() {
+        // A job with status='running' (pre-stamped) must still appear in
+        // list_model_created so that list_followups shows in-flight jobs.
+        let (store, _dir) = open_temp();
+        let id = store
+            .add_oneshot("in-flight job", "0 9 1 4 *", None)
+            .unwrap();
+        store.update_status(&id, "running").unwrap();
+
+        let jobs = store.list_model_created().unwrap();
+        assert_eq!(
+            jobs.len(),
+            1,
+            "running job must appear in list_model_created"
+        );
+        assert_eq!(jobs[0].status, "running");
+    }
+
+    #[test]
+    fn delete_if_model_created_allows_running_job() {
+        // A job with status='running' must still be cancellable.
+        let (store, _dir) = open_temp();
+        let id = store
+            .add_oneshot("in-flight job", "0 9 1 4 *", None)
+            .unwrap();
+        store.update_status(&id, "running").unwrap();
+
+        let deleted = store.delete_if_model_created(&id).unwrap();
+        assert!(deleted, "running job must be cancellable");
         assert!(store.list().unwrap().is_empty());
     }
 }

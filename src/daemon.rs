@@ -117,8 +117,16 @@ impl DaemonState {
             tokens: Arc::clone(&tokens),
         });
 
+        // FollowupContext has no per-session state — session_id is passed
+        // through each execute() call so concurrent sessions are isolated.
+        let followup_ctx = Arc::new(tools::FollowupContext {
+            current_session_id: None,
+            cron_db_path: None, // use ~/.amaebi/cron.db
+        });
+
         let mut executor = tools::LocalExecutor::new();
         executor.spawn_ctx = Some(spawn_ctx);
+        executor.followup_ctx = Some(followup_ctx);
 
         Ok(Self {
             http,
@@ -472,8 +480,17 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                     }
                     let mut sink = tokio::io::sink();
                     let (_, mut steer_rx) = tokio::sync::mpsc::channel::<Option<String>>(1);
-                    match run_agentic_loop(&state, &model, messages, &mut sink, &mut steer_rx, true)
-                        .await
+                    match run_agentic_loop(
+                        &state,
+                        &model,
+                        messages,
+                        &mut sink,
+                        &mut steer_rx,
+                        true,
+                        true,
+                        &sid,
+                    )
+                    .await
                     {
                         Ok((final_text, _, _)) => {
                             store_conversation(
@@ -585,6 +602,7 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                 let writer_loop = Arc::clone(&writer);
                 let state_loop = Arc::clone(&state);
                 let model_loop = model.clone();
+                let sid_loop = session_id.clone();
                 let mut loop_handle = tokio::spawn(async move {
                     let mut w = writer_loop.lock().await;
                     run_agentic_loop(
@@ -594,6 +612,8 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                         &mut *w,
                         &mut steer_rx,
                         true,
+                        true,
+                        &sid_loop,
                     )
                     .await
                 });
@@ -834,6 +854,7 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                 let writer_loop = Arc::clone(&writer);
                 let state_loop = Arc::clone(&state);
                 let model_loop = model.clone();
+                let sid_loop = sid.clone();
                 let mut loop_handle = tokio::spawn(async move {
                     let mut w = writer_loop.lock().await;
                     run_agentic_loop(
@@ -843,6 +864,8 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                         &mut *w,
                         &mut steer_rx,
                         true,
+                        true,
+                        &sid_loop,
                     )
                     .await
                 });
@@ -967,7 +990,7 @@ fn truncate_chars(s: String, max: usize) -> String {
     const MARKER: &str = "…[truncated]";
     let marker_len = MARKER.chars().count(); // derived, never drifts from MARKER
     if max <= marker_len {
-        return MARKER.chars().take(max).collect();
+        return MARKER.chars().take(max).collect::<String>();
     }
     let content_len = max - marker_len;
     let mut out: String = s.chars().take(content_len).collect();
@@ -1401,6 +1424,7 @@ const MAX_TOOL_OUTPUT_CHARS: usize = 8_000;
 /// `stream_chat` retries 5xx, 429, and transport errors internally up to its
 /// `MAX_RETRIES`, but those errors can still surface here if retries are
 /// exhausted or if a non-retryable error occurs.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_agentic_loop<W>(
     state: &DaemonState,
     model: &str,
@@ -1408,11 +1432,22 @@ pub(crate) async fn run_agentic_loop<W>(
     writer: &mut W,
     steer_rx: &mut tokio::sync::mpsc::Receiver<Option<String>>,
     include_spawn_agent: bool,
+    include_followup: bool,
+    session_id: &str,
 ) -> Result<(String, usize, Vec<Message>)>
 where
     W: AsyncWriteExt + Unpin,
 {
-    let schemas = tools::tool_schemas(include_spawn_agent);
+    let schemas = tools::tool_schemas(include_spawn_agent, include_followup);
+    let advertised_tools = Arc::new(
+        schemas
+            .iter()
+            .filter_map(|schema| schema.get("function"))
+            .filter_map(|function| function.get("name"))
+            .filter_map(|name| name.as_str())
+            .map(ToOwned::to_owned)
+            .collect::<HashSet<String>>(),
+    );
     let final_text;
     let mut tools_were_used = false;
     let mut conclusion_nudge_sent = false;
@@ -1755,8 +1790,10 @@ where
                     // to the sequential path where we can abort cleanly before
                     // the next tool runs.
                     let results = futures_util::future::join_all(tool_calls_snapshot.iter().map(
-                        |tc| async move {
-                            let args = match tc.parse_args() {
+                        |tc| {
+                            let advertised_tools = Arc::clone(&advertised_tools);
+                            async move {
+                                let args = match tc.parse_args() {
                                 Ok(v) => v,
                                 Err(e) => {
                                     tracing::warn!(
@@ -1767,7 +1804,18 @@ where
                                     return format!("argument error: {e:#}");
                                 }
                             };
-                            match state.executor.execute(&tc.name, args).await {
+                            if !advertised_tools.contains(&tc.name) {
+                                tracing::warn!(tool = %tc.name, "tool not advertised in schema");
+                                return format!(
+                                    "{} is not available in this context (not in the tool schema for this session)",
+                                    tc.name
+                                );
+                            }
+                            match state
+                                .executor
+                                .execute(&tc.name, args, Some(session_id), include_followup)
+                                .await
+                            {
                                 Ok(output) => {
                                     tracing::debug!(
                                         tool = %tc.name,
@@ -1780,6 +1828,7 @@ where
                                     tracing::warn!(tool = %tc.name, error = %e, "tool failed");
                                     format!("error: {e:#}")
                                 }
+                            }
                             }
                         },
                     ))
@@ -1875,18 +1924,27 @@ where
                             }
                         };
 
-                        let result = match state.executor.execute(&tc.name, args).await {
-                            Ok(output) => {
-                                tracing::debug!(
-                                    tool = %tc.name,
-                                    output_len = output.len(),
-                                    "tool succeeded"
-                                );
-                                truncate_chars(output, MAX_TOOL_OUTPUT_CHARS)
-                            }
-                            Err(e) => {
-                                tracing::warn!(tool = %tc.name, error = %e, "tool failed");
-                                format!("error: {e:#}")
+                        let result = if !advertised_tools.contains(&tc.name) {
+                            tracing::warn!(tool = %tc.name, "tool not advertised in schema");
+                            format!("{} is not available in this context (not in the tool schema for this session)", tc.name)
+                        } else {
+                            match state
+                                .executor
+                                .execute(&tc.name, args, Some(session_id), include_followup)
+                                .await
+                            {
+                                Ok(output) => {
+                                    tracing::debug!(
+                                        tool = %tc.name,
+                                        output_len = output.len(),
+                                        "tool succeeded"
+                                    );
+                                    truncate_chars(output, MAX_TOOL_OUTPUT_CHARS)
+                                }
+                                Err(e) => {
+                                    tracing::warn!(tool = %tc.name, error = %e, "tool failed");
+                                    format!("error: {e:#}")
+                                }
                             }
                         };
 
@@ -2159,6 +2217,13 @@ async fn run_cron_scheduler(state: Arc<DaemonState>) {
             if let Err(e) = cron::update_last_run(&job.id, &now_str) {
                 tracing::warn!(error = %e, id = %job.id, "cron: failed to pre-stamp last_run");
             }
+            // Mark as 'running' so list_followups and cancel_followup can still
+            // find this job even after last_run has been stamped.
+            if job.one_shot && job.created_by_model {
+                if let Err(e) = cron::set_job_status(&job.id, "running") {
+                    tracing::warn!(error = %e, id = %job.id, "cron: failed to set status=running");
+                }
+            }
 
             let state = Arc::clone(&state);
             let running = Arc::clone(&running_jobs);
@@ -2174,7 +2239,12 @@ async fn run_cron_scheduler(state: Arc<DaemonState>) {
 
 /// Execute a single cron job: runs the agentic loop, saves output to inbox.
 async fn run_cron_job(state: Arc<DaemonState>, job: &cron::CronJob) {
-    tracing::info!(id = %job.id, description = %job.description, "cron: firing job");
+    let kind = if job.one_shot {
+        "one-shot"
+    } else {
+        "recurring"
+    };
+    tracing::info!(id = %job.id, description = %job.description, kind, "cron: firing job");
 
     // Generate a fresh session UUID for this run.
     let session_id = uuid::Uuid::new_v4().to_string();
@@ -2182,14 +2252,57 @@ async fn run_cron_job(state: Arc<DaemonState>, job: &cron::CronJob) {
     // Resolve model from env var (same default as CLI client).
     let model = std::env::var("AMAEBI_MODEL").unwrap_or_else(|_| "gpt-4o".to_string());
 
-    let mut messages = build_messages(&job.description, None, &[], &[], None);
+    // If this job has a parent session, inject its summary as context.
+    // Wrap the sync SQLite call in spawn_blocking so the async reactor is
+    // not blocked while the DB is read.
+    let own_summary: Option<String> = if let Some(ref sid) = job.parent_session_id {
+        let db = Arc::clone(&state.db);
+        let sid_c = sid.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = db.lock().unwrap_or_else(|p| p.into_inner());
+            memory_db::get_session_own_summary(&conn, &sid_c)
+        })
+        .await
+        .unwrap_or_else(|e| {
+            tracing::error!(error = %e, "cron: spawn_blocking panicked loading parent summary");
+            Ok(None)
+        })
+        .unwrap_or_else(|e| {
+            tracing::error!(
+                error = %e,
+                parent_session_id = %sid,
+                "cron: failed to load parent session summary"
+            );
+            None
+        })
+    } else {
+        None
+    };
+
+    // Inject via past_summaries so build_messages labels it correctly as
+    // "Summaries from past sessions" rather than the within-session
+    // "[Summary of earlier in this session]" label used by own_summary.
+    let past_summaries: Vec<String> = own_summary.into_iter().collect();
+    let mut messages = build_messages(&job.description, None, &[], &past_summaries, None);
     inject_skill_files(&mut messages).await;
-    // Cron jobs are non-interactive: drop the sender immediately so steer_rx.recv()
-    // returns None at once if the model ends with '?', rather than timing out.
+
+    // Cron/follow-up jobs are non-interactive: drop the sender immediately so
+    // steer_rx.recv() returns None at once if the model ends with '?', rather
+    // than timing out.  Also disable followup tools to prevent recursive scheduling.
     let mut sink = tokio::io::sink();
     let (_, mut steer_rx) = tokio::sync::mpsc::channel::<Option<String>>(1);
 
-    let result = run_agentic_loop(&state, &model, messages, &mut sink, &mut steer_rx, true).await;
+    let result = run_agentic_loop(
+        &state,
+        &model,
+        messages,
+        &mut sink,
+        &mut steer_rx,
+        true,
+        false,
+        &session_id,
+    )
+    .await;
 
     let (output, run_ok) = match result {
         Ok((final_text, _, _)) => {
@@ -2222,7 +2335,32 @@ async fn run_cron_job(state: Arc<DaemonState>, job: &cron::CronJob) {
         }
     }
 
-    tracing::info!(id = %job.id, "cron: job complete");
+    // One-shot jobs are self-deleting: remove from cron.db after execution so
+    // the scheduler never re-fires them.
+    if job.one_shot {
+        // Mark 'completed' BEFORE attempting deletion so the scheduler never
+        // re-fires this job even if delete_job() fails or the daemon restarts
+        // before the DELETE commits.
+        if let Err(e) = cron::set_job_status(&job.id, "completed") {
+            tracing::warn!(error = %e, id = %job.id, "cron: failed to mark one-shot job completed");
+        }
+        match cron::delete_job(&job.id) {
+            Ok(true) => {
+                tracing::debug!(id = %job.id, "cron: one-shot job deleted after execution");
+            }
+            Ok(false) => {
+                tracing::warn!(
+                    id = %job.id,
+                    "cron: no row deleted for one-shot job (possibly already removed)"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, id = %job.id, "cron: failed to delete one-shot job after run");
+            }
+        }
+    }
+
+    tracing::info!(id = %job.id, kind, "cron: job complete");
 }
 
 // ---------------------------------------------------------------------------

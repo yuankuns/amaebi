@@ -307,6 +307,35 @@ pub fn setup_home() -> Result<TempDir> {
     Ok(home_dir)
 }
 
+/// Initialise a cron.db at `path` using the canonical DDL from src/cron_ddl.sql.
+///
+/// The `include_str!` path is relative to this source file, so both
+/// `src/cron.rs` and this helper always reference the same DDL — schema
+/// changes in one place are automatically reflected in the other.
+pub fn init_cron_db(path: &std::path::Path) {
+    let conn = rusqlite::Connection::open(path).expect("open cron.db");
+    conn.execute_batch(include_str!("../../src/cron_ddl.sql"))
+        .expect("create cron_jobs table");
+}
+
+/// Seed a model-created one-shot cron job into an already-initialised cron.db.
+pub fn seed_model_oneshot(
+    path: &std::path::Path,
+    id: &str,
+    description: &str,
+    schedule: &str,
+    created_at: &str,
+) {
+    let conn = rusqlite::Connection::open(path).expect("open cron.db");
+    conn.execute(
+        "INSERT INTO cron_jobs
+             (id, description, schedule, created_at, one_shot, created_by_model, status)
+         VALUES (?1, ?2, ?3, ?4, 1, 1, 'pending')",
+        rusqlite::params![id, description, schedule, created_at],
+    )
+    .expect("seed model oneshot job");
+}
+
 /// Seed a cron job into `<home_path>/.amaebi/cron.db` using the amaebi CLI.
 ///
 /// `HOME` is set to `home_path` so the cron.db lands in the right place.
