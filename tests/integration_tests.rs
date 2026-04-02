@@ -2564,7 +2564,6 @@ async fn cancel_followup_tool_call_removes_pending_job() {
     let cron_db_path = home_dir.path().join(".amaebi/cron.db");
 
     // Seed a model-created one-shot job directly via SQLite.
-    // Set PRAGMA user_version=2 so the daemon's migration is skipped.
     {
         let conn = rusqlite::Connection::open(&cron_db_path).expect("open cron.db for seeding");
         conn.execute_batch(
@@ -2576,7 +2575,6 @@ async fn cancel_followup_tool_call_removes_pending_job() {
                 parent_session_id TEXT,
                 status TEXT NOT NULL DEFAULT 'pending'
             );
-            PRAGMA user_version = 2;
             INSERT INTO cron_jobs
                 (id, description, schedule, created_at, one_shot, created_by_model, status)
             VALUES
@@ -2667,7 +2665,6 @@ async fn list_followups_tool_call_returns_pending_jobs() {
                 parent_session_id TEXT,
                 status TEXT NOT NULL DEFAULT 'pending'
             );
-            PRAGMA user_version = 2;
             -- model-created pending
             INSERT INTO cron_jobs
                 (id, description, schedule, created_at, one_shot, created_by_model, status)
@@ -2776,7 +2773,6 @@ async fn scheduled_followup_fires_and_deposits_inbox_report() {
                 parent_session_id TEXT,
                 status TEXT NOT NULL DEFAULT 'pending'
             );
-            PRAGMA user_version = 2;
             INSERT INTO cron_jobs
                 (id, description, schedule, created_at, one_shot, created_by_model, status)
             VALUES ('fire-test-id', 'followup-fire-unique-marker', '{cron_expr}',

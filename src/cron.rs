@@ -162,73 +162,22 @@ impl CronStore {
 
     fn init(&self) -> Result<()> {
         let conn = self.connect()?;
+        // No incremental migration: if an old DB with a stale schema exists,
+        // delete ~/.amaebi/cron.db once and it will be recreated here.
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS cron_jobs (
-                id          TEXT PRIMARY KEY,
-                description TEXT NOT NULL,
-                schedule    TEXT NOT NULL,
-                created_at  TEXT NOT NULL,
-                last_run    TEXT
-            );",
+                 id               TEXT PRIMARY KEY,
+                 description      TEXT NOT NULL,
+                 schedule         TEXT NOT NULL,
+                 created_at       TEXT NOT NULL,
+                 last_run         TEXT,
+                 one_shot         INTEGER NOT NULL DEFAULT 0,
+                 created_by_model INTEGER NOT NULL DEFAULT 0,
+                 parent_session_id TEXT,
+                 status           TEXT NOT NULL DEFAULT 'pending'
+             );",
         )
         .context("creating cron_jobs table")?;
-        self.migrate(&conn)?;
-        Ok(())
-    }
-
-    /// Incremental schema migration using `PRAGMA user_version`.
-    ///
-    /// - version 0 (original): 5-column schema
-    /// - version 1: adds `one_shot`, `created_by_model`, `parent_session_id`
-    /// - version 2: adds `status` (`pending` / `running` / `completed`)
-    ///
-    /// Each ALTER is guarded by a `PRAGMA table_info` column-existence check so
-    /// the migration is idempotent: a crash between the ALTER statements and the
-    /// `user_version` bump cannot leave the DB in an unrecoverable state.
-    fn migrate(&self, conn: &Connection) -> Result<()> {
-        let version: i64 = conn
-            .query_row("PRAGMA user_version", [], |r| r.get(0))
-            .context("reading user_version")?;
-
-        if version < 2 {
-            // Acquire an exclusive write lock first, then re-read the schema.
-            // Collecting column names before BEGIN IMMEDIATE could race with
-            // another process that runs the same migration concurrently.
-            conn.execute_batch("BEGIN IMMEDIATE;")
-                .context("beginning migration transaction")?;
-
-            // Re-read column names inside the transaction so the check is
-            // authoritative: no other writer can add columns between here and
-            // our ALTER TABLE calls.
-            let existing_cols: std::collections::HashSet<String> = conn
-                .prepare("PRAGMA table_info(cron_jobs)")
-                .context("PRAGMA table_info")?
-                .query_map([], |row| row.get::<_, String>(1))
-                .context("reading table_info")?
-                .collect::<rusqlite::Result<_>>()
-                .context("collecting column names")?;
-
-            let add_if_missing = |col: &str, def: &str| -> Result<()> {
-                if !existing_cols.contains(col) {
-                    conn.execute_batch(&format!("ALTER TABLE cron_jobs ADD COLUMN {col} {def};"))
-                        .with_context(|| format!("adding column {col}"))?;
-                }
-                Ok(())
-            };
-
-            // version 1 columns
-            if version < 1 {
-                add_if_missing("one_shot", "INTEGER NOT NULL DEFAULT 0")?;
-                add_if_missing("created_by_model", "INTEGER NOT NULL DEFAULT 0")?;
-                add_if_missing("parent_session_id", "TEXT")?;
-            }
-
-            // version 2 columns
-            add_if_missing("status", "TEXT NOT NULL DEFAULT 'pending'")?;
-
-            conn.execute_batch("PRAGMA user_version = 2; COMMIT;")
-                .context("committing migration")?;
-        }
         Ok(())
     }
 
@@ -1185,47 +1134,6 @@ mod tests {
     fn delete_if_model_created_nonexistent_returns_false() {
         let (store, _dir) = open_temp();
         assert!(!store.delete_if_model_created("no-such-id").unwrap());
-    }
-
-    // ---- schema migration ---------------------------------------------------
-
-    #[test]
-    fn schema_migration_adds_new_columns_to_existing_db() {
-        // Simulate a pre-migration DB: create the old 5-column schema manually.
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("cron.db");
-        {
-            let conn = rusqlite::Connection::open(&path).unwrap();
-            conn.execute_batch(
-                "CREATE TABLE cron_jobs (
-                    id TEXT PRIMARY KEY, description TEXT NOT NULL,
-                    schedule TEXT NOT NULL, created_at TEXT NOT NULL, last_run TEXT
-                );
-                INSERT INTO cron_jobs (id, description, schedule, created_at)
-                VALUES ('old-id', 'legacy job', '0 9 * * *', '2026-01-01T00:00:00Z');",
-            )
-            .unwrap();
-            // user_version stays at 0 (default)
-        }
-        // Opening via CronStore must trigger migration without error.
-        let store = CronStore::open_at(path).unwrap();
-        let jobs = store.list().unwrap();
-        assert_eq!(jobs.len(), 1);
-        assert_eq!(jobs[0].id, "old-id");
-        // New columns must have their default values on the migrated row.
-        assert!(!jobs[0].one_shot, "migrated row: one_shot default false");
-        assert!(
-            !jobs[0].created_by_model,
-            "migrated row: created_by_model default false"
-        );
-        assert!(
-            jobs[0].parent_session_id.is_none(),
-            "migrated row: parent_session_id default null"
-        );
-        assert_eq!(
-            jobs[0].status, "pending",
-            "migrated row: status default 'pending'"
-        );
     }
 
     // ---- update_status -------------------------------------------------------
