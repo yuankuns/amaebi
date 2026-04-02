@@ -202,7 +202,7 @@ pub enum WorkflowAction {
         resource: String,
         /// Number of available resource units (e.g. 2 GPUs).
         #[arg(long, default_value = "1")]
-        resource_count: usize,
+        resource_count: std::num::NonZeroUsize,
     },
 }
 

@@ -1944,7 +1944,8 @@ where
                                 Err(e) => {
                                     tracing::warn!(tool = %tc.name, error = %e, "tool failed");
                                     format!("error: {e:#}")
-                                }                            }
+                                }
+                            }
                         };
 
                         messages.push(Message::tool_result(&tc.id, result));
