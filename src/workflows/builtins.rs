@@ -115,23 +115,33 @@ pub fn dev_loop(
             Stage::new(
                 "review",
                 Action::Shell {
+                    // Poll until a Copilot review appears that was submitted AFTER
+                    // the most recent commit on this PR.  This prevents a stale
+                    // CHANGES_REQUESTED review (from a previous push) from being
+                    // mistaken for a review of the current code.
                     command: "GH_PROMPT_DISABLED=1; \
+                              COMMIT_DATE=$(gh pr view --json commits \
+                                --jq '.commits[-1].committedDate' 2>/dev/null \
+                                || echo '1970-01-01T00:00:00Z'); \
                               for i in $(seq 60); do \
                                 state=$(gh pr view --json reviews \
-                                  -q '.reviews[-1].state // \"\"' 2>/dev/null); \
+                                  --jq --arg cd \"$COMMIT_DATE\" \
+                                  '[.reviews[] | select(.submittedAt > $cd)] | last | .state // \"\"' \
+                                  2>/dev/null); \
                                 [ -n \"$state\" ] && echo \"$state\" && break; \
-                                echo \"Waiting for review ($i/60)...\"; \
+                                echo \"Waiting for review after latest push ($i/60)...\"; \
                                 sleep 30; \
                               done"
                         .into(),
                 },
             )
             .with_check(Check::Contains {
-                // Output format: "APPROVED: " or "CHANGES_REQUESTED: <body text>"
-                // The check passes when stdout contains "APPROVED".
-                // On failure, {stdout} in inject_prompt contains the actual review comments.
-                command: "gh pr view --json reviews --jq \
-                          '.reviews[-1] | .state + \": \" + (.body // \"\")'"
+                // Only look at reviews submitted after the most recent commit so
+                // that a stale CHANGES_REQUESTED does not count as a new review.
+                command: "gh pr view --json reviews,commits --jq \
+                          '(.commits[-1].committedDate) as $cd | \
+                           [.reviews[] | select(.submittedAt > $cd)] | last | \
+                           .state + \": \" + (.body // \"\")'"
                     .into(),
                 pattern: "APPROVED".into(),
             })
