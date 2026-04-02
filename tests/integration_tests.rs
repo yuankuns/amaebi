@@ -2340,7 +2340,6 @@ async fn chat_long_connection_steer_mid_turn() {
 async fn chat_long_connection_eof_exits_cleanly() {
     let server = MockLlmServer::start().await;
     server.enqueue(ScriptedResponse::text_chunks(vec!["hello"]));
-    server.enqueue(ScriptedResponse::text_chunks(vec!["world"]));
 
     let daemon = start_daemon(&server.url()).await.expect("start_daemon");
 
@@ -2360,6 +2359,21 @@ async fn chat_long_connection_eof_exits_cleanly() {
         assert!(collect_text(&r).contains("hello"));
         // conn dropped here → EOF
     }
+
+    // Wait for the mock queue to drain before enqueuing the Connection 2
+    // response.  A deferred follow-up or background summary may fire after
+    // Connection 1 drops and consume any remaining queued responses.
+    let drain_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        if server.pending_response_count() == 0 || std::time::Instant::now() > drain_deadline {
+            break;
+        }
+    }
+
+    // Enqueue the Connection 2 response only after drain so it cannot be
+    // consumed by any in-flight background task from Connection 1.
+    server.enqueue(ScriptedResponse::text_chunks(vec!["world"]));
 
     // Connection 2: daemon must still respond normally.
     let mut conn2 = LongChatConnection::connect(&daemon.socket)
