@@ -189,7 +189,7 @@ impl CronStore {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .context("reading user_version")?;
 
-        if version < 1 || version < 2 {
+        if version < 2 {
             // Collect existing column names once (used by both migrations).
             let existing_cols: std::collections::HashSet<String> = conn
                 .prepare("PRAGMA table_info(cron_jobs)")
@@ -616,6 +616,19 @@ pub fn due_jobs(jobs: &[CronJob], now: &chrono::DateTime<chrono::Utc>) -> Vec<Cr
             }
         };
         let due_now = if job.one_shot {
+            // Only fire one-shot jobs that are still pending.  A job whose
+            // status is 'running' or 'completed' has already been picked up;
+            // if delete_job() later fails the 'completed' status prevents
+            // the scheduler from re-executing the job on the next tick.
+            if job.status != "pending" {
+                tracing::debug!(
+                    id = %job.id,
+                    status = %job.status,
+                    "skipping one-shot job that is no longer pending"
+                );
+                continue;
+            }
+
             let (Some(month), Some(day), Some(hour), Some(minute)) = (
                 sched.month.exact_value(),
                 sched.dom.exact_value(),
