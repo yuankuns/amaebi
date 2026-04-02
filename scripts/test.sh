@@ -115,6 +115,7 @@ CONTAINER_ID=$(docker run -d \
     -v "$REPO_ROOT:$REPO_ROOT:rw" \
     "${EXTRA_ENV[@]}" \
     -e RUST_BACKTRACE=1 \
+    -e RUST_TEST_THREADS=1 \
     -e AMAEBI_FILTER="$FILTER" \
     "$DEV_IMAGE" \
     sh -c 'cargo check && \
@@ -140,7 +141,7 @@ if [[ "$RUN_DOCKER" == "1" ]]; then
 
     echo "    image:   amaebi-sandbox:bookworm-slim"
     echo "    running: cargo test -- --ignored"
-    if "$HOST_CARGO" test -- --ignored; then ok; else fail; fi
+    if RUST_TEST_THREADS=1 "$HOST_CARGO" test -- --ignored; then ok; else fail; fi
 fi
 
 echo ""
