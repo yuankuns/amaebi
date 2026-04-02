@@ -2,19 +2,54 @@ use anyhow::{anyhow, Context as _, Result};
 use async_recursion::async_recursion;
 use regex::Regex;
 use std::sync::Arc;
+use tokio::io::AsyncWrite;
 use tokio::sync::Mutex;
 
 use crate::copilot::Message;
 use crate::daemon::DaemonState;
 use crate::daemon::{build_messages, inject_skill_files, run_agentic_loop};
+use crate::ipc::{write_frame, Response};
+use crate::memory_db;
 
 use super::{sh, step, Action, Check, Context, FailStrategy, ResourcePool, Stage, Workflow};
+
+/// Shared writer that can be cloned into spawned tasks (parallel Map).
+/// Used to stream LLM output back to the client. Step markers always go
+/// to stderr (via `step()`); LLM text goes through this writer.
+/// - For IPC (daemon): wraps the socket via `ipc::MutexWriter` — `run_agentic_loop`
+///   writes `Response::Text` JSON frames that the client reads.
+/// - For CLI / tests: wraps `tokio::io::sink()`.
+pub type SharedWriter = Arc<Mutex<Box<dyn AsyncWrite + Unpin + Send>>>;
+
+/// Send a bright-cyan workflow step marker.
+/// Always writes to stderr (visible on the daemon's terminal / CLI).
+/// Additionally writes a `Response::Text` frame through the IPC writer
+/// so the client also sees the step marker.
+async fn write_step(writer: &SharedWriter, msg: &str) {
+    let formatted = format!("\n\x1b[1;36m==> {msg}\x1b[0m\n");
+    // Always show on daemon/CLI stderr.
+    step(msg);
+    // Also send through the IPC writer so clients see progress.
+    let mut w = writer.lock().await;
+    let _ = write_frame(&mut **w, &Response::Text { chunk: formatted }).await;
+}
+
+/// Create a no-op writer (for tests or contexts that discard output).
+pub fn sink_writer() -> SharedWriter {
+    Arc::new(Mutex::new(Box::new(tokio::io::sink())))
+}
 
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
 /// Execute a workflow from start to finish.
+///
+/// `writer` receives streamed `Response::Text` frames (LLM output + step
+/// markers) so the client sees real-time progress.
+///
+/// `history` is the parent session's conversation history — injected so the
+/// LLM has context about what the user was working on.
 ///
 /// Returns a summary string (from the final LLM stage, or a generated one).
 pub async fn execute(
@@ -23,14 +58,16 @@ pub async fn execute(
     model: &str,
     initial_ctx: Context,
     resources: &ResourcePool,
+    writer: SharedWriter,
+    history: &[memory_db::DbMemoryEntry],
 ) -> Result<String> {
-    step(&format!("Workflow: {}", workflow.name));
+    write_step(&writer, &format!("Workflow: {}", workflow.name)).await;
 
     let mut messages: Vec<Message> = {
         let mut msgs = build_messages(
             &format!("You are executing the workflow: {}.", workflow.name),
             None,
-            &[],
+            history,
             &[],
             None,
         );
@@ -46,6 +83,7 @@ pub async fn execute(
         &mut messages,
         &mut ctx,
         resources,
+        &writer,
     )
     .await?;
 
@@ -64,13 +102,15 @@ async fn run_stages(
     messages: &mut Vec<Message>,
     ctx: &mut Context,
     resources: &ResourcePool,
+    writer: &SharedWriter,
 ) -> Result<Option<String>> {
     let mut last_text: Option<String> = None;
 
     for stage in stages {
-        step(&format!("  Stage: {}", stage.name));
+        write_step(writer, &format!("  Stage: {}", stage.name)).await;
 
-        let text = run_stage_with_retry(stage, state, model, messages, ctx, resources).await?;
+        let text =
+            run_stage_with_retry(stage, state, model, messages, ctx, resources, writer).await?;
         if let Some(ref t) = text {
             last_text = Some(t.clone());
         }
@@ -87,6 +127,7 @@ async fn run_stage_with_retry(
     messages: &mut Vec<Message>,
     ctx: &mut Context,
     resources: &ResourcePool,
+    writer: &SharedWriter,
 ) -> Result<Option<String>> {
     let max_attempts = match &stage.on_fail {
         FailStrategy::Retry { max, .. } => *max + 1,
@@ -95,38 +136,39 @@ async fn run_stage_with_retry(
 
     for attempt in 0..max_attempts {
         if attempt > 0 {
-            step(&format!("    Retry {attempt}/{}", max_attempts - 1));
+            write_step(writer, &format!("    Retry {attempt}/{}", max_attempts - 1)).await;
         }
 
-        match run_single_stage(stage, state, model, messages, ctx, resources).await {
+        match run_single_stage(stage, state, model, messages, ctx, resources, writer).await {
             Ok(text) => return Ok(text),
-            Err(e) => {
-                match &stage.on_fail {
-                    FailStrategy::Abort => return Err(e),
-                    FailStrategy::Skip => {
-                        step(&format!("    Skipping stage '{}': {e}", stage.name));
-                        return Ok(None);
-                    }
-                    FailStrategy::RevertAndSkip => {
-                        step(&format!("    Reverting and skipping '{}': {e}", stage.name));
-                        let _ = sh("git stash --include-untracked").await;
-                        return Ok(None);
-                    }
-                    FailStrategy::Retry { inject_prompt, .. } => {
-                        if attempt + 1 >= max_attempts {
-                            return Err(e.context(format!(
-                                "Stage '{}' failed after {max_attempts} attempts",
-                                stage.name
-                            )));
-                        }
-                        // Inject error context back to LLM for the next attempt.
-                        let error_msg = e.to_string();
-                        let injection = ctx.render(inject_prompt).replace("{error}", &error_msg);
-                        step("    Injecting error context to LLM");
-                        let _ = llm_turn(state, model, messages, &injection).await?;
-                    }
+            Err(e) => match &stage.on_fail {
+                FailStrategy::Abort => return Err(e),
+                FailStrategy::Skip => {
+                    write_step(writer, &format!("    Skipping stage '{}': {e}", stage.name)).await;
+                    return Ok(None);
                 }
-            }
+                FailStrategy::RevertAndSkip => {
+                    write_step(
+                        writer,
+                        &format!("    Reverting and skipping '{}': {e}", stage.name),
+                    )
+                    .await;
+                    let _ = sh("git stash --include-untracked").await;
+                    return Ok(None);
+                }
+                FailStrategy::Retry { inject_prompt, .. } => {
+                    if attempt + 1 >= max_attempts {
+                        return Err(e.context(format!(
+                            "Stage '{}' failed after {max_attempts} attempts",
+                            stage.name
+                        )));
+                    }
+                    let error_msg = e.to_string();
+                    let injection = ctx.render(inject_prompt).replace("{error}", &error_msg);
+                    write_step(writer, "    Injecting error context to LLM").await;
+                    let _ = llm_turn(state, model, messages, &injection, writer).await?;
+                }
+            },
         }
     }
 
@@ -141,6 +183,7 @@ async fn run_single_stage(
     messages: &mut Vec<Message>,
     ctx: &mut Context,
     resources: &ResourcePool,
+    writer: &SharedWriter,
 ) -> Result<Option<String>> {
     // Acquire resource permit if required.
     let _permit = if let Some(ref res_name) = stage.requires {
@@ -156,7 +199,7 @@ async fn run_single_stage(
     match &stage.action {
         Action::Llm { prompt } => {
             let rendered = ctx.render(prompt);
-            let text = llm_turn(state, model, messages, &rendered).await?;
+            let text = llm_turn(state, model, messages, &rendered, writer).await?;
             ctx.set("last_llm_output", &text);
             // Write to a temp file so Shell stages can reference LLM output safely
             // without shell-injection risk from inlining it into a command string.
@@ -192,11 +235,11 @@ async fn run_single_stage(
         } => {
             let source = ctx.get("last_llm_output").unwrap_or("").to_owned();
             let items = parse_items(parse, &source)?;
-            step(&format!(
-                "    Map over {} items (parallel={})",
-                items.len(),
-                parallel
-            ));
+            write_step(
+                writer,
+                &format!("    Map over {} items (parallel={})", items.len(), parallel),
+            )
+            .await;
 
             if items.is_empty() {
                 return Err(anyhow!("Map stage found 0 items — check parse regex"));
@@ -211,10 +254,14 @@ async fn run_single_stage(
                     ctx,
                     resources,
                     concurrency.as_deref(),
+                    writer,
                 )
                 .await?;
             } else {
-                run_map_serial(&items, sub_stages, state, model, messages, ctx, resources).await?;
+                run_map_serial(
+                    &items, sub_stages, state, model, messages, ctx, resources, writer,
+                )
+                .await?;
             }
 
             Ok(None)
@@ -226,6 +273,7 @@ async fn run_single_stage(
 // Map: serial
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 #[async_recursion]
 async fn run_map_serial(
     items: &[String],
@@ -235,17 +283,17 @@ async fn run_map_serial(
     messages: &mut Vec<Message>,
     ctx: &mut Context,
     resources: &ResourcePool,
+    writer: &SharedWriter,
 ) -> Result<()> {
     for (i, item) in items.iter().enumerate() {
-        step(&format!("    [{}/{}] {}", i + 1, items.len(), item));
+        write_step(writer, &format!("    [{}/{}] {}", i + 1, items.len(), item)).await;
         ctx.set("item", item);
         ctx.set("item_index", i.to_string());
 
-        match run_stages(sub_stages, state, model, messages, ctx, resources).await {
+        match run_stages(sub_stages, state, model, messages, ctx, resources, writer).await {
             Ok(_) => {}
             Err(e) => {
-                step(&format!("    Item failed, skipping: {e}"));
-                // Serial map: skip failed items and continue.
+                write_step(writer, &format!("    Item failed, skipping: {e}")).await;
             }
         }
     }
@@ -256,6 +304,7 @@ async fn run_map_serial(
 // Map: parallel
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 async fn run_map_parallel(
     items: &[String],
     sub_stages: &[Stage],
@@ -264,8 +313,8 @@ async fn run_map_parallel(
     ctx: &Context,
     resources: &ResourcePool,
     _concurrency_resource: Option<&str>,
+    writer: &SharedWriter,
 ) -> Result<()> {
-    // Each parallel item gets its own messages Vec (independent context).
     #[allow(clippy::type_complexity)]
     let results: Arc<Mutex<Vec<(usize, Result<()>)>>> = Arc::new(Mutex::new(Vec::new()));
 
@@ -282,23 +331,21 @@ async fn run_map_parallel(
         let results = Arc::clone(&results);
         let model = model.to_owned();
         let total = items.len();
+        let writer = Arc::clone(writer);
 
-        // Concurrency semaphore — only for stages that declare `requires`.
-        // The overall Map concurrency is unlimited; individual stages within
-        // the sub-pipeline are constrained by their own `requires` field.
         let handle = tokio::spawn(async move {
-            step(&format!(
-                "    [parallel {i_plus_one}/{total}] {item}",
-                i_plus_one = i + 1
-            ));
+            write_step(
+                &writer,
+                &format!(
+                    "    [parallel {i_plus_one}/{total}] {item}",
+                    i_plus_one = i + 1
+                ),
+            )
+            .await;
 
-            // Each parallel worker gets a fresh messages vec.
             let mut messages = build_messages(&format!("Working on: {item}"), None, &[], &[], None);
             inject_skill_files(&mut messages).await;
 
-            // Collect sub-stages by cloning the action/check data.
-            // We can't share &Stage across tasks, so we build owned copies
-            // of the flat list here via a local runner.
             let result = run_parallel_item_stages(
                 &sub_stages,
                 &state,
@@ -306,6 +353,7 @@ async fn run_map_parallel(
                 &mut messages,
                 &mut item_ctx,
                 &resources,
+                &writer,
             )
             .await;
 
@@ -322,15 +370,18 @@ async fn run_map_parallel(
             .map_err(|e| anyhow!("parallel task panicked: {e}"))?;
     }
 
-    // Report any failures (they were already skipped individually).
     let results = results.lock().await;
     let failed: Vec<_> = results.iter().filter(|(_, r)| r.is_err()).collect();
     if !failed.is_empty() {
-        step(&format!(
-            "    {}/{} items had errors (skipped)",
-            failed.len(),
-            items.len()
-        ));
+        write_step(
+            writer,
+            &format!(
+                "    {}/{} items had errors (skipped)",
+                failed.len(),
+                items.len()
+            ),
+        )
+        .await;
     }
 
     Ok(())
@@ -346,10 +397,12 @@ async fn run_parallel_item_stages(
     messages: &mut Vec<Message>,
     ctx: &mut Context,
     resources: &ResourcePool,
+    writer: &SharedWriter,
 ) -> Result<Option<String>> {
     let mut last_text = None;
     for stage in stages {
-        let text = run_stage_with_retry(stage, state, model, messages, ctx, resources).await?;
+        let text =
+            run_stage_with_retry(stage, state, model, messages, ctx, resources, writer).await?;
         if let Some(t) = text {
             last_text = Some(t);
         }
@@ -427,22 +480,22 @@ pub async fn llm_turn(
     model: &str,
     messages: &mut Vec<Message>,
     prompt: &str,
+    writer: &SharedWriter,
 ) -> Result<String> {
     messages.push(Message::user(prompt.to_owned()));
     let (_, mut steer_rx) = tokio::sync::mpsc::channel::<Option<String>>(1);
-    let mut sink = tokio::io::sink();
+    let mut w = writer.lock().await;
     let (text, _, _) = run_agentic_loop(
         state,
         model,
         messages.clone(),
-        &mut sink,
+        &mut **w,
         &mut steer_rx,
         true,
     )
     .await
     .context("LLM turn failed")?;
-    // Note: messages are not returned by run_agentic_loop on this branch;
-    // push the user message manually so context accumulates.
+    drop(w);
     messages.push(crate::copilot::Message::assistant(
         Some(text.clone()),
         vec![],
@@ -1232,6 +1285,8 @@ mod llm_tests {
             "gpt-4o",
             Context::new(),
             &ResourcePool::empty(),
+            sink_writer(),
+            &[],
         )
         .await
         .unwrap();
@@ -1291,6 +1346,8 @@ mod llm_tests {
             "gpt-4o",
             Context::new(),
             &ResourcePool::empty(),
+            sink_writer(),
+            &[],
         )
         .await
         .unwrap();
@@ -1349,6 +1406,8 @@ mod llm_tests {
             "gpt-4o",
             Context::new(),
             &ResourcePool::empty(),
+            sink_writer(),
+            &[],
         )
         .await
         .expect("workflow should succeed after retry");
@@ -1426,6 +1485,8 @@ mod llm_tests {
             "gpt-4o",
             Context::new(),
             &ResourcePool::empty(),
+            sink_writer(),
+            &[],
         )
         .await;
         assert!(
@@ -1455,6 +1516,8 @@ async fn execute_with_ctx(
     use crate::copilot::Message;
     use crate::daemon::{build_messages, inject_skill_files};
 
+    let writer = sink_writer();
+
     let mut messages: Vec<Message> = {
         let mut msgs = build_messages(
             &format!("workflow: {}", workflow.name),
@@ -1475,6 +1538,7 @@ async fn execute_with_ctx(
         &mut messages,
         &mut ctx,
         resources,
+        &writer,
     )
     .await?;
     Ok(result.unwrap_or_default())

@@ -552,7 +552,7 @@ pub async fn stream_chat<W>(
     writer: &mut W,
 ) -> Result<CopilotResponse>
 where
-    W: AsyncWriteExt + Unpin,
+    W: AsyncWriteExt + Unpin + ?Sized,
 {
     let endpoint = chat_endpoint(base_url);
     tracing::debug!(messages = messages.len(), endpoint = %endpoint, model, "sending chat request");
@@ -575,9 +575,12 @@ where
 /// exported so `daemon.rs` can share the same constant.
 pub const WAITING_MARKER: &str = "[WAITING_FOR_INPUT]";
 
-async fn parse_sse_stream<W>(resp: reqwest::Response, writer: &mut W) -> Result<CopilotResponse>
+async fn parse_sse_stream<W>(
+    resp: reqwest::Response,
+    writer: &mut W,
+) -> Result<CopilotResponse>
 where
-    W: AsyncWriteExt + Unpin,
+    W: AsyncWriteExt + Unpin + ?Sized,
 {
     let mut stream = resp.bytes_stream();
     let mut buf = String::new();

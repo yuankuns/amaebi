@@ -247,7 +247,7 @@ async fn read_file(args: serde_json::Value) -> Result<String> {
 /// The workflow engine handles all flow control in code; Claude only does
 /// content work (coding, analysis, summaries) within each LLM stage.
 async fn run_workflow_tool(args: serde_json::Value, ctx: &SpawnContext) -> Result<String> {
-    use crate::workflows::{builtins, executor, Context, ResourcePool};
+    use crate::workflows::{build_workflow, executor, Context};
     use std::sync::Arc;
 
     let workflow_name = args["workflow"]
@@ -258,8 +258,6 @@ async fn run_workflow_tool(args: serde_json::Value, ctx: &SpawnContext) -> Resul
 
     let model = std::env::var("AMAEBI_MODEL").unwrap_or_else(|_| "gpt-4o".to_string());
 
-    // Build a minimal DaemonState from the SpawnContext so the workflow's
-    // LLM stages can call run_agentic_loop.
     let state = Arc::new(crate::daemon::DaemonState {
         http: ctx.http.clone(),
         tokens: Arc::clone(&ctx.tokens),
@@ -269,82 +267,11 @@ async fn run_workflow_tool(args: serde_json::Value, ctx: &SpawnContext) -> Resul
         active_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
     });
 
-    let ctx = Context::new();
+    let (workflow, pool) = build_workflow(workflow_name, &wf_args)?;
+    let wf_ctx = Context::new();
+    let writer = executor::sink_writer();
 
-    let workflow = match workflow_name {
-        "dev-loop" => {
-            let task = wf_args
-                .get("task")
-                .and_then(|v| v.as_str())
-                .unwrap_or("complete the task");
-            let test_cmd = wf_args
-                .get("test_cmd")
-                .and_then(|v| v.as_str())
-                .unwrap_or("cargo test");
-            let max_retries = wf_args
-                .get("max_retries")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(5) as usize;
-            builtins::dev_loop(task, test_cmd, max_retries, max_retries)
-        }
-        "bug-fix" => {
-            let repo = wf_args.get("repo").and_then(|v| v.as_str()).unwrap_or(".");
-            let test_cmd = wf_args
-                .get("test_cmd")
-                .and_then(|v| v.as_str())
-                .unwrap_or("cargo test");
-            let max_retries = wf_args
-                .get("max_retries")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(3) as usize;
-            builtins::bug_fix(repo, test_cmd, max_retries)
-        }
-        "perf-sweep" => {
-            let target = wf_args
-                .get("target")
-                .and_then(|v| v.as_str())
-                .unwrap_or("the target");
-            let bench_cmd = wf_args
-                .get("bench_cmd")
-                .and_then(|v| v.as_str())
-                .unwrap_or("make bench");
-            let threshold = wf_args
-                .get("regression_threshold")
-                .and_then(|v| v.as_f64())
-                .unwrap_or(0.05);
-            builtins::perf_sweep(target, "", bench_cmd, threshold)
-        }
-        "tune-sweep" => {
-            let target = wf_args
-                .get("target")
-                .and_then(|v| v.as_str())
-                .unwrap_or("the target");
-            let run_cmd = wf_args
-                .get("run_cmd")
-                .and_then(|v| v.as_str())
-                .unwrap_or("echo {item_index}");
-            let result_cmd = wf_args
-                .get("result_cmd")
-                .and_then(|v| v.as_str())
-                .unwrap_or("echo done");
-            let resource = wf_args
-                .get("resource")
-                .and_then(|v| v.as_str())
-                .unwrap_or("gpu");
-            let count = wf_args
-                .get("resource_count")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(1) as usize;
-            let wf = builtins::tune_sweep(target, "", run_cmd, result_cmd, resource);
-            let pool = ResourcePool::new([(resource, count)]);
-            return executor::execute(&wf, &state, &model, ctx, &pool).await;
-        }
-        other => anyhow::bail!(
-            "unknown workflow: {other:?}. Valid: dev-loop, bug-fix, perf-sweep, tune-sweep"
-        ),
-    };
-
-    executor::execute(&workflow, &state, &model, ctx, &ResourcePool::empty()).await
+    executor::execute(&workflow, &state, &model, wf_ctx, &pool, writer, &[]).await
 }
 
 /// Spawn a child agent session to complete a task in an isolated sandbox.

@@ -679,8 +679,16 @@ async fn run_workflow(
             max_review_retries,
         } => {
             let wf = builtins::dev_loop(&task, &test_cmd, max_test_retries, max_review_retries);
-            let summary =
-                executor::execute(&wf, &state, &model, ctx, &ResourcePool::empty()).await?;
+            let summary = executor::execute(
+                &wf,
+                &state,
+                &model,
+                ctx,
+                &ResourcePool::empty(),
+                executor::sink_writer(),
+                &[],
+            )
+            .await?;
             println!("{summary}");
         }
 
@@ -692,8 +700,16 @@ async fn run_workflow(
         } => {
             let docs_content = read_files(&docs).await?;
             let wf = builtins::perf_sweep(&target, &docs_content, &bench_cmd, regression_threshold);
-            let summary =
-                executor::execute(&wf, &state, &model, ctx, &ResourcePool::empty()).await?;
+            let summary = executor::execute(
+                &wf,
+                &state,
+                &model,
+                ctx,
+                &ResourcePool::empty(),
+                executor::sink_writer(),
+                &[],
+            )
+            .await?;
             println!("{summary}");
         }
 
@@ -703,8 +719,16 @@ async fn run_workflow(
             max_retries,
         } => {
             let wf = builtins::bug_fix(&repo, &test_cmd, max_retries);
-            let summary =
-                executor::execute(&wf, &state, &model, ctx, &ResourcePool::empty()).await?;
+            let summary = executor::execute(
+                &wf,
+                &state,
+                &model,
+                ctx,
+                &ResourcePool::empty(),
+                executor::sink_writer(),
+                &[],
+            )
+            .await?;
             println!("{summary}");
         }
 
@@ -719,7 +743,16 @@ async fn run_workflow(
             let docs_content = read_files(&docs).await?;
             let wf = builtins::tune_sweep(&target, &docs_content, &run_cmd, &result_cmd, &resource);
             let pool = ResourcePool::new([(resource.as_str(), resource_count)]);
-            let summary = executor::execute(&wf, &state, &model, ctx, &pool).await?;
+            let summary = executor::execute(
+                &wf,
+                &state,
+                &model,
+                ctx,
+                &pool,
+                executor::sink_writer(),
+                &[],
+            )
+            .await?;
             println!("{summary}");
         }
     }

@@ -12,6 +12,7 @@ use crate::inbox::InboxStore;
 use crate::ipc::{write_frame, Request, Response};
 use crate::memory_db;
 use crate::tools::{self, ToolExecutor};
+use crate::workflows;
 
 /// Resolve the raw model string to the API-level model ID for token lookups.
 ///
@@ -419,6 +420,79 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                     .await?;
                 }
                 write_frame(&mut *w, &Response::Done).await?;
+            }
+
+            Request::Workflow {
+                name,
+                args,
+                model,
+                session_id,
+            } => {
+                tracing::info!(workflow = %name, model = %model, "received workflow request");
+
+                // Load parent session history if session_id is provided.
+                let history = if let Some(ref sid) = session_id {
+                    let db = Arc::clone(&state.db);
+                    let sid = sid.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let conn = db.lock().unwrap_or_else(|p| p.into_inner());
+                        memory_db::get_session_history(&conn, &sid)
+                    })
+                    .await
+                    .unwrap_or_else(|_| Ok(vec![]))
+                    .unwrap_or_default()
+                } else {
+                    vec![]
+                };
+
+                match workflows::build_workflow(&name, &args) {
+                    Ok((workflow, pool)) => {
+                        let wf_writer: workflows::executor::SharedWriter = {
+                            let w = Arc::clone(&writer);
+                            Arc::new(tokio::sync::Mutex::new(Box::new(crate::ipc::MutexWriter(
+                                w,
+                            ))))
+                        };
+                        let ctx = workflows::Context::new();
+                        match workflows::executor::execute(
+                            &workflow, &state, &model, ctx, &pool, wf_writer, &history,
+                        )
+                        .await
+                        {
+                            Ok(summary) => {
+                                let mut w = writer.lock().await;
+                                write_frame(
+                                    &mut *w,
+                                    &Response::Text {
+                                        chunk: format!("\n{summary}\n"),
+                                    },
+                                )
+                                .await?;
+                                write_frame(&mut *w, &Response::Done).await?;
+                            }
+                            Err(e) => {
+                                let mut w = writer.lock().await;
+                                write_frame(
+                                    &mut *w,
+                                    &Response::Error {
+                                        message: format!("workflow error: {e:#}"),
+                                    },
+                                )
+                                .await?;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let mut w = writer.lock().await;
+                        write_frame(
+                            &mut *w,
+                            &Response::Error {
+                                message: format!("{e:#}"),
+                            },
+                        )
+                        .await?;
+                    }
+                }
             }
 
             Request::Steer { .. } => {
@@ -1272,7 +1346,7 @@ async fn invoke_model<W>(
     writer: &mut W,
 ) -> Result<copilot::CopilotResponse>
 where
-    W: AsyncWriteExt + Unpin,
+    W: AsyncWriteExt + Unpin + ?Sized,
 {
     let spec = crate::provider::resolve(model);
     tracing::debug!(
@@ -1483,7 +1557,7 @@ pub(crate) async fn run_agentic_loop<W>(
     include_spawn_agent: bool,
 ) -> Result<(String, usize, Vec<Message>)>
 where
-    W: AsyncWriteExt + Unpin,
+    W: AsyncWriteExt + Unpin + ?Sized,
 {
     let schemas = tools::tool_schemas(include_spawn_agent);
     let final_text;

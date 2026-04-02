@@ -336,7 +336,7 @@ async fn parse_responses_stream<W>(
     writer: &mut W,
 ) -> Result<CopilotResponse>
 where
-    W: AsyncWriteExt + Unpin,
+    W: AsyncWriteExt + Unpin + ?Sized,
 {
     let mut stream = resp.bytes_stream();
     let mut buf = String::new();
@@ -543,7 +543,7 @@ pub async fn stream_chat<W>(
     writer: &mut W,
 ) -> Result<CopilotResponse>
 where
-    W: AsyncWriteExt + Unpin,
+    W: AsyncWriteExt + Unpin + ?Sized,
 {
     tracing::debug!(
         messages = messages.len(),

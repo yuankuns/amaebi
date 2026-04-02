@@ -221,6 +221,66 @@ pub fn step(name: &str) {
 }
 
 // ---------------------------------------------------------------------------
+// Shared workflow builder — single source of truth for all entry points
+// ---------------------------------------------------------------------------
+
+/// Build a `(Workflow, ResourcePool)` from a workflow name and a flat JSON
+/// argument map.  Used by the daemon's `Request::Workflow` handler and
+/// `run_workflow` LLM tool so all entry points share the same construction
+/// logic.
+pub fn build_workflow(
+    name: &str,
+    args: &serde_json::Map<String, serde_json::Value>,
+) -> anyhow::Result<(Workflow, ResourcePool)> {
+    let str_arg = |key: &str| -> Option<&str> { args.get(key).and_then(|v| v.as_str()) };
+    let u64_arg = |key: &str| -> Option<u64> { args.get(key).and_then(|v| v.as_u64()) };
+    let f64_arg = |key: &str| -> Option<f64> { args.get(key).and_then(|v| v.as_f64()) };
+
+    match name {
+        "dev-loop" => {
+            let task = str_arg("task").unwrap_or("complete the task");
+            let test_cmd = str_arg("test_cmd").unwrap_or("cargo test");
+            let max_retries = u64_arg("max_retries").unwrap_or(5) as usize;
+            Ok((
+                builtins::dev_loop(task, test_cmd, max_retries, max_retries),
+                ResourcePool::empty(),
+            ))
+        }
+        "bug-fix" => {
+            let repo = str_arg("repo").unwrap_or(".");
+            let test_cmd = str_arg("test_cmd").unwrap_or("cargo test");
+            let max_retries = u64_arg("max_retries").unwrap_or(3) as usize;
+            Ok((
+                builtins::bug_fix(repo, test_cmd, max_retries),
+                ResourcePool::empty(),
+            ))
+        }
+        "perf-sweep" => {
+            let target = str_arg("target").unwrap_or("the target");
+            let bench_cmd = str_arg("bench_cmd").unwrap_or("make bench");
+            let threshold = f64_arg("regression_threshold").unwrap_or(0.05);
+            Ok((
+                builtins::perf_sweep(target, "", bench_cmd, threshold),
+                ResourcePool::empty(),
+            ))
+        }
+        "tune-sweep" => {
+            let target = str_arg("target").unwrap_or("the target");
+            let run_cmd = str_arg("run_cmd").unwrap_or("echo {item_index}");
+            let result_cmd = str_arg("result_cmd").unwrap_or("echo done");
+            let resource = str_arg("resource").unwrap_or("gpu");
+            let count = u64_arg("resource_count").unwrap_or(1) as usize;
+            let wf = builtins::tune_sweep(target, "", run_cmd, result_cmd, resource);
+            let pool = ResourcePool::new([(resource, count)]);
+            Ok((wf, pool))
+        }
+        other => anyhow::bail!(
+            "unknown workflow: '{other}'. Valid: dev-loop, bug-fix, perf-sweep, tune-sweep"
+        ),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

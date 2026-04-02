@@ -92,6 +92,25 @@ pub enum Request {
     /// The daemon responds with zero or more [`Response::MemoryEntry`] frames
     /// followed by a single [`Response::Done`] frame.
     RetrieveContext { prompt: String },
+    /// Run a supervised workflow on the daemon.
+    ///
+    /// All three entry points (CLI, `/workflow` slash command, `run_workflow`
+    /// LLM tool) funnel through this variant so workflow execution shares the
+    /// daemon's `DaemonState` (HTTP client, tokens, DB).
+    /// The daemon streams [`Response::Text`] progress and ends with
+    /// [`Response::Done`] or [`Response::Error`].
+    Workflow {
+        /// Workflow name: "dev-loop", "bug-fix", "perf-sweep", "tune-sweep".
+        name: String,
+        /// Workflow-specific arguments as a flat JSON object.
+        args: serde_json::Map<String, serde_json::Value>,
+        /// Chat model to use (e.g. "gpt-4o").
+        model: String,
+        /// Parent session ID — when set, the daemon loads conversation history
+        /// from this session so the workflow's LLM stages have context about
+        /// what the user was working on.
+        session_id: Option<String>,
+    },
 }
 
 /// A single frame streamed from the daemon back to the client.
@@ -154,7 +173,7 @@ pub enum Response {
 /// Write one `Response` frame as a JSON line to `writer`.
 pub async fn write_frame<W>(writer: &mut W, frame: &Response) -> anyhow::Result<()>
 where
-    W: tokio::io::AsyncWriteExt + Unpin,
+    W: tokio::io::AsyncWriteExt + Unpin + ?Sized,
 {
     let mut line = serde_json::to_string(frame)?;
     line.push('\n');
@@ -162,6 +181,57 @@ where
         .write_all(line.as_bytes())
         .await
         .map_err(anyhow::Error::from)
+}
+
+/// Adapter that implements [`tokio::io::AsyncWrite`] by locking an
+/// `Arc<tokio::sync::Mutex<W>>` on every write.  Used to bridge the daemon's
+/// shared writer into the workflow executor's `SharedWriter` type.
+pub struct MutexWriter<W>(pub std::sync::Arc<tokio::sync::Mutex<W>>);
+
+impl<W: tokio::io::AsyncWrite + Unpin + Send> tokio::io::AsyncWrite for MutexWriter<W> {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let inner = &self.0;
+        // try_lock: if the mutex is contended, return Pending and wake
+        match inner.try_lock() {
+            Ok(mut guard) => std::pin::Pin::new(&mut *guard).poll_write(cx, buf),
+            Err(_) => {
+                cx.waker().wake_by_ref();
+                std::task::Poll::Pending
+            }
+        }
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let inner = &self.0;
+        match inner.try_lock() {
+            Ok(mut guard) => std::pin::Pin::new(&mut *guard).poll_flush(cx),
+            Err(_) => {
+                cx.waker().wake_by_ref();
+                std::task::Poll::Pending
+            }
+        }
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let inner = &self.0;
+        match inner.try_lock() {
+            Ok(mut guard) => std::pin::Pin::new(&mut *guard).poll_shutdown(cx),
+            Err(_) => {
+                cx.waker().wake_by_ref();
+                std::task::Poll::Pending
+            }
+        }
+    }
 }
 
 #[cfg(test)]
