@@ -239,42 +239,9 @@ pub async fn sh(command: &str) -> anyhow::Result<ShellResult> {
     })
 }
 
-// ---------------------------------------------------------------------------
-// Progress channel — lets daemon forward step() output to the IPC stream
-// ---------------------------------------------------------------------------
-
-/// Per-call progress sender installed by the daemon before running
-/// `run_workflow_tool`.  `step()` forwards each marker through it so the
-/// daemon can relay progress to the connected client as `Response::Text`
-/// frames, making workflow stages visible even when triggered via LLM tool.
-static PROGRESS_TX: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<String>>> =
-    std::sync::Mutex::new(None);
-
-/// Install a progress sender.  The daemon calls this before executing a
-/// `run_workflow` tool and tears it down (via `clear_progress`) after.
-pub fn set_progress(tx: tokio::sync::mpsc::UnboundedSender<String>) {
-    if let Ok(mut g) = PROGRESS_TX.lock() {
-        *g = Some(tx);
-    }
-}
-
-/// Remove the progress sender after the workflow finishes.
-pub fn clear_progress() {
-    if let Ok(mut g) = PROGRESS_TX.lock() {
-        *g = None;
-    }
-}
-
-/// Print a workflow progress marker to stderr and, when a progress channel
-/// is installed (daemon / tool-call path), also send it there so the client
-/// can display it in real time.
+/// Print a workflow progress marker to stderr.
 pub fn step(name: &str) {
     eprintln!("\n\x1b[1;36m==> {name}\x1b[0m");
-    if let Ok(g) = PROGRESS_TX.lock() {
-        if let Some(tx) = g.as_ref() {
-            let _ = tx.send(name.to_owned());
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
