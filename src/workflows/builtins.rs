@@ -29,7 +29,8 @@ if [ -n "$REPO" ] && [ -n "$PR_NUM" ]; then
   for tid in $THREADS; do
     gh api graphql -f query="mutation { resolveReviewThread(input: {threadId: \"$tid\"}) { thread { isResolved } } }" >/dev/null 2>&1 || true
   done
-  gh pr edit --add-reviewer "@copilot" 2>/dev/null || true
+  gh api "repos/$OWNER/$NAME/pulls/$PR_NUM/requested_reviewers" \
+    --method POST -f 'reviewers[]=copilot-pull-request-reviewer[bot]' >/dev/null 2>&1 || true
 fi
 echo "resolve-and-request-review done"
 "#
