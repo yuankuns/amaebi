@@ -225,7 +225,10 @@ async fn run_single_stage(
         }
 
         Action::Shell { command } => {
-            let rendered = ctx.render_shell(command);
+            // Use plain render() — builtin workflows reference LLM output via
+            // {last_llm_output_file} (safe file path) not inline text.
+            // render_shell() is available for custom workflows that need it.
+            let rendered = ctx.render(command);
             let result = sh(&rendered).await?;
             ctx.set("stdout", &result.stdout);
             ctx.set("stderr", &result.stderr);
@@ -1321,10 +1324,19 @@ mod llm_tests {
             summary.contains("fix: add caching layer"),
             "summary: {summary}"
         );
-        // The executor must persist the output so Shell stages can use it.
-        let content = tokio::fs::read_to_string("/tmp/amaebi_llm_output.txt")
-            .await
-            .unwrap();
+        // The executor must persist the output to a unique temp file.
+        // Verify a file matching the pattern exists and contains the output.
+        let pattern = format!("/tmp/amaebi_llm_{}_*.txt", std::process::id());
+        let found = std::fs::read_dir("/tmp")
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .find(|e| {
+                let name = e.file_name().to_string_lossy().to_string();
+                name.starts_with(&format!("amaebi_llm_{}_", std::process::id()))
+                    && name.ends_with(".txt")
+            });
+        assert!(found.is_some(), "no temp file matching {pattern}");
+        let content = std::fs::read_to_string(found.unwrap().path()).unwrap();
         assert!(
             content.contains("fix: add caching layer"),
             "output file content: {content}"

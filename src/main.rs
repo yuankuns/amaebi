@@ -650,9 +650,14 @@ mod tests {
 // Workflow dispatch
 // ---------------------------------------------------------------------------
 
+/// Run a workflow from the CLI entry point.
+///
+/// TODO: connect to the daemon via `socket` and send `Request::Workflow`
+/// instead of constructing a standalone `DaemonState`.  This would unify
+/// the CLI path with the IPC path (slash command / LLM tool).
 async fn run_workflow(
     action: cli::WorkflowAction,
-    _socket: std::path::PathBuf, // reserved for future daemon connection
+    _socket: std::path::PathBuf,
     model: Option<String>,
 ) -> Result<()> {
     use std::sync::Arc;
