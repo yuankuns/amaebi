@@ -2370,6 +2370,11 @@ async fn chat_long_connection_eof_exits_cleanly() {
             break;
         }
     }
+    assert_eq!(
+        server.pending_response_count(),
+        0,
+        "drain deadline elapsed before all Connection 1 responses were consumed"
+    );
 
     // Enqueue the Connection 2 response only after drain so it cannot be
     // consumed by any in-flight background task from Connection 1.

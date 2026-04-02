@@ -1141,34 +1141,35 @@ mod prompt_input {
                 0x7f | 0x08 => {
                     if let (Some(_), Some(w)) = (chars.pop(), widths.pop()) {
                         if w > 0 {
-                            // ESC[wD (CUB) moves the cursor left exactly w columns.
+                            // Normal (non-zero-width) char: erase w display columns.
                             //
-                            // We use CUB instead of w×\x08 (BS) for two reasons:
+                            // ESC[wD (CUB) is used instead of w×\x08 (BS) because some
+                            // terminals snap the cursor to the left boundary of a wide
+                            // glyph on the first \x08, causing two \x08 to overshoot by
+                            // one column at odd column positions and leave the right-half
+                            // cell visible.  CUB always moves exactly w columns.
                             //
-                            //   1. CJK odd-column snap: some terminals snap the cursor
-                            //      to the left boundary of a wide glyph on the first \x08.
-                            //      Two consecutive \x08 then overshoot by one column when
-                            //      the character starts at an odd column position, leaving
-                            //      the right-half cell of the glyph visible on screen.
-                            //      CUB always moves exactly w columns regardless of cell
-                            //      boundaries.
-                            //
-                            //   2. Simplicity: \x08×w + spaces×w + \x08×w is three writes;
-                            //      CUB + ESC[K is two.
-                            //
-                            // Known limitation: CUB does NOT wrap to the previous visual
-                            // line, so if the user's input has soft-wrapped past column 0
-                            // the cursor stops at column 0 and ESC[K clears the wrong
-                            // region.  Fixing this would require tracking the column
-                            // position explicitly and using \x08 (which does wrap) plus
-                            // repainting the affected line segment.  This editor is
-                            // designed for single-line prompts; multi-line soft-wrap
-                            // support is out of scope.
+                            // Known limitation: CUB does not wrap to the previous visual
+                            // line on soft-wrapped input.  This editor targets single-line
+                            // prompts; multi-line soft-wrap support is out of scope.
                             write!(output, "\x1b[{w}D\x1b[K")?;
+                        } else {
+                            // Zero-width combining mark: it was rendered on top of the
+                            // preceding base character without advancing the cursor.
+                            // Removing it from the buffer leaves its glyph visible;
+                            // repaint the base char (and any remaining combining marks
+                            // on it) to erase the deleted mark from the display.
+                            if let Some(base_idx) = widths.iter().rposition(|&bw| bw > 0) {
+                                let base_width = widths[base_idx];
+                                // Move back to start of base char, clear to EOL.
+                                write!(output, "\x1b[{base_width}D\x1b[K")?;
+                                // Re-echo base char + any remaining combining marks.
+                                let repaint: String = chars[base_idx..].iter().collect();
+                                output.write_all(repaint.as_bytes())?;
+                            }
+                            // No preceding base char (mark at start of buffer):
+                            // nothing to repaint.
                         }
-                        // Zero-width characters (combining marks, etc.) are removed
-                        // from the buffer but don't need a cursor movement since
-                        // they did not advance the cursor when originally echoed.
                     }
                 }
                 // Escape sequences (arrows, function keys) — consume and discard.
@@ -1215,8 +1216,13 @@ mod prompt_input {
                     chars.push(b as char);
                     widths.push(1);
                 }
-                // UTF-8 multi-byte lead byte
-                b @ 0xC0..=0xFF => {
+                // Valid UTF-8 multi-byte lead bytes only.
+                //
+                // 0xC0/0xC1 produce "overlong" encodings of ASCII and are
+                // never valid in UTF-8; 0xF5..=0xFF exceed U+10FFFF and are
+                // also invalid.  Those bytes fall through to `_` (silently
+                // ignored) WITHOUT consuming any continuation bytes.
+                b @ 0xC2..=0xF4 => {
                     let n_extra: usize = if b >= 0xF0 {
                         3
                     } else if b >= 0xE0 {
@@ -1227,10 +1233,16 @@ mod prompt_input {
                     let mut utf8_buf: Vec<u8> = vec![b];
                     for _ in 0..n_extra {
                         let mut cb = [0u8; 1];
-                        if input.read_exact(&mut cb).is_err() {
-                            break;
+                        match input.read_exact(&mut cb) {
+                            // Valid continuation byte: collect it.
+                            Ok(()) if (0x80..=0xBF).contains(&cb[0]) => {
+                                utf8_buf.push(cb[0]);
+                            }
+                            // Invalid continuation or read error: stop.  The
+                            // byte has been consumed from the stream; discard
+                            // the whole sequence below.
+                            _ => break,
                         }
-                        utf8_buf.push(cb[0]);
                     }
                     if let Ok(s) = std::str::from_utf8(&utf8_buf) {
                         if let Some(ch) = s.chars().next() {
@@ -1244,7 +1256,7 @@ mod prompt_input {
                             widths.push(w);
                         }
                     }
-                    // Silently discard invalid UTF-8 sequences.
+                    // Silently discard invalid or truncated UTF-8 sequences.
                 }
                 // Other control bytes — ignore silently.
                 _ => {}
@@ -1570,9 +1582,10 @@ mod prompt_input {
         }
 
         #[test]
-        fn backspace_combining_mark_removes_only_mark() {
-            // "e" + combining accent + DEL + Enter → "e"
-            // Backspacing the combining mark should NOT move the cursor.
+        fn backspace_combining_mark_repaints_base() {
+            // "e" + U+0301 + DEL + Enter → "e"
+            // Backspacing the combining mark must repaint the base char so the
+            // accent glyph is cleared from the terminal display.
             let input = {
                 let mut v = Vec::new();
                 v.push(b'e');
@@ -1585,14 +1598,53 @@ mod prompt_input {
             let (res, echo) = run(&input);
             assert_eq!(res.unwrap(), Some("e".to_string()));
 
-            // The echo should contain 'e' (1 byte) + combining accent (2 bytes).
-            // Then backspace of zero-width char should NOT emit ESC[…D (no cursor move).
-            let after_char = &echo[3..]; // skip 'e' + 2-byte combining
-                                         // Should NOT start with a cursor-back sequence
+            // Echo: 'e' (1) + U+0301 (2) = 3 bytes, then the repaint sequence.
+            let after_char = &echo[3..]; // skip 'e' + 2-byte combining mark
+                                         // Repaint: ESC[1D ESC[K (move back base_width=1, clear EOL) …
             assert!(
-                !after_char.starts_with(b"\x1b["),
-                "zero-width backspace must not emit cursor-back; got: {:?}",
-                &after_char[..after_char.len().min(10)]
+                after_char.starts_with(b"\x1b[1D\x1b[K"),
+                "zero-width backspace must repaint base with ESC[1D ESC[K; got: {:?}",
+                &after_char[..after_char.len().min(15)]
+            );
+            // … then re-echo 'e' to restore the base char without the accent.
+            let after_erase = &after_char[b"\x1b[1D\x1b[K".len()..];
+            assert!(
+                after_erase.starts_with(b"e"),
+                "base char 'e' must be re-echoed after combining mark erase; got: {:?}",
+                &after_erase[..after_erase.len().min(10)]
+            );
+        }
+
+        #[test]
+        fn backspace_second_combining_mark_repaints_base_with_first() {
+            // "e" + U+0301 + U+0302 + DEL + Enter → "e\u{0301}"
+            // Backspacing U+0302 repaints 'e' + U+0301 so only U+0302 is cleared.
+            let input = {
+                let mut v = Vec::new();
+                v.push(b'e');
+                v.extend_from_slice(&[0xCC, 0x81]); // U+0301
+                v.extend_from_slice(&[0xCC, 0x82]); // U+0302 combining circumflex
+                v.push(0x7f); // DEL
+                v.push(b'\r');
+                v
+            };
+            let (res, echo) = run(&input);
+            assert_eq!(res.unwrap(), Some("e\u{0301}".to_string()));
+
+            // Echo: 'e'(1) + U+0301(2) + U+0302(2) = 5 bytes, then repaint.
+            let after_chars = &echo[5..];
+            assert!(
+                after_chars.starts_with(b"\x1b[1D\x1b[K"),
+                "backspace of second mark should emit ESC[1D ESC[K; got: {:?}",
+                &after_chars[..after_chars.len().min(15)]
+            );
+            // Re-echo must include 'e' + U+0301 but not U+0302.
+            let after_erase = &after_chars[b"\x1b[1D\x1b[K".len()..];
+            let expected: &[u8] = "e\u{0301}".as_bytes(); // 'e' + 0xCC 0x81
+            assert!(
+                after_erase.starts_with(expected),
+                "repaint must include 'e' + U+0301 only; got: {:?}",
+                &after_erase[..after_erase.len().min(10)]
             );
         }
 
