@@ -78,12 +78,18 @@ pub fn dev_loop(
                     // GIT_TERMINAL_PROMPT=0 and GH_PROMPT_DISABLED=1 prevent
                     // git/gh from blocking on credential prompts in non-interactive
                     // environments; auth failures surface immediately instead.
+                    // Copilot is added as a reviewer only when the PR is first
+                    // created; subsequent fix-and-push cycles skip the add since
+                    // Copilot is already assigned on the existing PR.
                     command: "GIT_TERMINAL_PROMPT=0 GH_PROMPT_DISABLED=1 \
                               git add -A && \
                               git commit -F {last_llm_output_file} && \
                               git push && \
-                              (gh pr create --fill 2>/dev/null || gh pr view --json url -q '.url') && \
-                              (gh pr edit --add-reviewer \"@github-copilot[bot]\" 2>/dev/null || true)"
+                              if gh pr create --fill 2>/dev/null; then \
+                                gh pr edit --add-reviewer Copilot 2>/dev/null || true; \
+                              else \
+                                gh pr view --json url -q '.url'; \
+                              fi"
                         .into(),
                 },
             )
