@@ -115,11 +115,13 @@ pub fn dev_loop(
             Stage::new(
                 "review",
                 Action::Shell {
-                    // Poll until a Copilot review appears that was submitted AFTER
-                    // the most recent commit on this PR.  This prevents a stale
-                    // CHANGES_REQUESTED review (from a previous push) from being
-                    // mistaken for a review of the current code.
+                    // Wait 60 s after the push before the first poll so Copilot
+                    // has time to pick up the review request.  Then poll every
+                    // 30 s (up to 60 more times) for a review submitted after
+                    // the most recent commit, ignoring any stale earlier reviews.
                     command: "GH_PROMPT_DISABLED=1; \
+                              echo 'Waiting 60s for Copilot to start reviewing...'; \
+                              sleep 60; \
                               COMMIT_DATE=$(gh pr view --json commits \
                                 --jq '.commits[-1].committedDate' 2>/dev/null \
                                 || echo '1970-01-01T00:00:00Z'); \
@@ -129,7 +131,7 @@ pub fn dev_loop(
                                   '[.reviews[] | select(.submittedAt > $cd)] | last | .state // \"\"' \
                                   2>/dev/null); \
                                 [ -n \"$state\" ] && echo \"$state\" && break; \
-                                echo \"Waiting for review after latest push ($i/60)...\"; \
+                                echo \"Waiting for review ($i/60)...\"; \
                                 sleep 30; \
                               done"
                         .into(),
