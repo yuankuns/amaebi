@@ -2455,8 +2455,7 @@ async fn chat_long_connection_ask_still_single_turn() {
     assert_eq!(reqs.len(), 1, "exactly 1 LLM request for single turn");
 }
 
-// 
-===================================================================
+// ===========================================================================
 // Deferred follow-up tool integration tests
 // ===========================================================================
 //
@@ -2917,7 +2916,8 @@ async fn followup_tools_blocked_in_cron_job_context() {
 
     let _ = child.kill().await;
     let _ = child.wait().await;
-=======
+}
+
 // ---------------------------------------------------------------------------
 // Workflow — run_workflow LLM tool integration tests
 //

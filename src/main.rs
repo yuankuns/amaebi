@@ -717,7 +717,7 @@ async fn run_workflow(
         } => {
             let docs_content = read_files(&docs).await?;
             let wf = builtins::tune_sweep(&target, &docs_content, &run_cmd, &result_cmd, &resource);
-            let pool = ResourcePool::new([(resource.as_str(), resource_count)]);
+            let pool = ResourcePool::new([(resource.as_str(), resource_count.get())]);
             let summary = executor::execute(&wf, &state, &model, ctx, &pool).await?;
             println!("{summary}");
         }

@@ -536,6 +536,8 @@ pub async fn llm_turn(
         &mut writer,
         &mut steer_rx,
         false, // workflow LLM turns must not expose spawn_agent / run_workflow
+        false, // workflow LLM turns must not schedule follow-ups
+        "",    // no session id needed for workflow turns
     )
     .await
     .context("LLM turn failed")?;
