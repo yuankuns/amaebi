@@ -236,10 +236,10 @@ async fn test_compaction_triggered_at_threshold() {
         );
     }
 
-    // Wait until every seed response has been consumed from the mock queue
+    // Wait until every seed response has been dequeued by the mock server
     // before killing the seed daemon.  On slow CI runners there is a window
-    // between the client receiving Done and the daemon's HTTP response being
-    // fully read; if we kill the daemon inside that window the mock server may
+    // between the client receiving Done and the response being dequeued by the
+    // mock server; if we kill the daemon inside that window the mock server may
     // not have drained the response, leaving it in the queue for Phase 2.
     let drain_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
@@ -2731,15 +2731,19 @@ async fn list_followups_tool_call_returns_pending_jobs() {
 // F4. Scheduled followup fires autonomously and deposits an inbox report
 // ---------------------------------------------------------------------------
 
-/// A model-created one-shot job with schedule `* * * * *` (fires every minute,
-/// i.e., immediately on the first cron tick) must be executed by the daemon's
-/// cron scheduler and its output stored in inbox.db.
+/// A model-created one-shot job must be executed by the daemon's cron scheduler
+/// and its output stored in inbox.db.
+///
+/// The schedule is an exact `"min hour dom month *"` expression anchored 1 minute
+/// in the past, so `oneshot_due_after_missed_window` fires it immediately on the
+/// first cron tick without waiting for the exact scheduled minute to arrive.
 ///
 /// Flow:
-///   1. Seed a model-created one-shot job (schedule "* * * * *") directly.
-///   2. Start the daemon; the scheduler fires on the first tick (~immediate).
-///   3. Wait up to 5 s for the LLM call.
-///   4. Assert inbox.db contains an unread report.
+///   1. Compute an exact cron expression for 1 minute ago; seed a model-created
+///      one-shot job with that schedule and `created_at` set to the same time.
+///   2. Start the daemon; the missed-window check fires it on the first tick.
+///   3. Poll up to 5 s for inbox.db to appear and contain a row.
+///   4. Assert the row contains the expected LLM output and is unread.
 #[tokio::test]
 async fn scheduled_followup_fires_and_deposits_inbox_report() {
     let home_dir = setup_home().expect("setup_home");
@@ -2801,42 +2805,63 @@ async fn scheduled_followup_fires_and_deposits_inbox_report() {
         "followup job did not fire within 5 s"
     );
 
-    // Give the daemon a moment to write the inbox report and delete the job.
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    // Assert inbox.db has an unread report.
+    // Poll until BOTH inbox.db has a row AND the one-shot job is gone from
+    // cron.db (up to 10 s).  Both writes happen sequentially in run_cron_job
+    // after the LLM response; checking them together avoids a TOCTOU race
+    // where inbox appears but the delete hasn't committed yet.
     let inbox_db = home_dir.path().join(".amaebi/inbox.db");
+    let post_deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let (inbox_output, inbox_read, cron_count) = loop {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let inbox_row: Option<(String, i64)> = if inbox_db.exists() {
+            rusqlite::Connection::open(&inbox_db).ok().and_then(|conn| {
+                conn.query_row(
+                    "SELECT output, read FROM inbox ORDER BY id DESC LIMIT 1",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .ok()
+            })
+        } else {
+            None
+        };
+
+        let cron_count: i64 = rusqlite::Connection::open(&cron_db_path)
+            .ok()
+            .and_then(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM cron_jobs WHERE id='fire-test-id'",
+                    [],
+                    |r| r.get(0),
+                )
+                .ok()
+            })
+            .unwrap_or(1); // default to 1 (not deleted) so we keep polling
+
+        if let Some((output, read)) = inbox_row {
+            if cron_count == 0 {
+                break (output, read, cron_count);
+            }
+        }
+
+        if std::time::Instant::now() > post_deadline {
+            panic!(
+                "followup post-conditions not met within 10 s: \
+                 inbox_exists={} cron_job_deleted={}",
+                inbox_db.exists(),
+                cron_count == 0,
+            );
+        }
+    };
+
     assert!(
-        inbox_db.exists(),
-        "inbox.db must exist after followup fires"
+        inbox_output.contains("followup-fire-executed"),
+        "inbox report should contain the LLM output: {inbox_output}"
     );
-
-    let conn = rusqlite::Connection::open(&inbox_db).expect("open inbox.db");
-    let (output, read): (String, i64) = conn
-        .query_row(
-            "SELECT output, read FROM inbox ORDER BY id DESC LIMIT 1",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .expect("query inbox");
-
-    assert!(
-        output.contains("followup-fire-executed"),
-        "inbox report should contain the LLM output: {output}"
-    );
-    assert_eq!(read, 0, "freshly deposited report must be unread");
-
-    // The one-shot job must have been deleted from cron.db after execution.
-    let count: i64 = rusqlite::Connection::open(&cron_db_path)
-        .expect("open cron.db")
-        .query_row(
-            "SELECT COUNT(*) FROM cron_jobs WHERE id='fire-test-id'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap_or(-1);
+    assert_eq!(inbox_read, 0, "freshly deposited report must be unread");
     assert_eq!(
-        count, 0,
+        cron_count, 0,
         "one-shot job must be deleted from cron.db after firing"
     );
 

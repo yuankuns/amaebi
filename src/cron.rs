@@ -586,7 +586,18 @@ pub fn due_jobs(jobs: &[CronJob], now: &chrono::DateTime<chrono::Utc>) -> Vec<Cr
             // Build from explicit components rather than chaining with_month →
             // with_day … which returns None for month-rollover cases like
             // "Jan 31 → Feb 1" (February has no 31st day).
-            let anchor: DateTime<Utc> = job.created_at.parse().unwrap_or(*now);
+            let anchor: DateTime<Utc> = match job.created_at.parse() {
+                Ok(dt) => dt,
+                Err(e) => {
+                    tracing::warn!(
+                        id = %job.id,
+                        created_at = %job.created_at,
+                        error = %e,
+                        "skipping one-shot job: cannot parse created_at as RFC 3339"
+                    );
+                    continue;
+                }
+            };
             let build_ymd = |year: i32| -> Option<DateTime<Utc>> {
                 match chrono::Utc.with_ymd_and_hms(year, month, day, hour, minute, 0) {
                     chrono::LocalResult::Single(dt) => Some(dt),
