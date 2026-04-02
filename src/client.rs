@@ -1943,6 +1943,14 @@ mod tests {
 ///   /workflow bug-fix --repo owner/repo
 ///   /workflow perf-sweep SDPA backward kernel --bench-cmd python bench.py
 ///   /workflow tune-sweep attention hyperparams --run-cmd ./train.sh --resource gpu
+///
+/// **Limitation**: arguments are split on whitespace; quoted strings with
+/// spaces (e.g. `--test-cmd "cargo test -- --nocapture"`) are NOT supported.
+/// Use the CLI (`amaebi workflow`) for complex arguments.
+///
+/// **Note**: `--max-retries` maps to both `max_test_retries` and
+/// `max_review_retries` in dev-loop.  The CLI has separate flags for
+/// fine-grained control.
 fn parse_workflow_args(
     prompt: &str,
 ) -> anyhow::Result<(String, serde_json::Map<String, serde_json::Value>)> {
