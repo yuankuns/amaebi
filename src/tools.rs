@@ -254,14 +254,25 @@ async fn run_workflow_tool(args: serde_json::Value, ctx: &SpawnContext) -> Resul
         .as_str()
         .context("run_workflow: missing 'workflow' argument")?;
 
-    let wf_args = args["args"].as_object().cloned().unwrap_or_default();
+    let wf_args = match args.get("args") {
+        Some(serde_json::Value::Object(m)) => m.clone(),
+        Some(other) => anyhow::bail!("run_workflow: 'args' must be a JSON object, got {}", other),
+        None => serde_json::Map::new(),
+    };
 
     let model = std::env::var("AMAEBI_MODEL").unwrap_or_else(|_| "gpt-4o".to_string());
 
+    let mut executor = crate::tools::LocalExecutor::new();
+    executor.spawn_ctx = Some(Arc::new(SpawnContext {
+        http: ctx.http.clone(),
+        db: Arc::clone(&ctx.db),
+        compacting_sessions: Arc::clone(&ctx.compacting_sessions),
+        tokens: Arc::clone(&ctx.tokens),
+    }));
     let state = Arc::new(crate::daemon::DaemonState {
         http: ctx.http.clone(),
         tokens: Arc::clone(&ctx.tokens),
-        executor: Box::new(crate::tools::LocalExecutor::new()),
+        executor: Box::new(executor),
         db: Arc::clone(&ctx.db),
         compacting_sessions: Arc::clone(&ctx.compacting_sessions),
         active_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
