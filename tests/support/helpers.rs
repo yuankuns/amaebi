@@ -33,6 +33,12 @@ pub enum Request {
         session_id: String,
         model: String,
     },
+    Workflow {
+        name: String,
+        args: serde_json::Map<String, serde_json::Value>,
+        model: String,
+        session_id: Option<String>,
+    },
 }
 
 /// A single frame streamed from the daemon back to the client.
@@ -379,6 +385,26 @@ pub async fn send_resume(
             tmux_pane: None,
             session_id: session_id.to_string(),
             model: model.to_string(),
+        },
+    )
+    .await
+}
+
+/// Send a workflow request and collect all response frames until `Done` or `Error`.
+pub async fn send_workflow(
+    client: &ClientHandle,
+    name: &str,
+    args: serde_json::Map<String, serde_json::Value>,
+    model: &str,
+    session_id: Option<&str>,
+) -> Result<Vec<Response>> {
+    send_request(
+        client,
+        &Request::Workflow {
+            name: name.to_string(),
+            args,
+            model: model.to_string(),
+            session_id: session_id.map(|s| s.to_string()),
         },
     )
     .await

@@ -26,7 +26,7 @@ use std::time::Duration;
 use support::{
     helpers::{
         collect_text, connect_client, seed_cron_job, send_message, send_message_with_session,
-        send_resume, setup_home, start_daemon, start_daemon_at_home_with_env,
+        send_resume, send_workflow, setup_home, start_daemon, start_daemon_at_home_with_env,
         start_daemon_with_env, LongChatConnection, Request, Response,
     },
     mock_llm::{MockLlmServer, ScriptedResponse},
@@ -2532,4 +2532,165 @@ async fn chat_long_connection_ask_still_single_turn() {
 
     let reqs = server.take_requests();
     assert_eq!(reqs.len(), 1, "exactly 1 LLM request for single turn");
+}
+
+// ---------------------------------------------------------------------------
+// Workflow IPC regression tests
+// ---------------------------------------------------------------------------
+
+/// W1: Request::Workflow reaches the daemon and streams Response::Text + Done.
+///
+/// Uses dev-loop with test_cmd="true" (always passes). The develop stage
+/// consumes one mock LLM response, the test stage passes, then commit-and-pr
+/// consumes a second LLM response. push-pr will fail (no git repo), so the
+/// workflow errors — but we verify that Text frames were streamed before the
+/// error, proving the IPC round-trip and streaming work.
+#[tokio::test]
+async fn workflow_ipc_streams_text_and_completes() {
+    let server = MockLlmServer::start().await;
+    // develop stage
+    server.enqueue(ScriptedResponse::text_chunks(vec![
+        "Implementing the feature now.",
+    ]));
+    // commit-and-pr stage (generate commit message)
+    server.enqueue(ScriptedResponse::text_chunks(vec![
+        "feat: add caching layer",
+    ]));
+
+    let daemon = start_daemon(&server.url()).await.expect("start daemon");
+    let client = connect_client(&daemon.socket);
+
+    let mut args = serde_json::Map::new();
+    args.insert("task".into(), "implement caching".into());
+    args.insert("test_cmd".into(), "true".into());
+
+    let responses = send_workflow(&client, "dev-loop", args, "gpt-4o", None)
+        .await
+        .expect("send_workflow");
+
+    // Must have at least one Text frame (LLM output or step markers).
+    let text_frames: Vec<_> = responses
+        .iter()
+        .filter(|r| matches!(r, Response::Text { .. }))
+        .collect();
+    assert!(
+        !text_frames.is_empty(),
+        "workflow must stream at least one Text frame; got: {responses:?}"
+    );
+
+    let text = collect_text(&responses);
+    // The LLM develop stage output should appear in the streamed text.
+    assert!(
+        text.contains("Implementing the feature now."),
+        "LLM output must be streamed to client; got: {text:?}"
+    );
+
+    // Step markers (cyan ==> lines) should also appear.
+    assert!(
+        text.contains("==>"),
+        "step markers must be streamed; got: {text:?}"
+    );
+}
+
+/// W2: Request::Workflow with unknown name returns Error frame.
+#[tokio::test]
+async fn workflow_ipc_unknown_name_returns_error() {
+    let server = MockLlmServer::start().await;
+    let daemon = start_daemon(&server.url()).await.expect("start daemon");
+    let client = connect_client(&daemon.socket);
+
+    let responses = send_workflow(
+        &client,
+        "nonexistent-workflow",
+        serde_json::Map::new(),
+        "gpt-4o",
+        None,
+    )
+    .await
+    .expect("send_workflow");
+
+    assert!(
+        responses
+            .iter()
+            .any(|r| matches!(r, Response::Error { .. })),
+        "unknown workflow must produce Error frame; got: {responses:?}"
+    );
+}
+
+/// W3: Request::Workflow with session_id injects parent session history into
+/// the LLM's context, so the model sees what the user was discussing.
+///
+/// Phase 1: seed a chat turn in session S so the daemon persists it to SQLite.
+/// Phase 2: send a workflow request with session_id=S, verify the captured LLM
+///          request includes the prior conversation in its messages array.
+#[tokio::test]
+async fn workflow_ipc_injects_session_context() {
+    let server = MockLlmServer::start().await;
+
+    // Phase 1: seed one chat turn so history exists in SQLite.
+    server.enqueue(ScriptedResponse::text_chunks(vec![
+        "The Redis caching layer should use LRU eviction.",
+    ]));
+    let daemon = start_daemon(&server.url()).await.expect("start daemon");
+    let client = connect_client(&daemon.socket);
+
+    let session_id = "test-wf-ctx-session";
+    send_message_with_session(
+        &client,
+        "design a Redis caching layer",
+        session_id,
+        "gpt-4o",
+    )
+    .await
+    .expect("seed chat turn");
+
+    // Drain phase-1 requests so they don't interfere with phase-2 inspection.
+    let drain_deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        if server.pending_response_count() == 0 || std::time::Instant::now() > drain_deadline {
+            break;
+        }
+    }
+    server.take_requests();
+
+    // Phase 2: send a workflow request with the same session_id.
+    // The develop stage will call the LLM — we check if the messages include
+    // the seeded history ("Redis caching layer").
+    server.enqueue(ScriptedResponse::text_chunks(vec![
+        "Implementing caching with Redis.",
+    ]));
+    // commit-and-pr stage
+    server.enqueue(ScriptedResponse::text_chunks(vec!["feat: add redis cache"]));
+
+    let mut args = serde_json::Map::new();
+    args.insert("task".into(), "implement the cache".into());
+    args.insert("test_cmd".into(), "true".into());
+
+    let _responses = send_workflow(&client, "dev-loop", args, "gpt-4o", Some(session_id))
+        .await
+        .expect("send_workflow with session");
+
+    // Inspect the captured LLM request — the first one is the develop stage.
+    let reqs = server.take_requests();
+    assert!(
+        !reqs.is_empty(),
+        "workflow must make at least one LLM request"
+    );
+
+    // The messages in the first request should contain the seeded conversation
+    // context (the user's "design a Redis caching layer" prompt).
+    let messages = reqs[0].messages().expect("request must have messages");
+    let all_text: String = messages
+        .iter()
+        .filter_map(|m| m.get("content"))
+        .filter_map(|c| c.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        all_text.contains("Redis caching layer")
+            || all_text.contains("redis")
+            || all_text.contains("caching layer"),
+        "workflow LLM request must include parent session history; messages: {all_text:?}"
+    );
 }
