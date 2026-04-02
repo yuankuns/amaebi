@@ -71,25 +71,22 @@ pub fn dev_loop(
                 "push-pr",
                 Action::Shell {
                     // -F reads the commit message from the file written by the preceding
-                    // Llm stage (last_llm_output_file), avoiding shell injection.
-                    // `gh pr create --fill` is idempotent: if a PR already exists for this
-                    // branch the command exits non-zero, so we fall back to printing the
-                    // existing PR URL instead.
                     // export sets env vars for the entire sh -c session so that
                     // git push and gh also get them (a bare `VAR=val cmd` prefix
                     // only applies to the first command in a && chain).
-                    // gh pr failures are best-effort: wrapped in (... || true) so
-                    // that a missing/failing gh never aborts the push-pr stage.
-                    // Copilot is added as reviewer only on initial PR creation.
+                    // Copilot review is triggered by posting '@github-copilot review'
+                    // as a PR comment — the only supported way to trigger the
+                    // copilot-pull-request-reviewer[bot]; reviewer API calls with
+                    // that bot login are rejected (not a collaborator).  Posting the
+                    // comment works on both initial creation and re-push retries.
                     command: "export GIT_TERMINAL_PROMPT=0 GH_PROMPT_DISABLED=1; \
                               git add -A && \
                               git commit -F {last_llm_output_file} && \
                               git push && \
-                              if gh pr create --fill 2>/dev/null; then \
-                                (gh pr edit --add-reviewer Copilot 2>/dev/null || true); \
-                              else \
-                                (gh pr view --json url -q '.url' 2>/dev/null || true); \
-                              fi"
+                              (gh pr create --fill 2>/dev/null || \
+                               gh pr view --json url -q '.url' 2>/dev/null || true) && \
+                              (gh pr comment --body '@github-copilot review' \
+                               2>/dev/null || true)"
                         .into(),
                 },
             )
