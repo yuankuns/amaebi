@@ -9,7 +9,7 @@ use super::{Action, Check, FailStrategy, Stage, Workflow};
 // ---------------------------------------------------------------------------
 
 /// Supervise Claude through a full development cycle:
-/// develop → run tests → (fix on fail) → create PR → @copilot review →
+/// develop → test script → (fix on fail) → create PR → @copilot review →
 /// (fix on comment) → done.
 pub fn dev_loop(
     task: &str,
@@ -31,7 +31,7 @@ pub fn dev_loop(
                 },
             )
             .with_on_fail(FailStrategy::Abort),
-            // Phase 2: run tests (code-guaranteed)
+            // Phase 2: run test script (fmt + clippy + tests in one shot)
             Stage::new(
                 "test",
                 Action::Shell {
@@ -40,29 +40,9 @@ pub fn dev_loop(
             )
             .with_on_fail(FailStrategy::Retry {
                 max: max_test_retries,
-                inject_prompt: "The test suite failed (exit code {exit_code}).\n\nstderr:\n```\n{stderr}\n```\n\nPlease fix the code so all tests pass.".into(),
+                inject_prompt: "The test script failed (exit code {exit_code}).\n\nstderr:\n```\n{stderr}\n```\n\nPlease fix the code so all checks pass.".into(),
             }),
-            // Phase 3: cargo fmt (code-guaranteed)
-            Stage::new(
-                "fmt",
-                Action::Shell {
-                    command: "cargo fmt".into(),
-                },
-            )
-            .with_on_fail(FailStrategy::Abort),
-            // Phase 4: clippy (code-guaranteed)
-            Stage::new(
-                "clippy",
-                Action::Shell {
-                    command: "cargo clippy -- -D warnings 2>&1".into(),
-                },
-            )
-            .with_on_fail(FailStrategy::Retry {
-                max: 2,
-                inject_prompt:
-                    "cargo clippy reported warnings:\n```\n{stderr}\n```\nPlease fix them.".into(),
-            }),
-            // Phase 5: commit + push + create PR (code-guaranteed)
+            // Phase 3: commit + push + create PR (code-guaranteed)
             Stage::new(
                 "commit-and-pr",
                 Action::Llm {
@@ -85,7 +65,7 @@ pub fn dev_loop(
                 },
             )
             .with_on_fail(FailStrategy::Abort),
-            // Phase 6: wait for @copilot review (code polls GitHub API)
+            // Phase 4: wait for @copilot review (code polls GitHub API)
             Stage::new(
                 "review",
                 Action::Shell {
