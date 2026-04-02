@@ -75,7 +75,11 @@ pub fn dev_loop(
                     // `gh pr create --fill` is idempotent: if a PR already exists for this
                     // branch the command exits non-zero, so we fall back to printing the
                     // existing PR URL instead.
-                    command: "git add -A && \
+                    // GIT_TERMINAL_PROMPT=0 and GH_PROMPT_DISABLED=1 prevent
+                    // git/gh from blocking on credential prompts in non-interactive
+                    // environments; auth failures surface immediately instead.
+                    command: "GIT_TERMINAL_PROMPT=0 GH_PROMPT_DISABLED=1 \
+                              git add -A && \
                               git commit -F {last_llm_output_file} && \
                               git push && \
                               (gh pr create --fill 2>/dev/null || gh pr view --json url -q '.url') && \
@@ -105,7 +109,8 @@ pub fn dev_loop(
             Stage::new(
                 "review",
                 Action::Shell {
-                    command: "for i in $(seq 60); do \
+                    command: "GH_PROMPT_DISABLED=1; \
+                              for i in $(seq 60); do \
                                 state=$(gh pr view --json reviews \
                                   -q '.reviews[-1].state // \"\"' 2>/dev/null); \
                                 [ -n \"$state\" ] && echo \"$state\" && break; \
@@ -279,9 +284,12 @@ pub fn bug_fix(
     max_retries: usize,
     list_cmd: Option<&str>,
 ) -> Workflow {
+    // Shell-quote the repo argument so that owner/repo values with special
+    // characters cannot escape the single-quoted shell context.
+    let repo_q = format!("'{}'", repo.replace('\'', r"'\''"));
     let list_command = list_cmd.map(|s| s.to_owned()).unwrap_or_else(|| {
         format!(
-            "gh issue list -R {repo} --label bug --json number,title,body \
+            "gh issue list -R {repo_q} --label bug --json number,title,body \
              --jq '.[] | \"- BUG #\" + (.number|tostring) + \": \" + .title'"
         )
     });
@@ -361,7 +369,8 @@ pub fn bug_fix(
                         Stage::new(
                             "pr",
                             Action::Shell {
-                                command: r#"git add -A && \
+                                command: r#"GIT_TERMINAL_PROMPT=0 GH_PROMPT_DISABLED=1 \
+                                          git add -A && \
                                           git commit -m "$(printf 'fix: %s' {item})" && \
                                           git push -u origin HEAD && \
                                           (gh pr create --fill 2>/dev/null || gh pr view --json url -q '.url')"#

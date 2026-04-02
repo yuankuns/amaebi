@@ -1906,6 +1906,32 @@ mod tests {
 // /workflow slash command handler
 // ---------------------------------------------------------------------------
 
+/// Minimal shell-word tokeniser: splits on whitespace while respecting
+/// `"double"` and `'single'` quoted spans.  Quotes are stripped from the
+/// output tokens.  No escape handling beyond the quotes themselves.
+fn shellwords(s: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut in_double = false;
+    let mut in_single = false;
+    for ch in s.chars() {
+        match ch {
+            '"' if !in_single => in_double = !in_double,
+            '\'' if !in_double => in_single = !in_single,
+            ' ' | '\t' if !in_double && !in_single => {
+                if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
+            }
+            _ => current.push(ch),
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
+}
+
 /// Parse and execute a `/workflow` slash command from `amaebi chat`.
 ///
 /// Syntax mirrors `amaebi workflow` subcommands:
@@ -1914,13 +1940,16 @@ mod tests {
 ///   /workflow perf-sweep SDPA backward kernel --bench-cmd python bench.py
 ///   /workflow tune-sweep attention hyperparams --run-cmd ./train.sh --resource gpu
 ///
-/// Positional arguments (task/target) are collected as all whitespace-separated
-/// tokens between the subcommand and the first `--flag`.
+/// Positional arguments (task/target) are collected as all shell-word tokens
+/// between the subcommand and the first `--flag`.
 async fn run_workflow_slash(prompt: &str, model: &str) -> anyhow::Result<String> {
     use crate::workflows::{builtins, executor, Context, ResourcePool};
     use std::sync::Arc;
 
-    let tokens: Vec<&str> = prompt.trim_start_matches('/').split_whitespace().collect();
+    // Shell-word-aware tokeniser: honours "quoted strings" and 'single quotes'
+    // so that arguments like --bench-cmd "python bench.py --iters 10" work.
+    let tokens = shellwords(prompt.trim_start_matches('/'));
+    let tokens: Vec<&str> = tokens.iter().map(|s| s.as_str()).collect();
     // tokens[0] = "workflow", tokens[1] = subcommand, tokens[2..] = args
     if tokens.len() < 2 {
         anyhow::bail!("usage: /workflow <dev-loop|bug-fix|perf-sweep|tune-sweep> [args]");
@@ -1943,9 +1972,19 @@ async fn run_workflow_slash(prompt: &str, model: &str) -> anyhow::Result<String>
         tokens.get(start..end).unwrap_or(&[]).join(" ")
     };
 
-    // Find the value for a `--flag value` pair.
-    let flag =
-        |flag: &str| -> Option<&str> { tokens.windows(2).find(|w| w[0] == flag).map(|w| w[1]) };
+    // Find the value for a `--flag value` or `--flag=value` pair.
+    let flag = |name: &str| -> Option<&str> {
+        let eq_prefix = format!("{name}=");
+        for (i, &tok) in tokens.iter().enumerate() {
+            if tok == name {
+                return tokens.get(i + 1).copied();
+            }
+            if let Some(val) = tok.strip_prefix(eq_prefix.as_str()) {
+                return Some(val);
+            }
+        }
+        None
+    };
 
     let workflow = match tokens[1] {
         "dev-loop" => {
