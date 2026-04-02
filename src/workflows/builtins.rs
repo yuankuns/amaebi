@@ -29,7 +29,7 @@ if [ -n "$REPO" ] && [ -n "$PR_NUM" ]; then
   for tid in $THREADS; do
     gh api graphql -f query="mutation { resolveReviewThread(input: {threadId: \"$tid\"}) { thread { isResolved } } }" >/dev/null 2>&1 || true
   done
-  gh pr edit --add-reviewer "copilot-pull-request-reviewer[bot]" 2>/dev/null || true
+  gh pr edit --add-reviewer "@copilot" 2>/dev/null || true
 fi
 echo "resolve-and-request-review done"
 "#
