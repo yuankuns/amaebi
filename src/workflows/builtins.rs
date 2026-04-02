@@ -9,11 +9,25 @@ use super::{Action, Check, FailStrategy, Stage, Workflow};
 // ---------------------------------------------------------------------------
 
 /// Supervise Claude through a full development cycle:
-/// develop → run tests → (fix on fail) → create PR → @copilot review →
+/// develop → test → (fix on fail) → create PR → @copilot review →
 /// (fix on comment) → done.
+///
+/// `test_cmd` is the **single quality gate** before the PR is created.
+/// It should run everything the project requires: unit tests, formatting,
+/// linting, type-checking, etc.  Use a script rather than a bare `cargo test`
+/// so that formatting and lint failures are caught in the same retry loop.
+///
+/// Example `scripts/test.sh` for a Rust project:
+/// ```bash
+/// #!/usr/bin/env bash
+/// set -e
+/// cargo test
+/// cargo fmt --check
+/// cargo clippy -- -D warnings
+/// ```
 pub fn dev_loop(
     task: &str,
-    test_cmd: &str, // e.g. "scripts/test.sh" or "cargo test"
+    test_cmd: &str, // comprehensive quality-gate script, e.g. "scripts/test.sh"
     max_test_retries: usize,
     max_review_retries: usize,
 ) -> Workflow {
@@ -31,7 +45,8 @@ pub fn dev_loop(
                 },
             )
             .with_on_fail(FailStrategy::Abort),
-            // Phase 2: run tests (code-guaranteed)
+            // Phase 2: full quality gate — tests, formatting, linting, etc.
+            // test_cmd should be a script that runs all checks in one shot.
             Stage::new(
                 "test",
                 Action::Shell {
@@ -42,29 +57,7 @@ pub fn dev_loop(
                 max: max_test_retries,
                 inject_prompt: "The test suite failed (exit code {exit_code}).\n\nstderr:\n```\n{stderr}\n```\n\nPlease fix the code so all tests pass.".into(),
             }),
-            // Phase 3: cargo fmt (code-guaranteed)
-            Stage::new(
-                "fmt",
-                Action::Shell {
-                    command: "cargo fmt".into(),
-                },
-            )
-            .with_on_fail(FailStrategy::Abort),
-            // Phase 4: clippy (code-guaranteed)
-            Stage::new(
-                "clippy",
-                Action::Shell {
-                    // No 2>&1: cargo clippy writes diagnostics to stderr.
-                    // The inject_prompt references {stderr} so the LLM sees the warnings.
-                    command: "cargo clippy -- -D warnings".into(),
-                },
-            )
-            .with_on_fail(FailStrategy::Retry {
-                max: 2,
-                inject_prompt:
-                    "cargo clippy reported warnings:\n```\n{stderr}\n```\nPlease fix them.".into(),
-            }),
-            // Phase 5: commit + push + create PR (code-guaranteed)
+            // Phase 3: commit + push + create PR (code-guaranteed)
             Stage::new(
                 "commit-and-pr",
                 Action::Llm {

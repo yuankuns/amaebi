@@ -2929,9 +2929,9 @@ async fn followup_tools_blocked_in_cron_job_context() {
 // IPC client.  They cover:
 //   WF-1. `run_workflow` is present in the tool schema
 //   WF-2. An unknown workflow name produces a clear error that the LLM sees
-//   WF-3. A real dev-loop workflow: LLM stages are called, shell stages run
-//         directly in the container (cargo fmt/clippy pass; git push fails
-//         as expected → workflow aborts → parent LLM handles gracefully)
+//   WF-3. A real dev-loop workflow: LLM stages are called, test_cmd runs,
+//         git commit fails (nothing staged) → workflow aborts → parent LLM
+//         handles gracefully
 // ---------------------------------------------------------------------------
 
 /// WF-1: The daemon must include `run_workflow` in the tools array it sends
@@ -3012,19 +3012,17 @@ async fn run_workflow_unknown_workflow_error_propagated_to_llm() {
 
 /// WF-3: A dev-loop workflow where the LLM tool is invoked from the daemon.
 ///
-/// The workflow runs real shell stages directly in the container:
-///   - "develop"       Llm stage  → mocked
-///   - "test"          Shell      → `true`  (always passes)
-///   - "fmt"           Shell      → `cargo fmt`  (passes in project root)
-///   - "clippy"        Shell      → `cargo clippy -- -D warnings 2>&1` (passes)
-///   - "commit-and-pr" Llm stage  → mocked
-///   - "push-pr"       Shell      → fails at `git push` (no remote) → Abort
+/// test_cmd is set to "true" so the quality gate passes instantly.
+/// The workflow then fails at push-pr because git commit finds nothing staged
+/// (the mocked develop LLM returns text without making file changes).
 ///
-/// The workflow aborts at push-pr; the daemon feeds the error back to the
-/// parent LLM; the parent responds with text.  This verifies:
-///   - Both Llm stages in the workflow fire (request count = 4)
-///   - Workflow failure is propagated to the parent LLM as a tool result
-///   - The daemon stays alive and completes the outer turn after the error
+///   - "develop"       Llm stage  → mocked
+///   - "test"          Shell      → `true` (quality-gate script, always passes)
+///   - "commit-and-pr" Llm stage  → mocked
+///   - "push-pr"       Shell      → fails at `git commit` (nothing staged) → Abort
+///
+/// Verifies: both Llm stages fire (4 total LLM requests), workflow failure
+/// propagates to the parent LLM, daemon stays alive.
 #[tokio::test]
 async fn run_workflow_dev_loop_executes_llm_stages_and_fails_at_push() {
     let server = MockLlmServer::start().await;
