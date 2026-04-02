@@ -75,20 +75,20 @@ pub fn dev_loop(
                     // `gh pr create --fill` is idempotent: if a PR already exists for this
                     // branch the command exits non-zero, so we fall back to printing the
                     // existing PR URL instead.
-                    // GIT_TERMINAL_PROMPT=0 and GH_PROMPT_DISABLED=1 prevent
-                    // git/gh from blocking on credential prompts in non-interactive
-                    // environments; auth failures surface immediately instead.
-                    // Copilot is added as a reviewer only when the PR is first
-                    // created; subsequent fix-and-push cycles skip the add since
-                    // Copilot is already assigned on the existing PR.
-                    command: "GIT_TERMINAL_PROMPT=0 GH_PROMPT_DISABLED=1 \
+                    // export sets env vars for the entire sh -c session so that
+                    // git push and gh also get them (a bare `VAR=val cmd` prefix
+                    // only applies to the first command in a && chain).
+                    // gh pr failures are best-effort: wrapped in (... || true) so
+                    // that a missing/failing gh never aborts the push-pr stage.
+                    // Copilot is added as reviewer only on initial PR creation.
+                    command: "export GIT_TERMINAL_PROMPT=0 GH_PROMPT_DISABLED=1; \
                               git add -A && \
                               git commit -F {last_llm_output_file} && \
                               git push && \
                               if gh pr create --fill 2>/dev/null; then \
-                                gh pr edit --add-reviewer Copilot 2>/dev/null || true; \
+                                (gh pr edit --add-reviewer Copilot 2>/dev/null || true); \
                               else \
-                                gh pr view --json url -q '.url'; \
+                                (gh pr view --json url -q '.url' 2>/dev/null || true); \
                               fi"
                         .into(),
                 },
@@ -387,11 +387,7 @@ pub fn bug_fix(
                         Stage::new(
                             "pr",
                             Action::Shell {
-                                command: r#"GIT_TERMINAL_PROMPT=0 GH_PROMPT_DISABLED=1 \
-                                          git add -A && \
-                                          git commit -m "$(printf 'fix: %s' {item})" && \
-                                          git push -u origin HEAD && \
-                                          (gh pr create --fill 2>/dev/null || gh pr view --json url -q '.url')"#
+                                command: r#"export GIT_TERMINAL_PROMPT=0 GH_PROMPT_DISABLED=1; git add -A && git commit -m "$(printf 'fix: %s' {item})" && git push -u origin HEAD && (gh pr create --fill 2>/dev/null || gh pr view --json url -q '.url' 2>/dev/null || true)"#
                                     .into(),
                             },
                         )
