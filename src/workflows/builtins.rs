@@ -15,6 +15,13 @@ fn resolve_and_request_review_cmd() -> String {
     // Step 1: resolve every unresolved review thread via GraphQL.
     // Step 2: re-request @copilot review so it evaluates the new commit.
     r#"
+GH_VER=$(gh --version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
+GH_MAJOR=$(echo "$GH_VER" | cut -d. -f1)
+GH_MINOR=$(echo "$GH_VER" | cut -d. -f2)
+if [ -z "$GH_VER" ] || [ "$GH_MAJOR" -lt 2 ] || { [ "$GH_MAJOR" -eq 2 ] && [ "$GH_MINOR" -lt 87 ]; }; then
+  echo "ERROR: gh >= 2.87.0 required for @copilot review (found ${GH_VER:-none})" >&2
+  exit 1
+fi
 REPO=$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null) || true
 PR_NUM=$(gh pr view --json number -q .number 2>/dev/null) || true
 if [ -n "$REPO" ] && [ -n "$PR_NUM" ]; then
