@@ -197,13 +197,13 @@ impl<W: tokio::io::AsyncWrite + Unpin + Send> tokio::io::AsyncWrite for MutexWri
         match self.0.try_lock() {
             Ok(mut guard) => std::pin::Pin::new(&mut *guard).poll_write(cx, buf),
             Err(_) => {
-                // Yield to the executor instead of busy-looping.  The next
-                // poll will re-attempt the lock after other tasks have run.
-                let waker = cx.waker().clone();
-                tokio::spawn(async move {
-                    tokio::task::yield_now().await;
-                    waker.wake();
-                });
+                // Contention is extremely rare in practice: the writer is
+                // only used sequentially by `run_agentic_loop` / workflow
+                // executor.  A simple immediate re-wake is sufficient —
+                // spawning a task from within poll_write is incorrect
+                // (futures must not spawn from poll).  The waker re-queues
+                // this future so the executor can schedule other work first.
+                cx.waker().wake_by_ref();
                 std::task::Poll::Pending
             }
         }
@@ -216,11 +216,7 @@ impl<W: tokio::io::AsyncWrite + Unpin + Send> tokio::io::AsyncWrite for MutexWri
         match self.0.try_lock() {
             Ok(mut guard) => std::pin::Pin::new(&mut *guard).poll_flush(cx),
             Err(_) => {
-                let waker = cx.waker().clone();
-                tokio::spawn(async move {
-                    tokio::task::yield_now().await;
-                    waker.wake();
-                });
+                cx.waker().wake_by_ref();
                 std::task::Poll::Pending
             }
         }
@@ -233,11 +229,7 @@ impl<W: tokio::io::AsyncWrite + Unpin + Send> tokio::io::AsyncWrite for MutexWri
         match self.0.try_lock() {
             Ok(mut guard) => std::pin::Pin::new(&mut *guard).poll_shutdown(cx),
             Err(_) => {
-                let waker = cx.waker().clone();
-                tokio::spawn(async move {
-                    tokio::task::yield_now().await;
-                    waker.wake();
-                });
+                cx.waker().wake_by_ref();
                 std::task::Poll::Pending
             }
         }

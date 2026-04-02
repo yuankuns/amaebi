@@ -35,6 +35,11 @@ pub struct SpawnContext {
 #[async_trait::async_trait]
 pub trait ToolExecutor: Send + Sync {
     async fn execute(&self, name: &str, args: serde_json::Value) -> Result<String>;
+
+    /// Set the current session ID so tools like `run_workflow` can load
+    /// conversation history from the DB.  Default implementation is a no-op
+    /// for executors that don't support session context.
+    fn set_session_id(&self, _sid: Option<String>) {}
 }
 
 // ---------------------------------------------------------------------------
@@ -67,6 +72,12 @@ pub struct LocalExecutor {
     /// Set to the agent's workspace in child executors so sandbox cwd matches
     /// the mounted workspace rather than the daemon process cwd.
     pub default_cwd: Option<PathBuf>,
+    /// Current session ID from the parent agentic loop.  Set by the daemon
+    /// before each loop so that `run_workflow` can load conversation history
+    /// from the DB and pass it to the workflow executor for context.
+    /// Wrapped in `Mutex` for interior mutability since `DaemonState` is
+    /// shared via `Arc`.
+    pub session_id: Arc<Mutex<Option<String>>>,
 }
 
 impl LocalExecutor {
@@ -94,12 +105,17 @@ impl LocalExecutor {
             sandbox,
             spawn_ctx: None,
             default_cwd,
+            session_id: Arc::new(Mutex::new(None)),
         }
     }
 }
 
 #[async_trait::async_trait]
 impl ToolExecutor for LocalExecutor {
+    fn set_session_id(&self, sid: Option<String>) {
+        *self.session_id.lock().unwrap_or_else(|p| p.into_inner()) = sid;
+    }
+
     async fn execute(&self, name: &str, args: serde_json::Value) -> Result<String> {
         tracing::debug!(tool = %name, "executing tool");
         match name {
@@ -118,7 +134,14 @@ impl ToolExecutor for LocalExecutor {
                 ),
             },
             "run_workflow" => match &self.spawn_ctx {
-                Some(ctx) => run_workflow_tool(args, ctx).await,
+                Some(ctx) => {
+                    let sid = self
+                        .session_id
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .clone();
+                    run_workflow_tool(args, ctx, sid.as_deref()).await
+                }
                 None => anyhow::bail!("run_workflow is not available in this context"),
             },
             other => anyhow::bail!("unknown tool: {other}"),
@@ -246,7 +269,11 @@ async fn read_file(args: serde_json::Value) -> Result<String> {
 ///
 /// The workflow engine handles all flow control in code; Claude only does
 /// content work (coding, analysis, summaries) within each LLM stage.
-async fn run_workflow_tool(args: serde_json::Value, ctx: &SpawnContext) -> Result<String> {
+async fn run_workflow_tool(
+    args: serde_json::Value,
+    ctx: &SpawnContext,
+    session_id: Option<&str>,
+) -> Result<String> {
     use crate::workflows::{build_workflow, executor, Context};
     use std::sync::Arc;
 
@@ -262,8 +289,34 @@ async fn run_workflow_tool(args: serde_json::Value, ctx: &SpawnContext) -> Resul
 
     let model = std::env::var("AMAEBI_MODEL").unwrap_or_else(|_| "gpt-4o".to_string());
 
-    let mut executor = crate::tools::LocalExecutor::new();
-    executor.spawn_ctx = Some(Arc::new(SpawnContext {
+    // Load parent session context so the workflow's LLM stages have
+    // conversation history about what the user was working on.
+    let (history, summaries, own_summary) = if let Some(sid) = session_id {
+        let db = Arc::clone(&ctx.db);
+        let sid = sid.to_owned();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+            let conn = db.lock().unwrap_or_else(|p| p.into_inner());
+            Ok((
+                crate::memory_db::get_session_history(&conn, &sid)?,
+                crate::memory_db::get_recent_summaries(&conn, &sid, 5)?,
+                crate::memory_db::get_session_own_summary(&conn, &sid)?,
+            ))
+        })
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(error=%e, "run_workflow_tool: session load panicked");
+            Ok((vec![], vec![], None))
+        })
+        .unwrap_or_else(|e| {
+            tracing::warn!(error=%e, "run_workflow_tool: session load failed");
+            (vec![], vec![], None)
+        })
+    } else {
+        (vec![], vec![], None)
+    };
+
+    let mut child_executor = crate::tools::LocalExecutor::new();
+    child_executor.spawn_ctx = Some(Arc::new(SpawnContext {
         http: ctx.http.clone(),
         db: Arc::clone(&ctx.db),
         compacting_sessions: Arc::clone(&ctx.compacting_sessions),
@@ -272,7 +325,7 @@ async fn run_workflow_tool(args: serde_json::Value, ctx: &SpawnContext) -> Resul
     let state = Arc::new(crate::daemon::DaemonState {
         http: ctx.http.clone(),
         tokens: Arc::clone(&ctx.tokens),
-        executor: Box::new(executor),
+        executor: Box::new(child_executor),
         db: Arc::clone(&ctx.db),
         compacting_sessions: Arc::clone(&ctx.compacting_sessions),
         active_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
@@ -289,9 +342,9 @@ async fn run_workflow_tool(args: serde_json::Value, ctx: &SpawnContext) -> Resul
         wf_ctx,
         &pool,
         writer,
-        &[],
-        &[],
-        None,
+        &history,
+        &summaries,
+        own_summary.as_deref(),
     )
     .await
 }
@@ -464,6 +517,7 @@ async fn spawn_agent(args: serde_json::Value, ctx: &SpawnContext) -> Result<Stri
         sandbox: Some(child_sandbox),
         spawn_ctx: None,
         default_cwd: Some(workspace.clone()),
+        session_id: Arc::new(Mutex::new(None)),
     };
 
     // Build a minimal DaemonState for the child: reuse the parent's HTTP
@@ -1031,6 +1085,7 @@ mod tests {
             sandbox: Some(Box::new(crate::sandbox::NoopSandbox)),
             spawn_ctx: None,
             default_cwd: None,
+            session_id: Arc::new(Mutex::new(None)),
         };
         let args = serde_json::json!({"command": "echo hello"});
         let result = exec.execute("shell_command", args).await.unwrap();
@@ -1044,6 +1099,7 @@ mod tests {
             sandbox: Some(Box::new(crate::sandbox::NoopSandbox)),
             spawn_ctx: None,
             default_cwd: Some(tmp.path().to_path_buf()),
+            session_id: Arc::new(Mutex::new(None)),
         };
         // pwd should print the default_cwd, not the daemon process cwd.
         let result = exec

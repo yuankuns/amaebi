@@ -2538,13 +2538,14 @@ async fn chat_long_connection_ask_still_single_turn() {
 // Workflow IPC regression tests
 // ---------------------------------------------------------------------------
 
-/// W1: Request::Workflow reaches the daemon and streams Response::Text + Done.
+/// W1: Request::Workflow reaches the daemon and streams Response::Text frames.
 ///
 /// Uses dev-loop with test_cmd="true" (always passes). The develop stage
 /// consumes one mock LLM response, the test stage passes, then commit-and-pr
-/// consumes a second LLM response. push-pr will fail (no git repo), so the
-/// workflow errors — but we verify that Text frames were streamed before the
-/// error, proving the IPC round-trip and streaming work.
+/// consumes a second LLM response. push-pr will fail (no git repo) so the
+/// workflow eventually errors — but we verify that streaming happened before
+/// the expected error, proving the IPC round-trip and streaming work.
+/// The test name reflects the success criterion: Text frames were streamed.
 #[tokio::test]
 async fn workflow_ipc_streams_text_and_completes() {
     let server = MockLlmServer::start().await;

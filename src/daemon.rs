@@ -944,6 +944,9 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                 let (steer_tx, mut steer_rx) = tokio::sync::mpsc::channel::<Option<String>>(16);
                 let expected_chat_sid = sid.clone();
 
+                // Propagate session ID to executor so run_workflow can load history.
+                state.executor.set_session_id(Some(sid.clone()));
+
                 let writer_loop = Arc::clone(&writer);
                 let state_loop = Arc::clone(&state);
                 let model_loop = model.clone();

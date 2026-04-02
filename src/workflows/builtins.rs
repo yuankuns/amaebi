@@ -147,7 +147,7 @@ pub fn perf_sweep(
                 Action::Map {
                     parse: r"- OPT: (.+)".into(),
                     parallel: false, // serial: each builds on previous
-                    concurrency: None,
+                    concurrency_resource: None,
                     stages: vec![
                         // 3a: Claude implements the optimization
                         Stage::new(
@@ -191,6 +191,13 @@ pub fn perf_sweep(
                                     .into(),
                         }),
                         // 3d: commit successful optimization
+                        // NOTE: {item} comes from the LLM's `- OPT: ...` output
+                        // parsed by regex.  If the text contains shell
+                        // metacharacters (e.g. single quotes), the quoting may
+                        // break.  This is a known limitation — items are
+                        // relatively constrained by the regex capture.  For
+                        // safety-critical contexts, use {last_llm_output_file}
+                        // with `git commit -F` instead.
                         Stage::new(
                             "commit",
                             Action::Shell {
@@ -262,7 +269,7 @@ pub fn bug_fix(
                 Action::Map {
                     parse: r"- BUG: (.+)".into(),
                     parallel: true, // bugs are independent
-                    concurrency: None,
+                    concurrency_resource: None,
                     stages: vec![
                         // 3a: checkout a new branch for this bug
                         Stage::new(
@@ -299,6 +306,11 @@ pub fn bug_fix(
                                     .into(),
                         }),
                         // 3d: push + PR (code-guaranteed)
+                        // NOTE: {item} comes from the LLM's `- BUG: ...` output
+                        // parsed by regex.  Shell metacharacters in the item
+                        // text (e.g. single quotes) could break the quoting.
+                        // This is a known limitation — see the perf_sweep
+                        // commit stage for the same caveat.
                         Stage::new(
                             "pr",
                             Action::Shell {
@@ -367,7 +379,7 @@ pub fn tune_sweep(
                 Action::Map {
                     parse: r"- TUNE: (.+)".into(),
                     parallel: true,
-                    concurrency: None, // config generation is just LLM, no resource needed
+                    concurrency_resource: None, // config generation is just LLM, no resource needed
                     stages: vec![Stage::new(
                         "write-config",
                         Action::Llm {
@@ -387,7 +399,7 @@ pub fn tune_sweep(
                 Action::Map {
                     parse: r"- TUNE: (.+)".into(),
                     parallel: true,
-                    concurrency: Some(resource.to_owned()), // e.g. "gpu" limits concurrency
+                    concurrency_resource: Some(resource.to_owned()), // e.g. "gpu" — metadata hint only
                     stages: vec![
                         Stage::new(
                             "run",

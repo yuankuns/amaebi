@@ -83,9 +83,12 @@ pub enum Action {
         /// false = sequential (items depend on each other, e.g. perf_sweep).
         /// true  = parallel (items are independent, e.g. bug_fix, tune_sweep).
         parallel: bool,
-        /// Optional named resource that limits concurrency within parallel maps.
-        /// e.g. Some("gpu") with a pool of 2 → at most 2 items run simultaneously.
-        concurrency: Option<String>,
+        /// Metadata hint: documents which named resource the sub-stages
+        /// reference for concurrency control.  **Not enforced at the Map
+        /// level** — actual semaphore acquisition happens inside each
+        /// sub-stage via `Stage::requires` / `with_requires()`.
+        /// e.g. Some("gpu") indicates sub-stages hold the "gpu" resource.
+        concurrency_resource: Option<String>,
     },
 }
 

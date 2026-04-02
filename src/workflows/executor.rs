@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Context as _, Result};
 use async_recursion::async_recursion;
 use regex::Regex;
+use std::os::unix::fs::OpenOptionsExt;
 use std::sync::Arc;
 use tokio::io::AsyncWrite;
 use tokio::sync::Mutex;
@@ -37,6 +38,12 @@ async fn write_step(writer: &SharedWriter, msg: &str) {
 /// Create a no-op writer (for tests or contexts that discard output).
 pub fn sink_writer() -> SharedWriter {
     Arc::new(Mutex::new(Box::new(tokio::io::sink())))
+}
+
+/// Create a writer that sends LLM output to stderr so the CLI user sees
+/// real-time progress from workflow stages.
+pub fn stderr_writer() -> SharedWriter {
+    Arc::new(Mutex::new(Box::new(tokio::io::stderr())))
 }
 
 // ---------------------------------------------------------------------------
@@ -210,15 +217,25 @@ async fn run_single_stage(
             let text = llm_turn(state, model, messages, &rendered, writer).await?;
             ctx.set("last_llm_output", &text);
             // Write to a unique temp file so parallel Map items don't race on
-            // a shared path.  The file is kept alive via `into_temp_path()` so
-            // downstream Shell stages can read it via {last_llm_output_file}.
-            // Use a unique temp file path (pid + atomic counter) so parallel
-            // Map items don't race on a shared path.
+            // a shared path.  Uses pid + atomic counter for uniqueness and
+            // restricts permissions to owner-only (0o600) to avoid leaking
+            // LLM output to other users on shared machines.
             use std::sync::atomic::{AtomicU64, Ordering};
             static COUNTER: AtomicU64 = AtomicU64::new(0);
             let id = COUNTER.fetch_add(1, Ordering::Relaxed);
             let tmp_path = format!("/tmp/amaebi_llm_{}_{id}.txt", std::process::id());
-            std::fs::write(&tmp_path, &text).context("writing LLM output to temp file")?;
+            {
+                use std::io::Write;
+                let mut f = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .mode(0o600)
+                    .open(&tmp_path)
+                    .context("creating LLM output temp file")?;
+                f.write_all(text.as_bytes())
+                    .context("writing LLM output to temp file")?;
+            }
             ctx.set("last_llm_output_file", &tmp_path);
             run_check(&stage.check, ctx).await?;
             Ok(Some(text))
@@ -248,7 +265,7 @@ async fn run_single_stage(
             parse,
             stages: sub_stages,
             parallel,
-            concurrency,
+            concurrency_resource,
         } => {
             let source = ctx.get("last_llm_output").unwrap_or("").to_owned();
             let items = parse_items(parse, &source)?;
@@ -271,8 +288,9 @@ async fn run_single_stage(
                     model,
                     ctx,
                     resources,
-                    concurrency.as_deref(),
+                    concurrency_resource.as_deref(),
                     writer,
+                    messages,
                 )
                 .await?;
             } else {
@@ -332,9 +350,13 @@ async fn run_map_parallel(
     resources: &ResourcePool,
     _concurrency_resource: Option<&str>,
     writer: &SharedWriter,
+    base_messages: &[Message],
 ) -> Result<()> {
     #[allow(clippy::type_complexity)]
     let results: Arc<Mutex<Vec<(usize, Result<()>)>>> = Arc::new(Mutex::new(Vec::new()));
+
+    // Clone once outside the loop; each spawned task gets its own clone.
+    let base_msgs: Vec<Message> = base_messages.to_vec();
 
     let mut handles = Vec::new();
 
@@ -350,6 +372,7 @@ async fn run_map_parallel(
         let model = model.to_owned();
         let total = items.len();
         let writer = Arc::clone(writer);
+        let item_base_msgs = base_msgs.clone();
 
         let handle = tokio::spawn(async move {
             // Concurrency is enforced per-stage via with_requires() on individual
@@ -365,9 +388,11 @@ async fn run_map_parallel(
             )
             .await;
 
-            let mut messages =
-                build_messages_no_workflow(&format!("Working on: {item}"), None, &[], &[], None);
-            inject_skill_files(&mut messages).await;
+            // Clone the parent messages so parallel items inherit the full
+            // session context (conversation history, summaries) built by
+            // execute().  This avoids each item starting with a blank slate.
+            let mut messages = item_base_msgs;
+            messages.push(Message::user(format!("Working on: {item}")));
 
             let result = run_parallel_item_stages(
                 &sub_stages,
@@ -543,6 +568,14 @@ fn parse_items(pattern: &str, text: &str) -> Result<Vec<String>> {
 
 /// Naive benchmark regression: compare JSON numbers between two snapshots.
 /// Returns Some(description) if any metric regressed beyond `threshold`.
+///
+/// **Assumption: all metrics are higher-is-better** (e.g. throughput, fps).
+/// A drop beyond `threshold` is flagged as a regression; an increase is fine.
+/// Metrics with a zero or negative baseline are silently skipped.
+///
+/// To support lower-is-better metrics (e.g. latency_ms, error_count), extend
+/// this function with a naming convention (e.g. metrics prefixed with `inv_`
+/// invert the comparison) or accept a separate `lower_is_better: &[&str]` set.
 fn detect_regression(
     baseline_json: &str,
     current_json: &str,
@@ -647,7 +680,7 @@ mod tests {
                     Action::Map {
                         parse: r"- ITEM: (.+)".into(),
                         parallel: false,
-                        concurrency: None,
+                        concurrency_resource: None,
                         stages: vec![Stage::new(
                             "write",
                             Action::Shell {
@@ -695,7 +728,7 @@ mod tests {
                 Action::Map {
                     parse: r"- SLEEP: (.+)".into(),
                     parallel: true,
-                    concurrency: None,
+                    concurrency_resource: None,
                     stages: vec![Stage::new(
                         "sleep",
                         Action::Shell {
@@ -742,7 +775,7 @@ mod tests {
                 Action::Map {
                     parse: r"- ITEM: (.+)".into(),
                     parallel: true,
-                    concurrency: Some("slot".into()),
+                    concurrency_resource: Some("slot".into()),
                     stages: vec![Stage::new(
                         "work",
                         Action::Shell {
