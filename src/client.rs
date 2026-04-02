@@ -1140,21 +1140,24 @@ mod prompt_input {
                 // Backspace (DEL = 0x7f on most terminals; BS = 0x08 on some)
                 0x7f | 0x08 => {
                     if let (Some(_), Some(w)) = (chars.pop(), widths.pop()) {
-                        // ESC[wD moves the cursor left exactly w columns.
-                        // Raw \x08 bytes are unreliable for wide characters: some
-                        // terminals "snap" the cursor to the left boundary of a wide
-                        // char on the first \x08, so two \x08s overshoot by one
-                        // column when the character starts at an odd column position
-                        // (e.g. after an odd count of ASCII chars).  That leaves the
-                        // right-half cell of the CJK glyph visible on screen even
-                        // though the character was correctly removed from the buffer.
-                        //
-                        // ESC[K (erase to end of line) then clears all remaining
-                        // visual cells without needing to know the exact cell layout.
-                        // This is safe here because the cursor is always at the very
-                        // end of the user's input in this editor.
-                        write!(output, "\x1b[{w}D\x1b[K")?;
-                        output.flush()?;
+                        if w > 0 {
+                            // ESC[wD moves the cursor left exactly w columns.
+                            // Raw \x08 bytes are unreliable for wide characters:
+                            // some terminals "snap" the cursor to the left boundary
+                            // of a wide char on the first \x08, so two \x08s
+                            // overshoot by one column when the character starts at
+                            // an odd column position (e.g. after an odd count of
+                            // ASCII chars).
+                            //
+                            // ESC[K (erase to end of line) then clears all remaining
+                            // visual cells without needing to know the exact cell
+                            // layout.  This is safe because the cursor is always at
+                            // the very end of the user's input in this editor.
+                            write!(output, "\x1b[{w}D\x1b[K")?;
+                        }
+                        // Zero-width characters (combining marks, etc.) are removed
+                        // from the buffer but don't need a cursor movement since
+                        // they did not advance the cursor when originally echoed.
                     }
                 }
                 // Escape sequences (arrows, function keys) — consume and discard.
@@ -1168,24 +1171,36 @@ mod prompt_input {
                 // need bare ESC can press Ctrl-C instead.
                 0x1b => {
                     let mut eb = [0u8; 1];
-                    if input.read_exact(&mut eb).is_ok() && eb[0] == b'[' {
-                        // CSI sequence: read until final byte in 0x40–0x7E.
-                        loop {
-                            let mut fb = [0u8; 1];
-                            if input.read_exact(&mut fb).is_err() {
-                                break;
+                    if input.read_exact(&mut eb).is_ok() {
+                        match eb[0] {
+                            // CSI sequence (ESC [): read until final byte in
+                            // 0x40–0x7E.
+                            b'[' => loop {
+                                let mut fb = [0u8; 1];
+                                if input.read_exact(&mut fb).is_err() {
+                                    break;
+                                }
+                                if (0x40..=0x7e).contains(&fb[0]) {
+                                    break;
+                                }
+                            },
+                            // SS3 sequence (ESC O): used by some terminals for
+                            // function keys (F1–F4) and keypad.  Always exactly
+                            // 3 bytes total (ESC O <final>), so consume one more.
+                            b'O' => {
+                                let mut fb = [0u8; 1];
+                                let _ = input.read_exact(&mut fb);
                             }
-                            if (0x40..=0x7e).contains(&fb[0]) {
-                                break;
-                            }
+                            // Other 2-byte ESC sequences (e.g. ESC M): the
+                            // second byte was already consumed by read_exact
+                            // above, so nothing more to discard.
+                            _ => {}
                         }
                     }
-                    // Other 2-byte ESC sequences: second byte already consumed above.
                 }
                 // ASCII printable
                 b @ 0x20..=0x7e => {
                     output.write_all(&[b])?;
-                    output.flush()?;
                     chars.push(b as char);
                     widths.push(1);
                 }
@@ -1208,12 +1223,12 @@ mod prompt_input {
                     }
                     if let Ok(s) = std::str::from_utf8(&utf8_buf) {
                         if let Some(ch) = s.chars().next() {
-                            // width() returns Some(0) for zero-width combining marks.
-                            // Clamp to 1 so the backspace erase emits at least ESC[1D,
-                            // which is well-defined on all VT100-compatible terminals.
-                            let w = ch.width().unwrap_or(1).max(1);
+                            // width() returns Some(0) for zero-width combining
+                            // marks; we preserve that so backspace knows not to
+                            // move the cursor for them.  Control/format characters
+                            // return None — default those to 1.
+                            let w = ch.width().unwrap_or(1);
                             output.write_all(s.as_bytes())?;
-                            output.flush()?;
                             chars.push(ch);
                             widths.push(w);
                         }
@@ -1223,6 +1238,11 @@ mod prompt_input {
                 // Other control bytes — ignore silently.
                 _ => {}
             }
+
+            // Flush once per iteration rather than after every individual
+            // write.  This batches output during fast input (e.g. pastes)
+            // while keeping the display responsive for single keystrokes.
+            output.flush()?;
         }
     }
 
@@ -1516,6 +1536,55 @@ mod prompt_input {
             assert_eq!('한'.width(), Some(2));
         }
 
+        // ------------------------------------------------------------------ //
+        // Zero-width combining marks — backspace must not over-erase
+        // ------------------------------------------------------------------ //
+
+        #[test]
+        fn combining_mark_stored_with_zero_width() {
+            // U+0301 COMBINING ACUTE ACCENT — zero-width
+            // "e" + combining accent + Enter → "e\u{0301}"
+            // Build the input manually for clarity (U+0301 = 0xCC 0x81).
+            let input = {
+                let mut v = Vec::new();
+                v.push(b'e');
+                // U+0301 is 0xCC 0x81 in UTF-8
+                v.push(0xCC);
+                v.push(0x81);
+                v.push(b'\r');
+                v
+            };
+            let (res, _) = run(&input);
+            assert_eq!(res.unwrap(), Some("e\u{0301}".to_string()));
+        }
+
+        #[test]
+        fn backspace_combining_mark_removes_only_mark() {
+            // "e" + combining accent + DEL + Enter → "e"
+            // Backspacing the combining mark should NOT move the cursor.
+            let input = {
+                let mut v = Vec::new();
+                v.push(b'e');
+                v.push(0xCC); // U+0301 lead
+                v.push(0x81); // U+0301 cont
+                v.push(0x7f); // DEL
+                v.push(b'\r');
+                v
+            };
+            let (res, echo) = run(&input);
+            assert_eq!(res.unwrap(), Some("e".to_string()));
+
+            // The echo should contain 'e' (1 byte) + combining accent (2 bytes).
+            // Then backspace of zero-width char should NOT emit ESC[…D (no cursor move).
+            let after_char = &echo[3..]; // skip 'e' + 2-byte combining
+                                         // Should NOT start with a cursor-back sequence
+            assert!(
+                !after_char.starts_with(b"\x1b["),
+                "zero-width backspace must not emit cursor-back; got: {:?}",
+                &after_char[..after_char.len().min(10)]
+            );
+        }
+
         #[test]
         fn latin_ascii_has_width_1() {
             assert_eq!('a'.width(), Some(1));
@@ -1551,6 +1620,21 @@ mod prompt_input {
             // ESC M (reverse index) — 2-byte, not CSI
             let (res, _) = run(b"\x1bMok\r");
             assert_eq!(res.unwrap(), Some("ok".to_string()));
+        }
+
+        #[test]
+        fn ss3_sequence_fully_consumed() {
+            // ESC O P = F1 key (SS3 sequence) — all 3 bytes must be consumed
+            // so the 'P' (0x50) does not leak into the input buffer.
+            let (res, _) = run(b"\x1bOPok\r");
+            assert_eq!(res.unwrap(), Some("ok".to_string()));
+        }
+
+        #[test]
+        fn ss3_f4_sequence_fully_consumed() {
+            // ESC O S = F4 key — another common SS3 sequence.
+            let (res, _) = run(b"hi\x1bOSthere\r");
+            assert_eq!(res.unwrap(), Some("hithere".to_string()));
         }
 
         // ------------------------------------------------------------------ //
