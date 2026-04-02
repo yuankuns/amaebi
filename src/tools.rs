@@ -17,8 +17,10 @@ use crate::sandbox::{docker::DockerSandboxConfig, DockerSandbox, NoopSandbox, Sa
 /// Note: parent-session summary lookup is performed by `run_cron_job` at
 /// fire time using `state.db` directly; this struct does not carry a DB handle.
 ///
-/// Set to `None` in child agents and in follow-up-triggered loops to prevent
-/// recursive scheduling.
+/// Recursive scheduling is prevented by passing `include_followup=false` to
+/// `run_agentic_loop` for child agents and cron-triggered loops, which omits
+/// the follow-up tools from the schema sent to the model.  The executor's
+/// `followup_ctx` may still be `Some` in those contexts.
 pub struct FollowupContext {
     /// Optional session UUID of the currently-running agentic loop, used as
     /// the default `parent_session_id` when the caller does not pass an
@@ -856,7 +858,10 @@ async fn cancel_followup(args: serde_json::Value, ctx: &FollowupContext) -> Resu
 
     let store = open_cron_store(ctx)?;
     if store.delete_if_model_created(id)? {
-        Ok(format!("Follow-up {id} cancelled."))
+        Ok(format!(
+            "Follow-up {id} cancelled (best-effort: if status was 'running' \
+             the job may already be executing and will complete normally)."
+        ))
     } else {
         Ok(format!("No model-created follow-up found with id {id}."))
     }

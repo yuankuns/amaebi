@@ -59,8 +59,9 @@ pub struct CronJob {
     ///
     /// One-shot model-created jobs transition: pending → running (at scheduler
     /// pre-stamp) → deleted (after execution).  The status column allows
-    /// `list_followups` to show in-flight jobs and `cancel_followup` to cancel
-    /// them even after the daemon has stamped `last_run`.
+    /// `list_followups` to show in-flight jobs.  `cancel_followup` can delete
+    /// a job in any non-completed state, but cancellation of a 'running' job
+    /// is best-effort: if the agentic loop has already started, it will finish.
     pub status: String,
 }
 
@@ -190,7 +191,15 @@ impl CronStore {
             .context("reading user_version")?;
 
         if version < 2 {
-            // Collect existing column names once (used by both migrations).
+            // Acquire an exclusive write lock first, then re-read the schema.
+            // Collecting column names before BEGIN IMMEDIATE could race with
+            // another process that runs the same migration concurrently.
+            conn.execute_batch("BEGIN IMMEDIATE;")
+                .context("beginning migration transaction")?;
+
+            // Re-read column names inside the transaction so the check is
+            // authoritative: no other writer can add columns between here and
+            // our ALTER TABLE calls.
             let existing_cols: std::collections::HashSet<String> = conn
                 .prepare("PRAGMA table_info(cron_jobs)")
                 .context("PRAGMA table_info")?
@@ -198,9 +207,6 @@ impl CronStore {
                 .context("reading table_info")?
                 .collect::<rusqlite::Result<_>>()
                 .context("collecting column names")?;
-
-            conn.execute_batch("BEGIN IMMEDIATE;")
-                .context("beginning migration transaction")?;
 
             let add_if_missing = |col: &str, def: &str| -> Result<()> {
                 if !existing_cols.contains(col) {
@@ -618,9 +624,10 @@ pub fn due_jobs(jobs: &[CronJob], now: &chrono::DateTime<chrono::Utc>) -> Vec<Cr
         let due_now = if job.one_shot {
             // Skip one-shot jobs that have already completed.  Jobs in the
             // 'running' state are eligible again: if the daemon crashed after
-            // setting status='running' but before execution, the in-memory
-            // running_jobs set (re-populated on restart) and the last_run
-            // guard (30-second window) prevent actual duplicate execution.
+            // setting status='running' but before execution, the last_run
+            // guard (30-second window) prevents immediate re-firing, and the
+            // in-memory running_jobs set (empty on a fresh restart) will be
+            // re-populated as the job is re-spawned on the next tick.
             if job.status == "completed" {
                 tracing::debug!(
                     id = %job.id,

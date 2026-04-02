@@ -2464,7 +2464,7 @@ async fn chat_long_connection_ask_still_single_turn() {
 //   cancel_followup    — deletes a pending model-created job
 //   list_followups     — returns pending model-created jobs to the model
 //
-// A sixth test verifies that followup tools are blocked (not in schema)
+// Another test verifies that followup tools are blocked (not in schema)
 // when called from inside a cron job context.
 
 // ---------------------------------------------------------------------------
