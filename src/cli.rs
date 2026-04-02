@@ -129,6 +129,84 @@ pub enum Command {
         #[command(subcommand)]
         action: InboxAction,
     },
+    /// Run a supervised workflow: amaebi controls flow, Claude does the work.
+    ///
+    /// Workflows guarantee every step executes (code-driven flow control).
+    /// The LLM is invoked only for content: coding, analysis, summaries.
+    Workflow {
+        #[command(subcommand)]
+        action: WorkflowAction,
+        /// Path to the Unix socket.
+        #[arg(long, default_value = DEFAULT_SOCKET, global = true)]
+        socket: PathBuf,
+        /// Model to use (overrides AMAEBI_MODEL; default: gpt-4o).
+        #[arg(long, global = true)]
+        model: Option<String>,
+    },
+}
+
+#[derive(clap::Subcommand, Debug)]
+pub enum WorkflowAction {
+    /// Develop → test → fix → PR → @copilot review → fix → done.
+    DevLoop {
+        /// Development task description.
+        task: String,
+        /// Test command (must exit 0 on success).
+        #[arg(long, default_value = "cargo test")]
+        test_cmd: String,
+        /// Max times to retry after test failure.
+        #[arg(long, default_value = "5")]
+        max_test_retries: usize,
+        /// Max times to retry after review comments.
+        #[arg(long, default_value = "5")]
+        max_review_retries: usize,
+    },
+    /// List optimization points → try each serially → revert regressions → summarize.
+    PerfSweep {
+        /// What to optimize (e.g. "SDPA backward kernel").
+        target: String,
+        /// Files to read as context (code, docs).
+        #[arg(long)]
+        docs: Vec<String>,
+        /// Benchmark command — must output JSON with numeric metrics.
+        #[arg(long)]
+        bench_cmd: String,
+        /// Regression threshold (0–1). Default 0.05 = 5%.
+        #[arg(long, default_value = "0.05")]
+        regression_threshold: f64,
+    },
+    /// Fetch open bug issues → fix each in parallel → PR → summarize.
+    BugFix {
+        /// GitHub repository (owner/repo).
+        #[arg(long)]
+        repo: String,
+        /// Test command.
+        #[arg(long, default_value = "cargo test")]
+        test_cmd: String,
+        /// Max retries per bug fix.
+        #[arg(long, default_value = "3")]
+        max_retries: usize,
+    },
+    /// List tuning directions → run experiments in parallel (resource-constrained) → summarize.
+    TuneSweep {
+        /// What to tune (e.g. "attention kernel hyperparameters").
+        target: String,
+        /// Context files (code, docs).
+        #[arg(long)]
+        docs: Vec<String>,
+        /// Command to run one experiment. Use {item_index} for output dir.
+        #[arg(long)]
+        run_cmd: String,
+        /// Command to collect results for one experiment.
+        #[arg(long)]
+        result_cmd: String,
+        /// Resource name that limits concurrency (e.g. "gpu").
+        #[arg(long, default_value = "gpu")]
+        resource: String,
+        /// Number of available resource units (e.g. 2 GPUs).
+        #[arg(long, default_value = "1")]
+        resource_count: usize,
+    },
 }
 
 #[derive(clap::Subcommand, Debug)]
