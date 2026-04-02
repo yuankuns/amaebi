@@ -330,7 +330,7 @@ async fn run_map_parallel(
     model: &str,
     ctx: &Context,
     resources: &ResourcePool,
-    concurrency_resource: Option<&str>,
+    _concurrency_resource: Option<&str>,
     writer: &SharedWriter,
 ) -> Result<()> {
     #[allow(clippy::type_complexity)]
@@ -350,15 +350,12 @@ async fn run_map_parallel(
         let model = model.to_owned();
         let total = items.len();
         let writer = Arc::clone(writer);
-        let concurrency_res = concurrency_resource.map(|s| s.to_owned());
 
         let handle = tokio::spawn(async move {
-            // Acquire concurrency semaphore if this Map declares a resource limit.
-            let _permit = match concurrency_res {
-                Some(ref res_name) => resources.acquire(res_name).await,
-                None => None,
-            };
-
+            // Concurrency is enforced per-stage via with_requires() on individual
+            // sub-stages, not at the Map level.  The concurrency_resource field
+            // documents which resource the sub-stages reference, but the actual
+            // semaphore acquire happens inside run_single_stage.
             write_step(
                 &writer,
                 &format!(
