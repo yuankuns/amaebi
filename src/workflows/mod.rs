@@ -188,6 +188,20 @@ impl Context {
         }
         out
     }
+
+    /// Like [`render`](Self::render), but single-quotes each variable value
+    /// before substitution to prevent shell injection.
+    ///
+    /// Any embedded single quotes in the value are escaped as `'\''`
+    /// (end-quote, escaped quote, re-open quote).
+    pub fn render_shell(&self, template: &str) -> String {
+        let mut out = template.to_owned();
+        for (k, v) in &self.vars {
+            let escaped = format!("'{}'", v.replace('\'', "'\\''"));
+            out = out.replace(&format!("{{{k}}}"), &escaped);
+        }
+        out
+    }
 }
 
 // ---------------------------------------------------------------------------

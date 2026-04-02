@@ -159,7 +159,9 @@ async fn run_stage_with_retry(
                         &format!("    Reverting and skipping '{}': {e}", stage.name),
                     )
                     .await;
-                    let _ = sh("git stash --include-untracked").await;
+                    if let Err(git_err) = sh("git checkout -- . && git clean -fd").await {
+                        tracing::warn!(error = %git_err, "RevertAndSkip: git revert failed");
+                    }
                     return Ok(None);
                 }
                 FailStrategy::Retry { inject_prompt, .. } => {
@@ -207,17 +209,23 @@ async fn run_single_stage(
             let rendered = ctx.render(prompt);
             let text = llm_turn(state, model, messages, &rendered, writer).await?;
             ctx.set("last_llm_output", &text);
-            // Write to a temp file so Shell stages can reference LLM output safely
-            // without shell-injection risk from inlining it into a command string.
-            let tmp = "/tmp/amaebi_llm_output.txt";
-            let _ = tokio::fs::write(tmp, &text).await;
-            ctx.set("last_llm_output_file", tmp);
+            // Write to a unique temp file so parallel Map items don't race on
+            // a shared path.  The file is kept alive via `into_temp_path()` so
+            // downstream Shell stages can read it via {last_llm_output_file}.
+            // Use a unique temp file path (pid + atomic counter) so parallel
+            // Map items don't race on a shared path.
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let tmp_path = format!("/tmp/amaebi_llm_{}_{id}.txt", std::process::id());
+            std::fs::write(&tmp_path, &text).context("writing LLM output to temp file")?;
+            ctx.set("last_llm_output_file", &tmp_path);
             run_check(&stage.check, ctx).await?;
             Ok(Some(text))
         }
 
         Action::Shell { command } => {
-            let rendered = ctx.render(command);
+            let rendered = ctx.render_shell(command);
             let result = sh(&rendered).await?;
             ctx.set("stdout", &result.stdout);
             ctx.set("stderr", &result.stderr);
@@ -248,7 +256,8 @@ async fn run_single_stage(
             .await;
 
             if items.is_empty() {
-                return Err(anyhow!("Map stage found 0 items — check parse regex"));
+                write_step(writer, "    Map: 0 items found — nothing to do").await;
+                return Ok(None);
             }
 
             if *parallel {
@@ -318,7 +327,7 @@ async fn run_map_parallel(
     model: &str,
     ctx: &Context,
     resources: &ResourcePool,
-    _concurrency_resource: Option<&str>,
+    concurrency_resource: Option<&str>,
     writer: &SharedWriter,
 ) -> Result<()> {
     #[allow(clippy::type_complexity)]
@@ -338,8 +347,15 @@ async fn run_map_parallel(
         let model = model.to_owned();
         let total = items.len();
         let writer = Arc::clone(writer);
+        let concurrency_res = concurrency_resource.map(|s| s.to_owned());
 
         let handle = tokio::spawn(async move {
+            // Acquire concurrency semaphore if this Map declares a resource limit.
+            let _permit = match concurrency_res {
+                Some(ref res_name) => resources.acquire(res_name).await,
+                None => None,
+            };
+
             write_step(
                 &writer,
                 &format!(
@@ -497,7 +513,7 @@ pub async fn llm_turn(
         messages.clone(),
         &mut **w,
         &mut steer_rx,
-        true,
+        false, // workflow LLM stages must not spawn sub-agents
     )
     .await
     .context("LLM turn failed")?;
@@ -551,7 +567,8 @@ fn detect_regression(
             current_obj.get(key).and_then(|v| v.as_f64()),
         ) {
             if b > 0.0 {
-                let change = (c - b) / b; // negative = regression (lower is better for latency)
+                // Higher-is-better metrics (throughput, fps): a drop is a regression.
+                let change = (c - b) / b;
                 if change < -threshold {
                     regressions.push(format!("{key}: {b:.4} → {c:.4} ({:+.1}%)", change * 100.0));
                 }
