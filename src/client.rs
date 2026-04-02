@@ -1141,18 +1141,29 @@ mod prompt_input {
                 0x7f | 0x08 => {
                     if let (Some(_), Some(w)) = (chars.pop(), widths.pop()) {
                         if w > 0 {
-                            // ESC[wD moves the cursor left exactly w columns.
-                            // Raw \x08 bytes are unreliable for wide characters:
-                            // some terminals "snap" the cursor to the left boundary
-                            // of a wide char on the first \x08, so two \x08s
-                            // overshoot by one column when the character starts at
-                            // an odd column position (e.g. after an odd count of
-                            // ASCII chars).
+                            // ESC[wD (CUB) moves the cursor left exactly w columns.
                             //
-                            // ESC[K (erase to end of line) then clears all remaining
-                            // visual cells without needing to know the exact cell
-                            // layout.  This is safe because the cursor is always at
-                            // the very end of the user's input in this editor.
+                            // We use CUB instead of w×\x08 (BS) for two reasons:
+                            //
+                            //   1. CJK odd-column snap: some terminals snap the cursor
+                            //      to the left boundary of a wide glyph on the first \x08.
+                            //      Two consecutive \x08 then overshoot by one column when
+                            //      the character starts at an odd column position, leaving
+                            //      the right-half cell of the glyph visible on screen.
+                            //      CUB always moves exactly w columns regardless of cell
+                            //      boundaries.
+                            //
+                            //   2. Simplicity: \x08×w + spaces×w + \x08×w is three writes;
+                            //      CUB + ESC[K is two.
+                            //
+                            // Known limitation: CUB does NOT wrap to the previous visual
+                            // line, so if the user's input has soft-wrapped past column 0
+                            // the cursor stops at column 0 and ESC[K clears the wrong
+                            // region.  Fixing this would require tracking the column
+                            // position explicitly and using \x08 (which does wrap) plus
+                            // repainting the affected line segment.  This editor is
+                            // designed for single-line prompts; multi-line soft-wrap
+                            // support is out of scope.
                             write!(output, "\x1b[{w}D\x1b[K")?;
                         }
                         // Zero-width characters (combining marks, etc.) are removed
