@@ -687,6 +687,8 @@ async fn run_workflow(
                 &ResourcePool::empty(),
                 executor::sink_writer(),
                 &[],
+                &[],
+                None,
             )
             .await?;
             println!("{summary}");
@@ -708,6 +710,8 @@ async fn run_workflow(
                 &ResourcePool::empty(),
                 executor::sink_writer(),
                 &[],
+                &[],
+                None,
             )
             .await?;
             println!("{summary}");
@@ -727,6 +731,8 @@ async fn run_workflow(
                 &ResourcePool::empty(),
                 executor::sink_writer(),
                 &[],
+                &[],
+                None,
             )
             .await?;
             println!("{summary}");
@@ -751,6 +757,8 @@ async fn run_workflow(
                 &pool,
                 executor::sink_writer(),
                 &[],
+                &[],
+                None,
             )
             .await?;
             println!("{summary}");

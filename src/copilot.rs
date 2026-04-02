@@ -575,10 +575,7 @@ where
 /// exported so `daemon.rs` can share the same constant.
 pub const WAITING_MARKER: &str = "[WAITING_FOR_INPUT]";
 
-async fn parse_sse_stream<W>(
-    resp: reqwest::Response,
-    writer: &mut W,
-) -> Result<CopilotResponse>
+async fn parse_sse_stream<W>(resp: reqwest::Response, writer: &mut W) -> Result<CopilotResponse>
 where
     W: AsyncWriteExt + Unpin + ?Sized,
 {

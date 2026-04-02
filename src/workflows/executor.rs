@@ -48,10 +48,14 @@ pub fn sink_writer() -> SharedWriter {
 /// `writer` receives streamed `Response::Text` frames (LLM output + step
 /// markers) so the client sees real-time progress.
 ///
-/// `history` is the parent session's conversation history — injected so the
-/// LLM has context about what the user was working on.
+/// Parent session context is injected so the LLM knows what the user was
+/// working on:
+/// - `history`       — full conversation turns from the parent session
+/// - `past_summaries`— summaries from earlier sessions (cross-session memory)
+/// - `own_summary`   — compaction summary of the parent session (if compacted)
 ///
 /// Returns a summary string (from the final LLM stage, or a generated one).
+#[allow(clippy::too_many_arguments)]
 pub async fn execute(
     workflow: &Workflow,
     state: &Arc<DaemonState>,
@@ -60,6 +64,8 @@ pub async fn execute(
     resources: &ResourcePool,
     writer: SharedWriter,
     history: &[memory_db::DbMemoryEntry],
+    past_summaries: &[String],
+    own_summary: Option<&str>,
 ) -> Result<String> {
     write_step(&writer, &format!("Workflow: {}", workflow.name)).await;
 
@@ -68,8 +74,8 @@ pub async fn execute(
             &format!("You are executing the workflow: {}.", workflow.name),
             None,
             history,
-            &[],
-            None,
+            past_summaries,
+            own_summary,
         );
         inject_skill_files(&mut msgs).await;
         msgs
@@ -1287,6 +1293,8 @@ mod llm_tests {
             &ResourcePool::empty(),
             sink_writer(),
             &[],
+            &[],
+            None,
         )
         .await
         .unwrap();
@@ -1348,6 +1356,8 @@ mod llm_tests {
             &ResourcePool::empty(),
             sink_writer(),
             &[],
+            &[],
+            None,
         )
         .await
         .unwrap();
@@ -1408,6 +1418,8 @@ mod llm_tests {
             &ResourcePool::empty(),
             sink_writer(),
             &[],
+            &[],
+            None,
         )
         .await
         .expect("workflow should succeed after retry");
@@ -1487,6 +1499,8 @@ mod llm_tests {
             &ResourcePool::empty(),
             sink_writer(),
             &[],
+            &[],
+            None,
         )
         .await;
         assert!(

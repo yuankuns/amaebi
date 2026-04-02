@@ -430,19 +430,29 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
             } => {
                 tracing::info!(workflow = %name, model = %model, "received workflow request");
 
-                // Load parent session history if session_id is provided.
-                let history = if let Some(ref sid) = session_id {
+                // Load parent session context (same as Request::Chat).
+                let (history, summaries, own_summary) = if let Some(ref sid) = session_id {
                     let db = Arc::clone(&state.db);
                     let sid = sid.clone();
-                    tokio::task::spawn_blocking(move || {
+                    tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
                         let conn = db.lock().unwrap_or_else(|p| p.into_inner());
-                        memory_db::get_session_history(&conn, &sid)
+                        Ok((
+                            memory_db::get_session_history(&conn, &sid)?,
+                            memory_db::get_recent_summaries(&conn, &sid, MAX_SUMMARIES)?,
+                            memory_db::get_session_own_summary(&conn, &sid)?,
+                        ))
                     })
                     .await
-                    .unwrap_or_else(|_| Ok(vec![]))
-                    .unwrap_or_default()
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(error=%e, "workflow: session load panicked");
+                        Ok((vec![], vec![], None))
+                    })
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(error=%e, "workflow: session load failed");
+                        (vec![], vec![], None)
+                    })
                 } else {
-                    vec![]
+                    (vec![], vec![], None)
                 };
 
                 match workflows::build_workflow(&name, &args) {
@@ -455,7 +465,15 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                         };
                         let ctx = workflows::Context::new();
                         match workflows::executor::execute(
-                            &workflow, &state, &model, ctx, &pool, wf_writer, &history,
+                            &workflow,
+                            &state,
+                            &model,
+                            ctx,
+                            &pool,
+                            wf_writer,
+                            &history,
+                            &summaries,
+                            own_summary.as_deref(),
                         )
                         .await
                         {

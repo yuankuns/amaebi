@@ -271,7 +271,18 @@ async fn run_workflow_tool(args: serde_json::Value, ctx: &SpawnContext) -> Resul
     let wf_ctx = Context::new();
     let writer = executor::sink_writer();
 
-    executor::execute(&workflow, &state, &model, wf_ctx, &pool, writer, &[]).await
+    executor::execute(
+        &workflow,
+        &state,
+        &model,
+        wf_ctx,
+        &pool,
+        writer,
+        &[],
+        &[],
+        None,
+    )
+    .await
 }
 
 /// Spawn a child agent session to complete a task in an isolated sandbox.
