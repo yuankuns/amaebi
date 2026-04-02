@@ -21,7 +21,6 @@ mod session;
 #[cfg(test)]
 mod test_utils;
 mod tools;
-mod workflows;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -98,11 +97,6 @@ async fn main() -> Result<()> {
         cli::Command::Cache { action } => run_cache(action),
         cli::Command::Inbox { action } => run_inbox(action),
         cli::Command::Cron { action } => run_cron(action),
-        cli::Command::Workflow {
-            action,
-            socket,
-            model,
-        } => run_workflow(action, socket, model).await,
     }
 }
 
@@ -643,96 +637,4 @@ mod tests {
         // ESC 'x' is not ST — sequence continues; only terminated by BEL here.
         assert_eq!(sanitize("\x1b]data\x1bxmore\x07end"), "end");
     }
-}
-
-// ---------------------------------------------------------------------------
-// Workflow dispatch
-// ---------------------------------------------------------------------------
-
-async fn run_workflow(
-    action: cli::WorkflowAction,
-    _socket: std::path::PathBuf, // reserved for future daemon connection
-    model: Option<String>,
-) -> Result<()> {
-    use std::sync::Arc;
-    use workflows::{builtins, executor, Context, ResourcePool};
-
-    let model = model
-        .or_else(|| std::env::var("AMAEBI_MODEL").ok())
-        .unwrap_or_else(|| "gpt-4o".to_string());
-
-    // Start (or connect to) the daemon so we can call run_agentic_loop.
-    let state = Arc::new(
-        daemon::DaemonState::new()
-            .await
-            .context("initialising daemon state for workflow")?,
-    );
-
-    let ctx = Context::new();
-
-    match action {
-        cli::WorkflowAction::DevLoop {
-            task,
-            test_cmd,
-            max_test_retries,
-            max_review_retries,
-        } => {
-            let wf = builtins::dev_loop(&task, &test_cmd, max_test_retries, max_review_retries);
-            let summary =
-                executor::execute(&wf, &state, &model, ctx, &ResourcePool::empty()).await?;
-            println!("{summary}");
-        }
-
-        cli::WorkflowAction::PerfSweep {
-            target,
-            docs,
-            bench_cmd,
-            regression_threshold,
-        } => {
-            let docs_content = read_files(&docs).await?;
-            let wf = builtins::perf_sweep(&target, &docs_content, &bench_cmd, regression_threshold);
-            let summary =
-                executor::execute(&wf, &state, &model, ctx, &ResourcePool::empty()).await?;
-            println!("{summary}");
-        }
-
-        cli::WorkflowAction::BugFix {
-            repo,
-            test_cmd,
-            max_retries,
-        } => {
-            let wf = builtins::bug_fix(&repo, &test_cmd, max_retries, None);
-            let summary =
-                executor::execute(&wf, &state, &model, ctx, &ResourcePool::empty()).await?;
-            println!("{summary}");
-        }
-
-        cli::WorkflowAction::TuneSweep {
-            target,
-            docs,
-            run_cmd,
-            result_cmd,
-            resource,
-            resource_count,
-        } => {
-            let docs_content = read_files(&docs).await?;
-            let wf = builtins::tune_sweep(&target, &docs_content, &run_cmd, &result_cmd, &resource);
-            let pool = ResourcePool::new([(resource.as_str(), resource_count.get())]);
-            let summary = executor::execute(&wf, &state, &model, ctx, &pool).await?;
-            println!("{summary}");
-        }
-    }
-
-    Ok(())
-}
-
-async fn read_files(paths: &[String]) -> Result<String> {
-    let mut out = String::new();
-    for path in paths {
-        let content = tokio::fs::read_to_string(path)
-            .await
-            .with_context(|| format!("reading {path}"))?;
-        out.push_str(&format!("### {path}\n\n{content}\n\n"));
-    }
-    Ok(out)
 }

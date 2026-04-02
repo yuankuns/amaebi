@@ -197,10 +197,6 @@ impl ToolExecutor for LocalExecutor {
                     None => anyhow::bail!("list_followups is not available in this context"),
                 }
             }
-            "run_workflow" => match &self.spawn_ctx {
-                Some(ctx) => run_workflow_tool(args, ctx).await,
-                None => anyhow::bail!("run_workflow is not available in this context"),
-            },
             other => anyhow::bail!("unknown tool: {other}"),
         }
     }
@@ -319,128 +315,6 @@ async fn read_file(args: serde_json::Value) -> Result<String> {
     tokio::fs::read_to_string(path)
         .await
         .with_context(|| format!("read_file: reading '{path}'"))
-}
-
-/// Run a supervised workflow tool — called by the LLM when it decides a
-/// structured multi-step process is appropriate.
-///
-/// The workflow engine handles all flow control in code; Claude only does
-/// content work (coding, analysis, summaries) within each LLM stage.
-async fn run_workflow_tool(args: serde_json::Value, ctx: &SpawnContext) -> Result<String> {
-    use crate::workflows::{builtins, executor, Context, ResourcePool};
-    use std::sync::Arc;
-
-    let workflow_name = args["workflow"]
-        .as_str()
-        .context("run_workflow: missing 'workflow' argument")?;
-
-    let wf_args = args["args"].as_object().cloned().unwrap_or_default();
-
-    let model = std::env::var("AMAEBI_MODEL").unwrap_or_else(|_| "gpt-4o".to_string());
-
-    tracing::info!(workflow = %workflow_name, model = %model, "run_workflow: starting");
-
-    // Build a minimal DaemonState from the SpawnContext so the workflow's
-    // LLM stages can call run_agentic_loop.
-    let state = Arc::new(crate::daemon::DaemonState {
-        http: ctx.http.clone(),
-        tokens: Arc::clone(&ctx.tokens),
-        executor: Box::new(crate::tools::LocalExecutor::new()),
-        db: Arc::clone(&ctx.db),
-        compacting_sessions: Arc::clone(&ctx.compacting_sessions),
-        active_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
-    });
-
-    // Use `wf_ctx` to avoid shadowing the `ctx: &SpawnContext` parameter above.
-    let wf_ctx = Context::new();
-
-    let workflow = match workflow_name {
-        "dev-loop" => {
-            let task = wf_args
-                .get("task")
-                .and_then(|v| v.as_str())
-                .unwrap_or("complete the task");
-            let test_cmd = wf_args
-                .get("test_cmd")
-                .and_then(|v| v.as_str())
-                .unwrap_or("cargo test");
-            let max_retries = wf_args
-                .get("max_retries")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(5) as usize;
-            builtins::dev_loop(task, test_cmd, max_retries, max_retries)
-        }
-        "bug-fix" => {
-            let repo = wf_args.get("repo").and_then(|v| v.as_str()).unwrap_or(".");
-            let test_cmd = wf_args
-                .get("test_cmd")
-                .and_then(|v| v.as_str())
-                .unwrap_or("cargo test");
-            let max_retries = wf_args
-                .get("max_retries")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(3) as usize;
-            let list_cmd = wf_args.get("list_cmd").and_then(|v| v.as_str());
-            builtins::bug_fix(repo, test_cmd, max_retries, list_cmd)
-        }
-        "perf-sweep" => {
-            let target = wf_args
-                .get("target")
-                .and_then(|v| v.as_str())
-                .unwrap_or("the target");
-            let bench_cmd = wf_args
-                .get("bench_cmd")
-                .and_then(|v| v.as_str())
-                .unwrap_or("make bench");
-            let threshold = wf_args
-                .get("regression_threshold")
-                .and_then(|v| v.as_f64())
-                .unwrap_or(0.05);
-            builtins::perf_sweep(target, "", bench_cmd, threshold)
-        }
-        "tune-sweep" => {
-            let target = wf_args
-                .get("target")
-                .and_then(|v| v.as_str())
-                .unwrap_or("the target");
-            let run_cmd = wf_args
-                .get("run_cmd")
-                .and_then(|v| v.as_str())
-                .unwrap_or("echo {item_index}");
-            let result_cmd = wf_args
-                .get("result_cmd")
-                .and_then(|v| v.as_str())
-                .unwrap_or("echo done");
-            let resource = wf_args
-                .get("resource")
-                .and_then(|v| v.as_str())
-                .unwrap_or("gpu");
-            let count = wf_args
-                .get("resource_count")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(1) as usize;
-            let wf = builtins::tune_sweep(target, "", run_cmd, result_cmd, resource);
-            let pool = ResourcePool::new([(resource, count)]);
-            let result = executor::execute(&wf, &state, &model, wf_ctx, &pool).await;
-            tracing::info!(
-                workflow = %workflow_name,
-                success = result.is_ok(),
-                "run_workflow: completed"
-            );
-            return result;
-        }
-        other => anyhow::bail!(
-            "unknown workflow: {other:?}. Valid: dev-loop, bug-fix, perf-sweep, tune-sweep"
-        ),
-    };
-
-    let result = executor::execute(&workflow, &state, &model, wf_ctx, &ResourcePool::empty()).await;
-    tracing::info!(
-        workflow = %workflow_name,
-        success = result.is_ok(),
-        "run_workflow: completed"
-    );
-    result
 }
 
 /// Spawn a child agent session to complete a task in an isolated sandbox.
@@ -855,35 +729,6 @@ pub fn tool_schemas(include_spawn_agent: bool, include_followup: bool) -> Vec<se
         }));
     }
     if include_spawn_agent {
-        schemas.push(serde_json::json!({
-            "type": "function",
-            "function": {
-                "name": "run_workflow",
-                "description": "Run a supervised multi-step workflow where amaebi controls the \
-                                flow (code-guaranteed) and Claude does the content work. \
-                                Use when the user wants a repeatable process: dev-loop, \
-                                bug-fix, perf-sweep, or tune-sweep. \
-                                TRIGGER when the user asks to: fix all bugs, run a dev/test \
-                                cycle, do a performance sweep, or run parallel experiments. \
-                                DO NOT TRIGGER for single-turn tasks.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "workflow": {
-                            "type": "string",
-                            "enum": ["dev-loop", "bug-fix", "perf-sweep", "tune-sweep"],
-                            "description": "Which workflow to run."
-                        },
-                        "args": {
-                            "type": "object",
-                            "description": "Workflow-specific arguments (see each workflow's CLI docs).",
-                            "additionalProperties": {}
-                        }
-                    },
-                    "required": ["workflow", "args"]
-                }
-            }
-        }));
         schemas.push(serde_json::json!({
             "type": "function",
             "function": {

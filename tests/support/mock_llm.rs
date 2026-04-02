@@ -434,27 +434,29 @@ fn finish_event(reason: &FinishReason) -> String {
 async fn handle_completion(
     State(state): State<ServerState>,
     headers: HeaderMap,
-    axum::Json(full_body): axum::Json<Value>,
+    axum::Json(req_body): axum::Json<ChatRequest>,
 ) -> Result<AxumResponse<Body>, (StatusCode, String)> {
-    // Validate via the typed struct while keeping the full body for capture.
-    let req_body: ChatRequest = match serde_json::from_value(full_body.clone()) {
-        Ok(r) => r,
-        Err(e) => return Err((StatusCode::BAD_REQUEST, e.to_string())),
-    };
+    // Validate if enabled.
     if state.validate {
         if let Err(msg) = validate_request(&req_body) {
             return Err((StatusCode::BAD_REQUEST, msg));
         }
     }
 
-    // Capture the full request body so tests can inspect any field (e.g. tools).
+    // Capture request.
     let captured_headers: Vec<(String, String)> = headers
         .iter()
         .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
         .collect();
+    let body_value = json!({
+        "model": req_body.model,
+        "messages": req_body.messages,
+        "stream": req_body.stream,
+        "max_completion_tokens": req_body.max_completion_tokens,
+    });
     state.captured.lock().unwrap().push(CapturedRequest {
         headers: captured_headers,
-        body: full_body,
+        body: body_value,
     });
 
     // Pop a queued item — fail fast if nothing queued.
