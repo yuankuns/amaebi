@@ -2227,24 +2227,68 @@ pub(crate) fn build_messages(
     past_summaries: &[String],
     own_summary: Option<&str>,
 ) -> Vec<Message> {
+    build_messages_inner(
+        prompt,
+        tmux_pane,
+        history,
+        past_summaries,
+        own_summary,
+        true,
+    )
+}
+
+/// Like `build_messages` but without workflow routing rules in the system
+/// prompt.  Used by workflow LLM stages and child agents where `run_workflow`
+/// is not in the tool schema.
+pub(crate) fn build_messages_no_workflow(
+    prompt: &str,
+    tmux_pane: Option<&str>,
+    history: &[memory_db::DbMemoryEntry],
+    past_summaries: &[String],
+    own_summary: Option<&str>,
+) -> Vec<Message> {
+    build_messages_inner(
+        prompt,
+        tmux_pane,
+        history,
+        past_summaries,
+        own_summary,
+        false,
+    )
+}
+
+fn build_messages_inner(
+    prompt: &str,
+    tmux_pane: Option<&str>,
+    history: &[memory_db::DbMemoryEntry],
+    past_summaries: &[String],
+    own_summary: Option<&str>,
+    include_workflow_routing: bool,
+) -> Vec<Message> {
     let mut system = "You are a helpful, concise AI assistant embedded in a tmux terminal. \
                       Answer in plain text; avoid markdown unless the user asks for it. \
                       You have tools available to inspect the terminal, run commands, \
                       and read or edit files — use them when they help you answer accurately. \
                       After using any tool, you MUST always follow up with a text response \
-                      summarising what you did and the outcome — never end silently after a tool call.\n\n\
-                      ## Workflow routing (MANDATORY)\n\
-                      When the user's request matches one of the following patterns, you MUST call \
-                      the `run_workflow` tool instead of attempting the task yourself:\n\
-                      - Full dev cycle (implement + test + PR): call `run_workflow` with workflow=\"dev-loop\"\n\
-                      - Fix multiple bugs / all open issues: call `run_workflow` with workflow=\"bug-fix\"\n\
-                      - Performance optimization sweep / benchmark: call `run_workflow` with workflow=\"perf-sweep\"\n\
-                      - Hyperparameter tuning / parallel experiments: call `run_workflow` with workflow=\"tune-sweep\"\n\n\
-                      Do NOT run these multi-step processes manually. The workflow engine handles \
-                      flow control, retries, and resource management — you only provide content \
-                      (code, analysis) when the engine calls you. For single-turn tasks (explain code, \
-                      quick edit, one-off shell command), respond directly without run_workflow."
+                      summarising what you did and the outcome — never end silently after a tool call."
         .to_owned();
+
+    if include_workflow_routing {
+        system.push_str(
+            "\n\n\
+             ## Workflow routing (MANDATORY)\n\
+             When the user's request matches one of the following patterns, you MUST call \
+             the `run_workflow` tool instead of attempting the task yourself:\n\
+             - Full dev cycle (implement + test + PR): call `run_workflow` with workflow=\"dev-loop\"\n\
+             - Fix multiple bugs / all open issues: call `run_workflow` with workflow=\"bug-fix\"\n\
+             - Performance optimization sweep / benchmark: call `run_workflow` with workflow=\"perf-sweep\"\n\
+             - Hyperparameter tuning / parallel experiments: call `run_workflow` with workflow=\"tune-sweep\"\n\n\
+             Do NOT run these multi-step processes manually. The workflow engine handles \
+             flow control, retries, and resource management — you only provide content \
+             (code, analysis) when the engine calls you. For single-turn tasks (explain code, \
+             quick edit, one-off shell command), respond directly without run_workflow.",
+        );
+    }
 
     if let Some(pane) = tmux_pane {
         system.push_str(&format!(" The user's active tmux pane is {pane}."));

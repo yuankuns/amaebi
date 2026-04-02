@@ -7,7 +7,7 @@ use tokio::sync::Mutex;
 
 use crate::copilot::Message;
 use crate::daemon::DaemonState;
-use crate::daemon::{build_messages, inject_skill_files, run_agentic_loop};
+use crate::daemon::{build_messages_no_workflow, inject_skill_files, run_agentic_loop};
 use crate::ipc::{write_frame, Response};
 use crate::memory_db;
 
@@ -70,7 +70,7 @@ pub async fn execute(
     write_step(&writer, &format!("Workflow: {}", workflow.name)).await;
 
     let mut messages: Vec<Message> = {
-        let mut msgs = build_messages(
+        let mut msgs = build_messages_no_workflow(
             &format!("You are executing the workflow: {}.", workflow.name),
             None,
             history,
@@ -365,7 +365,8 @@ async fn run_map_parallel(
             )
             .await;
 
-            let mut messages = build_messages(&format!("Working on: {item}"), None, &[], &[], None);
+            let mut messages =
+                build_messages_no_workflow(&format!("Working on: {item}"), None, &[], &[], None);
             inject_skill_files(&mut messages).await;
 
             let result = run_parallel_item_stages(
@@ -1545,12 +1546,12 @@ async fn execute_with_ctx(
     resources: &ResourcePool,
 ) -> anyhow::Result<String> {
     use crate::copilot::Message;
-    use crate::daemon::{build_messages, inject_skill_files};
+    use crate::daemon::{build_messages_no_workflow, inject_skill_files};
 
     let writer = sink_writer();
 
     let mut messages: Vec<Message> = {
-        let mut msgs = build_messages(
+        let mut msgs = build_messages_no_workflow(
             &format!("workflow: {}", workflow.name),
             None,
             &[],
