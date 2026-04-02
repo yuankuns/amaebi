@@ -81,6 +81,14 @@ pub fn parse_relative_time(when: &str) -> Result<DateTime<Utc>> {
     }
 
     let now = Utc::now();
+    const MAX_MINUTES: u64 = 365 * 24 * 60; // ~1 year
+    if minutes > MAX_MINUTES {
+        bail!(
+            "follow-up delay of {minutes} minutes exceeds the maximum of {MAX_MINUTES} minutes \
+             (~1 year); one-shot cron expressions cannot represent longer durations"
+        );
+    }
+
     let minutes_i64 = i64::try_from(minutes)
         .map_err(|_| anyhow::anyhow!("follow-up delay too large: {minutes} minutes"))?;
     let target = now

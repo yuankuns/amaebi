@@ -2331,10 +2331,19 @@ async fn run_cron_job(state: Arc<DaemonState>, job: &cron::CronJob) {
     // One-shot jobs are self-deleting: remove from cron.db after execution so
     // the scheduler never re-fires them.
     if job.one_shot {
-        if let Err(e) = cron::delete_job(&job.id) {
-            tracing::warn!(error = %e, id = %job.id, "cron: failed to delete one-shot job after run");
-        } else {
-            tracing::debug!(id = %job.id, "cron: one-shot job deleted after execution");
+        match cron::delete_job(&job.id) {
+            Ok(true) => {
+                tracing::debug!(id = %job.id, "cron: one-shot job deleted after execution");
+            }
+            Ok(false) => {
+                tracing::warn!(
+                    id = %job.id,
+                    "cron: no row deleted for one-shot job (possibly already removed)"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, id = %job.id, "cron: failed to delete one-shot job after run");
+            }
         }
     }
 
