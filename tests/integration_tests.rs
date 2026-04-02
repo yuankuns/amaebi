@@ -27,9 +27,10 @@ use chrono::{Datelike, Timelike};
 use rusqlite;
 use support::{
     helpers::{
-        collect_text, connect_client, seed_cron_job, send_message, send_message_with_session,
-        send_resume, setup_home, start_daemon, start_daemon_at_home_with_env,
-        start_daemon_with_env, LongChatConnection, Request, Response,
+        collect_text, connect_client, init_cron_db, seed_cron_job, seed_model_oneshot,
+        send_message, send_message_with_session, send_resume, setup_home, start_daemon,
+        start_daemon_at_home_with_env, start_daemon_with_env, LongChatConnection, Request,
+        Response,
     },
     mock_llm::{MockLlmServer, ScriptedResponse},
 };
@@ -2563,26 +2564,16 @@ async fn cancel_followup_tool_call_removes_pending_job() {
     let home_dir = setup_home().expect("setup_home");
     let cron_db_path = home_dir.path().join(".amaebi/cron.db");
 
-    // Seed a model-created one-shot job directly via SQLite.
-    {
-        let conn = rusqlite::Connection::open(&cron_db_path).expect("open cron.db for seeding");
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS cron_jobs (
-                id TEXT PRIMARY KEY, description TEXT NOT NULL, schedule TEXT NOT NULL,
-                created_at TEXT NOT NULL, last_run TEXT,
-                one_shot INTEGER NOT NULL DEFAULT 0,
-                created_by_model INTEGER NOT NULL DEFAULT 0,
-                parent_session_id TEXT,
-                status TEXT NOT NULL DEFAULT 'pending'
-            );
-            INSERT INTO cron_jobs
-                (id, description, schedule, created_at, one_shot, created_by_model, status)
-            VALUES
-                ('test-cancel-id', 'job to cancel', '0 0 1 1 *',
-                 '2099-01-01T00:00:00Z', 1, 1, 'pending');",
-        )
-        .expect("seed cron job");
-    }
+    // Seed a model-created one-shot job using the shared DDL helper so the
+    // schema stays in sync with src/cron_ddl.sql automatically.
+    init_cron_db(&cron_db_path);
+    seed_model_oneshot(
+        &cron_db_path,
+        "test-cancel-id",
+        "job to cancel",
+        "0 0 1 1 *",
+        "2099-01-01T00:00:00Z",
+    );
 
     let server = MockLlmServer::start().await;
     server.enqueue(ScriptedResponse::tool_call(
@@ -2654,29 +2645,27 @@ async fn list_followups_tool_call_returns_pending_jobs() {
     let home_dir = setup_home().expect("setup_home");
     let cron_db_path = home_dir.path().join(".amaebi/cron.db");
 
+    // Use the shared DDL helper so the schema stays in sync with src/cron_ddl.sql.
+    init_cron_db(&cron_db_path);
+    // model-created pending — must appear in list_followups
+    seed_model_oneshot(
+        &cron_db_path,
+        "model-job-1",
+        "list-marker-model-job",
+        "0 0 1 1 *",
+        "2099-01-01T00:00:00Z",
+    );
+    // human-created — must NOT appear in list_followups
     {
         let conn = rusqlite::Connection::open(&cron_db_path).expect("open cron.db");
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS cron_jobs (
-                id TEXT PRIMARY KEY, description TEXT NOT NULL, schedule TEXT NOT NULL,
-                created_at TEXT NOT NULL, last_run TEXT,
-                one_shot INTEGER NOT NULL DEFAULT 0,
-                created_by_model INTEGER NOT NULL DEFAULT 0,
-                parent_session_id TEXT,
-                status TEXT NOT NULL DEFAULT 'pending'
-            );
-            -- model-created pending
-            INSERT INTO cron_jobs
-                (id, description, schedule, created_at, one_shot, created_by_model, status)
-            VALUES ('model-job-1', 'list-marker-model-job', '0 0 1 1 *',
-                    '2099-01-01T00:00:00Z', 1, 1, 'pending');
-            -- human-created (should NOT appear in list_followups)
-            INSERT INTO cron_jobs
-                (id, description, schedule, created_at, one_shot, created_by_model, status)
-            VALUES ('human-job-1', 'list-marker-human-job', '0 10 * * *',
-                    '2026-04-01T00:00:00Z', 0, 0, 'pending');",
+        conn.execute(
+            "INSERT INTO cron_jobs
+                 (id, description, schedule, created_at, one_shot, created_by_model, status)
+             VALUES ('human-job-1', 'list-marker-human-job', '0 10 * * *',
+                     '2026-04-01T00:00:00Z', 0, 0, 'pending')",
+            [],
         )
-        .expect("seed cron jobs");
+        .expect("seed human cron job");
     }
 
     let server = MockLlmServer::start().await;
@@ -2762,24 +2751,15 @@ async fn scheduled_followup_fires_and_deposits_inbox_report() {
     );
     let created_at = fires_at.to_rfc3339();
 
-    {
-        let conn = rusqlite::Connection::open(&cron_db_path).expect("open cron.db");
-        conn.execute_batch(&format!(
-            "CREATE TABLE IF NOT EXISTS cron_jobs (
-                id TEXT PRIMARY KEY, description TEXT NOT NULL, schedule TEXT NOT NULL,
-                created_at TEXT NOT NULL, last_run TEXT,
-                one_shot INTEGER NOT NULL DEFAULT 0,
-                created_by_model INTEGER NOT NULL DEFAULT 0,
-                parent_session_id TEXT,
-                status TEXT NOT NULL DEFAULT 'pending'
-            );
-            INSERT INTO cron_jobs
-                (id, description, schedule, created_at, one_shot, created_by_model, status)
-            VALUES ('fire-test-id', 'followup-fire-unique-marker', '{cron_expr}',
-                    '{created_at}', 1, 1, 'pending');"
-        ))
-        .expect("seed oneshot job");
-    }
+    // Use the shared DDL helper so the schema stays in sync with src/cron_ddl.sql.
+    init_cron_db(&cron_db_path);
+    seed_model_oneshot(
+        &cron_db_path,
+        "fire-test-id",
+        "followup-fire-unique-marker",
+        &cron_expr,
+        &created_at,
+    );
 
     let server = MockLlmServer::start().await;
     server.enqueue(ScriptedResponse::text_chunks(vec![

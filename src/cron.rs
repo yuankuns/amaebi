@@ -162,22 +162,63 @@ impl CronStore {
 
     fn init(&self) -> Result<()> {
         let conn = self.connect()?;
-        // No incremental migration: if an old DB with a stale schema exists,
-        // delete ~/.amaebi/cron.db once and it will be recreated here.
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS cron_jobs (
-                 id               TEXT PRIMARY KEY,
-                 description      TEXT NOT NULL,
-                 schedule         TEXT NOT NULL,
-                 created_at       TEXT NOT NULL,
-                 last_run         TEXT,
-                 one_shot         INTEGER NOT NULL DEFAULT 0,
-                 created_by_model INTEGER NOT NULL DEFAULT 0,
-                 parent_session_id TEXT,
-                 status           TEXT NOT NULL DEFAULT 'pending'
-             );",
-        )
-        .context("creating cron_jobs table")?;
+        // Create the table on a fresh install.  The DDL is shared with the
+        // test helper via include_str! so both always stay in sync.
+        conn.execute_batch(include_str!("cron_ddl.sql"))
+            .context("creating cron_jobs table")?;
+        // Upgrade existing databases that pre-date one or more schema versions.
+        self.migrate(&conn)?;
+        Ok(())
+    }
+
+    /// Incremental schema migration using `PRAGMA user_version`.
+    ///
+    /// - version 0 (original): 5-column schema
+    /// - version 1: adds `one_shot`, `created_by_model`, `parent_session_id`
+    /// - version 2: adds `status`
+    ///
+    /// Each column is added only when absent so the migration is safe to
+    /// re-run and survives crashes between individual ALTER statements.
+    fn migrate(&self, conn: &Connection) -> Result<()> {
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .context("reading user_version")?;
+        if version >= 2 {
+            return Ok(());
+        }
+
+        // Hold a write lock for the duration so concurrent processes don't
+        // race on the same ALTER TABLE calls.
+        conn.execute_batch("BEGIN IMMEDIATE;")
+            .context("beginning migration transaction")?;
+
+        // Re-read columns inside the lock; another writer may have added
+        // some of them between our version check and the BEGIN IMMEDIATE.
+        let existing: std::collections::HashSet<String> = conn
+            .prepare("PRAGMA table_info(cron_jobs)")
+            .context("PRAGMA table_info")?
+            .query_map([], |row| row.get::<_, String>(1))
+            .context("querying table_info")?
+            .collect::<rusqlite::Result<_>>()
+            .context("collecting column names")?;
+
+        let add_col = |col: &str, def: &str| -> Result<()> {
+            if !existing.contains(col) {
+                conn.execute_batch(&format!("ALTER TABLE cron_jobs ADD COLUMN {col} {def};"))
+                    .with_context(|| format!("adding column {col}"))?;
+            }
+            Ok(())
+        };
+
+        if version < 1 {
+            add_col("one_shot", "INTEGER NOT NULL DEFAULT 0")?;
+            add_col("created_by_model", "INTEGER NOT NULL DEFAULT 0")?;
+            add_col("parent_session_id", "TEXT")?;
+        }
+        add_col("status", "TEXT NOT NULL DEFAULT 'pending'")?;
+
+        conn.execute_batch("PRAGMA user_version = 2; COMMIT;")
+            .context("committing migration")?;
         Ok(())
     }
 
