@@ -1988,7 +1988,7 @@ fn parse_workflow_args(
             }
             if let Some(v) = flag("--max-retries") {
                 let n = v.parse::<u64>().map_err(|_| {
-                    anyhow!("--max-retries must be a positive integer, got {:?}", v)
+                    anyhow!("--max-retries must be a non-negative integer, got {:?}", v)
                 })?;
                 args.insert("max_retries".into(), n.into());
             }
@@ -2002,7 +2002,7 @@ fn parse_workflow_args(
             }
             if let Some(v) = flag("--max-retries") {
                 let n = v.parse::<u64>().map_err(|_| {
-                    anyhow!("--max-retries must be a positive integer, got {:?}", v)
+                    anyhow!("--max-retries must be a non-negative integer, got {:?}", v)
                 })?;
                 args.insert("max_retries".into(), n.into());
             }
@@ -2038,7 +2038,10 @@ fn parse_workflow_args(
             }
             if let Some(v) = flag("--resource-count") {
                 let n = v.parse::<u64>().map_err(|_| {
-                    anyhow!("--resource-count must be a positive integer, got {:?}", v)
+                    anyhow!(
+                        "--resource-count must be a non-negative integer, got {:?}",
+                        v
+                    )
                 })?;
                 args.insert("resource_count".into(), n.into());
             }

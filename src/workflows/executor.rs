@@ -45,7 +45,9 @@ async fn write_step(writer: &SharedWriter, msg: &str) {
     step(msg);
     // Also send through the IPC writer so clients see progress.
     let mut w = writer.lock().await;
-    let _ = write_frame(&mut **w, &Response::Text { chunk: formatted }).await;
+    if let Err(e) = write_frame(&mut **w, &Response::Text { chunk: formatted }).await {
+        tracing::warn!(error = %e, step = %msg, "write_step: failed to send step marker to client");
+    }
 }
 
 /// Create a no-op writer (for tests or contexts that discard output).
@@ -248,10 +250,10 @@ async fn run_single_stage(
 ) -> Result<Option<String>> {
     // Acquire resource permit if required.
     let _permit = if let Some(ref res_name) = stage.requires {
-        let permit = resources
-            .acquire(res_name)
-            .await
-            .context(format!("acquiring resource '{}' for stage '{}'", res_name, stage.name))?;
+        let permit = resources.acquire(res_name).await.context(format!(
+            "acquiring resource '{}' for stage '{}'",
+            res_name, stage.name
+        ))?;
         Some(permit)
     } else {
         None
@@ -865,6 +867,10 @@ pub async fn llm_turn(
     messages.push(Message::user(prompt.to_owned()));
     let (_, mut steer_rx) = tokio::sync::mpsc::channel::<Option<String>>(1);
     let tool_ctx = crate::tools::ToolCallContext::default();
+    // NOTE: the writer mutex is held for the entire run_agentic_loop call.
+    // In parallel Map stages this serializes LLM output from concurrent items,
+    // preventing interleaved frames. Progress for each item is still visible;
+    // items simply take turns rather than truly overlapping writes.
     let mut w = writer.lock().await;
     let (text, _, _) = run_agentic_loop(
         state,

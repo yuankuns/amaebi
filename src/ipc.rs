@@ -194,7 +194,11 @@ pub struct MutexWriter<W: 'static> {
     inner: std::sync::Arc<tokio::sync::Mutex<W>>,
     /// In-progress lock acquisition, if any.  Stored between `poll_*` calls
     /// so the task is woken by the mutex when it becomes available.
-    lock_fut: Option<std::pin::Pin<Box<dyn std::future::Future<Output = tokio::sync::OwnedMutexGuard<W>> + Send>>>,
+    lock_fut: Option<
+        std::pin::Pin<
+            Box<dyn std::future::Future<Output = tokio::sync::OwnedMutexGuard<W>> + Send>,
+        >,
+    >,
     /// Guard held while a write/flush/shutdown operation is in progress.
     guard: Option<tokio::sync::OwnedMutexGuard<W>>,
 }
@@ -213,10 +217,7 @@ impl<W: tokio::io::AsyncWrite + Unpin + Send + 'static> MutexWriter<W> {
     /// Ensure we hold the lock, polling the lock future if needed.
     /// Returns `Poll::Ready(())` when the guard is available in `self.guard`,
     /// or `Poll::Pending` if still waiting for the lock.
-    fn poll_acquire_guard(
-        &mut self,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<()> {
+    fn poll_acquire_guard(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
         if self.guard.is_some() {
             return std::task::Poll::Ready(());
         }

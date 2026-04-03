@@ -161,12 +161,13 @@ impl ResourcePool {
     }
 
     pub async fn acquire(&self, name: &str) -> anyhow::Result<tokio::sync::SemaphorePermit<'_>> {
-        let sem = self.pools.get(name).ok_or_else(|| {
-            anyhow::anyhow!("unknown resource '{name}'")
-        })?;
-        sem.acquire().await.map_err(|e| {
-            anyhow::anyhow!("semaphore for resource '{name}' is closed: {e}")
-        })
+        let sem = self
+            .pools
+            .get(name)
+            .ok_or_else(|| anyhow::anyhow!("unknown resource '{name}'"))?;
+        sem.acquire()
+            .await
+            .map_err(|e| anyhow::anyhow!("semaphore for resource '{name}' is closed: {e}"))
     }
 }
 
