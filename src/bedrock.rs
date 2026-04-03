@@ -49,6 +49,27 @@ fn aws_region() -> String {
         .unwrap_or_else(|_| DEFAULT_REGION.to_owned())
 }
 
+/// Percent-encode a string for use as a single URL path segment.
+///
+/// Encodes everything except RFC 3986 unreserved characters:
+/// `ALPHA / DIGIT / "-" / "." / "_" / "~"`
+fn percent_encode_path_segment(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for &byte in s.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(byte as char);
+            }
+            _ => {
+                out.push('%');
+                out.push(char::from(b"0123456789ABCDEF"[(byte >> 4) as usize]));
+                out.push(char::from(b"0123456789ABCDEF"[(byte & 0x0F) as usize]));
+            }
+        }
+    }
+    out
+}
+
 /// Build the ConverseStream endpoint URL.
 ///
 /// `AMAEBI_BEDROCK_URL` is a test-only override (analogous to
@@ -60,9 +81,10 @@ fn converse_stream_endpoint(region: &str, model_id: &str) -> String {
             return trimmed.to_string();
         }
     }
-    // model_id may contain `:` (e.g. `us.anthropic.claude-sonnet-4-6-v1:0`)
-    // which must be URL-encoded in the path segment.
-    let encoded_model = model_id.replace(':', "%3A");
+    // Percent-encode the model ID for use as a URL path segment.
+    // Bedrock model IDs may contain `:` (e.g. `…-v1:0`) or other reserved
+    // characters; encode everything except unreserved chars (RFC 3986).
+    let encoded_model = percent_encode_path_segment(model_id);
     format!("https://bedrock-runtime.{region}.amazonaws.com/model/{encoded_model}/converse-stream")
 }
 
@@ -293,15 +315,26 @@ pub(crate) mod eventstream {
     /// Returns `Ok(Some((frame, consumed)))` on success, `Ok(None)` if `buf`
     /// does not yet contain a complete frame, or `Err` on corruption.
     pub fn try_parse_frame(buf: &[u8]) -> Result<Option<(Frame, usize)>> {
-        // Minimum frame size: 4 (total) + 4 (header) + 4 (prelude CRC)
-        //                    + 0 (headers) + 0 (payload) + 4 (msg CRC) = 16
+        // Need at least 12 bytes to read the prelude (total_len + header_len + CRC).
         if buf.len() < 12 {
-            return Ok(None); // not enough for even the prelude
+            return Ok(None);
         }
 
         let total_len = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
         let header_len = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]) as usize;
         let prelude_crc_expected = u32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]);
+
+        // Structural validation: minimum frame is 16 bytes (prelude 12 + msg CRC 4).
+        // header_len must fit within the frame (total - prelude 12 - msg CRC 4).
+        if total_len < 16 {
+            anyhow::bail!("event-stream frame too small: total_len={total_len}");
+        }
+        let max_header_len = total_len - 16;
+        if header_len > max_header_len {
+            anyhow::bail!(
+                "event-stream header_len ({header_len}) exceeds frame capacity ({max_header_len})"
+            );
+        }
 
         if buf.len() < total_len {
             return Ok(None); // incomplete frame
@@ -358,99 +391,82 @@ pub(crate) mod eventstream {
         let mut map = std::collections::HashMap::new();
 
         while !buf.is_empty() {
-            if buf.is_empty() {
-                break;
-            }
             let name_len = buf[0] as usize;
             buf = &buf[1..];
-            if buf.len() < name_len {
-                break;
-            }
+            anyhow::ensure!(
+                buf.len() >= name_len,
+                "truncated header name (need {name_len}, have {})",
+                buf.len()
+            );
             let name = std::str::from_utf8(&buf[..name_len])
                 .context("header name is not UTF-8")?
                 .to_owned();
             buf = &buf[name_len..];
 
-            if buf.is_empty() {
-                break;
-            }
+            anyhow::ensure!(!buf.is_empty(), "truncated header: missing value type");
             let value_type = buf[0];
             buf = &buf[1..];
+
+            /// Consume exactly `n` bytes from `buf`, failing if not enough remain.
+            macro_rules! consume {
+                ($n:expr) => {{
+                    let n = $n;
+                    anyhow::ensure!(
+                        buf.len() >= n,
+                        "truncated header value for {name:?} (need {n}, have {})",
+                        buf.len()
+                    );
+                    let (head, tail) = buf.split_at(n);
+                    buf = tail;
+                    head
+                }};
+            }
 
             match value_type {
                 // Type 7 = string
                 7 => {
-                    if buf.len() < 2 {
-                        break;
-                    }
-                    let val_len = u16::from_be_bytes([buf[0], buf[1]]) as usize;
-                    buf = &buf[2..];
-                    if buf.len() < val_len {
-                        break;
-                    }
-                    let value = std::str::from_utf8(&buf[..val_len])
-                        .unwrap_or("")
-                        .to_owned();
-                    buf = &buf[val_len..];
+                    let len_bytes = consume!(2);
+                    let val_len = u16::from_be_bytes([len_bytes[0], len_bytes[1]]) as usize;
+                    let val_bytes = consume!(val_len);
+                    let value = std::str::from_utf8(val_bytes).unwrap_or("").to_owned();
                     map.insert(name, value);
                 }
-                // Type 6 = bytes (store as hex for debugging)
+                // Type 6 = bytes (skip for now)
                 6 => {
-                    if buf.len() < 2 {
-                        break;
-                    }
-                    let val_len = u16::from_be_bytes([buf[0], buf[1]]) as usize;
-                    buf = &buf[2..];
-                    if buf.len() < val_len {
-                        break;
-                    }
-                    buf = &buf[val_len..];
+                    let len_bytes = consume!(2);
+                    let val_len = u16::from_be_bytes([len_bytes[0], len_bytes[1]]) as usize;
+                    consume!(val_len);
                 }
                 // Type 0 = bool_true, 1 = bool_false (no payload)
                 0 | 1 => {}
                 // Type 2 = byte (1 byte)
                 2 => {
-                    if !buf.is_empty() {
-                        buf = &buf[1..];
-                    }
+                    consume!(1);
                 }
                 // Type 3 = short (2 bytes)
                 3 => {
-                    if buf.len() >= 2 {
-                        buf = &buf[2..];
-                    }
+                    consume!(2);
                 }
                 // Type 4 = int (4 bytes)
                 4 => {
-                    if buf.len() >= 4 {
-                        buf = &buf[4..];
-                    }
+                    consume!(4);
                 }
                 // Type 5 = long (8 bytes)
                 5 => {
-                    if buf.len() >= 8 {
-                        buf = &buf[8..];
-                    }
+                    consume!(8);
                 }
                 // Type 8 = timestamp (8 bytes)
                 8 => {
-                    if buf.len() >= 8 {
-                        buf = &buf[8..];
-                    }
+                    consume!(8);
                 }
                 // Type 9 = uuid (16 bytes)
                 9 => {
-                    if buf.len() >= 16 {
-                        buf = &buf[16..];
-                    }
+                    consume!(16);
                 }
                 _ => {
-                    // Unknown type — cannot determine length; bail.
-                    tracing::warn!(
-                        value_type,
-                        "unknown event-stream header type; stopping parse"
+                    anyhow::bail!(
+                        "unknown event-stream header type {value_type} for header {name:?}"
                     );
-                    break;
                 }
             }
         }
@@ -786,15 +802,18 @@ where
     let mut finish_reason = FinishReason::Stop;
     let mut prompt_tokens = 0usize;
 
+    // Cursor into raw_buf: bytes before `start` have been consumed.
+    let mut start = 0usize;
+
     while let Some(chunk) = stream.next().await {
         let bytes = chunk.context("reading Bedrock stream chunk")?;
         raw_buf.extend_from_slice(&bytes);
 
         // Parse as many complete frames as possible from the buffer.
         loop {
-            match eventstream::try_parse_frame(&raw_buf) {
+            match eventstream::try_parse_frame(&raw_buf[start..]) {
                 Ok(Some((frame, consumed))) => {
-                    raw_buf = raw_buf[consumed..].to_vec();
+                    start += consumed;
                     handle_frame(
                         &frame,
                         &mut text,
@@ -809,13 +828,18 @@ where
                 Ok(None) => break, // need more data
                 Err(e) => {
                     tracing::warn!(error = %e, "skipping corrupted event-stream frame");
-                    // Try to recover by scanning for the next valid frame.
-                    // Drop the first byte and retry.
-                    if !raw_buf.is_empty() {
-                        raw_buf.remove(0);
+                    // Advance past the bad byte and retry.
+                    if start < raw_buf.len() {
+                        start += 1;
                     }
                 }
             }
+        }
+
+        // Compact: drop consumed bytes so the buffer doesn't grow unboundedly.
+        if start > 0 {
+            raw_buf.drain(..start);
+            start = 0;
         }
     }
 
