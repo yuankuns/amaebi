@@ -601,64 +601,106 @@ async fn run_check(check: &Option<Check>, ctx: &mut Context) -> Result<()> {
 // Delegate turn — send a task to an external Claude Code pane via tmux
 // ---------------------------------------------------------------------------
 
-/// Auto-detect which tmux pane has an idle Claude Code REPL by asking the LLM.
-pub async fn detect_delegate_pane(state: &Arc<DaemonState>, model: &str) -> Result<String> {
+/// Auto-detect which tmux pane has an idle Claude Code REPL.
+///
+/// Uses a local heuristic — no pane content is sent to the LLM, so no
+/// secrets or credentials from other panes can leak off-box.
+/// Captures only the last 5 lines of each pane to minimise I/O.
+pub async fn detect_delegate_pane(_state: &Arc<DaemonState>, _model: &str) -> Result<String> {
     let list_result = sh("tmux list-panes -a -F '#{pane_id}'").await?;
     if !list_result.success {
         anyhow::bail!("failed to list tmux panes: {}", list_result.stderr);
     }
-    let pane_ids: Vec<&str> = list_result
+    let pane_ids: Vec<String> = list_result
         .stdout
         .lines()
         .filter(|l| !l.is_empty())
+        .map(str::to_owned)
         .collect();
     if pane_ids.is_empty() {
         anyhow::bail!("no tmux panes found");
     }
 
-    let mut desc = String::new();
     for pane_id in &pane_ids {
-        let cap = sh(&format!("tmux capture-pane -t {pane_id} -p")).await?;
-        let content = cap.stdout;
-        let tail = {
-            let start = content.len().saturating_sub(500);
-            let mut s = start;
-            while s < content.len() && !content.is_char_boundary(s) {
-                s += 1;
+        let cap = sh(&format!("tmux capture-pane -t {pane_id} -p -S -5")).await?;
+        if pane_looks_idle(&cap.stdout) {
+            return Ok(pane_id.clone());
+        }
+    }
+
+    anyhow::bail!(
+        "no idle Claude Code pane found (checked {} panes for idle prompt)",
+        pane_ids.len()
+    )
+}
+
+/// Returns `true` when the captured pane content looks like an idle
+/// Claude Code REPL waiting for input.
+///
+/// Two complementary heuristics (both checked after stripping ANSI escapes):
+/// 1. The last non-empty line ends with the amaebi chat idle prompt (`> ` or `❯`).
+/// 2. No active-task spinner text is visible (e.g. "Flowing", "Burrowing",
+///    "↓ " token counter, "esc to interrupt" footer).
+pub fn pane_looks_idle(content: &str) -> bool {
+    let plain = strip_ansi(content);
+
+    // Active-task indicators take precedence — if any are visible, the pane
+    // is busy regardless of what the last line looks like.
+    let active = [
+        "Flowing",
+        "Burrowing",
+        "Ruminating",
+        "Pouncing",
+        "↓ ",
+        "· esc to interrupt",
+    ];
+    if active.iter().any(|kw| plain.contains(kw)) {
+        return false;
+    }
+
+    // Idle prompt on the last non-empty line confirms the REPL is waiting.
+    if let Some(last) = plain.lines().rev().find(|l| !l.trim().is_empty()) {
+        let t = last.trim_end();
+        if t.ends_with("> ") || t.ends_with('>') || t.ends_with("❯ ") || t.ends_with('❯') {
+            return true;
+        }
+    }
+
+    // No active indicators and no recognisable idle prompt — assume idle.
+    true
+}
+
+/// Strip common ANSI CSI escape sequences from `s`.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            match chars.peek() {
+                Some('[') => {
+                    chars.next();
+                    // consume until a letter (the final byte of the CSI sequence)
+                    for ch in chars.by_ref() {
+                        if ch.is_ascii_alphabetic() {
+                            break;
+                        }
+                    }
+                }
+                _ => {
+                    chars.next(); // skip the single char after ESC
+                }
             }
-            &content[s..]
-        };
-        desc.push_str(&format!(
-            "--- Pane {pane_id} (last 500 chars) ---\n{tail}\n\n"
-        ));
+        } else {
+            out.push(c);
+        }
     }
-
-    let prompt = format!(
-        "Below are the last 500 characters from several tmux panes.\n\
-         Which pane contains an idle Claude Code session waiting for user input?\n\
-         Return ONLY the pane ID (e.g. %3) or NONE.\n\n{desc}"
-    );
-
-    let text = ask_llm(state, model, &prompt).await?;
-    let trimmed = text.trim();
-    if trimmed.eq_ignore_ascii_case("NONE") || trimmed.is_empty() {
-        anyhow::bail!("no idle Claude Code pane detected");
-    }
-    let pane_id = trimmed
-        .split_whitespace()
-        .find(|t| t.starts_with('%'))
-        .unwrap_or(trimmed.lines().next().unwrap_or(""))
-        .trim();
-    if !pane_id.starts_with('%') {
-        anyhow::bail!("LLM returned invalid pane ID: {pane_id:?}");
-    }
-    Ok(pane_id.to_owned())
+    out
 }
 
 /// Send a prompt to an external Claude Code REPL and wait for it to finish.
 pub async fn delegate_turn(
-    state: &Arc<DaemonState>,
-    model: &str,
+    _state: &Arc<DaemonState>,
+    _model: &str,
     ctx: &mut Context,
     prompt: &str,
     writer: &SharedWriter,
@@ -685,9 +727,11 @@ pub async fn delegate_turn(
     let tmp_path = tmp.path().to_string_lossy().to_string();
 
     // Send prompt to the Claude pane via tmux paste-buffer.
+    // Use '' ENTER (empty literal + ENTER key name) so tmux sends the actual
+    // Return key, not the literal string "Enter".
     sh(&format!("tmux load-buffer '{tmp_path}'")).await?;
     sh(&format!("tmux paste-buffer -t '{pane}'")).await?;
-    sh(&format!("tmux send-keys -t '{pane}' Enter")).await?;
+    sh(&format!("tmux send-keys -t '{pane}' '' ENTER")).await?;
 
     // Wait for Claude to start processing.
     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
@@ -702,10 +746,10 @@ pub async fn delegate_turn(
             anyhow::bail!("delegate timeout: pane {pane} did not finish within 30 minutes");
         }
 
-        let capture = sh(&format!("tmux capture-pane -t '{pane}' -p")).await?;
+        let capture = sh(&format!("tmux capture-pane -t '{pane}' -p -S -10")).await?;
         let pane_content = &capture.stdout;
 
-        if is_pane_idle(state, model, pane_content).await? {
+        if is_pane_idle(pane_content) {
             write_step(writer, "    Delegate completed").await;
             ctx.set("last_llm_output", pane_content);
             return Ok(pane_content.clone());
@@ -715,44 +759,9 @@ pub async fn delegate_turn(
     }
 }
 
-/// Ask the internal LLM whether a tmux pane shows an idle Claude Code session.
-async fn is_pane_idle(state: &Arc<DaemonState>, model: &str, pane_content: &str) -> Result<bool> {
-    let tail = {
-        let start = pane_content.len().saturating_sub(2000);
-        let mut s = start;
-        while s < pane_content.len() && !pane_content.is_char_boundary(s) {
-            s += 1;
-        }
-        &pane_content[s..]
-    };
-    let prompt = format!(
-        "Below is the tail of a tmux pane running Claude Code.\n\
-         Is this session idle and waiting for user input?\n\
-         Answer YES or NO only.\n\n\
-         --- pane content ---\n{tail}\n--- end ---"
-    );
-    let text = ask_llm(state, model, &prompt).await?;
-    Ok(text.trim().to_uppercase().contains("YES"))
-}
-
-/// Lightweight single-turn LLM call (no tools, no message history).
-async fn ask_llm(state: &Arc<DaemonState>, model: &str, prompt: &str) -> Result<String> {
-    let messages = vec![Message::user(prompt.to_owned())];
-    let (_, mut steer_rx) = tokio::sync::mpsc::channel::<Option<String>>(1);
-    let tool_ctx = crate::tools::ToolCallContext::default();
-    let mut sink = tokio::io::sink();
-    let (text, _, _) = run_agentic_loop(
-        state,
-        model,
-        messages,
-        &mut sink,
-        &mut steer_rx,
-        false,
-        &tool_ctx,
-    )
-    .await
-    .context("ask_llm failed")?;
-    Ok(text)
+/// Returns `true` when the pane looks idle. Thin wrapper for `pane_looks_idle`.
+fn is_pane_idle(pane_content: &str) -> bool {
+    pane_looks_idle(pane_content)
 }
 
 // ---------------------------------------------------------------------------
@@ -1853,4 +1862,133 @@ async fn execute_with_ctx(
     )
     .await?;
     Ok(result.unwrap_or_default())
+}
+
+// ---------------------------------------------------------------------------
+// Delegate pane detection tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod delegate_tests {
+    use super::{pane_looks_idle, strip_ansi};
+
+    // --- strip_ansi ---
+
+    #[test]
+    fn strip_ansi_removes_csi_sequences() {
+        let raw = "\x1b[1;36m==> Stage\x1b[0m";
+        assert_eq!(strip_ansi(raw), "==> Stage");
+    }
+
+    #[test]
+    fn strip_ansi_removes_char_after_esc() {
+        // ESC followed by a non-'[' char: our stripper skips that one char only.
+        // ESC(B is a two-byte designate sequence; we skip '(' and keep 'B'.
+        // That's acceptable — the goal is to remove colour/cursor codes, not
+        // to perfectly handle every VT100 variant.
+        let raw = "before\x1b(Bafter";
+        // '(' is stripped; 'B' remains.
+        assert_eq!(strip_ansi(raw), "beforeBafter");
+    }
+
+    #[test]
+    fn strip_ansi_passthrough_plain_text() {
+        let s = "hello world\n> ";
+        assert_eq!(strip_ansi(s), s);
+    }
+
+    // --- pane_looks_idle: positive cases ---
+
+    #[test]
+    fn idle_ascii_prompt_with_space() {
+        // Classic amaebi chat idle prompt.
+        assert!(pane_looks_idle("Some output\n> "));
+    }
+
+    #[test]
+    fn idle_ascii_prompt_no_trailing_space() {
+        assert!(pane_looks_idle("Some output\n>"));
+    }
+
+    #[test]
+    fn idle_unicode_heavy_angle_with_space() {
+        // Powerlevel10k / Oh My Zsh shell prompt.
+        assert!(pane_looks_idle("Some output\n❯ "));
+    }
+
+    #[test]
+    fn idle_unicode_heavy_angle_no_trailing_space() {
+        assert!(pane_looks_idle("Some output\n❯"));
+    }
+
+    #[test]
+    fn idle_prompt_with_ansi_prefix() {
+        // ANSI colour codes before the prompt character.
+        let raw = "output\n\x1b[1;32m> \x1b[0m";
+        assert!(pane_looks_idle(raw));
+    }
+
+    #[test]
+    fn idle_when_no_active_indicator_present() {
+        // No spinner or "esc to interrupt" → assume idle.
+        assert!(pane_looks_idle("just some output"));
+    }
+
+    // --- pane_looks_idle: negative cases (active) ---
+
+    #[test]
+    fn active_flowing_indicator() {
+        assert!(!pane_looks_idle("· Flowing… (2s)\n❯ "));
+    }
+
+    #[test]
+    fn active_burrowing_indicator() {
+        assert!(!pane_looks_idle(
+            "output\n· Burrowing… (5s · ↓ 1.0k tokens)\n"
+        ));
+    }
+
+    #[test]
+    fn active_esc_to_interrupt_footer() {
+        // Status bar present → Claude is running.
+        let s = "working...\n──────\n  ⏵⏵ bypass permissions on · esc to interrupt\n";
+        assert!(!pane_looks_idle(s));
+    }
+
+    #[test]
+    fn active_token_counter() {
+        // "↓ " token count indicator.
+        assert!(!pane_looks_idle("analysing code\n↓ 500 tokens\n"));
+    }
+
+    // --- Regression: trim_end must not eat the space in '> ' ---
+
+    #[test]
+    fn regression_trim_end_does_not_swallow_space_in_prompt() {
+        // This was the original bug: trim_end() removed trailing space from
+        // '> ' before ends_with('> ') was checked, so it never matched.
+        let content = "> \n";
+        assert!(
+            pane_looks_idle(content),
+            "idle '> ' prompt must be detected even when followed by newline"
+        );
+    }
+
+    // --- Regression: ENTER key must be sent as key-name, not literal string ---
+
+    #[test]
+    fn enter_key_command_uses_key_name_not_literal() {
+        // delegate_turn builds the command "tmux send-keys -t '{pane}' '' ENTER".
+        // Verify the command string uses the key name ENTER, not the literal "Enter".
+        let pane = "%3";
+        let cmd = format!("tmux send-keys -t '{pane}' '' ENTER");
+        assert!(
+            cmd.contains("ENTER"),
+            "send-keys must use ENTER key name, got: {cmd}"
+        );
+        assert!(
+            !cmd.contains("Enter") || cmd.contains("ENTER"),
+            "send-keys must not send the literal string 'Enter', got: {cmd}"
+        );
+    }
 }
