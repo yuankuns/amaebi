@@ -603,56 +603,62 @@ async fn run_check(check: &Option<Check>, ctx: &mut Context) -> Result<()> {
 
 /// Auto-detect which tmux pane has an idle Claude Code REPL.
 ///
-/// Uses a local heuristic — no pane content is sent to the LLM, so no
-/// secrets or credentials from other panes can leak off-box.
-/// Captures only the last 5 lines of each pane to minimise I/O.
+/// Strategy (in priority order):
+/// 1. Panes running `claude` (Claude Code binary) that are idle.
+/// 2. Panes running `amaebi` with the Claude Code TUI footer (bypass
+///    permissions) — an amaebi chat session acting as a worker.
+///
+/// Plain bash/shell panes are ignored entirely, which prevents the
+/// supervisor from delegating to an unrelated terminal.
 pub async fn detect_delegate_pane(_state: &Arc<DaemonState>, _model: &str) -> Result<String> {
-    let list_result = sh("tmux list-panes -a -F '#{pane_id}'").await?;
+    // Fetch pane_id and pane_current_command together to filter by process.
+    let list_result = sh("tmux list-panes -a -F '#{pane_id} #{pane_current_command}'").await?;
     if !list_result.success {
         anyhow::bail!("failed to list tmux panes: {}", list_result.stderr);
     }
-    let pane_ids: Vec<String> = list_result
+
+    // Parse "pane_id command" lines.
+    let panes: Vec<(String, String)> = list_result
         .stdout
         .lines()
         .filter(|l| !l.is_empty())
-        .map(str::to_owned)
+        .filter_map(|l| {
+            let mut parts = l.splitn(2, ' ');
+            Some((parts.next()?.to_owned(), parts.next()?.trim().to_owned()))
+        })
         .collect();
-    if pane_ids.is_empty() {
+
+    if panes.is_empty() {
         anyhow::bail!("no tmux panes found");
     }
 
-    // First pass: prefer panes showing the Claude Code TUI (identified by the
-    // "bypass permissions" footer that appears when a tool-use permission
-    // prompt is active or the REPL is idle with bypass mode available).
-    // This distinguishes a worker Claude Code session from a plain amaebi chat
-    // supervisor pane (which would also show an idle '> ' prompt).
-    let mut fallback: Option<String> = None;
-    for pane_id in &pane_ids {
-        let cap = sh(&format!("tmux capture-pane -t {pane_id} -p -S -20")).await?;
-        let content = &cap.stdout;
-        let plain = strip_ansi(content);
-
-        if !pane_looks_idle(content) {
+    // Pass 1: panes running the `claude` binary — highest confidence.
+    for (pane_id, cmd) in &panes {
+        if cmd != "claude" {
             continue;
         }
-
-        if plain.contains("bypass permissions") {
-            // Definitive match: this is a Claude Code TUI waiting for input.
+        let cap = sh(&format!("tmux capture-pane -t {pane_id} -p -S -20")).await?;
+        if pane_looks_idle(&cap.stdout) {
             return Ok(pane_id.clone());
-        }
-
-        // Plain idle prompt — keep as fallback in case no TUI pane is found.
-        if fallback.is_none() {
-            fallback = Some(pane_id.clone());
         }
     }
 
-    fallback.ok_or_else(|| {
-        anyhow!(
-            "no idle Claude Code pane found (checked {} panes)",
-            pane_ids.len()
-        )
-    })
+    // Pass 2: panes running `amaebi` with the Claude Code TUI footer.
+    for (pane_id, cmd) in &panes {
+        if cmd != "amaebi" && cmd != "target/release/amaebi" {
+            continue;
+        }
+        let cap = sh(&format!("tmux capture-pane -t {pane_id} -p -S -20")).await?;
+        let plain = strip_ansi(&cap.stdout);
+        if pane_looks_idle(&cap.stdout) && plain.contains("bypass permissions") {
+            return Ok(pane_id.clone());
+        }
+    }
+
+    anyhow::bail!(
+        "no idle Claude Code pane found (checked {} panes)",
+        panes.len()
+    )
 }
 
 /// Returns `true` when the captured pane content looks like an idle
