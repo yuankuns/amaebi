@@ -44,7 +44,7 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
     // Resolve model: CLI flag > AMAEBI_MODEL env var > default.
     let model = model
         .or_else(|| std::env::var("AMAEBI_MODEL").ok())
-        .unwrap_or_else(|| "gpt-4o".to_string());
+        .unwrap_or_else(|| crate::provider::DEFAULT_MODEL.to_string());
 
     // Resolve the session UUID for the current working directory.
     // Wrapped in spawn_blocking because session::get_or_create does file I/O.
@@ -316,7 +316,7 @@ pub async fn run_chat_loop(
 
     let model = model
         .or_else(|| std::env::var("AMAEBI_MODEL").ok())
-        .unwrap_or_else(|| "gpt-4o".to_string());
+        .unwrap_or_else(|| crate::provider::DEFAULT_MODEL.to_string());
 
     let cwd = std::env::current_dir().context("getting current directory")?;
     let session_id = tokio::task::spawn_blocking(move || session::get_or_create(&cwd))
@@ -558,7 +558,7 @@ pub async fn run_detach(socket: PathBuf, prompt: String, model: Option<String>) 
 
     let model = model
         .or_else(|| std::env::var("AMAEBI_MODEL").ok())
-        .unwrap_or_else(|| "gpt-4o".to_string());
+        .unwrap_or_else(|| crate::provider::DEFAULT_MODEL.to_string());
 
     let cwd = std::env::current_dir().context("getting current directory")?;
     let session_id = tokio::task::spawn_blocking(move || session::get_or_create(&cwd))
@@ -623,7 +623,7 @@ pub async fn run_resume(
 
     let model = model
         .or_else(|| std::env::var("AMAEBI_MODEL").ok())
-        .unwrap_or_else(|| "gpt-4o".to_string());
+        .unwrap_or_else(|| crate::provider::DEFAULT_MODEL.to_string());
 
     let req = Request::Resume {
         prompt,

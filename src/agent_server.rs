@@ -366,7 +366,7 @@ impl acp::Agent for AmaebiAgent {
 pub async fn run(model: Option<String>, socket: PathBuf) -> Result<()> {
     let model: Arc<str> = model
         .or_else(|| std::env::var("AMAEBI_MODEL").ok())
-        .unwrap_or_else(|| "gpt-4o".to_string())
+        .unwrap_or_else(|| crate::provider::DEFAULT_MODEL.to_string())
         .into();
 
     let state = Arc::new(
@@ -467,9 +467,9 @@ mod tests {
         let _env = ModelEnvGuard::unset();
         let model: Arc<str> = None::<String>
             .or_else(|| std::env::var("AMAEBI_MODEL").ok())
-            .unwrap_or_else(|| "gpt-4o".to_string())
+            .unwrap_or_else(|| crate::provider::DEFAULT_MODEL.to_string())
             .into();
-        assert_eq!(&*model, "gpt-4o");
+        assert_eq!(&*model, crate::provider::DEFAULT_MODEL);
     }
 
     #[test]
@@ -478,7 +478,7 @@ mod tests {
         // Explicit flag takes priority regardless of env var.
         let model: Arc<str> = Some("gpt-4.1".to_string())
             .or_else(|| std::env::var("AMAEBI_MODEL").ok())
-            .unwrap_or_else(|| "gpt-4o".to_string())
+            .unwrap_or_else(|| crate::provider::DEFAULT_MODEL.to_string())
             .into();
         assert_eq!(&*model, "gpt-4.1");
     }
@@ -489,7 +489,7 @@ mod tests {
         let _env = ModelEnvGuard::set("o4-mini");
         let model: Arc<str> = None::<String>
             .or_else(|| std::env::var("AMAEBI_MODEL").ok())
-            .unwrap_or_else(|| "gpt-4o".to_string())
+            .unwrap_or_else(|| crate::provider::DEFAULT_MODEL.to_string())
             .into();
         assert_eq!(&*model, "o4-mini");
     }

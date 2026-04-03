@@ -292,7 +292,10 @@ async fn spawn_agent(args: serde_json::Value, ctx: &SpawnContext) -> Result<Stri
     let model = args["model"]
         .as_str()
         .map(|s| s.to_string())
-        .unwrap_or_else(|| std::env::var("AMAEBI_MODEL").unwrap_or_else(|_| "gpt-4o".to_string()));
+        .unwrap_or_else(|| {
+            std::env::var("AMAEBI_MODEL")
+                .unwrap_or_else(|_| crate::provider::DEFAULT_MODEL.to_string())
+        });
 
     let extra_mounts = args["extra_mounts"].as_array().cloned().unwrap_or_default();
     let mut ro_paths: Vec<PathBuf> = vec![];

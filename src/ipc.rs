@@ -10,7 +10,7 @@ pub enum Request {
         tmux_pane: Option<String>,
         /// Attach to an existing subagent session (Phase 4).
         session_id: Option<String>,
-        /// Chat model to use (e.g. "gpt-4o").
+        /// Chat model to use (e.g. "bedrock/claude-sonnet-4.6" or "copilot/gpt-4o").
         model: String,
     },
     /// Inject a user correction into a running agentic loop on the same connection.
@@ -37,7 +37,7 @@ pub enum Request {
         tmux_pane: Option<String>,
         /// Session UUID to associate with this task.
         session_id: Option<String>,
-        /// Chat model to use (e.g. "gpt-4o").
+        /// Chat model to use (e.g. "bedrock/claude-sonnet-4.6" or "copilot/gpt-4o").
         model: String,
     },
     /// Resume a prior session by UUID, loading its **full** chronological history
@@ -56,7 +56,7 @@ pub enum Request {
         /// Session UUID to re-hydrate.  Required — this variant always targets a
         /// specific historical session.
         session_id: String,
-        /// Chat model to use (e.g. "gpt-4o").
+        /// Chat model to use (e.g. "bedrock/claude-sonnet-4.6" or "copilot/gpt-4o").
         model: String,
     },
     /// Ask the daemon to abort the current tool execution and skip remaining

@@ -392,7 +392,7 @@ pub async fn send_message(client: &ClientHandle, prompt: &str) -> Result<Vec<Res
             prompt: prompt.to_string(),
             tmux_pane: None,
             session_id: None,
-            model: "gpt-4o".to_string(),
+            model: "copilot/gpt-4o".to_string(),
         },
     )
     .await
