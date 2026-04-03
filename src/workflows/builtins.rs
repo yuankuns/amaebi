@@ -116,20 +116,41 @@ pub fn dev_loop(
                     ),
                 },
             )
+            // The check command normalises the review result:
+            //  • Actual APPROVED state → "APPROVED"
+            //  • Copilot review with no new comments → "APPROVED: no new comments"
+            //  • Any other state (CHANGES_REQUESTED, COMMENTED with issues) → raw output
+            // This avoids spurious retries when Copilot has reviewed the code and
+            // found nothing wrong but didn't explicitly click "Approve".
             .with_check(Check::Contains {
-                command: "gh pr view --json reviews --jq \
-                          '.reviews[-1] | .state + \": \" + (.body // \"\")'"
-                    .into(),
+                command: r#"
+review=$(gh pr view --json reviews --jq '.reviews[-1] | .state + ": " + (.body // "")' 2>/dev/null || echo "PENDING: ")
+if echo "$review" | grep -qiE "^APPROVED|no new comments|generated no new comments"; then
+  echo "APPROVED"
+else
+  echo "$review"
+fi
+"#.trim().to_owned(),
                 pattern: "APPROVED".into(),
             })
             .with_on_fail(FailStrategy::Retry {
                 max: max_review_retries,
+                // The delegate Claude should FIRST determine whether the review
+                // output actually contains actionable feedback before making any
+                // changes.  If the body only says "no new comments" or is a
+                // general overview with no specific issues, reply with just
+                // "LGTM — no changes needed" so the workflow can re-poll.
                 inject_prompt:
-                    "The code review requires changes. Review feedback:\n\n{stdout}\n\n\
-                     Please address ALL the review comments, then:\n\
-                     1. Run the test suite to make sure everything passes\n\
-                     2. Commit and push the fixes\n\
-                     After you push, I will resolve the conversations and re-request review."
+                    "The code review has a new result. Here is the review output:\n\n{stdout}\n\n\
+                     IMPORTANT: First read the review output carefully.\n\
+                     - If the review says 'generated no new comments', 'no new comments', \
+                     or contains no specific code issues, just reply 'LGTM — no changes needed' \
+                     and stop — do NOT make any code changes.\n\
+                     - Only if there are specific code changes requested, address ALL of them:\n\
+                     1. Fix the issues in the code\n\
+                     2. Run the test suite to make sure everything passes\n\
+                     3. Commit and push the fixes\n\
+                     After you push I will re-request review."
                         .into(),
             }),
         ],
