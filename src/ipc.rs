@@ -183,97 +183,109 @@ where
         .map_err(anyhow::Error::from)
 }
 
-/// Adapter that implements [`tokio::io::AsyncWrite`] by locking an
-/// `Arc<tokio::sync::Mutex<W>>` on every write.  Used to bridge the daemon's
-/// shared writer into the workflow executor's `SharedWriter` type.
+/// Adapter that implements [`tokio::io::AsyncWrite`] by acquiring an
+/// `OwnedMutexGuard` via the mutex's own lock future.  Used to bridge the
+/// daemon's shared writer into the workflow executor's `SharedWriter` type.
 ///
-/// On contention, the caller's waker is parked in a shared `Vec<Waker>`.
-/// The successful lock path drains and wakes all parked wakers so blocked
-/// writers are re-polled only when the lock is actually released — no task
-/// spawning, no busy-loop.
-pub struct MutexWriter<W> {
+/// On contention the task is woken by the `tokio::sync::Mutex` itself (via
+/// its internal `Notify`), so there is no manual waker parking and no risk
+/// of missed wakeups or busy-loops.
+pub struct MutexWriter<W: 'static> {
     inner: std::sync::Arc<tokio::sync::Mutex<W>>,
-    /// Wakers parked while the mutex was contended.  The lock holder drains
-    /// this after each successful operation.
-    parked: std::sync::Arc<std::sync::Mutex<Vec<std::task::Waker>>>,
+    /// In-progress lock acquisition, if any.  Stored between `poll_*` calls
+    /// so the task is woken by the mutex when it becomes available.
+    lock_fut: Option<std::pin::Pin<Box<dyn std::future::Future<Output = tokio::sync::OwnedMutexGuard<W>> + Send>>>,
+    /// Guard held while a write/flush/shutdown operation is in progress.
+    guard: Option<tokio::sync::OwnedMutexGuard<W>>,
 }
 
-impl<W> MutexWriter<W> {
+impl<W: 'static> MutexWriter<W> {
     pub fn new(inner: std::sync::Arc<tokio::sync::Mutex<W>>) -> Self {
         Self {
             inner,
-            parked: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            lock_fut: None,
+            guard: None,
         }
-    }
-
-    /// Wake all parked writers so they retry the lock.
-    fn wake_parked(&self) {
-        let wakers: Vec<_> = self
-            .parked
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .drain(..)
-            .collect();
-        for w in wakers {
-            w.wake();
-        }
-    }
-
-    /// Park the current waker and return `Pending`.
-    fn park(&self, cx: &std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
-        self.parked
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .push(cx.waker().clone());
-        std::task::Poll::Pending
     }
 }
 
-impl<W: tokio::io::AsyncWrite + Unpin + Send> tokio::io::AsyncWrite for MutexWriter<W> {
+impl<W: tokio::io::AsyncWrite + Unpin + Send + 'static> MutexWriter<W> {
+    /// Ensure we hold the lock, polling the lock future if needed.
+    /// Returns `Poll::Ready(())` when the guard is available in `self.guard`,
+    /// or `Poll::Pending` if still waiting for the lock.
+    fn poll_acquire_guard(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<()> {
+        if self.guard.is_some() {
+            return std::task::Poll::Ready(());
+        }
+        // Start a lock future if we don't have one.
+        let fut = self.lock_fut.get_or_insert_with(|| {
+            let inner = std::sync::Arc::clone(&self.inner);
+            Box::pin(async move { inner.lock_owned().await })
+        });
+        match fut.as_mut().poll(cx) {
+            std::task::Poll::Ready(guard) => {
+                self.guard = Some(guard);
+                self.lock_fut = None;
+                std::task::Poll::Ready(())
+            }
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+}
+
+impl<W: tokio::io::AsyncWrite + Unpin + Send + 'static> tokio::io::AsyncWrite for MutexWriter<W> {
     fn poll_write(
-        self: std::pin::Pin<&mut Self>,
+        mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
         buf: &[u8],
     ) -> std::task::Poll<std::io::Result<usize>> {
-        match self.inner.try_lock() {
-            Ok(mut guard) => {
-                let result = std::pin::Pin::new(&mut *guard).poll_write(cx, buf);
-                drop(guard);
-                self.wake_parked();
-                result
-            }
-            Err(_) => self.park(cx).map(|_| unreachable!()),
+        match self.poll_acquire_guard(cx) {
+            std::task::Poll::Pending => return std::task::Poll::Pending,
+            std::task::Poll::Ready(()) => {}
         }
+        let guard = self.guard.as_mut().expect("guard must be held");
+        let result = std::pin::Pin::new(&mut **guard).poll_write(cx, buf);
+        if result.is_ready() {
+            // Release the lock after the operation completes so other
+            // writers can make progress.
+            self.guard = None;
+        }
+        result
     }
 
     fn poll_flush(
-        self: std::pin::Pin<&mut Self>,
+        mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
-        match self.inner.try_lock() {
-            Ok(mut guard) => {
-                let result = std::pin::Pin::new(&mut *guard).poll_flush(cx);
-                drop(guard);
-                self.wake_parked();
-                result
-            }
-            Err(_) => self.park(cx),
+        match self.poll_acquire_guard(cx) {
+            std::task::Poll::Pending => return std::task::Poll::Pending,
+            std::task::Poll::Ready(()) => {}
         }
+        let guard = self.guard.as_mut().expect("guard must be held");
+        let result = std::pin::Pin::new(&mut **guard).poll_flush(cx);
+        if result.is_ready() {
+            self.guard = None;
+        }
+        result
     }
 
     fn poll_shutdown(
-        self: std::pin::Pin<&mut Self>,
+        mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
-        match self.inner.try_lock() {
-            Ok(mut guard) => {
-                let result = std::pin::Pin::new(&mut *guard).poll_shutdown(cx);
-                drop(guard);
-                self.wake_parked();
-                result
-            }
-            Err(_) => self.park(cx),
+        match self.poll_acquire_guard(cx) {
+            std::task::Poll::Pending => return std::task::Poll::Pending,
+            std::task::Poll::Ready(()) => {}
         }
+        let guard = self.guard.as_mut().expect("guard must be held");
+        let result = std::pin::Pin::new(&mut **guard).poll_shutdown(cx);
+        if result.is_ready() {
+            self.guard = None;
+        }
+        result
     }
 }
 

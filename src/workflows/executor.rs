@@ -251,7 +251,7 @@ async fn run_single_stage(
         let permit = resources
             .acquire(res_name)
             .await
-            .ok_or_else(|| anyhow!("unknown resource '{res_name}'"))?;
+            .context(format!("acquiring resource '{}' for stage '{}'", res_name, stage.name))?;
         Some(permit)
     } else {
         None
