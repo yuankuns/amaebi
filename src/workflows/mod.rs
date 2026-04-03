@@ -94,7 +94,7 @@ pub enum Action {
         /// level** — actual semaphore acquisition happens inside each
         /// sub-stage via `Stage::requires` / `with_requires()`.
         /// e.g. Some("gpu") indicates sub-stages hold the "gpu" resource.
-        concurrency_resource: Option<String>,
+        resource_hint: Option<String>,
     },
 }
 

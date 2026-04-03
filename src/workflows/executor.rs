@@ -290,7 +290,7 @@ async fn run_single_stage(
             parse,
             stages: sub_stages,
             parallel,
-            concurrency_resource,
+            resource_hint,
         } => {
             let source = ctx.get("last_llm_output").unwrap_or("").to_owned();
             let items = parse_items(parse, &source)?;
@@ -313,7 +313,7 @@ async fn run_single_stage(
                     model,
                     ctx,
                     resources,
-                    concurrency_resource.as_deref(),
+                    resource_hint.as_deref(),
                     writer,
                     messages,
                 )
@@ -381,7 +381,7 @@ async fn run_map_parallel(
     model: &str,
     ctx: &Context,
     resources: &ResourcePool,
-    _concurrency_resource: Option<&str>,
+    _resource_hint: Option<&str>,
     writer: &SharedWriter,
     base_messages: &[Message],
 ) -> Result<()> {
@@ -409,7 +409,7 @@ async fn run_map_parallel(
 
         let handle = tokio::spawn(async move {
             // Concurrency is enforced per-stage via with_requires() on individual
-            // sub-stages, not at the Map level.  The concurrency_resource field
+            // sub-stages, not at the Map level.  The resource_hint field
             // documents which resource the sub-stages reference, but the actual
             // semaphore acquire happens inside run_single_stage.
             write_step(
@@ -861,7 +861,7 @@ mod tests {
                     Action::Map {
                         parse: r"- ITEM: (.+)".into(),
                         parallel: false,
-                        concurrency_resource: None,
+                        resource_hint: None,
                         stages: vec![Stage::new(
                             "write",
                             Action::Shell {
@@ -909,7 +909,7 @@ mod tests {
                 Action::Map {
                     parse: r"- SLEEP: (.+)".into(),
                     parallel: true,
-                    concurrency_resource: None,
+                    resource_hint: None,
                     stages: vec![Stage::new(
                         "sleep",
                         Action::Shell {
@@ -956,7 +956,7 @@ mod tests {
                 Action::Map {
                     parse: r"- ITEM: (.+)".into(),
                     parallel: true,
-                    concurrency_resource: Some("slot".into()),
+                    resource_hint: Some("slot".into()),
                     stages: vec![Stage::new(
                         "work",
                         Action::Shell {

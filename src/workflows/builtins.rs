@@ -187,7 +187,7 @@ pub fn perf_sweep(
                 Action::Map {
                     parse: r"- OPT: (.+)".into(),
                     parallel: false, // serial: each builds on previous
-                    concurrency_resource: None,
+                    resource_hint: None,
                     stages: vec![
                         // 3a: Claude implements the optimization
                         Stage::new(
@@ -329,7 +329,7 @@ pub fn bug_fix(
                 Action::Map {
                     parse: r"- BUG: (.+)".into(),
                     parallel: true, // bugs are independent
-                    concurrency_resource: None,
+                    resource_hint: None,
                     stages: vec![
                         // 3a: checkout a new branch for this bug
                         Stage::new(
@@ -436,7 +436,7 @@ pub fn tune_sweep(
                 Action::Map {
                     parse: r"- TUNE: (.+)".into(),
                     parallel: true,
-                    concurrency_resource: None, // config generation is just LLM, no resource needed
+                    resource_hint: None, // config generation is just LLM, no resource needed
                     stages: vec![Stage::new(
                         "write-config",
                         Action::Llm {
@@ -456,7 +456,7 @@ pub fn tune_sweep(
                 Action::Map {
                     parse: r"- TUNE: (.+)".into(),
                     parallel: true,
-                    concurrency_resource: Some(resource.to_owned()), // e.g. "gpu" — metadata hint only
+                    resource_hint: Some(resource.to_owned()), // e.g. "gpu" — metadata hint only
                     stages: vec![
                         Stage::new(
                             "run",
