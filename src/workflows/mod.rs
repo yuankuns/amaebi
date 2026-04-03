@@ -342,7 +342,9 @@ pub fn build_workflow(
                 anyhow::bail!("invalid resource_count: must be greater than 0");
             }
             let wf = builtins::tune_sweep(target, "", run_cmd, result_cmd, resource);
-            let pool = ResourcePool::new([(resource, count)]);
+            // "llm" limits concurrent config-generation LLM calls to 4;
+            // the user-specified resource (e.g. "gpu") limits experiments.
+            let pool = ResourcePool::new([(resource, count), ("llm", 4)]);
             Ok((wf, pool))
         }
         // Minimal workflow for integration tests: one LLM stage + one Shell stage.

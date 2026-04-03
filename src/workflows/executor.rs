@@ -713,23 +713,22 @@ pub async fn llm_turn(
     messages.push(Message::user(prompt.to_owned()));
     let (_, mut steer_rx) = tokio::sync::mpsc::channel::<Option<String>>(1);
     let tool_ctx = crate::tools::ToolCallContext::default();
-    // NOTE: the writer mutex is held for the entire run_agentic_loop call.
-    // In parallel Map stages this serializes LLM output from concurrent items,
-    // preventing interleaved frames. Progress for each item is still visible;
-    // items simply take turns rather than truly overlapping writes.
-    let mut w = writer.lock().await;
+    // Create a MutexWriter that locks per-write rather than holding the shared
+    // writer mutex for the entire run_agentic_loop call.  This allows parallel
+    // Map items to interleave progress output instead of serializing completely
+    // behind a single lock acquisition.
+    let mut mw = crate::ipc::MutexWriter::new(Arc::clone(writer));
     let (text, _, _) = run_agentic_loop(
         state,
         model,
         messages.clone(),
-        &mut **w,
+        &mut mw,
         &mut steer_rx,
         false, // workflow LLM stages must not spawn sub-agents
         &tool_ctx,
     )
     .await
     .context("LLM turn failed")?;
-    drop(w);
     messages.push(crate::copilot::Message::assistant(
         Some(text.clone()),
         vec![],

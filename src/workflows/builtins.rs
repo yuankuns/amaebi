@@ -491,11 +491,9 @@ pub fn tune_sweep(
                 Action::Map {
                     parse: r"- TUNE: (.+)".into(),
                     parallel: true,
-                    // No resource semaphore here — each item is one short LLM
-                    // call (write-config).  If the config list is very long and
-                    // rate limits become a concern, add a "llm" resource to the
-                    // pool and set resource_hint + Stage::with_requires("llm").
-                    resource_hint: None,
+                    // "llm" semaphore caps concurrent LLM calls so a large
+                    // TUNE list doesn't burst all requests simultaneously.
+                    resource_hint: Some("llm".to_owned()),
                     stages: vec![Stage::new(
                         "write-config",
                         Action::Llm {
@@ -505,6 +503,7 @@ pub fn tune_sweep(
                                     .into(),
                         },
                     )
+                    .with_requires("llm")
                     .with_on_fail(FailStrategy::Skip)],
                 },
             )
