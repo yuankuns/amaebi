@@ -6,7 +6,7 @@ pub const DEFAULT_SOCKET: &str = "/tmp/amaebi.sock";
 #[command(
     name = "amaebi",
     version,
-    about = "Tiny, memory-efficient AI assistant for tmux backed by GitHub Copilot"
+    about = "Tiny, memory-efficient AI assistant for tmux backed by Amazon Bedrock and GitHub Copilot"
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -28,7 +28,8 @@ pub enum Command {
         /// Path to the Unix socket.
         #[arg(long, default_value = DEFAULT_SOCKET)]
         socket: PathBuf,
-        /// Model to use (overrides AMAEBI_MODEL env var; default: gpt-4o).
+        /// Model to use (overrides AMAEBI_MODEL env var; default: claude-sonnet-4.6).
+        /// Format: [provider/]model — e.g. bedrock/claude-sonnet-4.6, copilot/gpt-4o.
         #[arg(long)]
         model: Option<String>,
         /// Submit the task in the background; print a task ID to stderr and exit
@@ -51,7 +52,8 @@ pub enum Command {
         prompt: Option<String>,
         #[arg(long, default_value = DEFAULT_SOCKET)]
         socket: PathBuf,
-        /// Model to use (overrides AMAEBI_MODEL env var; default: gpt-4o).
+        /// Model to use (overrides AMAEBI_MODEL env var; default: claude-sonnet-4.6).
+        /// Format: [provider/]model — e.g. bedrock/claude-sonnet-4.6, copilot/gpt-4o.
         #[arg(long)]
         model: Option<String>,
     },
@@ -79,7 +81,8 @@ pub enum Command {
     ///
     /// Example: amaebi acp
     Acp {
-        /// Model to use (overrides AMAEBI_MODEL env var; default: gpt-4o).
+        /// Model to use (overrides AMAEBI_MODEL env var; default: claude-sonnet-4.6).
+        /// Format: [provider/]model — e.g. bedrock/claude-sonnet-4.6, copilot/gpt-4o.
         #[arg(long)]
         model: Option<String>,
         /// Path to the daemon's Unix socket (used for memory IPC).

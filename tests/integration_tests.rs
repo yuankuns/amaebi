@@ -223,7 +223,7 @@ async fn test_compaction_triggered_at_threshold() {
             &seed_client,
             &format!("Seed message {i}."),
             &session_id,
-            "gpt-4o",
+            "copilot/gpt-4o",
         )
         .await
         .unwrap_or_else(|e| panic!("seed turn {i} failed: {e}"));
@@ -258,7 +258,7 @@ async fn test_compaction_triggered_at_threshold() {
         &trigger_client,
         "Trigger compaction now.",
         &session_id,
-        "gpt-4o",
+        "copilot/gpt-4o",
     )
     .await
     .expect("trigger turn");
@@ -327,7 +327,7 @@ async fn test_compaction_preserves_summary() {
             &seed_client,
             &format!("Seed message {i}."),
             &session_id,
-            "gpt-4o",
+            "copilot/gpt-4o",
         )
         .await
         .unwrap_or_else(|e| panic!("seed turn {i}: {e}"));
@@ -349,9 +349,10 @@ async fn test_compaction_preserves_summary() {
     .expect("compaction daemon");
     let client2 = connect_client(&socket2);
 
-    let ra = send_message_with_session(&client2, "What do you know?", &session_id, "gpt-4o")
-        .await
-        .expect("turn A");
+    let ra =
+        send_message_with_session(&client2, "What do you know?", &session_id, "copilot/gpt-4o")
+            .await
+            .expect("turn A");
     assert!(
         ra.iter()
             .any(|r| matches!(r, support::helpers::Response::Compacting)),
@@ -385,9 +386,14 @@ async fn test_compaction_preserves_summary() {
 
     // Phase 3: follow-up turn on same daemon — summary should appear in context.
     server.enqueue(ScriptedResponse::text_chunks(vec!["Turn B reply."]));
-    let rb = send_message_with_session(&client2, "What was the summary?", &session_id, "gpt-4o")
-        .await
-        .expect("turn B");
+    let rb = send_message_with_session(
+        &client2,
+        "What was the summary?",
+        &session_id,
+        "copilot/gpt-4o",
+    )
+    .await
+    .expect("turn B");
     let text_b = collect_text(&rb);
     assert!(
         text_b.contains("Turn B reply."),
@@ -444,7 +450,7 @@ async fn test_hot_tail_preserved_after_compaction() {
             &seed_client,
             &format!("Seed message {i}."),
             &session_id,
-            "gpt-4o",
+            "copilot/gpt-4o",
         )
         .await
         .unwrap_or_else(|e| panic!("seed turn {i}: {e}"));
@@ -466,9 +472,14 @@ async fn test_hot_tail_preserved_after_compaction() {
     .expect("compaction daemon");
     let client2 = connect_client(&socket2);
 
-    let rt = send_message_with_session(&client2, "Trigger compaction.", &session_id, "gpt-4o")
-        .await
-        .expect("trigger turn");
+    let rt = send_message_with_session(
+        &client2,
+        "Trigger compaction.",
+        &session_id,
+        "copilot/gpt-4o",
+    )
+    .await
+    .expect("trigger turn");
     assert!(
         rt.iter()
             .any(|r| matches!(r, support::helpers::Response::Compacting)),
@@ -488,9 +499,14 @@ async fn test_hot_tail_preserved_after_compaction() {
 
     // Phase 3: follow-up turn — should only include hot tail + summary, not full history.
     server.enqueue(ScriptedResponse::text_chunks(vec!["Hot tail reply."]));
-    let rh = send_message_with_session(&client2, "What is the hot tail?", &session_id, "gpt-4o")
-        .await
-        .expect("hot tail turn");
+    let rh = send_message_with_session(
+        &client2,
+        "What is the hot tail?",
+        &session_id,
+        "copilot/gpt-4o",
+    )
+    .await
+    .expect("hot tail turn");
     assert!(
         rh.iter()
             .any(|r| matches!(r, support::helpers::Response::Done)),
@@ -553,7 +569,7 @@ async fn test_pre_flight_trim_on_resume() {
         &client,
         "Seed message for resume test.",
         &session_id,
-        "gpt-4o",
+        "copilot/gpt-4o",
     )
     .await
     .expect("seed turn");
@@ -572,9 +588,14 @@ async fn test_pre_flight_trim_on_resume() {
     // Phase 2: resume the same session.  Should include the seeded history.
     server.enqueue(ScriptedResponse::text_chunks(vec!["Resume reply."]));
 
-    let r2 = send_resume(&client, "Continue from before.", &session_id, "gpt-4o")
-        .await
-        .expect("resume turn");
+    let r2 = send_resume(
+        &client,
+        "Continue from before.",
+        &session_id,
+        "copilot/gpt-4o",
+    )
+    .await
+    .expect("resume turn");
     assert!(
         collect_text(&r2).contains("Resume reply."),
         "resume turn failed: {r2:?}"
@@ -613,9 +634,14 @@ async fn test_pre_flight_trim_on_resume() {
 
     for i in 2..=5u32 {
         server.enqueue(ScriptedResponse::text_chunks(vec![&format!("Seed {i}.")]));
-        send_message_with_session(&client2, &format!("Extra seed {i}."), &session_id, "gpt-4o")
-            .await
-            .unwrap_or_else(|e| panic!("extra seed {i}: {e}"));
+        send_message_with_session(
+            &client2,
+            &format!("Extra seed {i}."),
+            &session_id,
+            "copilot/gpt-4o",
+        )
+        .await
+        .unwrap_or_else(|e| panic!("extra seed {i}: {e}"));
     }
     server.take_requests();
     let _ = child2.kill().await;
@@ -635,7 +661,7 @@ async fn test_pre_flight_trim_on_resume() {
     .expect("trim daemon");
     let client3 = connect_client(&socket3);
 
-    let r3 = send_resume(&client3, "What is the trim?", &session_id, "gpt-4o")
+    let r3 = send_resume(&client3, "What is the trim?", &session_id, "copilot/gpt-4o")
         .await
         .expect("trim resume");
 
@@ -703,9 +729,15 @@ async fn spawn_agent_runs_task() {
     // 4. Parent agent second turn (after spawn_agent result): final response.
     server.enqueue(ScriptedResponse::text_chunks(vec!["Task done: hello"]));
 
-    let daemon = start_daemon_with_env(&server.url(), &[("AMAEBI_SPAWN_SANDBOX", "noop")])
-        .await
-        .expect("start_daemon");
+    let daemon = start_daemon_with_env(
+        &server.url(),
+        &[
+            ("AMAEBI_SPAWN_SANDBOX", "noop"),
+            ("AMAEBI_MODEL", "copilot/gpt-4o"),
+        ],
+    )
+    .await
+    .expect("start_daemon");
     let client = connect_client(&daemon.socket);
 
     let responses = send_message(&client, "run a child task")
@@ -762,9 +794,15 @@ async fn spawn_agent_child_cannot_spawn() {
         "Parent done. Child reported recursion error.",
     ]));
 
-    let daemon = start_daemon_with_env(&server.url(), &[("AMAEBI_SPAWN_SANDBOX", "noop")])
-        .await
-        .expect("start_daemon");
+    let daemon = start_daemon_with_env(
+        &server.url(),
+        &[
+            ("AMAEBI_SPAWN_SANDBOX", "noop"),
+            ("AMAEBI_MODEL", "copilot/gpt-4o"),
+        ],
+    )
+    .await
+    .expect("start_daemon");
     let client = connect_client(&daemon.socket);
 
     let responses = send_message(&client, "try to spawn recursively")
@@ -825,16 +863,22 @@ async fn spawn_agent_uses_specified_model() {
     server.enqueue(ScriptedResponse::tool_call(
         "call-spawn-model",
         "spawn_agent",
-        r#"{"task":"simple task","workspace":"/tmp","model":"custom-model-123"}"#,
+        r#"{"task":"simple task","workspace":"/tmp","model":"copilot/custom-model-123"}"#,
     ));
     // 2. Child LLM turn 1 (should use "custom-model-123"): returns final text.
     server.enqueue(ScriptedResponse::text_chunks(vec!["Child done."]));
     // 3. Parent LLM turn 2 (after spawn_agent result): returns final text.
     server.enqueue(ScriptedResponse::text_chunks(vec!["Parent done."]));
 
-    let daemon = start_daemon_with_env(&server.url(), &[("AMAEBI_SPAWN_SANDBOX", "noop")])
-        .await
-        .expect("start_daemon");
+    let daemon = start_daemon_with_env(
+        &server.url(),
+        &[
+            ("AMAEBI_SPAWN_SANDBOX", "noop"),
+            ("AMAEBI_MODEL", "copilot/gpt-4o"),
+        ],
+    )
+    .await
+    .expect("start_daemon");
     let client = connect_client(&daemon.socket);
 
     let responses = send_message(&client, "run child with custom model")
@@ -892,9 +936,15 @@ async fn spawn_agent_missing_workspace_returns_error() {
         "Received an error from spawn_agent.",
     ]));
 
-    let daemon = start_daemon_with_env(&server.url(), &[("AMAEBI_SPAWN_SANDBOX", "noop")])
-        .await
-        .expect("start_daemon");
+    let daemon = start_daemon_with_env(
+        &server.url(),
+        &[
+            ("AMAEBI_SPAWN_SANDBOX", "noop"),
+            ("AMAEBI_MODEL", "copilot/gpt-4o"),
+        ],
+    )
+    .await
+    .expect("start_daemon");
     let client = connect_client(&daemon.socket);
 
     let responses = send_message(&client, "spawn agent without workspace")
@@ -976,9 +1026,15 @@ async fn spawn_agent_workspace_passed_to_sandbox() {
     // 3. Parent LLM turn 2: returns final text.
     server.enqueue(ScriptedResponse::text_chunks(vec!["Workspace test done."]));
 
-    let daemon = start_daemon_with_env(&server.url(), &[("AMAEBI_SPAWN_SANDBOX", "noop")])
-        .await
-        .expect("start_daemon");
+    let daemon = start_daemon_with_env(
+        &server.url(),
+        &[
+            ("AMAEBI_SPAWN_SANDBOX", "noop"),
+            ("AMAEBI_MODEL", "copilot/gpt-4o"),
+        ],
+    )
+    .await
+    .expect("start_daemon");
     let client = connect_client(&daemon.socket);
 
     let responses = send_message(&client, "check workspace passthrough")
@@ -1067,9 +1123,15 @@ async fn spawn_agent_parallel_calls() {
     // 6. Parent turn 2: receives both tool results, returns final text.
     server.enqueue(ScriptedResponse::text_chunks(vec!["all done"]));
 
-    let daemon = start_daemon_with_env(&server.url(), &[("AMAEBI_SPAWN_SANDBOX", "noop")])
-        .await
-        .expect("start_daemon");
+    let daemon = start_daemon_with_env(
+        &server.url(),
+        &[
+            ("AMAEBI_SPAWN_SANDBOX", "noop"),
+            ("AMAEBI_MODEL", "copilot/gpt-4o"),
+        ],
+    )
+    .await
+    .expect("start_daemon");
     let client = connect_client(&daemon.socket);
 
     let responses = send_message(&client, "run two child tasks in parallel")
@@ -1159,9 +1221,15 @@ async fn spawn_agent_parallel_timing() {
     // 6. Parent turn 2: both results received.
     server.enqueue(ScriptedResponse::text_chunks(vec!["both done"]));
 
-    let daemon = start_daemon_with_env(&server.url(), &[("AMAEBI_SPAWN_SANDBOX", "noop")])
-        .await
-        .expect("start_daemon");
+    let daemon = start_daemon_with_env(
+        &server.url(),
+        &[
+            ("AMAEBI_SPAWN_SANDBOX", "noop"),
+            ("AMAEBI_MODEL", "copilot/gpt-4o"),
+        ],
+    )
+    .await
+    .expect("start_daemon");
     let client = connect_client(&daemon.socket);
 
     let start = std::time::Instant::now();
@@ -1213,10 +1281,13 @@ async fn cron_job_triggers_llm_call() {
         .await
         .expect("seed_cron_job");
 
-    let (socket, mut child, _socket_dir) =
-        start_daemon_at_home_with_env(home_dir.path(), &server.url(), &[])
-            .await
-            .expect("start daemon");
+    let (socket, mut child, _socket_dir) = start_daemon_at_home_with_env(
+        home_dir.path(),
+        &server.url(),
+        &[("AMAEBI_MODEL", "copilot/gpt-4o")],
+    )
+    .await
+    .expect("start daemon");
 
     // The cron scheduler fires its first tick immediately (tokio interval
     // behaviour).  Wait up to 5 s for the LLM request to arrive.
@@ -1289,10 +1360,13 @@ async fn cron_job_result_not_sent_to_chat() {
         .await
         .expect("seed_cron_job");
 
-    let (socket, mut child, _socket_dir) =
-        start_daemon_at_home_with_env(home_dir.path(), &server.url(), &[])
-            .await
-            .expect("start daemon");
+    let (socket, mut child, _socket_dir) = start_daemon_at_home_with_env(
+        home_dir.path(),
+        &server.url(),
+        &[("AMAEBI_MODEL", "copilot/gpt-4o")],
+    )
+    .await
+    .expect("start daemon");
 
     // Wait for the cron job to call the LLM (up to 5 s).
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -1371,7 +1445,10 @@ async fn cron_job_with_spawn_agent() {
     let (_socket, mut child, _socket_dir) = start_daemon_at_home_with_env(
         home_dir.path(),
         &server.url(),
-        &[("AMAEBI_SPAWN_SANDBOX", "noop")],
+        &[
+            ("AMAEBI_SPAWN_SANDBOX", "noop"),
+            ("AMAEBI_MODEL", "copilot/gpt-4o"),
+        ],
     )
     .await
     .expect("start daemon");
@@ -1452,7 +1529,7 @@ async fn steer_e2e_delivers_ack_and_injects_message() {
         prompt: "run a slow tool".to_string(),
         tmux_pane: None,
         session_id: Some(session_id.clone()),
-        model: "gpt-4o".to_string(),
+        model: "copilot/gpt-4o".to_string(),
     };
     let mut json_line = serde_json::to_string(&chat_req).unwrap();
     json_line.push('\n');
@@ -1570,9 +1647,15 @@ async fn sandbox_noop_child_does_not_expose_credentials() {
     server.enqueue(ScriptedResponse::text_chunks(vec!["child done"]));
     server.enqueue(ScriptedResponse::text_chunks(vec!["all done"]));
 
-    let daemon = start_daemon_with_env(&server.url(), &[("AMAEBI_SPAWN_SANDBOX", "noop")])
-        .await
-        .expect("daemon");
+    let daemon = start_daemon_with_env(
+        &server.url(),
+        &[
+            ("AMAEBI_SPAWN_SANDBOX", "noop"),
+            ("AMAEBI_MODEL", "copilot/gpt-4o"),
+        ],
+    )
+    .await
+    .expect("daemon");
     let client = connect_client(&daemon.socket);
 
     let responses = send_message(&client, "spawn a child")
@@ -1666,15 +1749,26 @@ async fn subagent_chain_session_remains_usable_after_recursion_block() {
     ]));
 
     let session_id = uuid::Uuid::new_v4().to_string();
-    let daemon = start_daemon_with_env(&server.url(), &[("AMAEBI_SPAWN_SANDBOX", "noop")])
-        .await
-        .expect("daemon");
+    let daemon = start_daemon_with_env(
+        &server.url(),
+        &[
+            ("AMAEBI_SPAWN_SANDBOX", "noop"),
+            ("AMAEBI_MODEL", "copilot/gpt-4o"),
+        ],
+    )
+    .await
+    .expect("daemon");
     let client = connect_client(&daemon.socket);
 
     // Round 1.
-    let r1 = send_message_with_session(&client, "do nested agent task", &session_id, "gpt-4o")
-        .await
-        .expect("round 1");
+    let r1 = send_message_with_session(
+        &client,
+        "do nested agent task",
+        &session_id,
+        "copilot/gpt-4o",
+    )
+    .await
+    .expect("round 1");
     let text1 = collect_text(&r1);
     assert!(
         text1.contains("parent: child reported error"),
@@ -1712,7 +1806,7 @@ async fn subagent_chain_session_remains_usable_after_recursion_block() {
     // so it cannot be consumed by any in-flight Round 1 retry or background task.
     server.enqueue(ScriptedResponse::text_chunks(vec!["session still works"]));
 
-    let r2 = send_message_with_session(&client, "follow-up", &session_id, "gpt-4o")
+    let r2 = send_message_with_session(&client, "follow-up", &session_id, "copilot/gpt-4o")
         .await
         .expect("round 2");
     let text2 = collect_text(&r2);
@@ -1791,7 +1885,7 @@ async fn llm_error_path_surfaces_error_frame_and_daemon_stays_alive() {
         prompt: "trigger an llm error".to_string(),
         tmux_pane: None,
         session_id: None,
-        model: "gpt-4o".to_string(),
+        model: "copilot/gpt-4o".to_string(),
     })
     .expect("serialize chat request");
     line.push('\n');
@@ -1875,7 +1969,12 @@ async fn llm_error_path_surfaces_error_frame_and_daemon_stays_alive() {
 /// "unsupported_api_for_model" bug that affected non-Claude models.
 #[tokio::test]
 async fn all_models_use_copilot_endpoint_and_jwt() {
-    for model in &["gpt-5.4", "gemini-2.5-pro", "claude-sonnet-4.6", "gpt-4o"] {
+    for model in &[
+        "copilot/gpt-5.4",
+        "copilot/gemini-2.5-pro",
+        "copilot/claude-sonnet-4.6",
+        "copilot/gpt-4o",
+    ] {
         let server = MockLlmServer::start().await;
         server.enqueue(ScriptedResponse::text_chunks(vec!["ok"]));
 
@@ -1902,10 +2001,11 @@ async fn all_models_use_copilot_endpoint_and_jwt() {
             "model={model}: expected Copilot JWT in Authorization header; got: {auth:?}"
         );
 
-        // The correct model name must be forwarded to the API.
+        // The correct model name must be forwarded to the API (without provider prefix).
+        let expected_model = model.strip_prefix("copilot/").unwrap_or(model);
         assert_eq!(
             reqs[0].model(),
-            Some(model.as_ref()),
+            Some(expected_model),
             "model={model}: wrong model field in request"
         );
     }
@@ -1932,7 +2032,7 @@ async fn responses_api_fallback_on_unsupported_model() {
     let daemon = start_daemon(&server.url()).await.expect("start_daemon");
     let client = connect_client(&daemon.socket);
 
-    let responses = send_message_with_session(&client, "hello", "sess-fallback", "gpt-5.4")
+    let responses = send_message_with_session(&client, "hello", "sess-fallback", "copilot/gpt-5.4")
         .await
         .expect("send_message");
 
@@ -1956,7 +2056,12 @@ async fn responses_api_fallback_on_unsupported_model() {
 /// /chat/completions returns 400 unsupported_api_for_model.
 #[tokio::test]
 async fn responses_api_fallback_all_gpt5_variants() {
-    for model in &["gpt-5.4", "gpt-5.4-mini", "gpt-5", "gpt-5-turbo"] {
+    for model in &[
+        "copilot/gpt-5.4",
+        "copilot/gpt-5.4-mini",
+        "copilot/gpt-5",
+        "copilot/gpt-5-turbo",
+    ] {
         let server = MockLlmServer::start().await;
         server.enqueue_error(
             400,
@@ -1992,7 +2097,12 @@ async fn responses_api_fallback_all_gpt5_variants() {
 /// without needing the Responses API fallback.
 #[tokio::test]
 async fn chat_completions_models_no_fallback_needed() {
-    for model in &["claude-sonnet-4.6", "claude-opus-4.6", "gpt-4o", "gpt-4.1"] {
+    for model in &[
+        "copilot/claude-sonnet-4.6",
+        "copilot/claude-opus-4.6",
+        "copilot/gpt-4o",
+        "copilot/gpt-4.1",
+    ] {
         let server = MockLlmServer::start().await;
         // Enqueue exactly one response — if the daemon made a second request
         // (fallback) the mock would error with "no scripted response queued".
@@ -2027,10 +2137,10 @@ async fn chat_completions_models_no_fallback_needed() {
 #[tokio::test]
 async fn gemini_models_route_via_copilot_and_succeed() {
     for model in &[
-        "gemini-2.5-pro",
-        "gemini-2.0-flash",
-        "gemini-1.5-pro",
-        "gemini-flash",
+        "copilot/gemini-2.5-pro",
+        "copilot/gemini-2.0-flash",
+        "copilot/gemini-1.5-pro",
+        "copilot/gemini-flash",
     ] {
         let server = MockLlmServer::start().await;
         server.enqueue(ScriptedResponse::text_chunks(vec!["gemini-ok"]));
@@ -2107,7 +2217,7 @@ async fn chat_long_connection_multi_turn_context() {
 
     // Turn 1.
     let r1 = conn
-        .chat("what is 6 times 7?", session_id, "gpt-4o")
+        .chat("what is 6 times 7?", session_id, "copilot/gpt-4o")
         .await
         .expect("turn 1");
     assert!(
@@ -2118,7 +2228,7 @@ async fn chat_long_connection_multi_turn_context() {
 
     // Turn 2 — same connection.
     let r2 = conn
-        .chat("double that", session_id, "gpt-4o")
+        .chat("double that", session_id, "copilot/gpt-4o")
         .await
         .expect("turn 2");
     assert!(
@@ -2190,7 +2300,7 @@ async fn chat_long_connection_tool_context_preserved() {
         .expect("connect");
 
     let r1 = conn
-        .chat("run echo hello", session_id, "gpt-4o")
+        .chat("run echo hello", session_id, "copilot/gpt-4o")
         .await
         .expect("turn 1");
     assert!(
@@ -2200,7 +2310,7 @@ async fn chat_long_connection_tool_context_preserved() {
     );
 
     let _r2 = conn
-        .chat("what did the tool return?", session_id, "gpt-4o")
+        .chat("what did the tool return?", session_id, "copilot/gpt-4o")
         .await
         .expect("turn 2");
 
@@ -2271,7 +2381,7 @@ async fn chat_long_connection_steer_mid_turn() {
         prompt: "run sleep 0.3".to_string(),
         tmux_pane: None,
         session_id: Some(session_id.to_string()),
-        model: "gpt-4o".to_string(),
+        model: "copilot/gpt-4o".to_string(),
     };
     let mut line = serde_json::to_string(&chat_req).unwrap();
     line.push('\n');
@@ -2353,7 +2463,7 @@ async fn chat_long_connection_eof_exits_cleanly() {
             .await
             .expect("conn1");
         let r = conn
-            .chat("hello", session_id, "gpt-4o")
+            .chat("hello", session_id, "copilot/gpt-4o")
             .await
             .expect("turn on conn1");
         assert!(collect_text(&r).contains("hello"));
@@ -2385,7 +2495,7 @@ async fn chat_long_connection_eof_exits_cleanly() {
         .await
         .expect("conn2");
     let r2 = conn2
-        .chat("world", session_id, "gpt-4o")
+        .chat("world", session_id, "copilot/gpt-4o")
         .await
         .expect("turn on conn2");
     assert!(

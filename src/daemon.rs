@@ -13,11 +13,27 @@ use crate::ipc::{write_frame, Request, Response};
 use crate::memory_db;
 use crate::tools::{self, ToolExecutor};
 
+/// Resolve the raw model string to the API-level model ID for token lookups.
+///
+/// The raw model may be `bedrock/claude-sonnet-4.6` or plain `gpt-4o`.
+/// We resolve via [`crate::provider::resolve`] so the token tables can
+/// match against Bedrock IDs (e.g. `us.anthropic.claude-*`) or Copilot
+/// IDs (e.g. `gpt-4o`).
+fn resolved_model_id(model: &str) -> String {
+    crate::provider::resolve(model).model_id
+}
+
 /// Compute `max_tokens` for a request to `model`: capped at half the model's context window
 /// so it never exceeds what the model supports (e.g. gpt-4's 8,192-token limit).
 fn max_output_tokens_for_model(model: &str) -> usize {
+    let model = resolved_model_id(model);
     // Ordered longest-prefix-first so that e.g. "gpt-4-turbo" beats "gpt-4".
     const TABLE: &[(&str, usize)] = &[
+        // Bedrock model IDs (cross-region us.anthropic.* format)
+        ("us.anthropic.claude-3-5-haiku", 8_192),
+        ("us.anthropic.claude-3-5-sonnet", 8_192),
+        ("us.anthropic.claude", 16_384), // catch-all for Bedrock Claude models
+        // Copilot model IDs
         ("gpt-5.4", 32_768), // gpt-5.4 via Responses API
         ("gpt-5.3", 32_768),
         ("gpt-5.2", 32_768),
@@ -43,8 +59,9 @@ fn max_output_tokens_for_model(model: &str) -> usize {
 }
 
 fn response_max_tokens(model: &str) -> usize {
-    let model_max = max_output_tokens_for_model(model);
-    let context_budget = context_limit_for_model(model) / 2;
+    let model_id = &resolved_model_id(model);
+    let model_max = max_output_tokens_for_model(model_id);
+    let context_budget = context_limit_for_model(model_id) / 2;
     let result = model_max.min(context_budget);
     tracing::debug!(
         model,
@@ -201,8 +218,12 @@ fn count_message_tokens(messages: &[Message]) -> usize {
 /// Falls back to a conservative 32 k for unknown models so we never send
 /// more tokens than the server can handle.
 fn context_limit_for_model(model: &str) -> usize {
+    let model = resolved_model_id(model);
     // Ordered longest-prefix-first so that e.g. "gpt-4-turbo" beats "gpt-4".
     const TABLE: &[(&str, usize)] = &[
+        // Bedrock model IDs (cross-region us.anthropic.* format): 200k context.
+        ("us.anthropic.claude", 200_000),
+        // Copilot model IDs
         // gpt-5.x via Responses API: 128k context (conservative)
         ("gpt-5", 128_000),
         ("gpt-4o", 128_000),
@@ -212,7 +233,7 @@ fn context_limit_for_model(model: &str) -> usize {
         ("gpt-3.5-turbo", 16_385),
         ("o1", 200_000),
         ("o3", 200_000),
-        // Claude models: 200k context window.
+        // Claude models (via Copilot): 200k context window.
         ("claude", 200_000),
         // Gemini models — more specific prefixes must precede less specific ones.
         ("gemini-2.0-flash", 1_048_576), // Gemini 2.0 Flash: 1 M context
@@ -1228,17 +1249,69 @@ fn is_unsupported_via_chat_completions(e: &anyhow::Error) -> bool {
         })
 }
 
-/// Send one model turn, with automatic endpoint selection and fallback.
+/// Send one model turn, dispatching to the correct provider backend.
 ///
-/// 1. The base URL is derived from the `proxy-ep` field in the Copilot JWT
-///    so each user reaches their account-specific gateway automatically.
-/// 2. All models try `/v1/chat/completions` first.
-/// 3. If the model returns `400 unsupported_api_for_model` (e.g. gpt-5.x),
-///    the request is transparently retried via `/v1/responses` (OpenAI
-///    Responses API), which uses a different request/response format handled
-///    by `crate::responses`.
+/// The raw `model` string is resolved via [`crate::provider::resolve`] to
+/// determine the provider (Copilot or Bedrock) and the actual model ID.
+///
+/// **Copilot** path (existing behaviour):
+/// 1. The base URL is derived from the `proxy-ep` field in the Copilot JWT.
+/// 2. Tries `/v1/chat/completions` first.
+/// 3. Falls back to `/v1/responses` on 400 `unsupported_api_for_model`.
 /// 4. Auth errors (401/403) evict the token cache and retry once.
+///
+/// **Bedrock** path:
+/// 1. Reads `AWS_BEARER_TOKEN_BEDROCK` and `AWS_REGION` from the environment.
+/// 2. Calls the ConverseStream API directly.
 async fn invoke_model<W>(
+    state: &DaemonState,
+    model: &str,
+    messages: &[Message],
+    tools: &[serde_json::Value],
+    max_completion_tokens: usize,
+    writer: &mut W,
+) -> Result<copilot::CopilotResponse>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    let spec = crate::provider::resolve(model);
+    tracing::debug!(
+        provider = %spec.provider,
+        model_id = %spec.model_id,
+        display = %spec.display_name,
+        "invoke_model: resolved provider"
+    );
+
+    match spec.provider {
+        crate::provider::ProviderKind::Bedrock => {
+            crate::bedrock::stream_chat(
+                &state.http,
+                &spec.model_id,
+                messages,
+                tools,
+                max_completion_tokens,
+                writer,
+            )
+            .await
+        }
+
+        crate::provider::ProviderKind::Copilot => {
+            invoke_copilot(
+                state,
+                &spec.model_id,
+                messages,
+                tools,
+                max_completion_tokens,
+                writer,
+            )
+            .await
+        }
+    }
+}
+
+/// Copilot-specific model invocation with Chat Completions / Responses API
+/// fallback and auth-error retry.
+async fn invoke_copilot<W>(
     state: &DaemonState,
     model: &str,
     messages: &[Message],
@@ -2180,7 +2253,8 @@ async fn run_cron_job(state: Arc<DaemonState>, job: &cron::CronJob) {
     let session_id = uuid::Uuid::new_v4().to_string();
 
     // Resolve model from env var (same default as CLI client).
-    let model = std::env::var("AMAEBI_MODEL").unwrap_or_else(|_| "gpt-4o".to_string());
+    let model = std::env::var("AMAEBI_MODEL")
+        .unwrap_or_else(|_| crate::provider::DEFAULT_MODEL.to_string());
 
     let mut messages = build_messages(&job.description, None, &[], &[], None);
     inject_skill_files(&mut messages).await;

@@ -49,8 +49,35 @@ fn category(id: &str, family: Option<&str>) -> &'static str {
     }
 }
 
-/// Fetch models from the Copilot API and print a table.
+/// List available models for all providers.
 pub async fn run() -> Result<()> {
+    // ── Bedrock aliases ───────────────────────────────────────────────────
+    println!("Bedrock (use as: bedrock/<alias> or just <alias>):");
+    let aliases = crate::provider::bedrock_aliases();
+    let alias_width = aliases.iter().map(|(a, _)| a.len()).max().unwrap_or(0);
+    for &(alias, full_id) in aliases {
+        println!(
+            "  {:<alias_width$}  → {full_id}",
+            alias,
+            alias_width = alias_width
+        );
+    }
+    println!();
+
+    // ── Copilot models ────────────────────────────────────────────────────
+    println!("Copilot (use as: copilot/<model>):");
+    match run_copilot_models().await {
+        Ok(()) => {}
+        Err(e) => {
+            println!("  (could not fetch Copilot models: {e:#})");
+        }
+    }
+
+    Ok(())
+}
+
+/// Fetch models from the Copilot API and print a table.
+async fn run_copilot_models() -> Result<()> {
     let oauth_token = crate::auth::read_oauth_token()?;
     let http = reqwest::Client::new();
 
