@@ -161,7 +161,14 @@ impl ResourcePool {
     }
 
     pub async fn acquire(&self, name: &str) -> Option<tokio::sync::SemaphorePermit<'_>> {
-        self.pools.get(name)?.acquire().await.ok()
+        let sem = self.pools.get(name)?;
+        match sem.acquire().await {
+            Ok(permit) => Some(permit),
+            Err(e) => {
+                tracing::warn!(resource = %name, error = %e, "semaphore acquire failed");
+                None
+            }
+        }
     }
 }
 

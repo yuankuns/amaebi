@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use std::collections::VecDeque;
 use std::io::IsTerminal as _;
 use std::path::PathBuf;
@@ -1987,9 +1987,10 @@ fn parse_workflow_args(
                 args.insert("test_cmd".into(), v.into());
             }
             if let Some(v) = flag("--max-retries") {
-                if let Ok(n) = v.parse::<u64>() {
-                    args.insert("max_retries".into(), n.into());
-                }
+                let n = v.parse::<u64>().map_err(|_| {
+                    anyhow!("--max-retries must be a positive integer, got {:?}", v)
+                })?;
+                args.insert("max_retries".into(), n.into());
             }
         }
         "bug-fix" => {
@@ -2000,9 +2001,10 @@ fn parse_workflow_args(
                 args.insert("test_cmd".into(), v.into());
             }
             if let Some(v) = flag("--max-retries") {
-                if let Ok(n) = v.parse::<u64>() {
-                    args.insert("max_retries".into(), n.into());
-                }
+                let n = v.parse::<u64>().map_err(|_| {
+                    anyhow!("--max-retries must be a positive integer, got {:?}", v)
+                })?;
+                args.insert("max_retries".into(), n.into());
             }
         }
         "perf-sweep" => {
@@ -2014,9 +2016,10 @@ fn parse_workflow_args(
                 args.insert("bench_cmd".into(), v.into());
             }
             if let Some(v) = flag("--regression-threshold") {
-                if let Ok(n) = v.parse::<f64>() {
-                    args.insert("regression_threshold".into(), n.into());
-                }
+                let n = v
+                    .parse::<f64>()
+                    .map_err(|_| anyhow!("--regression-threshold must be a number, got {:?}", v))?;
+                args.insert("regression_threshold".into(), n.into());
             }
         }
         "tune-sweep" => {
@@ -2034,9 +2037,10 @@ fn parse_workflow_args(
                 args.insert("resource".into(), v.into());
             }
             if let Some(v) = flag("--resource-count") {
-                if let Ok(n) = v.parse::<u64>() {
-                    args.insert("resource_count".into(), n.into());
-                }
+                let n = v.parse::<u64>().map_err(|_| {
+                    anyhow!("--resource-count must be a positive integer, got {:?}", v)
+                })?;
+                args.insert("resource_count".into(), n.into());
             }
         }
         other => anyhow::bail!(

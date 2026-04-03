@@ -467,6 +467,11 @@ async fn run_map_parallel(
             )
             .await;
 
+            // Clean up temp files created by Action::Llm stages within this
+            // parallel item.  The top-level ctx.cleanup_temp_files() only
+            // covers the root context; each item has its own clone.
+            item_ctx.cleanup_temp_files();
+
             let mut r = results.lock().await;
             r.push((i, result.map(|_| ())));
         });
