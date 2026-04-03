@@ -115,20 +115,6 @@ pub async fn execute(
     };
 
     let mut ctx = initial_ctx;
-
-    // Auto-detect delegate pane if the workflow uses Action::Delegate stages
-    // and no pane was explicitly provided.
-    let has_delegate = workflow
-        .stages
-        .iter()
-        .any(|s| matches!(&s.action, Action::Delegate { .. }));
-    if has_delegate && ctx.get("delegate_pane").is_none() {
-        write_step(&writer, "  Detecting delegate Claude pane...").await;
-        let pane = detect_delegate_pane(state, model).await?;
-        write_step(&writer, &format!("  Using delegate pane: {pane}")).await;
-        ctx.set("delegate_pane", &pane);
-    }
-
     let result = run_stages(
         &workflow.stages,
         state,
@@ -222,14 +208,13 @@ async fn run_stage_with_retry(
                         )));
                     }
                     let error_msg = e.to_string();
-                    let injection = ctx.render(inject_prompt).replace("{error}", &error_msg);
-                    if ctx.get("delegate_pane").is_some() {
-                        write_step(writer, "    Injecting error context to delegate").await;
-                        let _ = delegate_turn(state, model, ctx, &injection, writer).await?;
-                    } else {
-                        write_step(writer, "    Injecting error context to LLM").await;
-                        let _ = llm_turn(state, model, messages, &injection, writer).await?;
-                    }
+                    let raw_injection = ctx.render(inject_prompt).replace("{error}", &error_msg);
+                    // Summarise noisy inject_prompt content (review bodies, HTTP logs)
+                    // before sending to the LLM so it receives a clean task.
+                    let injection =
+                        summarize_for_delegate(state, model, &raw_injection, writer).await?;
+                    write_step(writer, "    Injecting error context to LLM").await;
+                    let _ = llm_turn(state, model, messages, &injection, writer).await?;
                 }
             },
         }
@@ -307,14 +292,6 @@ async fn run_single_stage(
             }
             run_check(&stage.check, ctx).await?;
             Ok(None)
-        }
-
-        Action::Delegate { prompt } => {
-            let rendered = ctx.render(prompt);
-            let text = delegate_turn(state, model, ctx, &rendered, writer).await?;
-            ctx.set("last_llm_output", &text);
-            run_check(&stage.check, ctx).await?;
-            Ok(Some(text))
         }
 
         Action::Map {
@@ -605,68 +582,8 @@ async fn run_check(check: &Option<Check>, ctx: &mut Context) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// Delegate turn — send a task to an external Claude Code pane via tmux
+// Pane idle detection helpers (used by delegate_tests below)
 // ---------------------------------------------------------------------------
-
-/// Auto-detect which tmux pane has an idle Claude Code REPL.
-///
-/// Strategy (in priority order):
-/// 1. Panes running `claude` (Claude Code binary) that are idle.
-/// 2. Panes running `amaebi` with the Claude Code TUI footer (bypass
-///    permissions) — an amaebi chat session acting as a worker.
-///
-/// Plain bash/shell panes are ignored entirely, which prevents the
-/// supervisor from delegating to an unrelated terminal.
-pub async fn detect_delegate_pane(_state: &Arc<DaemonState>, _model: &str) -> Result<String> {
-    // Fetch pane_id and pane_current_command together to filter by process.
-    let list_result = sh("tmux list-panes -a -F '#{pane_id} #{pane_current_command}'").await?;
-    if !list_result.success {
-        anyhow::bail!("failed to list tmux panes: {}", list_result.stderr);
-    }
-
-    // Parse "pane_id command" lines.
-    let panes: Vec<(String, String)> = list_result
-        .stdout
-        .lines()
-        .filter(|l| !l.is_empty())
-        .filter_map(|l| {
-            let mut parts = l.splitn(2, ' ');
-            Some((parts.next()?.to_owned(), parts.next()?.trim().to_owned()))
-        })
-        .collect();
-
-    if panes.is_empty() {
-        anyhow::bail!("no tmux panes found");
-    }
-
-    // Pass 1: panes running the `claude` binary — highest confidence.
-    for (pane_id, cmd) in &panes {
-        if cmd != "claude" {
-            continue;
-        }
-        let cap = sh(&format!("tmux capture-pane -t {pane_id} -p -S -20")).await?;
-        if pane_looks_idle(&cap.stdout) {
-            return Ok(pane_id.clone());
-        }
-    }
-
-    // Pass 2: panes running `amaebi` with the Claude Code TUI footer.
-    for (pane_id, cmd) in &panes {
-        if cmd != "amaebi" && cmd != "target/release/amaebi" {
-            continue;
-        }
-        let cap = sh(&format!("tmux capture-pane -t {pane_id} -p -S -20")).await?;
-        let plain = strip_ansi(&cap.stdout);
-        if pane_looks_idle(&cap.stdout) && plain.contains("bypass permissions") {
-            return Ok(pane_id.clone());
-        }
-    }
-
-    anyhow::bail!(
-        "no idle Claude Code pane found (checked {} panes)",
-        panes.len()
-    )
-}
 
 /// Returns `true` when the captured pane content looks like an idle
 /// Claude Code REPL waiting for input.
@@ -675,6 +592,7 @@ pub async fn detect_delegate_pane(_state: &Arc<DaemonState>, _model: &str) -> Re
 /// 1. The last non-empty line ends with the amaebi chat idle prompt (`> ` or `❯`).
 /// 2. No active-task spinner text is visible (e.g. "Flowing", "Burrowing",
 ///    "↓ " token counter, "esc to interrupt" footer).
+#[cfg(test)]
 pub fn pane_looks_idle(content: &str) -> bool {
     let plain = strip_ansi(content);
 
@@ -707,6 +625,7 @@ pub fn pane_looks_idle(content: &str) -> bool {
 }
 
 /// Strip common ANSI CSI escape sequences from `s`.
+#[cfg(test)]
 fn strip_ansi(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
@@ -735,12 +654,10 @@ fn strip_ansi(s: &str) -> String {
 
 /// Compress a raw inject_prompt into a clean, actionable task description.
 ///
-/// inject_prompt content can be noisy (thinking traces, HTTP log lines, HTML,
-/// pasted review bodies). This uses the internal LLM to extract only the
-/// actionable instructions before the prompt is sent to the delegate pane.
-/// Short prompts (<500 chars) are returned as-is. Falls back to the raw
-/// prompt on any LLM error so delegation is never blocked.
-async fn summarize_for_delegate(
+/// Removes noise (thinking traces, HTTP log lines, HTML, pasted review bodies)
+/// so the Claude CLI invocation receives a concise task. Short prompts
+/// (<500 chars) are returned as-is. Falls back to the raw prompt on error.
+pub async fn summarize_for_delegate(
     state: &Arc<DaemonState>,
     model: &str,
     raw: &str,
@@ -749,7 +666,7 @@ async fn summarize_for_delegate(
     if raw.len() < 500 {
         return Ok(raw.to_owned());
     }
-    write_step(writer, "    Summarising task for delegate...").await;
+    write_step(writer, "    Summarising task...").await;
     let meta = format!(
         "You are preparing a task for a Claude Code session.\n\
          The raw text may contain noise: reasoning traces, HTTP log lines,\n\
@@ -776,81 +693,10 @@ async fn summarize_for_delegate(
     {
         Ok((text, _, _)) if !text.trim().is_empty() => Ok(text),
         _ => {
-            tracing::warn!("delegate summarisation failed, using raw prompt");
+            tracing::warn!("summarise failed, using raw prompt");
             Ok(raw.to_owned())
         }
     }
-}
-
-/// Send a prompt to an external Claude Code REPL and wait for it to finish.
-pub async fn delegate_turn(
-    state: &Arc<DaemonState>,
-    model: &str,
-    ctx: &mut Context,
-    prompt: &str,
-    writer: &SharedWriter,
-) -> Result<String> {
-    let pane = ctx
-        .get("delegate_pane")
-        .ok_or_else(|| anyhow!("no delegate pane configured"))?
-        .to_owned();
-
-    write_step(writer, &format!("    Delegating to pane {pane}")).await;
-
-    // Compress the raw prompt before sending to avoid noise (thinking text,
-    // HTTP logs, HTML review bodies) reaching the delegate Claude session.
-    let clean_prompt = summarize_for_delegate(state, model, prompt, writer).await?;
-
-    // Write prompt to a temp file to avoid tmux special-character issues.
-    let tmp = tempfile::Builder::new()
-        .prefix("amaebi_delegate_")
-        .suffix(".txt")
-        .tempfile()
-        .context("creating delegate prompt file")?;
-    {
-        use std::io::Write;
-        tmp.as_file()
-            .write_all(clean_prompt.as_bytes())
-            .context("writing delegate prompt")?;
-    }
-    let tmp_path = tmp.path().to_string_lossy().to_string();
-
-    // Send prompt to the Claude pane via tmux paste-buffer.
-    // Use '' ENTER (empty literal + ENTER key name) so tmux sends the actual
-    // Return key, not the literal string "Enter".
-    sh(&format!("tmux load-buffer '{tmp_path}'")).await?;
-    sh(&format!("tmux paste-buffer -t '{pane}'")).await?;
-    sh(&format!("tmux send-keys -t '{pane}' '' ENTER")).await?;
-
-    // Wait for Claude to start processing.
-    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-
-    // Poll until the pane is idle again (LLM-based detection).
-    let timeout = std::time::Duration::from_secs(30 * 60);
-    let start = std::time::Instant::now();
-    let poll_interval = std::time::Duration::from_secs(10);
-
-    loop {
-        if start.elapsed() > timeout {
-            anyhow::bail!("delegate timeout: pane {pane} did not finish within 30 minutes");
-        }
-
-        let capture = sh(&format!("tmux capture-pane -t '{pane}' -p -S -10")).await?;
-        let pane_content = &capture.stdout;
-
-        if is_pane_idle(pane_content) {
-            write_step(writer, "    Delegate completed").await;
-            ctx.set("last_llm_output", pane_content);
-            return Ok(pane_content.clone());
-        }
-
-        tokio::time::sleep(poll_interval).await;
-    }
-}
-
-/// Returns `true` when the pane looks idle. Thin wrapper for `pane_looks_idle`.
-fn is_pane_idle(pane_content: &str) -> bool {
-    pane_looks_idle(pane_content)
 }
 
 // ---------------------------------------------------------------------------

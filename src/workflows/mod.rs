@@ -72,12 +72,6 @@ pub enum Action {
     /// Run a shell command. May contain `{var}` placeholders.
     Shell { command: String },
 
-    /// Delegate a task to an external Claude Code REPL running in a tmux pane.
-    /// The workflow sends the prompt via tmux, waits for Claude to finish
-    /// (detected by asking the internal LLM if the pane is idle), then captures
-    /// the pane output.  The delegate pane is auto-detected at workflow start.
-    Delegate { prompt: String },
-
     /// Parse the previous LLM output into a list, then run sub-stages on each
     /// item (sequentially or in parallel).
     Map {

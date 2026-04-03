@@ -7,6 +7,14 @@ use anyhow::{bail, Result};
 use super::{Action, Check, FailStrategy, Stage, Workflow};
 
 // ---------------------------------------------------------------------------
+// Shell helpers
+
+/// Wrap `s` in single quotes and escape any embedded single quotes as `'\''`.
+fn shell_single_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -61,14 +69,19 @@ pub fn dev_loop(
     Workflow {
         name: "dev-loop".into(),
         stages: vec![
-            // Phase 1: Delegate coding to external Claude pane.
+            // Phase 1: invoke Claude CLI directly with --bypass so it runs
+            // non-interactively without needing a tmux pane.
+            // Task is embedded at build time (single-quoted) to prevent
+            // shell injection from untrusted characters in the task string.
             Stage::new(
                 "develop",
-                Action::Delegate {
-                    prompt: format!(
-                        "Complete the following development task. \
-                         Make sure the code compiles and all tests pass before finishing. \
-                         Commit and push your changes when done.\n\n{task}"
+                Action::Shell {
+                    command: format!(
+                        "claude --permission-mode bypassPermissions --model us.anthropic.claude-opus-4-6-v1[1m] -p {}",
+                        shell_single_quote(&format!(
+                            "Complete the following development task. \
+                             Make sure the code compiles before finishing.\n\n{task}"
+                        ))
                     ),
                 },
             )
@@ -82,7 +95,7 @@ pub fn dev_loop(
             )
             .with_on_fail(FailStrategy::Retry {
                 max: max_test_retries,
-                inject_prompt: "The test script failed (exit code {exit_code}).\n\nstderr:\n```\n{stderr}\n```\n\nPlease fix the code so all checks pass, then commit and push.".into(),
+                inject_prompt: "The test script failed (exit code {exit_code}).\n\nstderr:\n```\n{stderr}\n```\n\nPlease fix the code so all checks pass.".into(),
             }),
             // Phase 3: push + create PR.
             // Claude may have already committed during develop, so tolerate
@@ -551,17 +564,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn dev_loop_develop_uses_delegate() {
+    fn dev_loop_develop_invokes_claude_cli() {
         let wf = dev_loop("test task", "cargo test", 3, 3);
         let stage = wf
             .stages
             .iter()
             .find(|s| s.name == "develop")
             .expect("develop stage missing");
-        assert!(
-            matches!(&stage.action, Action::Delegate { .. }),
-            "develop stage must be Action::Delegate"
-        );
+        if let Action::Shell { command } = &stage.action {
+            assert!(
+                command.contains("claude --permission-mode bypassPermissions"),
+                "develop stage must use bypassPermissions, got: {command}"
+            );
+            assert!(
+                command.contains("us.anthropic.claude-opus-4-6-v1[1m]"),
+                "develop stage must use 1M context model, got: {command}"
+            );
+            assert!(
+                command.contains("test task"),
+                "develop stage command must embed the task, got: {command}"
+            );
+        } else {
+            panic!("develop stage must be Action::Shell");
+        }
     }
 
     #[test]
