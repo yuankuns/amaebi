@@ -265,12 +265,15 @@ pub(crate) mod eventstream {
         pub payload: Vec<u8>,
     }
 
-    /// CRC-32C (Castagnoli) — used by AWS event-stream for checksums.
+    /// CRC-32 — used by AWS event-stream for frame checksums.
     ///
-    /// Uses the lookup-table approach (no external crate needed).
-    fn crc32c(data: &[u8]) -> u32 {
-        // CRC-32C polynomial 0x1EDC6F41 reflected → 0x82F63B78
-        const POLY: u32 = 0x82F63B78;
+    /// The AWS event-stream specification calls for CRC-32C (Castagnoli),
+    /// but the Bedrock ConverseStream endpoint empirically uses standard
+    /// CRC-32 (ISO 3309 / ITU-T V.42, polynomial 0xEDB88320 reflected).
+    /// Verified against real Bedrock responses on 2026-04-03.
+    fn crc32(data: &[u8]) -> u32 {
+        // Standard CRC-32 polynomial 0x04C11DB7 reflected → 0xEDB88320
+        const POLY: u32 = 0xEDB8_8320;
         let mut crc: u32 = 0xFFFF_FFFF;
         for &byte in data {
             crc ^= byte as u32;
@@ -305,7 +308,7 @@ pub(crate) mod eventstream {
         }
 
         // Verify prelude CRC (first 8 bytes).
-        let prelude_crc_actual = crc32c(&buf[..8]);
+        let prelude_crc_actual = crc32(&buf[..8]);
         if prelude_crc_actual != prelude_crc_expected {
             anyhow::bail!(
                 "event-stream prelude CRC mismatch: expected {prelude_crc_expected:#010X}, \
@@ -321,7 +324,7 @@ pub(crate) mod eventstream {
             buf[msg_crc_offset + 2],
             buf[msg_crc_offset + 3],
         ]);
-        let msg_crc_actual = crc32c(&buf[..msg_crc_offset]);
+        let msg_crc_actual = crc32(&buf[..msg_crc_offset]);
         if msg_crc_actual != msg_crc_expected {
             anyhow::bail!(
                 "event-stream message CRC mismatch: expected {msg_crc_expected:#010X}, \
@@ -480,7 +483,7 @@ pub(crate) mod eventstream {
         frame.extend_from_slice(&(header_len as u32).to_be_bytes());
 
         // Prelude CRC (over first 8 bytes).
-        let prelude_crc = crc32c(&frame[..8]);
+        let prelude_crc = crc32(&frame[..8]);
         frame.extend_from_slice(&prelude_crc.to_be_bytes());
 
         // Headers + payload.
@@ -488,7 +491,7 @@ pub(crate) mod eventstream {
         frame.extend_from_slice(payload);
 
         // Message CRC (over everything so far).
-        let msg_crc = crc32c(&frame);
+        let msg_crc = crc32(&frame);
         frame.extend_from_slice(&msg_crc.to_be_bytes());
 
         assert_eq!(frame.len(), total_len);
@@ -593,9 +596,9 @@ pub(crate) mod eventstream {
         }
 
         #[test]
-        fn crc32c_known_value() {
-            // "123456789" → CRC-32C = 0xE3069283
-            assert_eq!(crc32c(b"123456789"), 0xE306_9283);
+        fn crc32_known_value() {
+            // "123456789" → CRC-32 = 0xCBF43926 (ISO 3309)
+            assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
         }
     }
 }
