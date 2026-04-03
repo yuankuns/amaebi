@@ -187,21 +187,45 @@ where
 /// `Arc<tokio::sync::Mutex<W>>` on every write.  Used to bridge the daemon's
 /// shared writer into the workflow executor's `SharedWriter` type.
 ///
-/// Uses an `Arc<tokio::sync::Notify>` to avoid busy-looping on contention:
-/// when `try_lock()` fails the waker is registered via `Notify`, and the
-/// successful lock path calls `notify_waiters()` on completion so blocked
-/// writers are re-polled only when the lock is actually available.
+/// On contention, the caller's waker is parked in a shared `Vec<Waker>`.
+/// The successful lock path drains and wakes all parked wakers so blocked
+/// writers are re-polled only when the lock is actually released — no task
+/// spawning, no busy-loop.
 pub struct MutexWriter<W> {
     inner: std::sync::Arc<tokio::sync::Mutex<W>>,
-    notify: std::sync::Arc<tokio::sync::Notify>,
+    /// Wakers parked while the mutex was contended.  The lock holder drains
+    /// this after each successful operation.
+    parked: std::sync::Arc<std::sync::Mutex<Vec<std::task::Waker>>>,
 }
 
 impl<W> MutexWriter<W> {
     pub fn new(inner: std::sync::Arc<tokio::sync::Mutex<W>>) -> Self {
         Self {
             inner,
-            notify: std::sync::Arc::new(tokio::sync::Notify::new()),
+            parked: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
         }
+    }
+
+    /// Wake all parked writers so they retry the lock.
+    fn wake_parked(&self) {
+        let wakers: Vec<_> = self
+            .parked
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .drain(..)
+            .collect();
+        for w in wakers {
+            w.wake();
+        }
+    }
+
+    /// Park the current waker and return `Pending`.
+    fn park(&self, cx: &std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+        self.parked
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(cx.waker().clone());
+        std::task::Poll::Pending
     }
 }
 
@@ -214,20 +238,11 @@ impl<W: tokio::io::AsyncWrite + Unpin + Send> tokio::io::AsyncWrite for MutexWri
         match self.inner.try_lock() {
             Ok(mut guard) => {
                 let result = std::pin::Pin::new(&mut *guard).poll_write(cx, buf);
-                self.notify.notify_waiters();
+                drop(guard);
+                self.wake_parked();
                 result
             }
-            Err(_) => {
-                // Register the waker so we're re-polled when the lock holder
-                // finishes and calls notify_waiters(), instead of busy-looping.
-                let waker = cx.waker().clone();
-                let notify = self.notify.clone();
-                tokio::spawn(async move {
-                    notify.notified().await;
-                    waker.wake();
-                });
-                std::task::Poll::Pending
-            }
+            Err(_) => self.park(cx).map(|_| unreachable!()),
         }
     }
 
@@ -238,18 +253,11 @@ impl<W: tokio::io::AsyncWrite + Unpin + Send> tokio::io::AsyncWrite for MutexWri
         match self.inner.try_lock() {
             Ok(mut guard) => {
                 let result = std::pin::Pin::new(&mut *guard).poll_flush(cx);
-                self.notify.notify_waiters();
+                drop(guard);
+                self.wake_parked();
                 result
             }
-            Err(_) => {
-                let waker = cx.waker().clone();
-                let notify = self.notify.clone();
-                tokio::spawn(async move {
-                    notify.notified().await;
-                    waker.wake();
-                });
-                std::task::Poll::Pending
-            }
+            Err(_) => self.park(cx),
         }
     }
 
@@ -260,18 +268,11 @@ impl<W: tokio::io::AsyncWrite + Unpin + Send> tokio::io::AsyncWrite for MutexWri
         match self.inner.try_lock() {
             Ok(mut guard) => {
                 let result = std::pin::Pin::new(&mut *guard).poll_shutdown(cx);
-                self.notify.notify_waiters();
+                drop(guard);
+                self.wake_parked();
                 result
             }
-            Err(_) => {
-                let waker = cx.waker().clone();
-                let notify = self.notify.clone();
-                tokio::spawn(async move {
-                    notify.notified().await;
-                    waker.wake();
-                });
-                std::task::Poll::Pending
-            }
+            Err(_) => self.park(cx),
         }
     }
 }

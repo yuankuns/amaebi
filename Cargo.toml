@@ -29,9 +29,9 @@ tokio-util = { version = "0.7", features = ["compat"] }
 fs2 = "0.4"
 libc = "0.2"
 unicode-width = "0.1"
+tempfile = "3"
 
 [dev-dependencies]
-tempfile = "3"
 serial_test = "3"
 axum = "0.7"
 tokio-stream = "0.1"

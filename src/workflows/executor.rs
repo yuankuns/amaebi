@@ -1,7 +1,6 @@
 use anyhow::{anyhow, Context as _, Result};
 use async_recursion::async_recursion;
 use regex::Regex;
-use std::os::unix::fs::OpenOptionsExt;
 use std::sync::Arc;
 use tokio::io::AsyncWrite;
 use tokio::sync::Mutex;
@@ -217,24 +216,24 @@ async fn run_single_stage(
             let text = llm_turn(state, model, messages, &rendered, writer).await?;
             ctx.set("last_llm_output", &text);
             // Write to a unique temp file so parallel Map items don't race on
-            // a shared path.  Uses pid + atomic counter for uniqueness,
-            // create_new(true) to prevent symlink/TOCTOU attacks, and
-            // restricts permissions to owner-only (0o600).
-            use std::sync::atomic::{AtomicU64, Ordering};
-            static COUNTER: AtomicU64 = AtomicU64::new(0);
-            let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-            let tmp_path = format!("/tmp/amaebi_llm_{}_{id}.txt", std::process::id());
-            {
+            // a shared path.  Uses the tempfile crate for secure unique
+            // file creation (no predictable paths, no symlink/TOCTOU races).
+            // keep() prevents auto-deletion so later stages can read the file.
+            let tmp_path = {
                 use std::io::Write;
-                let mut f = std::fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .mode(0o600)
-                    .open(&tmp_path)
+                let mut tmp = tempfile::Builder::new()
+                    .prefix("amaebi_llm_")
+                    .suffix(".txt")
+                    .tempfile()
                     .context("creating LLM output temp file")?;
-                f.write_all(text.as_bytes())
+                tmp.write_all(text.as_bytes())
                     .context("writing LLM output to temp file")?;
-            }
+                tmp.into_temp_path()
+                    .keep()
+                    .context("persisting LLM output temp file")?
+                    .to_string_lossy()
+                    .to_string()
+            };
             ctx.set("last_llm_output_file", &tmp_path);
             run_check(&stage.check, ctx).await?;
             Ok(Some(text))
@@ -1365,18 +1364,16 @@ mod llm_tests {
             summary.contains("fix: add caching layer"),
             "summary: {summary}"
         );
-        // The executor must persist the output to a unique temp file.
-        // Verify a file matching the pattern exists and contains the output.
-        let pattern = format!("/tmp/amaebi_llm_{}_*.txt", std::process::id());
+        // The executor must persist the output to a temp file created by
+        // the tempfile crate.  Verify at least one amaebi_llm_*.txt exists.
         let found = std::fs::read_dir("/tmp")
             .unwrap()
             .filter_map(|e| e.ok())
             .find(|e| {
                 let name = e.file_name().to_string_lossy().to_string();
-                name.starts_with(&format!("amaebi_llm_{}_", std::process::id()))
-                    && name.ends_with(".txt")
+                name.starts_with("amaebi_llm_") && name.ends_with(".txt")
             });
-        assert!(found.is_some(), "no temp file matching {pattern}");
+        assert!(found.is_some(), "no temp file matching amaebi_llm_*.txt");
         let content = std::fs::read_to_string(found.unwrap().path()).unwrap();
         assert!(
             content.contains("fix: add caching layer"),
