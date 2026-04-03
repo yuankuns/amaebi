@@ -757,7 +757,7 @@ pub fn tool_schemas(include_spawn_agent: bool) -> Vec<serde_json::Value> {
                             "additionalProperties": {}
                         }
                     },
-                    "required": ["workflow", "args"]
+                    "required": ["workflow"]
                 }
             }
         }));

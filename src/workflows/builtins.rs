@@ -277,11 +277,13 @@ pub fn perf_sweep(
 }
 
 // ---------------------------------------------------------------------------
-// 3. bug_fix — list bugs → fix each in parallel → summarize
+// 3. bug_fix — list bugs → fix each serially → summarize
 // ---------------------------------------------------------------------------
 
-/// Supervise Claude fixing a list of bugs in parallel.
-/// Each bug is independent: fix → test → PR → review.
+/// Supervise Claude fixing a list of bugs serially.
+/// Each bug follows the same flow: fix → test → PR → review.
+/// Execution is serial because sub-stages share a git working tree and
+/// cannot safely run in parallel (concurrent checkouts/commits would race).
 ///
 /// `repo` must match the `owner/name` pattern (e.g. `"yuankuns/amaebi"`).
 /// Returns an error on invalid values to prevent shell injection.
@@ -338,7 +340,7 @@ pub fn bug_fix(
                 },
             )
             .with_on_fail(FailStrategy::Abort),
-            // Phase 3: fix each bug in parallel
+            // Phase 3: fix each bug serially (shared working tree — see above)
             Stage::new(
                 "fix-each",
                 Action::Map {
@@ -455,7 +457,11 @@ pub fn tune_sweep(
                 Action::Map {
                     parse: r"- TUNE: (.+)".into(),
                     parallel: true,
-                    resource_hint: None, // config generation is just LLM, no resource needed
+                    // No resource semaphore here — each item is one short LLM
+                    // call (write-config).  If the config list is very long and
+                    // rate limits become a concern, add a "llm" resource to the
+                    // pool and set resource_hint + Stage::with_requires("llm").
+                    resource_hint: None,
                     stages: vec![Stage::new(
                         "write-config",
                         Action::Llm {
