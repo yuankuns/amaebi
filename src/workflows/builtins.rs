@@ -96,10 +96,14 @@ pub fn dev_loop(
                 Action::Shell {
                     // Use -F to read the commit message from the file written by the
                     // preceding Llm stage (last_llm_output_file), avoiding shell injection.
+                    // Tolerate "nothing to commit" (the LLM may have already committed
+                    // during the develop stage) by checking the index first.
                     command: "git add -A && \
-                              git commit -F {last_llm_output_file} && \
+                              if ! git diff --cached --quiet; then \
+                                git commit -F {last_llm_output_file}; \
+                              fi && \
                               git push && \
-                              gh pr create --fill"
+                              (gh pr create --fill 2>&1 || true)"
                         .into(),
                 },
             )
