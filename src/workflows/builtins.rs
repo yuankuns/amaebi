@@ -2,6 +2,8 @@
 ///
 /// Each function constructs a `Workflow` from the static primitives.
 /// No LLM is involved in flow decisions — only in content (coding, analysis).
+use anyhow::{bail, Result};
+
 use super::{Action, Check, FailStrategy, Stage, Workflow};
 
 // ---------------------------------------------------------------------------
@@ -282,33 +284,46 @@ pub fn perf_sweep(
 /// Each bug is independent: fix → test → PR → review.
 ///
 /// `repo` must match the `owner/name` pattern (e.g. `"yuankuns/amaebi"`).
-/// The function panics on invalid values to prevent shell injection.
+/// Returns an error on invalid values to prevent shell injection.
 pub fn bug_fix(
     repo: &str, // e.g. "yuankuns/amaebi"
     test_cmd: &str,
     max_retries: usize,
-) -> Workflow {
+) -> Result<Workflow> {
     // Validate repo matches owner/name to prevent shell injection.
-    assert!(
-        repo == "."
-            || repo.chars().all(|c| c.is_alphanumeric()
-                || c == '/'
-                || c == '-'
-                || c == '_'
-                || c == '.'),
-        "invalid repo: must be 'owner/name' or '.', got: {repo:?}"
-    );
-    Workflow {
+    if repo != "."
+        && !repo
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '/' || c == '-' || c == '_' || c == '.')
+    {
+        bail!("invalid repo: must be 'owner/name' or '.', got: {repo:?}");
+    }
+
+    // When repo is ".", omit `-R` so gh infers from the current git remote.
+    let gh_issue_cmd = if repo == "." {
+        "gh issue list --label bug --json number,title,body \
+         --jq '.[] | \"- BUG #\" + (.number|tostring) + \": \" + .title'"
+            .to_owned()
+    } else {
+        format!(
+            "gh issue list -R {repo} --label bug --json number,title,body \
+             --jq '.[] | \"- BUG #\" + (.number|tostring) + \": \" + .title'"
+        )
+    };
+
+    // Detect default branch dynamically instead of hardcoding `master`.
+    let checkout_default_branch =
+        "git checkout $(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null \
+         | sed 's|refs/remotes/origin/||' || echo master)";
+
+    Ok(Workflow {
         name: "bug-fix".into(),
         stages: vec![
             // Phase 1: fetch open bug issues (code-guaranteed)
             Stage::new(
                 "list-bugs",
                 Action::Shell {
-                    command: format!(
-                        "gh issue list -R {repo} --label bug --json number,title,body \
-                         --jq '.[] | \"- BUG #\" + (.number|tostring) + \": \" + .title'"
-                    ),
+                    command: gh_issue_cmd,
                 },
             )
             .with_on_fail(FailStrategy::Abort),
@@ -328,16 +343,20 @@ pub fn bug_fix(
                 "fix-each",
                 Action::Map {
                     parse: r"- BUG: (.+)".into(),
-                    parallel: true, // bugs are independent
+                    // Serial: sub-stages do git operations (checkout, commit,
+                    // push) in the same working tree so they cannot run in
+                    // parallel without racing on the index and HEAD.
+                    parallel: false,
                     resource_hint: None,
                     stages: vec![
                         // 3a: checkout a new branch for this bug
                         Stage::new(
                             "branch",
                             Action::Shell {
-                                command: "git checkout master && \
-                                          git checkout -b fix/bug-{item_index}"
-                                    .into(),
+                                command: format!(
+                                    "{checkout_default_branch} && \
+                                     git checkout -b fix/bug-{{item_index}}"
+                                ),
                             },
                         )
                         .with_on_fail(FailStrategy::Skip),
@@ -394,7 +413,7 @@ pub fn bug_fix(
             )
             .with_on_fail(FailStrategy::Abort),
         ],
-    }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -625,7 +644,7 @@ mod tests {
 
     #[test]
     fn bug_fix_pr_uses_item_index_not_item() {
-        let wf = bug_fix("owner/repo", "cargo test", 3);
+        let wf = bug_fix("owner/repo", "cargo test", 3).unwrap();
         let fix_each = wf
             .stages
             .iter()
@@ -655,15 +674,86 @@ mod tests {
 
     #[test]
     fn bug_fix_repo_validation() {
-        // Valid repos should not panic.
-        let _ = bug_fix("owner/repo", "true", 1);
-        let _ = bug_fix(".", "true", 1);
-        let _ = bug_fix("my-org/my_repo.rs", "true", 1);
+        // Valid repos should not error.
+        bug_fix("owner/repo", "true", 1).unwrap();
+        bug_fix(".", "true", 1).unwrap();
+        bug_fix("my-org/my_repo.rs", "true", 1).unwrap();
     }
 
     #[test]
-    #[should_panic(expected = "invalid repo")]
     fn bug_fix_rejects_shell_metacharacters_in_repo() {
-        let _ = bug_fix("owner/repo; rm -rf /", "true", 1);
+        let result = bug_fix("owner/repo; rm -rf /", "true", 1);
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("invalid repo"),
+            "error should mention 'invalid repo', got: {msg}"
+        );
+    }
+
+    #[test]
+    fn bug_fix_dot_repo_omits_dash_r() {
+        let wf = bug_fix(".", "true", 1).unwrap();
+        let list_bugs = wf
+            .stages
+            .iter()
+            .find(|s| s.name == "list-bugs")
+            .expect("list-bugs stage missing");
+        if let Action::Shell { command } = &list_bugs.action {
+            assert!(
+                !command.contains("-R"),
+                "repo='.' should omit -R flag; got: {command}"
+            );
+        } else {
+            panic!("list-bugs must be a Shell action");
+        }
+    }
+
+    #[test]
+    fn bug_fix_serial_not_parallel() {
+        let wf = bug_fix("owner/repo", "true", 1).unwrap();
+        let fix_each = wf
+            .stages
+            .iter()
+            .find(|s| s.name == "fix-each")
+            .expect("fix-each stage missing");
+        if let Action::Map { parallel, .. } = &fix_each.action {
+            assert!(
+                !parallel,
+                "fix-each Map must be serial (parallel=false) because sub-stages do git operations"
+            );
+        } else {
+            panic!("fix-each must be a Map action");
+        }
+    }
+
+    #[test]
+    fn bug_fix_branch_detects_default_branch() {
+        let wf = bug_fix("owner/repo", "true", 1).unwrap();
+        let fix_each = wf
+            .stages
+            .iter()
+            .find(|s| s.name == "fix-each")
+            .expect("fix-each stage missing");
+        if let Action::Map { stages, .. } = &fix_each.action {
+            let branch = stages
+                .iter()
+                .find(|s| s.name == "branch")
+                .expect("branch sub-stage missing");
+            if let Action::Shell { command } = &branch.action {
+                assert!(
+                    command.contains("symbolic-ref"),
+                    "branch stage must detect default branch dynamically; got: {command}"
+                );
+                assert!(
+                    !command.contains("git checkout master"),
+                    "branch stage must not hardcode 'git checkout master'; got: {command}"
+                );
+            } else {
+                panic!("branch must be a Shell action");
+            }
+        } else {
+            panic!("fix-each must be a Map action");
+        }
     }
 }

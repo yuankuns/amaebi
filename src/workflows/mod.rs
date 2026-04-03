@@ -17,14 +17,14 @@ use tokio::sync::Semaphore;
 // ---------------------------------------------------------------------------
 
 /// A complete workflow: a named sequence of stages.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Workflow {
     pub name: String,
     pub stages: Vec<Stage>,
 }
 
 /// One step in the workflow.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Stage {
     pub name: String,
     pub action: Action,
@@ -63,7 +63,7 @@ impl Stage {
 }
 
 /// What a stage does.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum Action {
     /// Ask the LLM to do something. The prompt may contain `{var}` placeholders
     /// resolved from the current `Context`.
@@ -99,7 +99,7 @@ pub enum Action {
 }
 
 /// How to decide whether a stage succeeded.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 #[allow(dead_code)]
 pub enum Check {
     /// Shell command must exit 0.
@@ -112,7 +112,7 @@ pub enum Check {
 }
 
 /// What to do when a stage's Check fails (or the action itself errors).
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum FailStrategy {
     /// Terminate the whole workflow.
     Abort,
@@ -174,6 +174,9 @@ impl ResourcePool {
 #[derive(Clone, Default)]
 pub struct Context {
     vars: HashMap<String, String>,
+    /// Paths to temporary files created during workflow execution.
+    /// Cleaned up by [`Context::cleanup_temp_files`] at the end of `execute()`.
+    pub temp_files: Vec<String>,
 }
 
 impl Context {
@@ -196,6 +199,20 @@ impl Context {
             out = out.replace(&format!("{{{k}}}"), v);
         }
         out
+    }
+
+    /// Record a temporary file path for cleanup at the end of the workflow.
+    pub fn track_temp_file(&mut self, path: impl Into<String>) {
+        self.temp_files.push(path.into());
+    }
+
+    /// Delete all tracked temporary files.  Errors are logged but not propagated.
+    pub fn cleanup_temp_files(&self) {
+        for path in &self.temp_files {
+            if let Err(e) = std::fs::remove_file(path) {
+                tracing::debug!(path = %path, error = %e, "failed to clean up temp file");
+            }
+        }
     }
 
     /// Like [`render`](Self::render), but single-quotes each variable value
@@ -251,6 +268,18 @@ pub fn step(name: &str) {
 // Shared workflow builder — single source of truth for all entry points
 // ---------------------------------------------------------------------------
 
+/// Convert a `u64` argument to `usize` safely, capping at a reasonable
+/// maximum (50) to prevent absurd retry counts.  Returns an error if the
+/// value cannot be represented as `usize`.
+fn safe_usize(value: u64, name: &str) -> anyhow::Result<usize> {
+    const MAX_REASONABLE: u64 = 50;
+    if value > MAX_REASONABLE {
+        anyhow::bail!("invalid {name}: {value} exceeds maximum ({MAX_REASONABLE})");
+    }
+    usize::try_from(value)
+        .map_err(|_| anyhow::anyhow!("invalid {name}: value {value} too large for usize"))
+}
+
 /// Build a `(Workflow, ResourcePool)` from a workflow name and a flat JSON
 /// argument map.  Used by the daemon's `Request::Workflow` handler and
 /// `run_workflow` LLM tool so all entry points share the same construction
@@ -274,7 +303,7 @@ pub fn build_workflow(
         "dev-loop" => {
             let task = str_arg("task").unwrap_or("complete the task");
             let test_cmd = str_arg("test_cmd").unwrap_or(default_test_cmd);
-            let max_retries = u64_arg("max_retries").unwrap_or(5) as usize;
+            let max_retries = safe_usize(u64_arg("max_retries").unwrap_or(5), "max_retries")?;
             Ok((
                 builtins::dev_loop(task, test_cmd, max_retries, max_retries),
                 ResourcePool::empty(),
@@ -283,9 +312,9 @@ pub fn build_workflow(
         "bug-fix" => {
             let repo = str_arg("repo").unwrap_or(".");
             let test_cmd = str_arg("test_cmd").unwrap_or(default_test_cmd);
-            let max_retries = u64_arg("max_retries").unwrap_or(3) as usize;
+            let max_retries = safe_usize(u64_arg("max_retries").unwrap_or(3), "max_retries")?;
             Ok((
-                builtins::bug_fix(repo, test_cmd, max_retries),
+                builtins::bug_fix(repo, test_cmd, max_retries)?,
                 ResourcePool::empty(),
             ))
         }
@@ -293,6 +322,11 @@ pub fn build_workflow(
             let target = str_arg("target").unwrap_or("the target");
             let bench_cmd = str_arg("bench_cmd").unwrap_or("make bench");
             let threshold = f64_arg("regression_threshold").unwrap_or(0.05);
+            if !threshold.is_finite() || !(0.0..=1.0).contains(&threshold) {
+                anyhow::bail!(
+                    "invalid regression_threshold: must be a finite number in 0.0..=1.0, got {threshold}"
+                );
+            }
             Ok((
                 builtins::perf_sweep(target, "", bench_cmd, threshold),
                 ResourcePool::empty(),
@@ -303,12 +337,10 @@ pub fn build_workflow(
             let run_cmd = str_arg("run_cmd").unwrap_or("echo {item_index}");
             let result_cmd = str_arg("result_cmd").unwrap_or("echo done");
             let resource = str_arg("resource").unwrap_or("gpu");
-            let count_u64 = u64_arg("resource_count").unwrap_or(1);
-            if count_u64 == 0 {
+            let count = safe_usize(u64_arg("resource_count").unwrap_or(1), "resource_count")?;
+            if count == 0 {
                 anyhow::bail!("invalid resource_count: must be greater than 0");
             }
-            let count = usize::try_from(count_u64)
-                .map_err(|_| anyhow::anyhow!("invalid resource_count: value too large"))?;
             let wf = builtins::tune_sweep(target, "", run_cmd, result_cmd, resource);
             let pool = ResourcePool::new([(resource, count)]);
             Ok((wf, pool))

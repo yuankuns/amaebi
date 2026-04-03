@@ -139,7 +139,7 @@ pub enum Command {
         /// Path to the Unix socket.
         #[arg(long, default_value = DEFAULT_SOCKET, global = true)]
         socket: PathBuf,
-        /// Model to use (overrides AMAEBI_MODEL; default: gpt-4o).
+        /// Model to use (overrides AMAEBI_MODEL; default: claude-sonnet-4.6).
         #[arg(long, global = true)]
         model: Option<String>,
     },
@@ -152,8 +152,9 @@ pub enum WorkflowAction {
         /// Development task description.
         task: String,
         /// Test command (must exit 0 on success).
-        #[arg(long, default_value = "cargo test")]
-        test_cmd: String,
+        /// Defaults to scripts/test.sh if it exists, otherwise cargo test.
+        #[arg(long)]
+        test_cmd: Option<String>,
         /// Max times to retry after test failure.
         #[arg(long, default_value = "5")]
         max_test_retries: usize,
@@ -175,14 +176,15 @@ pub enum WorkflowAction {
         #[arg(long, default_value = "0.05")]
         regression_threshold: f64,
     },
-    /// Fetch open bug issues → fix each in parallel → PR → summarize.
+    /// Fetch open bug issues → fix each (serial) → PR → summarize.
     BugFix {
         /// GitHub repository (owner/repo).
         #[arg(long)]
         repo: String,
         /// Test command.
-        #[arg(long, default_value = "cargo test")]
-        test_cmd: String,
+        /// Defaults to scripts/test.sh if it exists, otherwise cargo test.
+        #[arg(long)]
+        test_cmd: Option<String>,
         /// Max retries per bug fix.
         #[arg(long, default_value = "3")]
         max_retries: usize,

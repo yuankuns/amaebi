@@ -665,7 +665,7 @@ async fn run_workflow(
 
     let model = model
         .or_else(|| std::env::var("AMAEBI_MODEL").ok())
-        .unwrap_or_else(|| "gpt-4o".to_string());
+        .unwrap_or_else(|| crate::provider::DEFAULT_MODEL.to_string());
 
     // Start (or connect to) the daemon so we can call run_agentic_loop.
     let state = Arc::new(
@@ -683,6 +683,7 @@ async fn run_workflow(
             max_test_retries,
             max_review_retries,
         } => {
+            let test_cmd = test_cmd.unwrap_or_else(detect_test_cmd);
             let wf = builtins::dev_loop(&task, &test_cmd, max_test_retries, max_review_retries);
             let summary = executor::execute(
                 &wf,
@@ -690,7 +691,7 @@ async fn run_workflow(
                 &model,
                 ctx,
                 &ResourcePool::empty(),
-                executor::stderr_writer(),
+                executor::sink_writer(),
                 &[],
                 &[],
                 None,
@@ -713,7 +714,7 @@ async fn run_workflow(
                 &model,
                 ctx,
                 &ResourcePool::empty(),
-                executor::stderr_writer(),
+                executor::sink_writer(),
                 &[],
                 &[],
                 None,
@@ -727,14 +728,15 @@ async fn run_workflow(
             test_cmd,
             max_retries,
         } => {
-            let wf = builtins::bug_fix(&repo, &test_cmd, max_retries);
+            let test_cmd = test_cmd.unwrap_or_else(detect_test_cmd);
+            let wf = builtins::bug_fix(&repo, &test_cmd, max_retries)?;
             let summary = executor::execute(
                 &wf,
                 &state,
                 &model,
                 ctx,
                 &ResourcePool::empty(),
-                executor::stderr_writer(),
+                executor::sink_writer(),
                 &[],
                 &[],
                 None,
@@ -751,6 +753,9 @@ async fn run_workflow(
             resource,
             resource_count,
         } => {
+            if resource_count == 0 {
+                anyhow::bail!("invalid resource_count: must be greater than 0");
+            }
             let docs_content = read_files(&docs).await?;
             let wf = builtins::tune_sweep(&target, &docs_content, &run_cmd, &result_cmd, &resource);
             let pool = ResourcePool::new([(resource.as_str(), resource_count)]);
@@ -760,7 +765,7 @@ async fn run_workflow(
                 &model,
                 ctx,
                 &pool,
-                executor::stderr_writer(),
+                executor::sink_writer(),
                 &[],
                 &[],
                 None,
@@ -771,6 +776,16 @@ async fn run_workflow(
     }
 
     Ok(())
+}
+
+/// Auto-detect test command: prefer `scripts/test.sh` when it exists,
+/// otherwise fall back to `cargo test`.
+fn detect_test_cmd() -> String {
+    if std::path::Path::new("scripts/test.sh").exists() {
+        "scripts/test.sh".to_string()
+    } else {
+        "cargo test".to_string()
+    }
 }
 
 async fn read_files(paths: &[String]) -> Result<String> {

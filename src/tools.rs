@@ -305,7 +305,7 @@ async fn run_workflow_tool(
     let model = parent_model
         .map(|s| s.to_string())
         .or_else(|| std::env::var("AMAEBI_MODEL").ok())
-        .unwrap_or_else(|| "gpt-4o".to_string());
+        .unwrap_or_else(|| crate::provider::DEFAULT_MODEL.to_string());
 
     // Load parent session context so the workflow's LLM stages have
     // conversation history about what the user was working on.
@@ -739,12 +739,20 @@ pub fn tool_schemas(include_spawn_agent: bool) -> Vec<serde_json::Value> {
                         },
                         "args": {
                             "type": "object",
-                            "description": "Workflow-specific arguments. \
-                                            dev-loop/bug-fix: 'task' (string, required), \
-                                            'test_cmd' (string, test script to run; \
-                                            defaults to scripts/test.sh if it exists, \
-                                            otherwise cargo test), \
-                                            'max_retries' (integer, default 5).",
+                            "description": "Workflow-specific arguments (JSON object). \
+                                            dev-loop: 'task' (string, required — the task description), \
+                                            'test_cmd' (string, test script; defaults to scripts/test.sh \
+                                            if it exists, otherwise cargo test), \
+                                            'max_retries' (integer, default 5). \
+                                            bug-fix: 'repo' (string, 'owner/name' or '.' for current repo), \
+                                            'test_cmd' (string, same default as dev-loop), \
+                                            'max_retries' (integer, default 3). \
+                                            perf-sweep: 'target' (string, what to optimize), \
+                                            'bench_cmd' (string, must output JSON with numeric metrics), \
+                                            'regression_threshold' (float 0.0–1.0, default 0.05). \
+                                            tune-sweep: 'target' (string), 'run_cmd' (string), \
+                                            'result_cmd' (string), 'resource' (string, e.g. 'gpu'), \
+                                            'resource_count' (integer, default 1).",
                             "additionalProperties": {}
                         }
                     },

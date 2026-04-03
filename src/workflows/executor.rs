@@ -13,6 +13,20 @@ use crate::memory_db;
 
 use super::{sh, step, Action, Check, Context, FailStrategy, ResourcePool, Stage, Workflow};
 
+/// Truncate a string to at most `max_bytes` bytes without splitting a
+/// multi-byte UTF-8 character.  Returns the longest prefix of `s` that
+/// fits within `max_bytes` and is valid UTF-8.
+fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 /// Shared writer that can be cloned into spawned tasks (parallel Map).
 /// Used to stream LLM output back to the client. Step markers always go
 /// to stderr (via `step()`); LLM text goes through this writer.
@@ -39,8 +53,19 @@ pub fn sink_writer() -> SharedWriter {
     Arc::new(Mutex::new(Box::new(tokio::io::sink())))
 }
 
-/// Create a writer that sends LLM output to stderr so the CLI user sees
-/// real-time progress from workflow stages.
+/// Create a writer that sends LLM output to stderr as plain text so the
+/// CLI user sees real-time progress from workflow stages.
+///
+/// Note: the workflow executor also sends `Response::Text` JSON frames
+/// through the writer (for IPC clients).  When the writer is raw stderr,
+/// these JSON frames would be unintelligible to a human.  The CLI path
+/// therefore uses `sink_writer()` instead and relies on `step()` (which
+/// writes plain ANSI markers directly to stderr) for progress display.
+///
+/// This function is retained for cases where raw stderr output is
+/// acceptable (e.g. debugging), but the default CLI path should prefer
+/// `sink_writer()`.
+#[allow(dead_code)]
 pub fn stderr_writer() -> SharedWriter {
     Arc::new(Mutex::new(Box::new(tokio::io::stderr())))
 }
@@ -111,9 +136,12 @@ pub async fn execute(
         resources,
         &writer,
     )
-    .await?;
+    .await;
 
-    Ok(result.unwrap_or_else(|| "Workflow completed.".to_owned()))
+    // Clean up temporary files regardless of success or failure.
+    ctx.cleanup_temp_files();
+
+    Ok(result?.unwrap_or_else(|| "Workflow completed.".to_owned()))
 }
 
 // ---------------------------------------------------------------------------
@@ -253,6 +281,7 @@ async fn run_single_stage(
                     .to_string_lossy()
                     .to_string()
             };
+            ctx.track_temp_file(&tmp_path);
             ctx.set("last_llm_output_file", &tmp_path);
             run_check(&stage.check, ctx).await?;
             Ok(Some(text))
@@ -271,7 +300,7 @@ async fn run_single_stage(
                 return Err(anyhow!(
                     "Shell command failed (exit {})\nstderr: {}",
                     result.code,
-                    &result.stderr[..result.stderr.len().min(2000)]
+                    truncate_utf8(&result.stderr, 2000)
                 ));
             }
             run_check(&stage.check, ctx).await?;
@@ -514,7 +543,7 @@ async fn run_check(check: &Option<Check>, ctx: &mut Context) -> Result<()> {
                     "Check failed (exit {}): {}\nstderr: {}",
                     r.code,
                     rendered,
-                    &r.stderr[..r.stderr.len().min(2000)]
+                    truncate_utf8(&r.stderr, 2000)
                 ));
             }
             ctx.set("stdout", &r.stdout);
@@ -526,11 +555,18 @@ async fn run_check(check: &Option<Check>, ctx: &mut Context) -> Result<()> {
             let r = sh(&rendered).await?;
             ctx.set("stdout", &r.stdout);
             ctx.set("stderr", &r.stderr);
+            if !r.success {
+                return Err(anyhow!(
+                    "Check command failed (exit {}): {}",
+                    r.code,
+                    truncate_utf8(&r.stderr, 500)
+                ));
+            }
             if !r.stdout.contains(pattern.as_str()) {
                 return Err(anyhow!(
                     "Check failed: output does not contain {:?}\nstdout: {}",
                     pattern,
-                    &r.stdout[..r.stdout.len().min(2000)]
+                    truncate_utf8(&r.stdout, 2000)
                 ));
             }
         }
@@ -539,15 +575,22 @@ async fn run_check(check: &Option<Check>, ctx: &mut Context) -> Result<()> {
             let rendered = ctx.render(command);
             let r = sh(&rendered).await?;
             ctx.set("stdout", &r.stdout);
+            if !r.success {
+                return Err(anyhow!(
+                    "Benchmark command failed (exit {}): {}",
+                    r.code,
+                    truncate_utf8(&r.stderr, 500)
+                ));
+            }
 
             let baseline_json = ctx.get("benchmark_baseline").unwrap_or("{}").to_owned();
-            let regression = detect_regression(&baseline_json, &r.stdout, *threshold)?;
+            let regression = detect_regression(baseline_json.trim(), r.stdout.trim(), *threshold)?;
             if let Some(msg) = regression {
                 ctx.set("regression_summary", &msg);
                 return Err(anyhow!("Benchmark regression detected: {msg}"));
             }
             // Update baseline on success.
-            ctx.set("benchmark_baseline", &r.stdout);
+            ctx.set("benchmark_baseline", r.stdout.trim());
         }
     }
 
@@ -577,7 +620,14 @@ pub async fn detect_delegate_pane(state: &Arc<DaemonState>, model: &str) -> Resu
     for pane_id in &pane_ids {
         let cap = sh(&format!("tmux capture-pane -t {pane_id} -p")).await?;
         let content = cap.stdout;
-        let tail = &content[content.len().saturating_sub(500)..];
+        let tail = {
+            let start = content.len().saturating_sub(500);
+            let mut s = start;
+            while s < content.len() && !content.is_char_boundary(s) {
+                s += 1;
+            }
+            &content[s..]
+        };
         desc.push_str(&format!(
             "--- Pane {pane_id} (last 500 chars) ---\n{tail}\n\n"
         ));
@@ -667,7 +717,14 @@ pub async fn delegate_turn(
 
 /// Ask the internal LLM whether a tmux pane shows an idle Claude Code session.
 async fn is_pane_idle(state: &Arc<DaemonState>, model: &str, pane_content: &str) -> Result<bool> {
-    let tail = &pane_content[pane_content.len().saturating_sub(2000)..];
+    let tail = {
+        let start = pane_content.len().saturating_sub(2000);
+        let mut s = start;
+        while s < pane_content.len() && !pane_content.is_char_boundary(s) {
+            s += 1;
+        }
+        &pane_content[s..]
+    };
     let prompt = format!(
         "Below is the tail of a tmux pane running Claude Code.\n\
          Is this session idle and waiting for user input?\n\
@@ -763,8 +820,14 @@ fn detect_regression(
     threshold: f64,
 ) -> Result<Option<String>> {
     // Parse as flat JSON objects {metric: number}.
-    let baseline: serde_json::Value = serde_json::from_str(baseline_json).unwrap_or_default();
-    let current: serde_json::Value = serde_json::from_str(current_json).unwrap_or_default();
+    let baseline: serde_json::Value = serde_json::from_str(baseline_json).with_context(|| {
+        format!(
+            "parsing baseline JSON: {}",
+            truncate_utf8(baseline_json, 200)
+        )
+    })?;
+    let current: serde_json::Value = serde_json::from_str(current_json)
+        .with_context(|| format!("parsing current JSON: {}", truncate_utf8(current_json, 200)))?;
 
     let baseline_obj = match baseline.as_object() {
         Some(o) => o,
@@ -1503,9 +1566,10 @@ mod llm_tests {
 
     // ---- Tests ----------------------------------------------------------
 
-    /// Action::Llm must write its output to `/tmp/amaebi_llm_output.txt` and
-    /// set ctx["last_llm_output_file"] so that downstream Shell stages can
-    /// safely read the commit message / analysis without shell injection.
+    /// Action::Llm must write its output to a unique tempfile (prefix
+    /// `amaebi_llm_`) and set ctx["last_llm_output_file"] so that downstream
+    /// Shell stages can safely read the commit message / analysis without
+    /// shell injection.
     #[tokio::test]
     #[serial]
     async fn llm_stage_writes_output_file() {
@@ -1541,21 +1605,9 @@ mod llm_tests {
             summary.contains("fix: add caching layer"),
             "summary: {summary}"
         );
-        // The executor must persist the output to a temp file created by
-        // the tempfile crate.  Verify at least one amaebi_llm_*.txt exists.
-        let found = std::fs::read_dir("/tmp")
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .find(|e| {
-                let name = e.file_name().to_string_lossy().to_string();
-                name.starts_with("amaebi_llm_") && name.ends_with(".txt")
-            });
-        assert!(found.is_some(), "no temp file matching amaebi_llm_*.txt");
-        let content = std::fs::read_to_string(found.unwrap().path()).unwrap();
-        assert!(
-            content.contains("fix: add caching layer"),
-            "output file content: {content}"
-        );
+        // The executor creates a unique tempfile (prefix `amaebi_llm_`) during
+        // the LLM stage and cleans it up when execute() returns.
+        // We verify the LLM output was captured correctly via the summary above.
         assert_eq!(mock.request_count(), 1);
     }
 
