@@ -53,6 +53,7 @@ pub trait ToolExecutor: Send + Sync {
         name: &str,
         args: serde_json::Value,
         ctx: &ToolCallContext,
+        writer: Option<crate::workflows::executor::SharedWriter>,
     ) -> Result<String>;
 }
 
@@ -124,6 +125,7 @@ impl ToolExecutor for LocalExecutor {
         name: &str,
         args: serde_json::Value,
         call_ctx: &ToolCallContext,
+        writer: Option<crate::workflows::executor::SharedWriter>,
     ) -> Result<String> {
         tracing::debug!(tool = %name, "executing tool");
         match name {
@@ -148,6 +150,7 @@ impl ToolExecutor for LocalExecutor {
                         ctx,
                         call_ctx.session_id.as_deref(),
                         call_ctx.model.as_deref(),
+                        writer,
                     )
                     .await
                 }
@@ -283,6 +286,7 @@ async fn run_workflow_tool(
     ctx: &SpawnContext,
     session_id: Option<&str>,
     parent_model: Option<&str>,
+    writer: Option<crate::workflows::executor::SharedWriter>,
 ) -> Result<String> {
     use crate::workflows::{build_workflow, executor, Context};
     use std::sync::Arc;
@@ -347,7 +351,7 @@ async fn run_workflow_tool(
 
     let (workflow, pool) = build_workflow(workflow_name, &wf_args)?;
     let wf_ctx = Context::new();
-    let writer = executor::sink_writer();
+    let writer = writer.unwrap_or_else(executor::sink_writer);
 
     executor::execute(
         &workflow,
@@ -938,6 +942,7 @@ mod tests {
                 "shell_command",
                 serde_json::json!({"command": "echo hello"}),
                 &ToolCallContext::default(),
+                None,
             )
             .await
             .unwrap();
@@ -952,6 +957,7 @@ mod tests {
                 "shell_command",
                 serde_json::json!({"command": "echo bad && exit 2"}),
                 &ToolCallContext::default(),
+                None,
             )
             .await
             .unwrap();
@@ -967,6 +973,7 @@ mod tests {
                 "shell_command",
                 serde_json::json!({"command": "true"}),
                 &ToolCallContext::default(),
+                None,
             )
             .await
             .unwrap();
@@ -981,6 +988,7 @@ mod tests {
                 "shell_command",
                 serde_json::json!({}),
                 &ToolCallContext::default(),
+                None,
             )
             .await;
         assert!(result.is_err());
@@ -1005,6 +1013,7 @@ mod tests {
                 "read_file",
                 serde_json::json!({"path": path.to_str().unwrap()}),
                 &ToolCallContext::default(),
+                None,
             )
             .await
             .unwrap();
@@ -1021,6 +1030,7 @@ mod tests {
                 "read_file",
                 serde_json::json!({"path": path.to_str().unwrap()}),
                 &ToolCallContext::default(),
+                None,
             )
             .await;
         assert!(result.is_err());
@@ -1034,6 +1044,7 @@ mod tests {
                 "read_file",
                 serde_json::json!({}),
                 &ToolCallContext::default(),
+                None,
             )
             .await;
         assert!(result.is_err());
@@ -1052,6 +1063,7 @@ mod tests {
                 "edit_file",
                 serde_json::json!({"path": path.to_str().unwrap(), "content": "written"}),
                 &ToolCallContext::default(),
+                None,
             )
             .await
             .unwrap();
@@ -1073,6 +1085,7 @@ mod tests {
             "edit_file",
             serde_json::json!({"path": path.to_str().unwrap(), "content": "new"}),
             &ToolCallContext::default(),
+            None,
         )
         .await
         .unwrap();
@@ -1135,7 +1148,10 @@ mod tests {
         };
         let ctx = ToolCallContext::default();
         let args = serde_json::json!({"command": "echo hello"});
-        let result = exec.execute("shell_command", args, &ctx).await.unwrap();
+        let result = exec
+            .execute("shell_command", args, &ctx, None)
+            .await
+            .unwrap();
         assert!(result.contains("hello"));
     }
 
@@ -1150,7 +1166,12 @@ mod tests {
         let ctx = ToolCallContext::default();
         // pwd should print the default_cwd, not the daemon process cwd.
         let result = exec
-            .execute("shell_command", serde_json::json!({"command": "pwd"}), &ctx)
+            .execute(
+                "shell_command",
+                serde_json::json!({"command": "pwd"}),
+                &ctx,
+                None,
+            )
             .await
             .unwrap();
         assert!(
@@ -1263,6 +1284,7 @@ mod tests {
                 "nonexistent_tool",
                 serde_json::json!({}),
                 &ToolCallContext::default(),
+                None,
             )
             .await;
         assert!(result.is_err());

@@ -1958,7 +1958,7 @@ where
                                     return format!("argument error: {e:#}");
                                 }
                             };
-                            match state.executor.execute(&tc.name, args, tool_ctx).await {
+                            match state.executor.execute(&tc.name, args, tool_ctx, None).await {
                                 Ok(output) => {
                                     tracing::debug!(
                                         tool = %tc.name,
@@ -2066,7 +2066,41 @@ where
                             }
                         };
 
-                        let result = match state.executor.execute(&tc.name, args, tool_ctx).await {
+                        // For run_workflow, bridge progress output back to the
+                        // client via a duplex pipe so step markers and LLM text
+                        // stream in real-time instead of being swallowed by
+                        // sink_writer().
+                        let execute_result = if tc.name == "run_workflow" {
+                            let (duplex_read, duplex_write) = tokio::io::duplex(16384);
+                            let shared: crate::workflows::executor::SharedWriter =
+                                std::sync::Arc::new(tokio::sync::Mutex::new(Box::new(
+                                    duplex_write,
+                                )));
+                            let (r, _) = tokio::join!(
+                                state
+                                    .executor
+                                    .execute(&tc.name, args, tool_ctx, Some(shared)),
+                                async {
+                                    let mut reader = duplex_read;
+                                    let mut buf = [0u8; 4096];
+                                    loop {
+                                        match tokio::io::AsyncReadExt::read(&mut reader, &mut buf)
+                                            .await
+                                        {
+                                            Ok(0) | Err(_) => break,
+                                            Ok(n) => {
+                                                let _ = writer.write_all(&buf[..n]).await;
+                                            }
+                                        }
+                                    }
+                                }
+                            );
+                            r
+                        } else {
+                            state.executor.execute(&tc.name, args, tool_ctx, None).await
+                        };
+
+                        let result = match execute_result {
                             Ok(output) => {
                                 tracing::debug!(
                                     tool = %tc.name,
