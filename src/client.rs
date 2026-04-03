@@ -185,7 +185,8 @@ fn hash_based_name(description: &str) -> String {
 /// worktrees and spawn parallel development agents.
 fn build_dev_prompt(tasks: &[DevTask], cwd: &Path) -> String {
     let cwd_display = cwd.display();
-    let worktree_base = "~/amaebi-wt";
+    let home = std::env::var("HOME").unwrap_or_else(|_| "~".to_string());
+    let worktree_base = format!("{home}/amaebi-wt");
 
     let mut task_list = String::new();
     for (i, task) in tasks.iter().enumerate() {
@@ -2274,7 +2275,7 @@ mod tests {
         assert!(prompt.contains("fix context limit"));
         assert!(prompt.contains("parallel"));
         assert!(prompt.contains("git worktree add"));
-        assert!(prompt.contains("~/amaebi-wt"));
+        assert!(prompt.contains("amaebi-wt"));
         assert!(prompt.contains("/home/user/project"));
     }
 
@@ -2285,7 +2286,7 @@ mod tests {
             description: "do something".into(),
         }];
         let prompt = build_dev_prompt(&tasks, Path::new("/tmp"));
-        assert!(prompt.contains("~/amaebi-wt/my-task"));
+        assert!(prompt.contains("amaebi-wt/my-task"));
         assert!(prompt.contains("feat/my-task"));
     }
 }
