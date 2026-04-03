@@ -732,7 +732,12 @@ pub fn tool_schemas(include_spawn_agent: bool) -> Vec<serde_json::Value> {
                         },
                         "args": {
                             "type": "object",
-                            "description": "Workflow-specific arguments (see each workflow's CLI docs).",
+                            "description": "Workflow-specific arguments. \
+                                            dev-loop/bug-fix: 'task' (string, required), \
+                                            'test_cmd' (string, test script to run; \
+                                            defaults to scripts/test.sh if it exists, \
+                                            otherwise cargo test), \
+                                            'max_retries' (integer, default 5).",
                             "additionalProperties": {}
                         }
                     },

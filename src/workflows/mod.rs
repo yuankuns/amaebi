@@ -257,10 +257,17 @@ pub fn build_workflow(
     let u64_arg = |key: &str| -> Option<u64> { args.get(key).and_then(|v| v.as_u64()) };
     let f64_arg = |key: &str| -> Option<f64> { args.get(key).and_then(|v| v.as_f64()) };
 
+    // Auto-detect test script: prefer scripts/test.sh when it exists.
+    let default_test_cmd = if std::path::Path::new("scripts/test.sh").exists() {
+        "scripts/test.sh"
+    } else {
+        "cargo test"
+    };
+
     match name {
         "dev-loop" => {
             let task = str_arg("task").unwrap_or("complete the task");
-            let test_cmd = str_arg("test_cmd").unwrap_or("cargo test");
+            let test_cmd = str_arg("test_cmd").unwrap_or(default_test_cmd);
             let max_retries = u64_arg("max_retries").unwrap_or(5) as usize;
             Ok((
                 builtins::dev_loop(task, test_cmd, max_retries, max_retries),
@@ -269,7 +276,7 @@ pub fn build_workflow(
         }
         "bug-fix" => {
             let repo = str_arg("repo").unwrap_or(".");
-            let test_cmd = str_arg("test_cmd").unwrap_or("cargo test");
+            let test_cmd = str_arg("test_cmd").unwrap_or(default_test_cmd);
             let max_retries = u64_arg("max_retries").unwrap_or(3) as usize;
             Ok((
                 builtins::bug_fix(repo, test_cmd, max_retries),
