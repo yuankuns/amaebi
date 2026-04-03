@@ -583,6 +583,8 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                             build_messages(&prompt, tmux_pane.as_deref(), trimmed, &[], None);
                         inject_skill_files(&mut messages).await;
                     }
+                    // Propagate model so run_workflow/spawn_agent inherit it.
+                    state.executor.set_model(Some(model.clone()));
                     let mut sink = tokio::io::sink();
                     let (_, mut steer_rx) = tokio::sync::mpsc::channel::<Option<String>>(1);
                     match run_agentic_loop(&state, &model, messages, &mut sink, &mut steer_rx, true)
@@ -648,6 +650,8 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                     .await?;
                     break 'connection;
                 }
+                // Propagate model to executor so run_workflow/spawn_agent inherit it.
+                state.executor.set_model(Some(model.clone()));
                 let (steer_tx, mut steer_rx) = tokio::sync::mpsc::channel::<Option<String>>(16);
                 let expected_sid = session_id.clone();
                 let db = Arc::clone(&state.db);
@@ -944,8 +948,10 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                 let (steer_tx, mut steer_rx) = tokio::sync::mpsc::channel::<Option<String>>(16);
                 let expected_chat_sid = sid.clone();
 
-                // Propagate session ID to executor so run_workflow can load history.
+                // Propagate session ID and model to executor so run_workflow
+                // and spawn_agent inherit them from the current session.
                 state.executor.set_session_id(Some(sid.clone()));
+                state.executor.set_model(Some(model.clone()));
 
                 let writer_loop = Arc::clone(&writer);
                 let state_loop = Arc::clone(&state);
@@ -2405,6 +2411,7 @@ async fn run_cron_job(state: Arc<DaemonState>, job: &cron::CronJob) {
     // Resolve model from env var (same default as CLI client).
     let model = std::env::var("AMAEBI_MODEL")
         .unwrap_or_else(|_| crate::provider::DEFAULT_MODEL.to_string());
+    state.executor.set_model(Some(model.clone()));
 
     let mut messages = build_messages(&job.description, None, &[], &[], None);
     inject_skill_files(&mut messages).await;

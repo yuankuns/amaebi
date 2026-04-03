@@ -40,6 +40,11 @@ pub trait ToolExecutor: Send + Sync {
     /// conversation history from the DB.  Default implementation is a no-op
     /// for executors that don't support session context.
     fn set_session_id(&self, _sid: Option<String>) {}
+
+    /// Set the model used by the parent session so tools like `run_workflow`
+    /// and `spawn_agent` inherit it instead of falling back to AMAEBI_MODEL
+    /// env var or the `gpt-4o` default.
+    fn set_model(&self, _model: Option<String>) {}
 }
 
 // ---------------------------------------------------------------------------
@@ -78,6 +83,10 @@ pub struct LocalExecutor {
     /// Wrapped in `Mutex` for interior mutability since `DaemonState` is
     /// shared via `Arc`.
     pub session_id: Arc<Mutex<Option<String>>>,
+    /// Model used by the parent agentic loop.  Set by the daemon before each
+    /// loop so that `run_workflow` and `spawn_agent` inherit the model from
+    /// the current chat/ask session instead of falling back to env var.
+    pub model: Arc<Mutex<Option<String>>>,
 }
 
 impl LocalExecutor {
@@ -106,6 +115,7 @@ impl LocalExecutor {
             spawn_ctx: None,
             default_cwd,
             session_id: Arc::new(Mutex::new(None)),
+            model: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -114,6 +124,10 @@ impl LocalExecutor {
 impl ToolExecutor for LocalExecutor {
     fn set_session_id(&self, sid: Option<String>) {
         *self.session_id.lock().unwrap_or_else(|p| p.into_inner()) = sid;
+    }
+
+    fn set_model(&self, model: Option<String>) {
+        *self.model.lock().unwrap_or_else(|p| p.into_inner()) = model;
     }
 
     async fn execute(&self, name: &str, args: serde_json::Value) -> Result<String> {
@@ -127,7 +141,10 @@ impl ToolExecutor for LocalExecutor {
             "read_file" => read_file(args).await,
             "edit_file" => edit_file(args).await,
             "spawn_agent" => match &self.spawn_ctx {
-                Some(ctx) => spawn_agent(args, ctx).await,
+                Some(ctx) => {
+                    let model = self.model.lock().unwrap_or_else(|p| p.into_inner()).clone();
+                    spawn_agent(args, ctx, model.as_deref()).await
+                }
                 None => anyhow::bail!(
                     "spawn_agent is not available in this context \
                      (child agents cannot spawn further agents)"
@@ -140,7 +157,8 @@ impl ToolExecutor for LocalExecutor {
                         .lock()
                         .unwrap_or_else(|p| p.into_inner())
                         .clone();
-                    run_workflow_tool(args, ctx, sid.as_deref()).await
+                    let model = self.model.lock().unwrap_or_else(|p| p.into_inner()).clone();
+                    run_workflow_tool(args, ctx, sid.as_deref(), model.as_deref()).await
                 }
                 None => anyhow::bail!("run_workflow is not available in this context"),
             },
@@ -273,6 +291,7 @@ async fn run_workflow_tool(
     args: serde_json::Value,
     ctx: &SpawnContext,
     session_id: Option<&str>,
+    parent_model: Option<&str>,
 ) -> Result<String> {
     use crate::workflows::{build_workflow, executor, Context};
     use std::sync::Arc;
@@ -287,7 +306,11 @@ async fn run_workflow_tool(
         None => serde_json::Map::new(),
     };
 
-    let model = std::env::var("AMAEBI_MODEL").unwrap_or_else(|_| "gpt-4o".to_string());
+    // Inherit model from parent session > AMAEBI_MODEL env var > default.
+    let model = parent_model
+        .map(|s| s.to_string())
+        .or_else(|| std::env::var("AMAEBI_MODEL").ok())
+        .unwrap_or_else(|| "gpt-4o".to_string());
 
     // Load parent session context so the workflow's LLM stages have
     // conversation history about what the user was working on.
@@ -363,7 +386,11 @@ async fn run_workflow_tool(
 /// The child executor is created with `spawn_ctx: None` so it cannot
 /// call `spawn_agent` itself.
 /// TODO: enforce a depth limit for nested agents if needed.
-async fn spawn_agent(args: serde_json::Value, ctx: &SpawnContext) -> Result<String> {
+async fn spawn_agent(
+    args: serde_json::Value,
+    ctx: &SpawnContext,
+    parent_model: Option<&str>,
+) -> Result<String> {
     let task = args["task"]
         .as_str()
         .context("spawn_agent: missing string argument 'task'")?;
@@ -399,15 +426,13 @@ async fn spawn_agent(args: serde_json::Value, ctx: &SpawnContext) -> Result<Stri
         )
     })?;
 
-    // Fix 4: inherit the parent's current model when the tool caller does not
-    // specify one explicitly.
+    // Inherit model: explicit tool arg > parent session > AMAEBI_MODEL > default.
     let model = args["model"]
         .as_str()
         .map(|s| s.to_string())
-        .unwrap_or_else(|| {
-            std::env::var("AMAEBI_MODEL")
-                .unwrap_or_else(|_| crate::provider::DEFAULT_MODEL.to_string())
-        });
+        .or_else(|| parent_model.map(|s| s.to_string()))
+        .or_else(|| std::env::var("AMAEBI_MODEL").ok())
+        .unwrap_or_else(|| crate::provider::DEFAULT_MODEL.to_string());
 
     let extra_mounts = args["extra_mounts"].as_array().cloned().unwrap_or_default();
     let mut ro_paths: Vec<PathBuf> = vec![];
@@ -518,6 +543,7 @@ async fn spawn_agent(args: serde_json::Value, ctx: &SpawnContext) -> Result<Stri
         spawn_ctx: None,
         default_cwd: Some(workspace.clone()),
         session_id: Arc::new(Mutex::new(None)),
+        model: Arc::new(Mutex::new(Some(model.clone()))),
     };
 
     // Build a minimal DaemonState for the child: reuse the parent's HTTP
@@ -1086,6 +1112,7 @@ mod tests {
             spawn_ctx: None,
             default_cwd: None,
             session_id: Arc::new(Mutex::new(None)),
+            model: Arc::new(Mutex::new(None)),
         };
         let args = serde_json::json!({"command": "echo hello"});
         let result = exec.execute("shell_command", args).await.unwrap();
@@ -1100,6 +1127,7 @@ mod tests {
             spawn_ctx: None,
             default_cwd: Some(tmp.path().to_path_buf()),
             session_id: Arc::new(Mutex::new(None)),
+            model: Arc::new(Mutex::new(None)),
         };
         // pwd should print the default_cwd, not the daemon process cwd.
         let result = exec
@@ -1155,6 +1183,7 @@ mod tests {
         let result = spawn_agent(
             serde_json::json!({"task": "t", "workspace": "relative/path"}),
             &ctx,
+            None,
         )
         .await;
         assert!(result.is_err());
@@ -1169,6 +1198,7 @@ mod tests {
         let result = spawn_agent(
             serde_json::json!({"task": "t", "workspace": "/tmp/amaebi_test_nonexistent_xyz"}),
             &ctx,
+            None,
         )
         .await;
         assert!(result.is_err());
@@ -1186,6 +1216,7 @@ mod tests {
         let result = spawn_agent(
             serde_json::json!({"task": "t", "workspace": file.to_str().unwrap()}),
             &ctx,
+            None,
         )
         .await;
         assert!(result.is_err());

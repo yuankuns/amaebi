@@ -2695,3 +2695,124 @@ async fn workflow_ipc_injects_session_context() {
         "workflow LLM request must include parent session history; messages: {all_text:?}"
     );
 }
+
+/// W4: Request::Workflow forwards the model field to the executor's LLM stages.
+///
+/// The client sends Request::Workflow with model="custom-wf-model-789".
+/// The LLM requests produced by the workflow's stages must carry that model,
+/// not the default "gpt-4o".
+#[tokio::test]
+async fn workflow_ipc_inherits_model_from_request() {
+    let server = MockLlmServer::start().await;
+    // develop stage
+    server.enqueue(ScriptedResponse::text_chunks(vec!["dev output"]));
+    // commit-and-pr stage
+    server.enqueue(ScriptedResponse::text_chunks(vec!["feat: model test"]));
+
+    let daemon = start_daemon(&server.url()).await.expect("start daemon");
+    let client = connect_client(&daemon.socket);
+
+    let mut args = serde_json::Map::new();
+    args.insert("task".into(), "test model inheritance".into());
+    args.insert("test_cmd".into(), "true".into());
+
+    let _responses = send_workflow(&client, "dev-loop", args, "custom-wf-model-789", None)
+        .await
+        .expect("send_workflow");
+
+    let reqs = server.take_requests();
+    assert!(
+        !reqs.is_empty(),
+        "workflow must make at least one LLM request"
+    );
+
+    // Every LLM request from the workflow must use the specified model.
+    for (i, req) in reqs.iter().enumerate() {
+        assert_eq!(
+            req.model(),
+            Some("custom-wf-model-789"),
+            "workflow LLM request {i} must use the model from Request::Workflow; got {:?}",
+            req.model()
+        );
+    }
+}
+
+/// W5: The run_workflow tool inherits the parent chat session's model.
+///
+/// When the LLM calls `run_workflow` during a chat session that uses
+/// model="chat-model-abc", the workflow's internal LLM stages must also
+/// use "chat-model-abc" — not fall back to AMAEBI_MODEL or "gpt-4o".
+///
+/// Flow:
+///   1. Chat with model "chat-model-abc"
+///   2. LLM calls run_workflow("dev-loop", {...})
+///   3. Workflow's develop stage calls the LLM → must use "chat-model-abc"
+///   4. Workflow's test stage passes (test_cmd="true")
+///   5. Workflow's commit stage calls the LLM → must use "chat-model-abc"
+///   6. Workflow errors (no git repo) → result returned to parent
+///   7. Parent LLM returns final text
+#[tokio::test]
+async fn run_workflow_tool_inherits_chat_model() {
+    let server = MockLlmServer::start().await;
+
+    // 1. Parent chat turn 1: LLM calls run_workflow tool.
+    server.enqueue(ScriptedResponse::tool_call(
+        "call-wf-001",
+        "run_workflow",
+        r#"{"workflow":"dev-loop","args":{"task":"implement feature","test_cmd":"true"}}"#,
+    ));
+    // 2. Workflow develop stage (LLM call — should use parent's model).
+    server.enqueue(ScriptedResponse::text_chunks(vec!["developing feature"]));
+    // 3. Workflow commit-and-pr stage (LLM call — should use parent's model).
+    server.enqueue(ScriptedResponse::text_chunks(vec!["feat: new feature"]));
+    // 4. Parent chat turn 2: receives workflow result, returns final text.
+    server.enqueue(ScriptedResponse::text_chunks(vec![
+        "Workflow completed successfully.",
+    ]));
+
+    let daemon = start_daemon(&server.url()).await.expect("start daemon");
+    let client = connect_client(&daemon.socket);
+
+    let responses = send_message_with_session(
+        &client,
+        "run the dev loop for this feature",
+        "model-inherit-session",
+        "chat-model-abc",
+    )
+    .await
+    .expect("send_message");
+
+    // Wait a moment for any in-flight LLM requests to complete.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let reqs = server.take_requests();
+    // At minimum: parent turn 1 + workflow develop stage = 2 requests.
+    // The workflow will eventually error (no git repo in test env), but we
+    // only care that the LLM requests used the correct model.
+    assert!(
+        reqs.len() >= 2,
+        "expected at least 2 LLM requests (parent + workflow develop), got {};\n\
+         responses: {responses:?}",
+        reqs.len()
+    );
+
+    // Request 0 is the parent chat → must use "chat-model-abc".
+    assert_eq!(
+        reqs[0].model(),
+        Some("chat-model-abc"),
+        "parent chat request must use the specified model; got {:?}",
+        reqs[0].model()
+    );
+
+    // Requests 1+ are from the workflow's LLM stages → must also use "chat-model-abc".
+    // The last request is the parent's second turn (after tool result), which
+    // also uses the parent's model.
+    for (i, req) in reqs.iter().enumerate().skip(1) {
+        assert_eq!(
+            req.model(),
+            Some("chat-model-abc"),
+            "workflow/parent LLM request {i} must inherit parent model; got {:?}",
+            req.model()
+        );
+    }
+}
