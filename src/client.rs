@@ -397,7 +397,8 @@ pub async fn run_chat_loop(
         };
 
         // /workflow slash command: parse and send to daemon via IPC.
-        if prompt.trim_start().starts_with("/workflow") {
+        let trimmed_prompt = prompt.trim_start();
+        if trimmed_prompt == "/workflow" || trimmed_prompt.starts_with("/workflow ") {
             match parse_workflow_args(&prompt) {
                 Ok((name, args)) => {
                     let req = Request::Workflow {

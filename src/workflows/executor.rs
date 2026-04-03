@@ -217,9 +217,9 @@ async fn run_single_stage(
             let text = llm_turn(state, model, messages, &rendered, writer).await?;
             ctx.set("last_llm_output", &text);
             // Write to a unique temp file so parallel Map items don't race on
-            // a shared path.  Uses pid + atomic counter for uniqueness and
-            // restricts permissions to owner-only (0o600) to avoid leaking
-            // LLM output to other users on shared machines.
+            // a shared path.  Uses pid + atomic counter for uniqueness,
+            // create_new(true) to prevent symlink/TOCTOU attacks, and
+            // restricts permissions to owner-only (0o600).
             use std::sync::atomic::{AtomicU64, Ordering};
             static COUNTER: AtomicU64 = AtomicU64::new(0);
             let id = COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -228,8 +228,7 @@ async fn run_single_stage(
                 use std::io::Write;
                 let mut f = std::fs::OpenOptions::new()
                     .write(true)
-                    .create(true)
-                    .truncate(true)
+                    .create_new(true)
                     .mode(0o600)
                     .open(&tmp_path)
                     .context("creating LLM output temp file")?;
@@ -321,19 +320,27 @@ async fn run_map_serial(
     resources: &ResourcePool,
     writer: &SharedWriter,
 ) -> Result<()> {
+    let mut errors = Vec::new();
     for (i, item) in items.iter().enumerate() {
         write_step(writer, &format!("    [{}/{}] {}", i + 1, items.len(), item)).await;
         ctx.set("item", item);
         ctx.set("item_index", i.to_string());
 
-        match run_stages(sub_stages, state, model, messages, ctx, resources, writer).await {
-            Ok(_) => {}
-            Err(e) => {
-                write_step(writer, &format!("    Item failed, skipping: {e}")).await;
-            }
+        if let Err(e) = run_stages(sub_stages, state, model, messages, ctx, resources, writer).await
+        {
+            write_step(writer, &format!("    Item {i} failed: {e}")).await;
+            errors.push((i, e));
         }
     }
-    Ok(())
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "serial map: {}/{} items failed",
+            errors.len(),
+            items.len()
+        ))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -423,13 +430,15 @@ async fn run_map_parallel(
     if !failed.is_empty() {
         write_step(
             writer,
-            &format!(
-                "    {}/{} items had errors (skipped)",
-                failed.len(),
-                items.len()
-            ),
+            &format!("    {}/{} items had errors", failed.len(), items.len()),
         )
         .await;
+
+        return Err(anyhow!(
+            "parallel map: {}/{} items failed",
+            failed.len(),
+            items.len()
+        ));
     }
 
     Ok(())
@@ -532,6 +541,7 @@ pub async fn llm_turn(
 ) -> Result<String> {
     messages.push(Message::user(prompt.to_owned()));
     let (_, mut steer_rx) = tokio::sync::mpsc::channel::<Option<String>>(1);
+    let tool_ctx = crate::tools::ToolCallContext::default();
     let mut w = writer.lock().await;
     let (text, _, _) = run_agentic_loop(
         state,
@@ -540,6 +550,7 @@ pub async fn llm_turn(
         &mut **w,
         &mut steer_rx,
         false, // workflow LLM stages must not spawn sub-agents
+        &tool_ctx,
     )
     .await
     .context("LLM turn failed")?;

@@ -268,6 +268,7 @@ impl acp::Agent for AmaebiAgent {
         let (steer_tx, mut steer_rx) = tokio::sync::mpsc::channel::<Option<String>>(1);
         drop(steer_tx);
         tokio::task::spawn_local(async move {
+            let tool_ctx = crate::tools::ToolCallContext::default();
             let outcome = run_agentic_loop(
                 &state,
                 &model,
@@ -275,6 +276,7 @@ impl acp::Agent for AmaebiAgent {
                 &mut write_half,
                 &mut steer_rx,
                 true,
+                &tool_ctx,
             )
             .await
             .map(|(text, tokens, _messages)| (text, tokens)) // discard messages Vec

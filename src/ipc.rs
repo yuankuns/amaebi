@@ -186,7 +186,24 @@ where
 /// Adapter that implements [`tokio::io::AsyncWrite`] by locking an
 /// `Arc<tokio::sync::Mutex<W>>` on every write.  Used to bridge the daemon's
 /// shared writer into the workflow executor's `SharedWriter` type.
-pub struct MutexWriter<W>(pub std::sync::Arc<tokio::sync::Mutex<W>>);
+///
+/// Uses an `Arc<tokio::sync::Notify>` to avoid busy-looping on contention:
+/// when `try_lock()` fails the waker is registered via `Notify`, and the
+/// successful lock path calls `notify_waiters()` on completion so blocked
+/// writers are re-polled only when the lock is actually available.
+pub struct MutexWriter<W> {
+    inner: std::sync::Arc<tokio::sync::Mutex<W>>,
+    notify: std::sync::Arc<tokio::sync::Notify>,
+}
+
+impl<W> MutexWriter<W> {
+    pub fn new(inner: std::sync::Arc<tokio::sync::Mutex<W>>) -> Self {
+        Self {
+            inner,
+            notify: std::sync::Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+}
 
 impl<W: tokio::io::AsyncWrite + Unpin + Send> tokio::io::AsyncWrite for MutexWriter<W> {
     fn poll_write(
@@ -194,16 +211,21 @@ impl<W: tokio::io::AsyncWrite + Unpin + Send> tokio::io::AsyncWrite for MutexWri
         cx: &mut std::task::Context<'_>,
         buf: &[u8],
     ) -> std::task::Poll<std::io::Result<usize>> {
-        match self.0.try_lock() {
-            Ok(mut guard) => std::pin::Pin::new(&mut *guard).poll_write(cx, buf),
+        match self.inner.try_lock() {
+            Ok(mut guard) => {
+                let result = std::pin::Pin::new(&mut *guard).poll_write(cx, buf);
+                self.notify.notify_waiters();
+                result
+            }
             Err(_) => {
-                // Contention is extremely rare in practice: the writer is
-                // only used sequentially by `run_agentic_loop` / workflow
-                // executor.  A simple immediate re-wake is sufficient —
-                // spawning a task from within poll_write is incorrect
-                // (futures must not spawn from poll).  The waker re-queues
-                // this future so the executor can schedule other work first.
-                cx.waker().wake_by_ref();
+                // Register the waker so we're re-polled when the lock holder
+                // finishes and calls notify_waiters(), instead of busy-looping.
+                let waker = cx.waker().clone();
+                let notify = self.notify.clone();
+                tokio::spawn(async move {
+                    notify.notified().await;
+                    waker.wake();
+                });
                 std::task::Poll::Pending
             }
         }
@@ -213,10 +235,19 @@ impl<W: tokio::io::AsyncWrite + Unpin + Send> tokio::io::AsyncWrite for MutexWri
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
-        match self.0.try_lock() {
-            Ok(mut guard) => std::pin::Pin::new(&mut *guard).poll_flush(cx),
+        match self.inner.try_lock() {
+            Ok(mut guard) => {
+                let result = std::pin::Pin::new(&mut *guard).poll_flush(cx);
+                self.notify.notify_waiters();
+                result
+            }
             Err(_) => {
-                cx.waker().wake_by_ref();
+                let waker = cx.waker().clone();
+                let notify = self.notify.clone();
+                tokio::spawn(async move {
+                    notify.notified().await;
+                    waker.wake();
+                });
                 std::task::Poll::Pending
             }
         }
@@ -226,10 +257,19 @@ impl<W: tokio::io::AsyncWrite + Unpin + Send> tokio::io::AsyncWrite for MutexWri
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
-        match self.0.try_lock() {
-            Ok(mut guard) => std::pin::Pin::new(&mut *guard).poll_shutdown(cx),
+        match self.inner.try_lock() {
+            Ok(mut guard) => {
+                let result = std::pin::Pin::new(&mut *guard).poll_shutdown(cx);
+                self.notify.notify_waiters();
+                result
+            }
             Err(_) => {
-                cx.waker().wake_by_ref();
+                let waker = cx.waker().clone();
+                let notify = self.notify.clone();
+                tokio::spawn(async move {
+                    notify.notified().await;
+                    waker.wake();
+                });
                 std::task::Poll::Pending
             }
         }

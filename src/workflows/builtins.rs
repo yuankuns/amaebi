@@ -236,19 +236,26 @@ pub fn perf_sweep(
                                  If there is no viable fix, reply with SKIP."
                                     .into(),
                         }),
-                        // 3d: commit successful optimization
-                        // NOTE: {item} comes from the LLM's `- OPT: ...` output
-                        // parsed by regex.  If the text contains shell
-                        // metacharacters (e.g. single quotes), the quoting may
-                        // break.  This is a known limitation — items are
-                        // relatively constrained by the regex capture.  For
-                        // safety-critical contexts, use {last_llm_output_file}
-                        // with `git commit -F` instead.
+                        // 3d: generate a commit message without embedding
+                        // LLM-controlled text directly into shell.
+                        Stage::new(
+                            "compose-commit-message",
+                            Action::Llm {
+                                prompt: "Write a git commit message for this optimization.\n\
+                                         Use exactly one subject line prefixed with `perf: `.\n\
+                                         Do not use code fences or surrounding quotes.\n\n\
+                                         Optimization:\n{item}"
+                                    .into(),
+                            },
+                        )
+                        .with_on_fail(FailStrategy::Skip),
+                        // 3e: commit via file input to avoid shell injection.
                         Stage::new(
                             "commit",
                             Action::Shell {
-                                command: "git add -A && git commit -m 'perf: {item}' || true"
-                                    .into(),
+                                command:
+                                    "git add -A && git commit -F {last_llm_output_file} || true"
+                                        .into(),
                             },
                         )
                         .with_on_fail(FailStrategy::Skip),
@@ -279,11 +286,24 @@ pub fn perf_sweep(
 
 /// Supervise Claude fixing a list of bugs in parallel.
 /// Each bug is independent: fix → test → PR → review.
+///
+/// `repo` must match the `owner/name` pattern (e.g. `"yuankuns/amaebi"`).
+/// The function panics on invalid values to prevent shell injection.
 pub fn bug_fix(
     repo: &str, // e.g. "yuankuns/amaebi"
     test_cmd: &str,
     max_retries: usize,
 ) -> Workflow {
+    // Validate repo matches owner/name to prevent shell injection.
+    assert!(
+        repo == "."
+            || repo.chars().all(|c| c.is_alphanumeric()
+                || c == '/'
+                || c == '-'
+                || c == '_'
+                || c == '.'),
+        "invalid repo: must be 'owner/name' or '.', got: {repo:?}"
+    );
     Workflow {
         name: "bug-fix".into(),
         stages: vec![
@@ -352,16 +372,13 @@ pub fn bug_fix(
                                     .into(),
                         }),
                         // 3d: push + PR (code-guaranteed)
-                        // NOTE: {item} comes from the LLM's `- BUG: ...` output
-                        // parsed by regex.  Shell metacharacters in the item
-                        // text (e.g. single quotes) could break the quoting.
-                        // This is a known limitation — see the perf_sweep
-                        // commit stage for the same caveat.
+                        // Uses {item_index} instead of {item} to avoid
+                        // shell injection from LLM-controlled text.
                         Stage::new(
                             "pr",
                             Action::Shell {
                                 command: "git add -A && \
-                                          git commit -m 'fix: {item}' && \
+                                          git commit -m 'fix: bug {item_index}' && \
                                           git push -u origin HEAD && \
                                           gh pr create --fill"
                                     .into(),
@@ -588,5 +605,79 @@ mod tests {
         } else {
             panic!("optimize-each must be a Map action");
         }
+    }
+
+    #[test]
+    fn perf_sweep_commit_uses_file_not_item() {
+        let wf = perf_sweep("target", "", "bench --output json", 0.05);
+        let optimize_each = wf
+            .stages
+            .iter()
+            .find(|s| s.name == "optimize-each")
+            .expect("optimize-each stage missing");
+        if let Action::Map { stages, .. } = &optimize_each.action {
+            let commit = stages
+                .iter()
+                .find(|s| s.name == "commit")
+                .expect("commit sub-stage missing");
+            if let Action::Shell { command } = &commit.action {
+                assert!(
+                    command.contains("{last_llm_output_file}"),
+                    "commit must use {{last_llm_output_file}} to avoid shell injection; got: {command}"
+                );
+                assert!(
+                    !command.contains("{item}"),
+                    "commit must not embed {{item}} in shell; got: {command}"
+                );
+            } else {
+                panic!("commit must be a Shell action");
+            }
+        } else {
+            panic!("optimize-each must be a Map action");
+        }
+    }
+
+    #[test]
+    fn bug_fix_pr_uses_item_index_not_item() {
+        let wf = bug_fix("owner/repo", "cargo test", 3);
+        let fix_each = wf
+            .stages
+            .iter()
+            .find(|s| s.name == "fix-each")
+            .expect("fix-each stage missing");
+        if let Action::Map { stages, .. } = &fix_each.action {
+            let pr = stages
+                .iter()
+                .find(|s| s.name == "pr")
+                .expect("pr sub-stage missing");
+            if let Action::Shell { command } = &pr.action {
+                assert!(
+                    command.contains("{item_index}"),
+                    "pr commit must use {{item_index}}; got: {command}"
+                );
+                assert!(
+                    !command.contains("{item}"),
+                    "pr commit must not embed {{item}} in shell; got: {command}"
+                );
+            } else {
+                panic!("pr must be a Shell action");
+            }
+        } else {
+            panic!("fix-each must be a Map action");
+        }
+    }
+
+    #[test]
+    fn bug_fix_repo_validation() {
+        // Valid repos should not panic.
+        let _ = bug_fix("owner/repo", "true", 1);
+        let _ = bug_fix(".", "true", 1);
+        let _ = bug_fix("my-org/my_repo.rs", "true", 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid repo")]
+    fn bug_fix_rejects_shell_metacharacters_in_repo() {
+        let _ = bug_fix("owner/repo; rm -rf /", "true", 1);
     }
 }

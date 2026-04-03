@@ -30,21 +30,30 @@ pub struct SpawnContext {
 // ToolExecutor trait
 // ---------------------------------------------------------------------------
 
+/// Per-call context passed to [`ToolExecutor::execute`] so tools like
+/// `run_workflow` and `spawn_agent` can inherit session-scoped state without
+/// storing it in shared mutable fields (which would race across concurrent
+/// connections on the same `DaemonState`).
+#[derive(Clone, Default)]
+pub struct ToolCallContext {
+    /// Session ID of the parent agentic loop.  Used by `run_workflow` to
+    /// load conversation history from the DB.
+    pub session_id: Option<String>,
+    /// Model used by the parent session.  Inherited by `run_workflow` and
+    /// `spawn_agent` so child agents use the same model.
+    pub model: Option<String>,
+}
+
 /// Executes agent tools by name.  The trait exists so Phase 4 can swap in a
 /// `DockerExecutor` without touching the agentic loop.
 #[async_trait::async_trait]
 pub trait ToolExecutor: Send + Sync {
-    async fn execute(&self, name: &str, args: serde_json::Value) -> Result<String>;
-
-    /// Set the current session ID so tools like `run_workflow` can load
-    /// conversation history from the DB.  Default implementation is a no-op
-    /// for executors that don't support session context.
-    fn set_session_id(&self, _sid: Option<String>) {}
-
-    /// Set the model used by the parent session so tools like `run_workflow`
-    /// and `spawn_agent` inherit it instead of falling back to AMAEBI_MODEL
-    /// env var or the `gpt-4o` default.
-    fn set_model(&self, _model: Option<String>) {}
+    async fn execute(
+        &self,
+        name: &str,
+        args: serde_json::Value,
+        ctx: &ToolCallContext,
+    ) -> Result<String>;
 }
 
 // ---------------------------------------------------------------------------
@@ -77,16 +86,6 @@ pub struct LocalExecutor {
     /// Set to the agent's workspace in child executors so sandbox cwd matches
     /// the mounted workspace rather than the daemon process cwd.
     pub default_cwd: Option<PathBuf>,
-    /// Current session ID from the parent agentic loop.  Set by the daemon
-    /// before each loop so that `run_workflow` can load conversation history
-    /// from the DB and pass it to the workflow executor for context.
-    /// Wrapped in `Mutex` for interior mutability since `DaemonState` is
-    /// shared via `Arc`.
-    pub session_id: Arc<Mutex<Option<String>>>,
-    /// Model used by the parent agentic loop.  Set by the daemon before each
-    /// loop so that `run_workflow` and `spawn_agent` inherit the model from
-    /// the current chat/ask session instead of falling back to env var.
-    pub model: Arc<Mutex<Option<String>>>,
 }
 
 impl LocalExecutor {
@@ -114,23 +113,18 @@ impl LocalExecutor {
             sandbox,
             spawn_ctx: None,
             default_cwd,
-            session_id: Arc::new(Mutex::new(None)),
-            model: Arc::new(Mutex::new(None)),
         }
     }
 }
 
 #[async_trait::async_trait]
 impl ToolExecutor for LocalExecutor {
-    fn set_session_id(&self, sid: Option<String>) {
-        *self.session_id.lock().unwrap_or_else(|p| p.into_inner()) = sid;
-    }
-
-    fn set_model(&self, model: Option<String>) {
-        *self.model.lock().unwrap_or_else(|p| p.into_inner()) = model;
-    }
-
-    async fn execute(&self, name: &str, args: serde_json::Value) -> Result<String> {
+    async fn execute(
+        &self,
+        name: &str,
+        args: serde_json::Value,
+        call_ctx: &ToolCallContext,
+    ) -> Result<String> {
         tracing::debug!(tool = %name, "executing tool");
         match name {
             "shell_command" => {
@@ -141,10 +135,7 @@ impl ToolExecutor for LocalExecutor {
             "read_file" => read_file(args).await,
             "edit_file" => edit_file(args).await,
             "spawn_agent" => match &self.spawn_ctx {
-                Some(ctx) => {
-                    let model = self.model.lock().unwrap_or_else(|p| p.into_inner()).clone();
-                    spawn_agent(args, ctx, model.as_deref()).await
-                }
+                Some(ctx) => spawn_agent(args, ctx, call_ctx.model.as_deref()).await,
                 None => anyhow::bail!(
                     "spawn_agent is not available in this context \
                      (child agents cannot spawn further agents)"
@@ -152,13 +143,13 @@ impl ToolExecutor for LocalExecutor {
             },
             "run_workflow" => match &self.spawn_ctx {
                 Some(ctx) => {
-                    let sid = self
-                        .session_id
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .clone();
-                    let model = self.model.lock().unwrap_or_else(|p| p.into_inner()).clone();
-                    run_workflow_tool(args, ctx, sid.as_deref(), model.as_deref()).await
+                    run_workflow_tool(
+                        args,
+                        ctx,
+                        call_ctx.session_id.as_deref(),
+                        call_ctx.model.as_deref(),
+                    )
+                    .await
                 }
                 None => anyhow::bail!("run_workflow is not available in this context"),
             },
@@ -542,8 +533,6 @@ async fn spawn_agent(
         sandbox: Some(child_sandbox),
         spawn_ctx: None,
         default_cwd: Some(workspace.clone()),
-        session_id: Arc::new(Mutex::new(None)),
-        model: Arc::new(Mutex::new(Some(model.clone()))),
     };
 
     // Build a minimal DaemonState for the child: reuse the parent's HTTP
@@ -576,6 +565,10 @@ async fn spawn_agent(
 
     // Fix 5: child agents do not get spawn_agent in their tool schema to
     // prevent unbounded recursion at the schema level.
+    let child_tool_ctx = ToolCallContext {
+        session_id: None,
+        model: Some(model.clone()),
+    };
     let (final_text, _, _) = crate::daemon::run_agentic_loop(
         &child_state,
         &model,
@@ -583,6 +576,7 @@ async fn spawn_agent(
         &mut sink,
         &mut steer_rx,
         false,
+        &child_tool_ctx,
     )
     .await?;
 
@@ -938,6 +932,7 @@ mod tests {
             .execute(
                 "shell_command",
                 serde_json::json!({"command": "echo hello"}),
+                &ToolCallContext::default(),
             )
             .await
             .unwrap();
@@ -951,6 +946,7 @@ mod tests {
             .execute(
                 "shell_command",
                 serde_json::json!({"command": "echo bad && exit 2"}),
+                &ToolCallContext::default(),
             )
             .await
             .unwrap();
@@ -962,7 +958,11 @@ mod tests {
     async fn shell_command_empty_output_shows_exit_zero() {
         let exec = LocalExecutor::new();
         let out = exec
-            .execute("shell_command", serde_json::json!({"command": "true"}))
+            .execute(
+                "shell_command",
+                serde_json::json!({"command": "true"}),
+                &ToolCallContext::default(),
+            )
             .await
             .unwrap();
         assert_eq!(out, "[exit 0]");
@@ -971,7 +971,13 @@ mod tests {
     #[tokio::test]
     async fn shell_command_missing_arg_returns_err() {
         let exec = LocalExecutor::new();
-        let result = exec.execute("shell_command", serde_json::json!({})).await;
+        let result = exec
+            .execute(
+                "shell_command",
+                serde_json::json!({}),
+                &ToolCallContext::default(),
+            )
+            .await;
         assert!(result.is_err());
         let msg = format!("{}", result.unwrap_err());
         assert!(
@@ -993,6 +999,7 @@ mod tests {
             .execute(
                 "read_file",
                 serde_json::json!({"path": path.to_str().unwrap()}),
+                &ToolCallContext::default(),
             )
             .await
             .unwrap();
@@ -1008,6 +1015,7 @@ mod tests {
             .execute(
                 "read_file",
                 serde_json::json!({"path": path.to_str().unwrap()}),
+                &ToolCallContext::default(),
             )
             .await;
         assert!(result.is_err());
@@ -1016,7 +1024,13 @@ mod tests {
     #[tokio::test]
     async fn read_file_missing_path_arg_returns_err() {
         let exec = LocalExecutor::new();
-        let result = exec.execute("read_file", serde_json::json!({})).await;
+        let result = exec
+            .execute(
+                "read_file",
+                serde_json::json!({}),
+                &ToolCallContext::default(),
+            )
+            .await;
         assert!(result.is_err());
     }
 
@@ -1032,6 +1046,7 @@ mod tests {
             .execute(
                 "edit_file",
                 serde_json::json!({"path": path.to_str().unwrap(), "content": "written"}),
+                &ToolCallContext::default(),
             )
             .await
             .unwrap();
@@ -1052,6 +1067,7 @@ mod tests {
         exec.execute(
             "edit_file",
             serde_json::json!({"path": path.to_str().unwrap(), "content": "new"}),
+            &ToolCallContext::default(),
         )
         .await
         .unwrap();
@@ -1111,11 +1127,10 @@ mod tests {
             sandbox: Some(Box::new(crate::sandbox::NoopSandbox)),
             spawn_ctx: None,
             default_cwd: None,
-            session_id: Arc::new(Mutex::new(None)),
-            model: Arc::new(Mutex::new(None)),
         };
+        let ctx = ToolCallContext::default();
         let args = serde_json::json!({"command": "echo hello"});
-        let result = exec.execute("shell_command", args).await.unwrap();
+        let result = exec.execute("shell_command", args, &ctx).await.unwrap();
         assert!(result.contains("hello"));
     }
 
@@ -1126,12 +1141,11 @@ mod tests {
             sandbox: Some(Box::new(crate::sandbox::NoopSandbox)),
             spawn_ctx: None,
             default_cwd: Some(tmp.path().to_path_buf()),
-            session_id: Arc::new(Mutex::new(None)),
-            model: Arc::new(Mutex::new(None)),
         };
+        let ctx = ToolCallContext::default();
         // pwd should print the default_cwd, not the daemon process cwd.
         let result = exec
-            .execute("shell_command", serde_json::json!({"command": "pwd"}))
+            .execute("shell_command", serde_json::json!({"command": "pwd"}), &ctx)
             .await
             .unwrap();
         assert!(
@@ -1240,7 +1254,11 @@ mod tests {
     async fn unknown_tool_returns_descriptive_error() {
         let exec = LocalExecutor::new();
         let result = exec
-            .execute("nonexistent_tool", serde_json::json!({}))
+            .execute(
+                "nonexistent_tool",
+                serde_json::json!({}),
+                &ToolCallContext::default(),
+            )
             .await;
         assert!(result.is_err());
         let msg = format!("{}", result.unwrap_err());

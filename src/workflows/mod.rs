@@ -290,7 +290,12 @@ pub fn build_workflow(
             let run_cmd = str_arg("run_cmd").unwrap_or("echo {item_index}");
             let result_cmd = str_arg("result_cmd").unwrap_or("echo done");
             let resource = str_arg("resource").unwrap_or("gpu");
-            let count = u64_arg("resource_count").unwrap_or(1) as usize;
+            let count_u64 = u64_arg("resource_count").unwrap_or(1);
+            if count_u64 == 0 {
+                anyhow::bail!("invalid resource_count: must be greater than 0");
+            }
+            let count = usize::try_from(count_u64)
+                .map_err(|_| anyhow::anyhow!("invalid resource_count: value too large"))?;
             let wf = builtins::tune_sweep(target, "", run_cmd, result_cmd, resource);
             let pool = ResourcePool::new([(resource, count)]);
             Ok((wf, pool))

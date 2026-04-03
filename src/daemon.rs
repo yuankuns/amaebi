@@ -459,9 +459,9 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                     Ok((workflow, pool)) => {
                         let wf_writer: workflows::executor::SharedWriter = {
                             let w = Arc::clone(&writer);
-                            Arc::new(tokio::sync::Mutex::new(Box::new(crate::ipc::MutexWriter(
-                                w,
-                            ))))
+                            Arc::new(tokio::sync::Mutex::new(Box::new(
+                                crate::ipc::MutexWriter::new(w),
+                            )))
                         };
                         let ctx = workflows::Context::new();
                         match workflows::executor::execute(
@@ -583,12 +583,22 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                             build_messages(&prompt, tmux_pane.as_deref(), trimmed, &[], None);
                         inject_skill_files(&mut messages).await;
                     }
-                    // Propagate model so run_workflow/spawn_agent inherit it.
-                    state.executor.set_model(Some(model.clone()));
+                    let tool_ctx = tools::ToolCallContext {
+                        session_id: Some(sid.clone()),
+                        model: Some(model.clone()),
+                    };
                     let mut sink = tokio::io::sink();
                     let (_, mut steer_rx) = tokio::sync::mpsc::channel::<Option<String>>(1);
-                    match run_agentic_loop(&state, &model, messages, &mut sink, &mut steer_rx, true)
-                        .await
+                    match run_agentic_loop(
+                        &state,
+                        &model,
+                        messages,
+                        &mut sink,
+                        &mut steer_rx,
+                        true,
+                        &tool_ctx,
+                    )
+                    .await
                     {
                         Ok((final_text, _, _)) => {
                             store_conversation(
@@ -650,8 +660,10 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                     .await?;
                     break 'connection;
                 }
-                // Propagate model to executor so run_workflow/spawn_agent inherit it.
-                state.executor.set_model(Some(model.clone()));
+                let tool_ctx = tools::ToolCallContext {
+                    session_id: Some(session_id.clone()),
+                    model: Some(model.clone()),
+                };
                 let (steer_tx, mut steer_rx) = tokio::sync::mpsc::channel::<Option<String>>(16);
                 let expected_sid = session_id.clone();
                 let db = Arc::clone(&state.db);
@@ -702,6 +714,7 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                 let writer_loop = Arc::clone(&writer);
                 let state_loop = Arc::clone(&state);
                 let model_loop = model.clone();
+                let tool_ctx_loop = tool_ctx.clone();
                 let mut loop_handle = tokio::spawn(async move {
                     let mut w = writer_loop.lock().await;
                     run_agentic_loop(
@@ -711,6 +724,7 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                         &mut *w,
                         &mut steer_rx,
                         true,
+                        &tool_ctx_loop,
                     )
                     .await
                 });
@@ -948,14 +962,15 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                 let (steer_tx, mut steer_rx) = tokio::sync::mpsc::channel::<Option<String>>(16);
                 let expected_chat_sid = sid.clone();
 
-                // Propagate session ID and model to executor so run_workflow
-                // and spawn_agent inherit them from the current session.
-                state.executor.set_session_id(Some(sid.clone()));
-                state.executor.set_model(Some(model.clone()));
+                let tool_ctx = tools::ToolCallContext {
+                    session_id: Some(sid.clone()),
+                    model: Some(model.clone()),
+                };
 
                 let writer_loop = Arc::clone(&writer);
                 let state_loop = Arc::clone(&state);
                 let model_loop = model.clone();
+                let tool_ctx_loop = tool_ctx.clone();
                 let mut loop_handle = tokio::spawn(async move {
                     let mut w = writer_loop.lock().await;
                     run_agentic_loop(
@@ -965,6 +980,7 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                         &mut *w,
                         &mut steer_rx,
                         true,
+                        &tool_ctx_loop,
                     )
                     .await
                 });
@@ -1582,6 +1598,7 @@ pub(crate) async fn run_agentic_loop<W>(
     writer: &mut W,
     steer_rx: &mut tokio::sync::mpsc::Receiver<Option<String>>,
     include_spawn_agent: bool,
+    tool_ctx: &tools::ToolCallContext,
 ) -> Result<(String, usize, Vec<Message>)>
 where
     W: AsyncWriteExt + Unpin + ?Sized,
@@ -1941,7 +1958,7 @@ where
                                     return format!("argument error: {e:#}");
                                 }
                             };
-                            match state.executor.execute(&tc.name, args).await {
+                            match state.executor.execute(&tc.name, args, tool_ctx).await {
                                 Ok(output) => {
                                     tracing::debug!(
                                         tool = %tc.name,
@@ -2049,7 +2066,7 @@ where
                             }
                         };
 
-                        let result = match state.executor.execute(&tc.name, args).await {
+                        let result = match state.executor.execute(&tc.name, args, tool_ctx).await {
                             Ok(output) => {
                                 tracing::debug!(
                                     tool = %tc.name,
@@ -2411,7 +2428,10 @@ async fn run_cron_job(state: Arc<DaemonState>, job: &cron::CronJob) {
     // Resolve model from env var (same default as CLI client).
     let model = std::env::var("AMAEBI_MODEL")
         .unwrap_or_else(|_| crate::provider::DEFAULT_MODEL.to_string());
-    state.executor.set_model(Some(model.clone()));
+    let tool_ctx = tools::ToolCallContext {
+        session_id: Some(session_id.clone()),
+        model: Some(model.clone()),
+    };
 
     let mut messages = build_messages(&job.description, None, &[], &[], None);
     inject_skill_files(&mut messages).await;
@@ -2420,7 +2440,16 @@ async fn run_cron_job(state: Arc<DaemonState>, job: &cron::CronJob) {
     let mut sink = tokio::io::sink();
     let (_, mut steer_rx) = tokio::sync::mpsc::channel::<Option<String>>(1);
 
-    let result = run_agentic_loop(&state, &model, messages, &mut sink, &mut steer_rx, true).await;
+    let result = run_agentic_loop(
+        &state,
+        &model,
+        messages,
+        &mut sink,
+        &mut steer_rx,
+        true,
+        &tool_ctx,
+    )
+    .await;
 
     let (output, run_ok) = match result {
         Ok((final_text, _, _)) => {

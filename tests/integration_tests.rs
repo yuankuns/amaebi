@@ -2545,9 +2545,8 @@ async fn chat_long_connection_ask_still_single_turn() {
 /// consumes a second LLM response. push-pr will fail (no git repo) so the
 /// workflow eventually errors — but we verify that streaming happened before
 /// the expected error, proving the IPC round-trip and streaming work.
-/// The test name reflects the success criterion: Text frames were streamed.
 #[tokio::test]
-async fn workflow_ipc_streams_text_and_completes() {
+async fn workflow_ipc_streams_text_frames() {
     let server = MockLlmServer::start().await;
     // develop stage
     server.enqueue(ScriptedResponse::text_chunks(vec![
