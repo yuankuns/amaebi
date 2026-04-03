@@ -52,9 +52,27 @@ pub struct ModelSpec {
 /// To find the correct model ID, check the Bedrock console or run:
 ///   `aws bedrock list-foundation-models --by-provider Anthropic`
 const BEDROCK_ALIASES: &[(&str, &str)] = &[
-    // Claude 4.6 family
-    ("claude-sonnet-4.6", "us.anthropic.claude-sonnet-4-6-v1:0"),
-    ("claude-opus-4.6", "us.anthropic.claude-opus-4-6-v1:0"),
+    // Claude 4.6 family (cross-region inference profiles — no `:0` suffix)
+    ("claude-sonnet-4.6", "us.anthropic.claude-sonnet-4-6"),
+    ("claude-opus-4.6", "us.anthropic.claude-opus-4-6-v1"),
+    // Claude 4.5 family
+    (
+        "claude-sonnet-4.5",
+        "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+    ),
+    (
+        "claude-opus-4.5",
+        "us.anthropic.claude-opus-4-5-20251101-v1:0",
+    ),
+    (
+        "claude-haiku-4.5",
+        "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+    ),
+    // Claude 4.1 family
+    (
+        "claude-opus-4.1",
+        "us.anthropic.claude-opus-4-1-20250805-v1:0",
+    ),
     // Claude 4 family
     (
         "claude-sonnet-4",
@@ -65,10 +83,6 @@ const BEDROCK_ALIASES: &[(&str, &str)] = &[
     (
         "claude-haiku-3.5",
         "us.anthropic.claude-3-5-haiku-20241022-v1:0",
-    ),
-    (
-        "claude-sonnet-3.5",
-        "us.anthropic.claude-3-5-sonnet-20241022-v2:0",
     ),
 ];
 
@@ -158,7 +172,7 @@ mod tests {
     fn resolve_bedrock_prefix() {
         let spec = resolve("bedrock/claude-sonnet-4.6");
         assert_eq!(spec.provider, ProviderKind::Bedrock);
-        assert_eq!(spec.model_id, "us.anthropic.claude-sonnet-4-6-v1:0");
+        assert_eq!(spec.model_id, "us.anthropic.claude-sonnet-4-6");
         assert_eq!(spec.display_name, "bedrock/claude-sonnet-4.6");
     }
 
@@ -174,7 +188,7 @@ mod tests {
     fn resolve_no_prefix_defaults_to_bedrock() {
         let spec = resolve("claude-sonnet-4.6");
         assert_eq!(spec.provider, ProviderKind::Bedrock);
-        assert_eq!(spec.model_id, "us.anthropic.claude-sonnet-4-6-v1:0");
+        assert_eq!(spec.model_id, "us.anthropic.claude-sonnet-4-6");
     }
 
     #[test]
@@ -206,7 +220,7 @@ mod tests {
     fn alias_claude_sonnet_4_6() {
         assert_eq!(
             resolve_bedrock_alias("claude-sonnet-4.6"),
-            "us.anthropic.claude-sonnet-4-6-v1:0"
+            "us.anthropic.claude-sonnet-4-6"
         );
     }
 
@@ -214,7 +228,7 @@ mod tests {
     fn alias_claude_opus_4_6() {
         assert_eq!(
             resolve_bedrock_alias("claude-opus-4.6"),
-            "us.anthropic.claude-opus-4-6-v1:0"
+            "us.anthropic.claude-opus-4-6-v1"
         );
     }
 

@@ -1189,10 +1189,10 @@ mod tests {
     #[serial_test::serial]
     fn bedrock_endpoint_uses_region() {
         std::env::remove_var("AMAEBI_BEDROCK_URL");
-        let url = converse_stream_endpoint("us-east-2", "us.anthropic.claude-sonnet-4-6-v1:0");
+        let url = converse_stream_endpoint("us-east-2", "us.anthropic.claude-sonnet-4-6");
         assert_eq!(
             url,
-            "https://bedrock-runtime.us-east-2.amazonaws.com/model/us.anthropic.claude-sonnet-4-6-v1%3A0/converse-stream"
+            "https://bedrock-runtime.us-east-2.amazonaws.com/model/us.anthropic.claude-sonnet-4-6/converse-stream"
         );
     }
 
