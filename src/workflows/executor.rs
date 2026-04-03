@@ -621,17 +621,38 @@ pub async fn detect_delegate_pane(_state: &Arc<DaemonState>, _model: &str) -> Re
         anyhow::bail!("no tmux panes found");
     }
 
+    // First pass: prefer panes showing the Claude Code TUI (identified by the
+    // "bypass permissions" footer that appears when a tool-use permission
+    // prompt is active or the REPL is idle with bypass mode available).
+    // This distinguishes a worker Claude Code session from a plain amaebi chat
+    // supervisor pane (which would also show an idle '> ' prompt).
+    let mut fallback: Option<String> = None;
     for pane_id in &pane_ids {
-        let cap = sh(&format!("tmux capture-pane -t {pane_id} -p -S -5")).await?;
-        if pane_looks_idle(&cap.stdout) {
+        let cap = sh(&format!("tmux capture-pane -t {pane_id} -p -S -20")).await?;
+        let content = &cap.stdout;
+        let plain = strip_ansi(content);
+
+        if !pane_looks_idle(content) {
+            continue;
+        }
+
+        if plain.contains("bypass permissions") {
+            // Definitive match: this is a Claude Code TUI waiting for input.
             return Ok(pane_id.clone());
+        }
+
+        // Plain idle prompt — keep as fallback in case no TUI pane is found.
+        if fallback.is_none() {
+            fallback = Some(pane_id.clone());
         }
     }
 
-    anyhow::bail!(
-        "no idle Claude Code pane found (checked {} panes for idle prompt)",
-        pane_ids.len()
-    )
+    fallback.ok_or_else(|| {
+        anyhow!(
+            "no idle Claude Code pane found (checked {} panes)",
+            pane_ids.len()
+        )
+    })
 }
 
 /// Returns `true` when the captured pane content looks like an idle
@@ -646,6 +667,7 @@ pub fn pane_looks_idle(content: &str) -> bool {
 
     // Active-task indicators take precedence — if any are visible, the pane
     // is busy regardless of what the last line looks like.
+    // "==>" step markers mean this pane is the workflow supervisor itself.
     let active = [
         "Flowing",
         "Burrowing",
@@ -653,6 +675,7 @@ pub fn pane_looks_idle(content: &str) -> bool {
         "Pouncing",
         "↓ ",
         "· esc to interrupt",
+        "==> ",
     ];
     if active.iter().any(|kw| plain.contains(kw)) {
         return false;
@@ -1932,6 +1955,13 @@ mod delegate_tests {
     fn idle_when_no_active_indicator_present() {
         // No spinner or "esc to interrupt" → assume idle.
         assert!(pane_looks_idle("just some output"));
+    }
+
+    #[test]
+    fn not_idle_when_workflow_step_marker_present() {
+        // "==> " step markers mean this pane is the workflow supervisor —
+        // must not be selected as a delegate target.
+        assert!(!pane_looks_idle("==> Stage: develop\n> "));
     }
 
     // --- pane_looks_idle: negative cases (active) ---
