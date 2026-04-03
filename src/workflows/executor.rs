@@ -88,6 +88,20 @@ pub async fn execute(
     };
 
     let mut ctx = initial_ctx;
+
+    // Auto-detect delegate pane if the workflow uses Action::Delegate stages
+    // and no pane was explicitly provided.
+    let has_delegate = workflow
+        .stages
+        .iter()
+        .any(|s| matches!(&s.action, Action::Delegate { .. }));
+    if has_delegate && ctx.get("delegate_pane").is_none() {
+        write_step(&writer, "  Detecting delegate Claude pane...").await;
+        let pane = detect_delegate_pane(state, model).await?;
+        write_step(&writer, &format!("  Using delegate pane: {pane}")).await;
+        ctx.set("delegate_pane", &pane);
+    }
+
     let result = run_stages(
         &workflow.stages,
         state,
@@ -179,8 +193,13 @@ async fn run_stage_with_retry(
                     }
                     let error_msg = e.to_string();
                     let injection = ctx.render(inject_prompt).replace("{error}", &error_msg);
-                    write_step(writer, "    Injecting error context to LLM").await;
-                    let _ = llm_turn(state, model, messages, &injection, writer).await?;
+                    if ctx.get("delegate_pane").is_some() {
+                        write_step(writer, "    Injecting error context to delegate").await;
+                        let _ = delegate_turn(state, model, ctx, &injection, writer).await?;
+                    } else {
+                        write_step(writer, "    Injecting error context to LLM").await;
+                        let _ = llm_turn(state, model, messages, &injection, writer).await?;
+                    }
                 }
             },
         }
@@ -257,6 +276,14 @@ async fn run_single_stage(
             }
             run_check(&stage.check, ctx).await?;
             Ok(None)
+        }
+
+        Action::Delegate { prompt } => {
+            let rendered = ctx.render(prompt);
+            let text = delegate_turn(state, model, ctx, &rendered, writer).await?;
+            ctx.set("last_llm_output", &text);
+            run_check(&stage.check, ctx).await?;
+            Ok(Some(text))
         }
 
         Action::Map {
@@ -528,6 +555,150 @@ async fn run_check(check: &Option<Check>, ctx: &mut Context) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// Delegate turn — send a task to an external Claude Code pane via tmux
+// ---------------------------------------------------------------------------
+
+/// Auto-detect which tmux pane has an idle Claude Code REPL by asking the LLM.
+pub async fn detect_delegate_pane(state: &Arc<DaemonState>, model: &str) -> Result<String> {
+    let list_result = sh("tmux list-panes -a -F '#{pane_id}'").await?;
+    if !list_result.success {
+        anyhow::bail!("failed to list tmux panes: {}", list_result.stderr);
+    }
+    let pane_ids: Vec<&str> = list_result
+        .stdout
+        .lines()
+        .filter(|l| !l.is_empty())
+        .collect();
+    if pane_ids.is_empty() {
+        anyhow::bail!("no tmux panes found");
+    }
+
+    let mut desc = String::new();
+    for pane_id in &pane_ids {
+        let cap = sh(&format!("tmux capture-pane -t {pane_id} -p")).await?;
+        let content = cap.stdout;
+        let tail = &content[content.len().saturating_sub(500)..];
+        desc.push_str(&format!(
+            "--- Pane {pane_id} (last 500 chars) ---\n{tail}\n\n"
+        ));
+    }
+
+    let prompt = format!(
+        "Below are the last 500 characters from several tmux panes.\n\
+         Which pane contains an idle Claude Code session waiting for user input?\n\
+         Return ONLY the pane ID (e.g. %3) or NONE.\n\n{desc}"
+    );
+
+    let text = ask_llm(state, model, &prompt).await?;
+    let trimmed = text.trim();
+    if trimmed.eq_ignore_ascii_case("NONE") || trimmed.is_empty() {
+        anyhow::bail!("no idle Claude Code pane detected");
+    }
+    let pane_id = trimmed
+        .split_whitespace()
+        .find(|t| t.starts_with('%'))
+        .unwrap_or(trimmed.lines().next().unwrap_or(""))
+        .trim();
+    if !pane_id.starts_with('%') {
+        anyhow::bail!("LLM returned invalid pane ID: {pane_id:?}");
+    }
+    Ok(pane_id.to_owned())
+}
+
+/// Send a prompt to an external Claude Code REPL and wait for it to finish.
+pub async fn delegate_turn(
+    state: &Arc<DaemonState>,
+    model: &str,
+    ctx: &mut Context,
+    prompt: &str,
+    writer: &SharedWriter,
+) -> Result<String> {
+    let pane = ctx
+        .get("delegate_pane")
+        .ok_or_else(|| anyhow!("no delegate pane configured"))?
+        .to_owned();
+
+    write_step(writer, &format!("    Delegating to pane {pane}")).await;
+
+    // Write prompt to a temp file to avoid tmux special-character issues.
+    let tmp = tempfile::Builder::new()
+        .prefix("amaebi_delegate_")
+        .suffix(".txt")
+        .tempfile()
+        .context("creating delegate prompt file")?;
+    {
+        use std::io::Write;
+        tmp.as_file()
+            .write_all(prompt.as_bytes())
+            .context("writing delegate prompt")?;
+    }
+    let tmp_path = tmp.path().to_string_lossy().to_string();
+
+    // Send prompt to the Claude pane via tmux paste-buffer.
+    sh(&format!("tmux load-buffer '{tmp_path}'")).await?;
+    sh(&format!("tmux paste-buffer -t '{pane}'")).await?;
+    sh(&format!("tmux send-keys -t '{pane}' Enter")).await?;
+
+    // Wait for Claude to start processing.
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
+    // Poll until the pane is idle again (LLM-based detection).
+    let timeout = std::time::Duration::from_secs(30 * 60);
+    let start = std::time::Instant::now();
+    let poll_interval = std::time::Duration::from_secs(10);
+
+    loop {
+        if start.elapsed() > timeout {
+            anyhow::bail!("delegate timeout: pane {pane} did not finish within 30 minutes");
+        }
+
+        let capture = sh(&format!("tmux capture-pane -t '{pane}' -p")).await?;
+        let pane_content = &capture.stdout;
+
+        if is_pane_idle(state, model, pane_content).await? {
+            write_step(writer, "    Delegate completed").await;
+            ctx.set("last_llm_output", pane_content);
+            return Ok(pane_content.clone());
+        }
+
+        tokio::time::sleep(poll_interval).await;
+    }
+}
+
+/// Ask the internal LLM whether a tmux pane shows an idle Claude Code session.
+async fn is_pane_idle(state: &Arc<DaemonState>, model: &str, pane_content: &str) -> Result<bool> {
+    let tail = &pane_content[pane_content.len().saturating_sub(2000)..];
+    let prompt = format!(
+        "Below is the tail of a tmux pane running Claude Code.\n\
+         Is this session idle and waiting for user input?\n\
+         Answer YES or NO only.\n\n\
+         --- pane content ---\n{tail}\n--- end ---"
+    );
+    let text = ask_llm(state, model, &prompt).await?;
+    Ok(text.trim().to_uppercase().contains("YES"))
+}
+
+/// Lightweight single-turn LLM call (no tools, no message history).
+async fn ask_llm(state: &Arc<DaemonState>, model: &str, prompt: &str) -> Result<String> {
+    let messages = vec![Message::user(prompt.to_owned())];
+    let (_, mut steer_rx) = tokio::sync::mpsc::channel::<Option<String>>(1);
+    let tool_ctx = crate::tools::ToolCallContext::default();
+    let mut sink = tokio::io::sink();
+    let (text, _, _) = run_agentic_loop(
+        state,
+        model,
+        messages,
+        &mut sink,
+        &mut steer_rx,
+        false,
+        &tool_ctx,
+    )
+    .await
+    .context("ask_llm failed")?;
+    Ok(text)
+}
+
+// ---------------------------------------------------------------------------
 // LLM turn
 // ---------------------------------------------------------------------------
 
@@ -711,7 +882,7 @@ mod tests {
             "- ITEM: alpha\n- ITEM: beta\n- ITEM: gamma",
         );
 
-        execute_with_ctx(&wf, &state, "gpt-4o", ctx, &ResourcePool::empty())
+        execute_with_ctx(&wf, &state, "copilot/gpt-4o", ctx, &ResourcePool::empty())
             .await
             .unwrap();
 
@@ -756,7 +927,7 @@ mod tests {
         ctx.set("last_llm_output", "- SLEEP: a\n- SLEEP: b\n- SLEEP: c");
 
         let t = Instant::now();
-        execute_with_ctx(&wf, &state, "gpt-4o", ctx, &ResourcePool::empty())
+        execute_with_ctx(&wf, &state, "copilot/gpt-4o", ctx, &ResourcePool::empty())
             .await
             .unwrap();
         let elapsed = t.elapsed();
@@ -804,7 +975,7 @@ mod tests {
 
         let pool = ResourcePool::new([("slot", 1usize)]);
         let t = Instant::now();
-        execute_with_ctx(&wf, &state, "gpt-4o", ctx, &pool)
+        execute_with_ctx(&wf, &state, "copilot/gpt-4o", ctx, &pool)
             .await
             .unwrap();
         let elapsed = t.elapsed();
@@ -848,7 +1019,7 @@ mod tests {
         let result = execute_with_ctx(
             &wf,
             &state,
-            "gpt-4o",
+            "copilot/gpt-4o",
             Context::new(),
             &ResourcePool::empty(),
         )
@@ -883,7 +1054,7 @@ mod tests {
         let result = execute_with_ctx(
             &wf,
             &state,
-            "gpt-4o",
+            "copilot/gpt-4o",
             Context::new(),
             &ResourcePool::empty(),
         )
@@ -914,7 +1085,7 @@ mod tests {
         let mut ctx = Context::new();
         ctx.set("greeting", "hello-workflow");
 
-        execute_with_ctx(&wf, &state, "gpt-4o", ctx, &ResourcePool::empty())
+        execute_with_ctx(&wf, &state, "copilot/gpt-4o", ctx, &ResourcePool::empty())
             .await
             .unwrap();
         let content = std::fs::read_to_string(&path).unwrap();
@@ -993,9 +1164,15 @@ mod shell_regression_tests {
         // No baseline yet.
         assert!(ctx.get("benchmark_baseline").is_none());
 
-        execute_with_ctx(&wf, &state, "gpt-4o", ctx.clone(), &ResourcePool::empty())
-            .await
-            .unwrap();
+        execute_with_ctx(
+            &wf,
+            &state,
+            "copilot/gpt-4o",
+            ctx.clone(),
+            &ResourcePool::empty(),
+        )
+        .await
+        .unwrap();
 
         // The BenchmarkNoRegression check must have seeded ctx["benchmark_baseline"].
         // We verify by running the check again on a fresh context seeded from the
@@ -1031,7 +1208,7 @@ mod shell_regression_tests {
         };
 
         ctx = Context::new();
-        execute_with_ctx(&wf2, &state, "gpt-4o", ctx, &ResourcePool::empty())
+        execute_with_ctx(&wf2, &state, "copilot/gpt-4o", ctx, &ResourcePool::empty())
             .await
             .unwrap();
 
@@ -1082,7 +1259,7 @@ mod shell_regression_tests {
         let result = execute_with_ctx(
             &wf,
             &state,
-            "gpt-4o",
+            "copilot/gpt-4o",
             Context::new(),
             &ResourcePool::empty(),
         )
@@ -1136,7 +1313,7 @@ mod shell_regression_tests {
         execute_with_ctx(
             &wf,
             &state,
-            "gpt-4o",
+            "copilot/gpt-4o",
             Context::new(),
             &ResourcePool::empty(),
         )
@@ -1349,7 +1526,7 @@ mod llm_tests {
         let summary = execute(
             &wf,
             &state,
-            "gpt-4o",
+            "copilot/gpt-4o",
             Context::new(),
             &ResourcePool::empty(),
             sink_writer(),
@@ -1419,7 +1596,7 @@ mod llm_tests {
         execute(
             &wf,
             &state,
-            "gpt-4o",
+            "copilot/gpt-4o",
             Context::new(),
             &ResourcePool::empty(),
             sink_writer(),
@@ -1481,7 +1658,7 @@ mod llm_tests {
         execute(
             &wf,
             &state,
-            "gpt-4o",
+            "copilot/gpt-4o",
             Context::new(),
             &ResourcePool::empty(),
             sink_writer(),
@@ -1562,7 +1739,7 @@ mod llm_tests {
         let result = execute(
             &wf,
             &state,
-            "gpt-4o",
+            "copilot/gpt-4o",
             Context::new(),
             &ResourcePool::empty(),
             sink_writer(),

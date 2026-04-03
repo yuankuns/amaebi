@@ -2540,7 +2540,7 @@ async fn chat_long_connection_ask_still_single_turn() {
 
 /// W1: Request::Workflow reaches the daemon and streams Response::Text frames.
 ///
-/// Uses dev-loop with test_cmd="true" (always passes). The develop stage
+/// Uses test-echo with test_cmd="true" (always passes). The develop stage
 /// consumes one mock LLM response, the test stage passes, then commit-and-pr
 /// consumes a second LLM response. push-pr will fail (no git repo) so the
 /// workflow eventually errors — but we verify that streaming happened before
@@ -2548,13 +2548,9 @@ async fn chat_long_connection_ask_still_single_turn() {
 #[tokio::test]
 async fn workflow_ipc_streams_text_frames() {
     let server = MockLlmServer::start().await;
-    // develop stage
+    // develop stage (test-echo has one LLM stage)
     server.enqueue(ScriptedResponse::text_chunks(vec![
         "Implementing the feature now.",
-    ]));
-    // commit-and-pr stage (generate commit message)
-    server.enqueue(ScriptedResponse::text_chunks(vec![
-        "feat: add caching layer",
     ]));
 
     let daemon = start_daemon(&server.url()).await.expect("start daemon");
@@ -2564,7 +2560,7 @@ async fn workflow_ipc_streams_text_frames() {
     args.insert("task".into(), "implement caching".into());
     args.insert("test_cmd".into(), "true".into());
 
-    let responses = send_workflow(&client, "dev-loop", args, "gpt-4o", None)
+    let responses = send_workflow(&client, "test-echo", args, "copilot/gpt-4o", None)
         .await
         .expect("send_workflow");
 
@@ -2603,7 +2599,7 @@ async fn workflow_ipc_unknown_name_returns_error() {
         &client,
         "nonexistent-workflow",
         serde_json::Map::new(),
-        "gpt-4o",
+        "copilot/gpt-4o",
         None,
     )
     .await
@@ -2639,7 +2635,7 @@ async fn workflow_ipc_injects_session_context() {
         &client,
         "design a Redis caching layer",
         session_id,
-        "gpt-4o",
+        "copilot/gpt-4o",
     )
     .await
     .expect("seed chat turn");
@@ -2660,16 +2656,20 @@ async fn workflow_ipc_injects_session_context() {
     server.enqueue(ScriptedResponse::text_chunks(vec![
         "Implementing caching with Redis.",
     ]));
-    // commit-and-pr stage
-    server.enqueue(ScriptedResponse::text_chunks(vec!["feat: add redis cache"]));
 
     let mut args = serde_json::Map::new();
     args.insert("task".into(), "implement the cache".into());
     args.insert("test_cmd".into(), "true".into());
 
-    let _responses = send_workflow(&client, "dev-loop", args, "gpt-4o", Some(session_id))
-        .await
-        .expect("send_workflow with session");
+    let _responses = send_workflow(
+        &client,
+        "test-echo",
+        args,
+        "copilot/gpt-4o",
+        Some(session_id),
+    )
+    .await
+    .expect("send_workflow with session");
 
     // Inspect the captured LLM request — the first one is the develop stage.
     let reqs = server.take_requests();
@@ -2697,9 +2697,9 @@ async fn workflow_ipc_injects_session_context() {
 
 /// W4: Request::Workflow forwards the model field to the executor's LLM stages.
 ///
-/// The client sends Request::Workflow with model="custom-wf-model-789".
+/// The client sends Request::Workflow with model="copilot/custom-wf-model-789".
 /// The LLM requests produced by the workflow's stages must carry that model,
-/// not the default "gpt-4o".
+/// not the default "copilot/gpt-4o".
 #[tokio::test]
 async fn workflow_ipc_inherits_model_from_request() {
     let server = MockLlmServer::start().await;
@@ -2715,9 +2715,15 @@ async fn workflow_ipc_inherits_model_from_request() {
     args.insert("task".into(), "test model inheritance".into());
     args.insert("test_cmd".into(), "true".into());
 
-    let _responses = send_workflow(&client, "dev-loop", args, "custom-wf-model-789", None)
-        .await
-        .expect("send_workflow");
+    let _responses = send_workflow(
+        &client,
+        "test-echo",
+        args,
+        "copilot/custom-wf-model-789",
+        None,
+    )
+    .await
+    .expect("send_workflow");
 
     let reqs = server.take_requests();
     assert!(
@@ -2739,17 +2745,15 @@ async fn workflow_ipc_inherits_model_from_request() {
 /// W5: The run_workflow tool inherits the parent chat session's model.
 ///
 /// When the LLM calls `run_workflow` during a chat session that uses
-/// model="chat-model-abc", the workflow's internal LLM stages must also
-/// use "chat-model-abc" — not fall back to AMAEBI_MODEL or "gpt-4o".
+/// model="copilot/chat-model-abc", the workflow's internal LLM stages must also
+/// use "copilot/chat-model-abc" — not fall back to AMAEBI_MODEL or "copilot/gpt-4o".
 ///
 /// Flow:
-///   1. Chat with model "chat-model-abc"
-///   2. LLM calls run_workflow("dev-loop", {...})
-///   3. Workflow's develop stage calls the LLM → must use "chat-model-abc"
+///   1. Chat with model "copilot/chat-model-abc"
+///   2. LLM calls run_workflow("test-echo", {...})
+///   3. Workflow's develop stage calls the LLM → must use "copilot/chat-model-abc"
 ///   4. Workflow's test stage passes (test_cmd="true")
-///   5. Workflow's commit stage calls the LLM → must use "chat-model-abc"
-///   6. Workflow errors (no git repo) → result returned to parent
-///   7. Parent LLM returns final text
+///   5. Parent LLM returns final text
 #[tokio::test]
 async fn run_workflow_tool_inherits_chat_model() {
     let server = MockLlmServer::start().await;
@@ -2758,12 +2762,10 @@ async fn run_workflow_tool_inherits_chat_model() {
     server.enqueue(ScriptedResponse::tool_call(
         "call-wf-001",
         "run_workflow",
-        r#"{"workflow":"dev-loop","args":{"task":"implement feature","test_cmd":"true"}}"#,
+        r#"{"workflow":"test-echo","args":{"task":"implement feature","test_cmd":"true"}}"#,
     ));
     // 2. Workflow develop stage (LLM call — should use parent's model).
     server.enqueue(ScriptedResponse::text_chunks(vec!["developing feature"]));
-    // 3. Workflow commit-and-pr stage (LLM call — should use parent's model).
-    server.enqueue(ScriptedResponse::text_chunks(vec!["feat: new feature"]));
     // 4. Parent chat turn 2: receives workflow result, returns final text.
     server.enqueue(ScriptedResponse::text_chunks(vec![
         "Workflow completed successfully.",
@@ -2776,7 +2778,7 @@ async fn run_workflow_tool_inherits_chat_model() {
         &client,
         "run the dev loop for this feature",
         "model-inherit-session",
-        "chat-model-abc",
+        "copilot/chat-model-abc",
     )
     .await
     .expect("send_message");
@@ -2786,8 +2788,6 @@ async fn run_workflow_tool_inherits_chat_model() {
 
     let reqs = server.take_requests();
     // At minimum: parent turn 1 + workflow develop stage = 2 requests.
-    // The workflow will eventually error (no git repo in test env), but we
-    // only care that the LLM requests used the correct model.
     assert!(
         reqs.len() >= 2,
         "expected at least 2 LLM requests (parent + workflow develop), got {};\n\
@@ -2795,7 +2795,7 @@ async fn run_workflow_tool_inherits_chat_model() {
         reqs.len()
     );
 
-    // Request 0 is the parent chat → must use "chat-model-abc".
+    // Request 0 is the parent chat → must use "copilot/chat-model-abc".
     assert_eq!(
         reqs[0].model(),
         Some("chat-model-abc"),
@@ -2803,7 +2803,7 @@ async fn run_workflow_tool_inherits_chat_model() {
         reqs[0].model()
     );
 
-    // Requests 1+ are from the workflow's LLM stages → must also use "chat-model-abc".
+    // Requests 1+ are from the workflow's LLM stages → must also use "copilot/chat-model-abc".
     // The last request is the parent's second turn (after tool result), which
     // also uses the parent's model.
     for (i, req) in reqs.iter().enumerate().skip(1) {

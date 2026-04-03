@@ -59,13 +59,14 @@ pub fn dev_loop(
     Workflow {
         name: "dev-loop".into(),
         stages: vec![
-            // Phase 1: Claude develops
+            // Phase 1: Delegate coding to external Claude pane.
             Stage::new(
                 "develop",
-                Action::Llm {
+                Action::Delegate {
                     prompt: format!(
                         "Complete the following development task. \
-                         Make sure the code compiles before finishing.\n\n{task}"
+                         Make sure the code compiles and all tests pass before finishing. \
+                         Commit and push your changes when done.\n\n{task}"
                     ),
                 },
             )
@@ -79,28 +80,17 @@ pub fn dev_loop(
             )
             .with_on_fail(FailStrategy::Retry {
                 max: max_test_retries,
-                inject_prompt: "The test script failed (exit code {exit_code}).\n\nstderr:\n```\n{stderr}\n```\n\nPlease fix the code so all checks pass.".into(),
+                inject_prompt: "The test script failed (exit code {exit_code}).\n\nstderr:\n```\n{stderr}\n```\n\nPlease fix the code so all checks pass, then commit and push.".into(),
             }),
-            // Phase 3: commit + push + create PR (code-guaranteed)
-            Stage::new(
-                "commit-and-pr",
-                Action::Llm {
-                    prompt: "Generate a concise commit message for the changes just made. \
-                             Output only the commit message text, nothing else."
-                        .into(),
-                },
-            )
-            .with_on_fail(FailStrategy::Abort),
+            // Phase 3: push + create PR.
+            // Claude may have already committed during develop, so tolerate
+            // clean working tree.
             Stage::new(
                 "push-pr",
                 Action::Shell {
-                    // Use -F to read the commit message from the file written by the
-                    // preceding Llm stage (last_llm_output_file), avoiding shell injection.
-                    // Tolerate "nothing to commit" (the LLM may have already committed
-                    // during the develop stage) by checking the index first.
                     command: "git add -A && \
                               if ! git diff --cached --quiet; then \
-                                git commit -F {last_llm_output_file}; \
+                                git commit -m 'feat: dev-loop automated commit'; \
                               fi && \
                               git push && \
                               (gh pr create --fill 2>&1 || true)"
@@ -515,25 +505,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn dev_loop_push_pr_uses_llm_output_file() {
+    fn dev_loop_develop_uses_delegate() {
         let wf = dev_loop("test task", "cargo test", 3, 3);
         let stage = wf
             .stages
             .iter()
-            .find(|s| s.name == "push-pr")
-            .expect("push-pr stage missing");
-        if let Action::Shell { command } = &stage.action {
-            assert!(
-                command.contains("{last_llm_output_file}"),
-                "push-pr must use {{last_llm_output_file}} to avoid shell injection; got: {command}"
-            );
-            assert!(
-                !command.contains("/tmp/amaebi_commit_msg.txt"),
-                "push-pr must not reference the old hard-coded temp path"
-            );
-        } else {
-            panic!("push-pr must be a Shell action");
-        }
+            .find(|s| s.name == "develop")
+            .expect("develop stage missing");
+        assert!(
+            matches!(&stage.action, Action::Delegate { .. }),
+            "develop stage must be Action::Delegate"
+        );
     }
 
     #[test]

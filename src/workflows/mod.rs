@@ -72,6 +72,12 @@ pub enum Action {
     /// Run a shell command. May contain `{var}` placeholders.
     Shell { command: String },
 
+    /// Delegate a task to an external Claude Code REPL running in a tmux pane.
+    /// The workflow sends the prompt via tmux, waits for Claude to finish
+    /// (detected by asking the internal LLM if the pane is idle), then captures
+    /// the pane output.  The delegate pane is auto-detected at workflow start.
+    Delegate { prompt: String },
+
     /// Parse the previous LLM output into a list, then run sub-stages on each
     /// item (sequentially or in parallel).
     Map {
@@ -306,6 +312,34 @@ pub fn build_workflow(
             let wf = builtins::tune_sweep(target, "", run_cmd, result_cmd, resource);
             let pool = ResourcePool::new([(resource, count)]);
             Ok((wf, pool))
+        }
+        // Minimal workflow for integration tests: one LLM stage + one Shell stage.
+        // Not exposed in tool schemas or CLI docs.
+        "test-echo" => {
+            let task = str_arg("task").unwrap_or("do the task");
+            let test_cmd = str_arg("test_cmd").unwrap_or("true");
+            Ok((
+                Workflow {
+                    name: "test-echo".into(),
+                    stages: vec![
+                        Stage::new(
+                            "develop",
+                            Action::Llm {
+                                prompt: format!("Complete this task:\n\n{task}"),
+                            },
+                        )
+                        .with_on_fail(FailStrategy::Abort),
+                        Stage::new(
+                            "test",
+                            Action::Shell {
+                                command: test_cmd.to_owned(),
+                            },
+                        )
+                        .with_on_fail(FailStrategy::Abort),
+                    ],
+                },
+                ResourcePool::empty(),
+            ))
         }
         other => anyhow::bail!(
             "unknown workflow: '{other}'. Valid: dev-loop, bug-fix, perf-sweep, tune-sweep"

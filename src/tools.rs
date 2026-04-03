@@ -350,7 +350,10 @@ async fn run_workflow_tool(
     });
 
     let (workflow, pool) = build_workflow(workflow_name, &wf_args)?;
-    let wf_ctx = Context::new();
+    let mut wf_ctx = Context::new();
+    if let Some(pane) = wf_args.get("pane").and_then(|v| v.as_str()) {
+        wf_ctx.set("delegate_pane", pane);
+    }
     let writer = writer.unwrap_or_else(executor::sink_writer);
 
     executor::execute(

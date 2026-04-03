@@ -1437,7 +1437,7 @@ async fn invoke_copilot<W>(
     writer: &mut W,
 ) -> Result<copilot::CopilotResponse>
 where
-    W: AsyncWriteExt + Unpin,
+    W: AsyncWriteExt + Unpin + ?Sized,
 {
     let tok = state
         .tokens

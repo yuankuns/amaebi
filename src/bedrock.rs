@@ -789,7 +789,7 @@ async fn parse_converse_stream<W>(
     writer: &mut W,
 ) -> Result<CopilotResponse>
 where
-    W: AsyncWriteExt + Unpin,
+    W: AsyncWriteExt + Unpin + ?Sized,
 {
     let mut stream = resp.bytes_stream();
     let mut raw_buf: Vec<u8> = Vec::new();
@@ -879,7 +879,7 @@ async fn handle_frame<W>(
     writer: &mut W,
 ) -> Result<()>
 where
-    W: AsyncWriteExt + Unpin,
+    W: AsyncWriteExt + Unpin + ?Sized,
 {
     let msg_type = frame.headers.get(":message-type").map(|s| s.as_str());
     if msg_type == Some("exception") || msg_type == Some("error") {
@@ -1032,7 +1032,7 @@ pub async fn stream_chat<W>(
     writer: &mut W,
 ) -> Result<CopilotResponse>
 where
-    W: AsyncWriteExt + Unpin,
+    W: AsyncWriteExt + Unpin + ?Sized,
 {
     let token = read_bearer_token()?;
     let region = aws_region();
