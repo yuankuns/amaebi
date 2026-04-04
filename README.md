@@ -2,7 +2,7 @@
 
 A tiny, memory-efficient AI assistant for the terminal, backed by Amazon Bedrock and GitHub Copilot.
 
-**amaebi** (甘エビ, sweet shrimp) runs as a lightweight daemon. It can run shell commands, read and edit files, interact with tmux panes, spawn parallel sub-agents, schedule autonomous cron jobs, and steer live AI responses mid-flight — all from a single binary under 7 MB.
+**amaebi** (甘エビ, 小甜虾, sweet shrimp) runs as a lightweight daemon. It can run shell commands, read and edit files, interact with tmux panes, spawn parallel sub-agents, schedule autonomous cron jobs, and steer live AI responses mid-flight — all from a single binary under 7 MB.
 
 ## Quick Start
 
