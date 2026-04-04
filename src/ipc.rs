@@ -172,7 +172,7 @@ mod tests {
     // ---- Request serialization -------------------------------------------
 
     #[test]
-    fn request_chat_round_trip() {
+    fn request_chat_round_trip() -> anyhow::Result<()> {
         let req = Request::Chat {
             prompt: "hello world".into(),
             tmux_pane: Some("%3".into()),
@@ -192,16 +192,17 @@ mod tests {
             model,
         } = back
         else {
-            panic!("expected Chat variant");
+            anyhow::bail!("expected Chat variant");
         };
         assert_eq!(prompt, "hello world");
         assert_eq!(tmux_pane.as_deref(), Some("%3"));
         assert!(session_id.is_none());
         assert_eq!(model, "gpt-4o");
+        Ok(())
     }
 
     #[test]
-    fn request_chat_optional_fields_can_be_null() {
+    fn request_chat_optional_fields_can_be_null() -> anyhow::Result<()> {
         let json = r#"{"type":"chat","prompt":"p","tmux_pane":null,"session_id":null,"model":"m"}"#;
         let req: Request = serde_json::from_str(json).unwrap();
         let Request::Chat {
@@ -210,14 +211,15 @@ mod tests {
             ..
         } = req
         else {
-            panic!("expected Chat variant");
+            anyhow::bail!("expected Chat variant");
         };
         assert!(tmux_pane.is_none());
         assert!(session_id.is_none());
+        Ok(())
     }
 
     #[test]
-    fn request_steer_round_trip() {
+    fn request_steer_round_trip() -> anyhow::Result<()> {
         let req = Request::Steer {
             session_id: "abc-123".into(),
             message: "no, keep the old signature".into(),
@@ -233,10 +235,11 @@ mod tests {
             message,
         } = back
         else {
-            panic!("expected Steer variant");
+            anyhow::bail!("expected Steer variant");
         };
         assert_eq!(session_id, "abc-123");
         assert_eq!(message, "no, keep the old signature");
+        Ok(())
     }
 
     #[test]
@@ -256,7 +259,7 @@ mod tests {
     }
 
     #[test]
-    fn request_resume_round_trip() {
+    fn request_resume_round_trip() -> anyhow::Result<()> {
         let req = Request::Resume {
             prompt: "continue".into(),
             tmux_pane: Some("%3".into()),
@@ -272,14 +275,15 @@ mod tests {
             session_id, prompt, ..
         } = back
         else {
-            panic!("expected Resume variant");
+            anyhow::bail!("expected Resume variant");
         };
         assert_eq!(session_id, "old-uuid");
         assert_eq!(prompt, "continue");
+        Ok(())
     }
 
     #[test]
-    fn request_interrupt_round_trip() {
+    fn request_interrupt_round_trip() -> anyhow::Result<()> {
         let req = Request::Interrupt {
             session_id: "sess-xyz".into(),
         };
@@ -290,9 +294,10 @@ mod tests {
 
         let back: Request = serde_json::from_str(&json).unwrap();
         let Request::Interrupt { session_id } = back else {
-            panic!("expected Interrupt variant");
+            anyhow::bail!("expected Interrupt variant");
         };
         assert_eq!(session_id, "sess-xyz");
+        Ok(())
     }
 
     #[test]
