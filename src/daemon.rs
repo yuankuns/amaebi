@@ -317,8 +317,9 @@ pub async fn run(socket: PathBuf) -> Result<()> {
 
 /// Run a blocking database operation on `db` inside `spawn_blocking`.
 ///
-/// Locks the connection, calls `f`, and maps a task-panic into an `anyhow`
-/// error so callers never need to deal with `JoinError` directly.
+/// Locks the connection, calls `f`, and maps any `JoinError` (panic or
+/// cancellation) into an `anyhow` error so callers never need to deal with
+/// `JoinError` directly.
 async fn with_db<F, T>(db: Arc<Mutex<rusqlite::Connection>>, f: F) -> anyhow::Result<T>
 where
     F: FnOnce(&rusqlite::Connection) -> anyhow::Result<T> + Send + 'static,
@@ -595,9 +596,10 @@ struct ConnState<'a> {
 /// Spawn the agentic loop in a separate task and route steer/interrupt frames
 /// from the connection until the loop finishes or the client disconnects.
 ///
-/// Returns `Some(loop_result)` when the loop finishes and the caller must
-/// flush pending unsolicited errors and send `Done`/`Error` to the client
-/// based on that inner result.
+/// Returns `Some(Ok(...))` when the loop finishes successfully, or
+/// `Some(Err(...))` when it finishes with an error. In either case the
+/// caller must flush pending unsolicited errors and send `Done`/`Error`
+/// to the client based on that inner result.
 /// Returns `None` when the client disconnects mid-loop; the caller should
 /// then return `ConnAction::Break`.
 async fn drive_agentic_loop(
@@ -628,7 +630,11 @@ async fn drive_agentic_loop(
     let result = loop {
         tokio::select! { biased;
             r = &mut loop_handle => {
-                break r.unwrap_or_else(|e| Err(anyhow::anyhow!("loop panicked: {e}")));
+                break match r {
+                    Ok(result) => result,
+                    Err(e) if e.is_cancelled() => Err(anyhow::anyhow!("loop cancelled: {e}")),
+                    Err(e) => Err(anyhow::anyhow!("loop panicked: {e}")),
+                };
             }
             f = conn_state.frame_rx.recv() => match f {
                 None => {
