@@ -13,8 +13,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build dev image
-        run: docker build -t amaebi-dev:bookworm-slim docker/dev
+      - name: Build dev image (if missing)
+        run: |
+          if ! docker image inspect amaebi-dev:bookworm-slim &>/dev/null; then
+            docker build -t amaebi-dev:bookworm-slim docker/dev
+          fi
 
       - name: Fmt
         run: |
