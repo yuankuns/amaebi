@@ -345,8 +345,12 @@ async fn spawn_agent(args: serde_json::Value, ctx: &SpawnContext) -> Result<Stri
         HashMap::new()
     };
 
-    // Fix 3: build sandbox preamble accurately based on which backend will be used.
-    let using_noop = std::env::var("AMAEBI_SPAWN_SANDBOX").as_deref() == Ok("noop");
+    // Determine sandbox mode: explicit `sandbox` arg takes priority, then env var,
+    // then default to docker.
+    let sandbox_override = args.get("sandbox").and_then(|v| v.as_str());
+    let using_noop = sandbox_override == Some("noop")
+        || (sandbox_override.is_none()
+            && std::env::var("AMAEBI_SPAWN_SANDBOX").as_deref() == Ok("noop"));
     let mut context_lines = vec![
         "[Sandbox Context]".to_string(),
         if using_noop {
@@ -379,25 +383,24 @@ async fn spawn_agent(args: serde_json::Value, ctx: &SpawnContext) -> Result<Stri
 
     tracing::info!(task = %task, workspace = %workspace.display(), model = %model, "spawn_agent: starting child agent");
 
-    // Build the child sandbox.
-    let child_sandbox: Box<dyn Sandbox> =
-        if std::env::var("AMAEBI_SPAWN_SANDBOX").as_deref() == Ok("noop") {
-            Box::new(NoopSandbox)
-        } else {
-            let image = std::env::var("AMAEBI_SANDBOX_IMAGE")
-                .unwrap_or_else(|_| "amaebi-sandbox:bookworm-slim".to_string());
-            let docker = DockerSandbox::new(DockerSandboxConfig {
-                image,
-                workspace: workspace.clone(),
-                ro_paths,
-                rw_paths,
-                env,
-            });
-            if !docker.available() {
-                anyhow::bail!("Docker is not available; cannot spawn agent");
-            }
-            Box::new(docker)
-        };
+    // Build the child sandbox using the pre-computed `using_noop` flag.
+    let child_sandbox: Box<dyn Sandbox> = if using_noop {
+        Box::new(NoopSandbox)
+    } else {
+        let image = std::env::var("AMAEBI_SANDBOX_IMAGE")
+            .unwrap_or_else(|_| "amaebi-sandbox:bookworm-slim".to_string());
+        let docker = DockerSandbox::new(DockerSandboxConfig {
+            image,
+            workspace: workspace.clone(),
+            ro_paths,
+            rw_paths,
+            env,
+        });
+        if !docker.available() {
+            anyhow::bail!("Docker is not available; cannot spawn agent");
+        }
+        Box::new(docker)
+    };
 
     // Child executor: no spawn_ctx (prevents unbounded recursion), and cwd
     // defaults to the workspace so sandbox commands start in the right place.
@@ -630,6 +633,12 @@ pub fn tool_schemas(include_spawn_agent: bool) -> Vec<serde_json::Value> {
                             "type": "boolean",
                             "description": "If true, this call may run concurrently with other spawn_agent calls \
                                             in the same batch (default: false)."
+                        },
+                        "sandbox": {
+                            "type": "string",
+                            "description": "Sandbox backend: 'docker' (default, network-isolated) or 'noop' \
+                                            (host-direct, for tasks needing cargo/git).",
+                            "enum": ["docker", "noop"]
                         }
                     },
                     "required": ["task", "workspace"]
@@ -758,6 +767,33 @@ mod tests {
             props["parallel"]["type"].as_str(),
             Some("boolean"),
             "parallel property should be type boolean in spawn_agent schema"
+        );
+    }
+
+    #[test]
+    fn spawn_agent_schema_has_sandbox() {
+        let schemas = tool_schemas(true);
+        let spawn = schemas
+            .iter()
+            .find(|s| s["function"]["name"].as_str() == Some("spawn_agent"))
+            .expect("spawn_agent schema missing");
+        let props = &spawn["function"]["parameters"]["properties"];
+        assert_eq!(
+            props["sandbox"]["type"].as_str(),
+            Some("string"),
+            "sandbox property should be type string in spawn_agent schema"
+        );
+        let enum_values = props["sandbox"]["enum"]
+            .as_array()
+            .expect("sandbox should have an enum array");
+        let values: Vec<&str> = enum_values.iter().filter_map(|v| v.as_str()).collect();
+        assert!(
+            values.contains(&"docker"),
+            "sandbox enum should contain 'docker'"
+        );
+        assert!(
+            values.contains(&"noop"),
+            "sandbox enum should contain 'noop'"
         );
     }
 
