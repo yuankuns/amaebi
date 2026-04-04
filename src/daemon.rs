@@ -370,7 +370,7 @@ async fn load_session_state(
     })
     .await
     .unwrap_or_else(|e| {
-        tracing::warn!(error = %e, "failed to load session state");
+        tracing::warn!(error = %e, session_id, "failed to load session state");
         (vec![], vec![], None)
     })
 }
@@ -387,18 +387,19 @@ async fn build_and_trim_messages(
     own_summary: Option<&str>,
     model: &str,
 ) -> (Vec<Message>, bool) {
-    let raw = build_messages(prompt, tmux_pane, history, summaries, own_summary);
     let threshold = compaction_threshold_tokens(model);
-    let (mut msgs, trimmed) = if count_message_tokens(&raw) > threshold {
-        (
-            build_messages(prompt, tmux_pane, hot_tail(history), summaries, own_summary),
-            true,
-        )
-    } else {
-        (raw, false)
-    };
+    // Build with full history first and inject skill files so the threshold
+    // check accounts for their token cost (AGENTS.md / SOUL.md can be large).
+    let mut msgs = build_messages(prompt, tmux_pane, history, summaries, own_summary);
     inject_skill_files(&mut msgs).await;
-    (msgs, trimmed)
+    if count_message_tokens(&msgs) > threshold {
+        // Rebuild with trimmed history and re-inject so skill files are present.
+        msgs = build_messages(prompt, tmux_pane, hot_tail(history), summaries, own_summary);
+        inject_skill_files(&mut msgs).await;
+        (msgs, true)
+    } else {
+        (msgs, false)
+    }
 }
 
 // ---------------------------------------------------------------------------
