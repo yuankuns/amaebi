@@ -12,8 +12,9 @@ use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use tokio::io::AsyncWriteExt;
 
-use crate::copilot::{backoff_delay, CopilotResponse, FinishReason, Message, ToolCall};
+use crate::copilot::{CopilotResponse, FinishReason, Message, ToolCall};
 use crate::ipc::{write_frame, Response};
+use crate::retry::{backoff_delay, parse_retry_after_header};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -21,9 +22,6 @@ use crate::ipc::{write_frame, Response};
 
 /// Maximum retries for transient errors (same policy as copilot.rs).
 const MAX_RETRIES: u32 = 3;
-
-/// Cap on `Retry-After` header values.
-const MAX_RETRY_AFTER_SECS: u64 = 30;
 
 /// Default AWS region when `AWS_REGION` is not set.
 const DEFAULT_REGION: &str = "us-east-1";
@@ -703,13 +701,7 @@ async fn send_with_retry(
                         body: body_text,
                     }));
                 }
-                let delay = resp
-                    .headers()
-                    .get(reqwest::header::RETRY_AFTER)
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|s| s.parse::<u64>().ok())
-                    .filter(|&s| s > 0)
-                    .map(|s| std::time::Duration::from_secs(s.min(MAX_RETRY_AFTER_SECS)))
+                let delay = parse_retry_after_header(resp.headers())
                     .unwrap_or_else(|| backoff_delay(attempt));
                 tracing::warn!(
                     attempt,

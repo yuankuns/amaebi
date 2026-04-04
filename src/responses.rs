@@ -13,10 +13,9 @@ use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use tokio::io::AsyncWriteExt;
 
-use crate::copilot::{
-    backoff_delay, CopilotHttpError, CopilotResponse, FinishReason, Message, ToolCall,
-};
+use crate::copilot::{CopilotHttpError, CopilotResponse, FinishReason, Message, ToolCall};
 use crate::ipc::{write_frame, Response};
+use crate::retry::{backoff_delay, parse_retry_after_header};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -48,7 +47,6 @@ fn responses_endpoint(base_url: &str) -> String {
     format!("{}/v1/responses", base_url.trim_end_matches('/'))
 }
 const MAX_RETRIES: u32 = 3;
-const MAX_RETRY_AFTER_SECS: u64 = 30;
 
 // ---------------------------------------------------------------------------
 // Message format conversion: Chat Completions → Responses API
@@ -238,19 +236,8 @@ async fn send_with_retry(
                         body: body_text,
                     }));
                 }
-                let delay = {
-                    let secs = resp
-                        .headers()
-                        .get(reqwest::header::RETRY_AFTER)
-                        .and_then(|v| v.to_str().ok())
-                        .and_then(|s| s.parse::<u64>().ok())
-                        .unwrap_or(0);
-                    if secs > 0 {
-                        std::time::Duration::from_secs(secs.min(MAX_RETRY_AFTER_SECS))
-                    } else {
-                        backoff_delay(attempt)
-                    }
-                };
+                let delay = parse_retry_after_header(resp.headers())
+                    .unwrap_or_else(|| backoff_delay(attempt));
                 tracing::warn!(
                     attempt,
                     delay_ms = delay.as_millis(),
