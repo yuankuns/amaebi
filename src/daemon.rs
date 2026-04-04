@@ -339,6 +339,68 @@ where
     })?
 }
 
+/// Return the last `HOT_TAIL_PAIRS * 2` entries of `history`, or the whole
+/// slice when it is shorter.  Used to trim over-budget message lists.
+fn hot_tail(history: &[memory_db::DbMemoryEntry]) -> &[memory_db::DbMemoryEntry] {
+    let hot = HOT_TAIL_PAIRS * 2;
+    if history.len() > hot {
+        &history[history.len() - hot..]
+    } else {
+        history
+    }
+}
+
+/// Load the three pieces of session state needed to build a message list.
+///
+/// Returns `(history, summaries, own_summary)`.  On error, logs a warning and
+/// returns empty defaults so the caller can still proceed with a fresh context.
+async fn load_session_state(
+    state: &Arc<DaemonState>,
+    session_id: &str,
+) -> (Vec<memory_db::DbMemoryEntry>, Vec<String>, Option<String>) {
+    with_db(Arc::clone(&state.db), {
+        let sid = session_id.to_owned();
+        move |conn| {
+            Ok((
+                memory_db::get_session_history(conn, &sid)?,
+                memory_db::get_recent_summaries(conn, &sid, MAX_SUMMARIES)?,
+                memory_db::get_session_own_summary(conn, &sid)?,
+            ))
+        }
+    })
+    .await
+    .unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "failed to load session state");
+        (vec![], vec![], None)
+    })
+}
+
+/// Build a message list from session state, trim to the token budget, and
+/// inject skill files.  Does a single `inject_skill_files` call — always at
+/// the end — so the injected content is never wasted on a list that gets
+/// rebuilt.
+async fn build_and_trim_messages(
+    prompt: &str,
+    tmux_pane: Option<&str>,
+    history: &[memory_db::DbMemoryEntry],
+    summaries: &[String],
+    own_summary: Option<&str>,
+    model: &str,
+) -> (Vec<Message>, bool) {
+    let raw = build_messages(prompt, tmux_pane, history, summaries, own_summary);
+    let threshold = compaction_threshold_tokens(model);
+    let (mut msgs, trimmed) = if count_message_tokens(&raw) > threshold {
+        (
+            build_messages(prompt, tmux_pane, hot_tail(history), summaries, own_summary),
+            true,
+        )
+    } else {
+        (raw, false)
+    };
+    inject_skill_files(&mut msgs).await;
+    (msgs, trimmed)
+}
+
 // ---------------------------------------------------------------------------
 // Per-connection handler
 // ---------------------------------------------------------------------------
@@ -465,21 +527,15 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                     })
                     .await
                     .unwrap_or_default();
-                    let mut messages =
-                        build_messages(&prompt, tmux_pane.as_deref(), &history, &[], None);
-                    inject_skill_files(&mut messages).await;
-                    let threshold = compaction_threshold_tokens(&model);
-                    if count_message_tokens(&messages) > threshold {
-                        let hot = HOT_TAIL_PAIRS * 2;
-                        let trimmed = if history.len() > hot {
-                            &history[history.len() - hot..]
-                        } else {
-                            &history[..]
-                        };
-                        messages =
-                            build_messages(&prompt, tmux_pane.as_deref(), trimmed, &[], None);
-                        inject_skill_files(&mut messages).await;
-                    }
+                    let (messages, _) = build_and_trim_messages(
+                        &prompt,
+                        tmux_pane.as_deref(),
+                        &history,
+                        &[],
+                        None,
+                        &model,
+                    )
+                    .await;
                     let mut sink = tokio::io::sink();
                     let (_, mut steer_rx) = tokio::sync::mpsc::channel::<Option<String>>(1);
                     let task_desc = truncate_chars(&prompt, 200);
@@ -765,46 +821,16 @@ async fn handle_resume_request(
         .await?;
         return Ok(ConnAction::Break);
     }
-    let (history, summaries, own_summary) = with_db(Arc::clone(&state.db), {
-        let sid = session_id.clone();
-        move |conn| {
-            Ok((
-                memory_db::get_session_history(conn, &sid)?,
-                memory_db::get_recent_summaries(conn, &sid, MAX_SUMMARIES)?,
-                memory_db::get_session_own_summary(conn, &sid)?,
-            ))
-        }
-    })
-    .await
-    .unwrap_or_else(|e| {
-        tracing::warn!(error=%e, "resume load failed");
-        (vec![], vec![], None)
-    });
-    let mut messages = build_messages(
+    let (history, summaries, own_summary) = load_session_state(state, &session_id).await;
+    let (messages, _) = build_and_trim_messages(
         &prompt,
         tmux_pane.as_deref(),
         &history,
         &summaries,
         own_summary.as_deref(),
-    );
-    inject_skill_files(&mut messages).await;
-    let threshold = compaction_threshold_tokens(&model);
-    if count_message_tokens(&messages) > threshold {
-        let hot = HOT_TAIL_PAIRS * 2;
-        let trimmed = if history.len() > hot {
-            &history[history.len() - hot..]
-        } else {
-            &history[..]
-        };
-        messages = build_messages(
-            &prompt,
-            tmux_pane.as_deref(),
-            trimmed,
-            &summaries,
-            own_summary.as_deref(),
-        );
-        inject_skill_files(&mut messages).await;
-    }
+        &model,
+    )
+    .await;
     let Some(result) =
         drive_agentic_loop(state, writer, conn_state, &session_id, messages, &model).await
     else {
@@ -905,28 +931,11 @@ async fn handle_chat_request(
         let threshold_inner = compaction_threshold_tokens(&model);
         if count_message_tokens(&prev) > threshold_inner {
             // Rebuild from persisted history when over budget.
-            let (hist2, sum2, own2) = with_db(Arc::clone(&state.db), {
-                let sid = sid.clone();
-                move |conn| {
-                    Ok((
-                        memory_db::get_session_history(conn, &sid)?,
-                        memory_db::get_recent_summaries(conn, &sid, MAX_SUMMARIES)?,
-                        memory_db::get_session_own_summary(conn, &sid)?,
-                    ))
-                }
-            })
-            .await
-            .unwrap_or((vec![], vec![], None));
-            let hot = HOT_TAIL_PAIRS * 2;
-            let trimmed_hist = if hist2.len() > hot {
-                &hist2[hist2.len() - hot..]
-            } else {
-                &hist2[..]
-            };
+            let (hist2, sum2, own2) = load_session_state(state, &sid).await;
             let mut rebuilt = build_messages(
                 &prompt,
                 tmux_pane.as_deref(),
-                trimmed_hist,
+                hot_tail(&hist2),
                 &sum2,
                 own2.as_deref(),
             );
@@ -936,21 +945,7 @@ async fn handle_chat_request(
             (prev, false)
         }
     } else {
-        let (history, summaries, own_summary) = with_db(Arc::clone(&state.db), {
-            let sid = sid.clone();
-            move |conn| {
-                Ok((
-                    memory_db::get_session_history(conn, &sid)?,
-                    memory_db::get_recent_summaries(conn, &sid, MAX_SUMMARIES)?,
-                    memory_db::get_session_own_summary(conn, &sid)?,
-                ))
-            }
-        })
-        .await
-        .unwrap_or_else(|e| {
-            tracing::warn!(error=%e, "failed to load chat history");
-            (vec![], vec![], None)
-        });
+        let (history, summaries, own_summary) = load_session_state(state, &sid).await;
 
         if history.is_empty() {
             let old = with_db(Arc::clone(&state.db), {
@@ -969,34 +964,15 @@ async fn handle_chat_request(
             }
         }
 
-        let mut msgs = build_messages(
+        build_and_trim_messages(
             &prompt,
             tmux_pane.as_deref(),
             &history,
             &summaries,
             own_summary.as_deref(),
-        );
-        inject_skill_files(&mut msgs).await;
-        let threshold_inner = compaction_threshold_tokens(&model);
-        if count_message_tokens(&msgs) > threshold_inner {
-            let hot = HOT_TAIL_PAIRS * 2;
-            let trimmed = if history.len() > hot {
-                &history[history.len() - hot..]
-            } else {
-                &history[..]
-            };
-            msgs = build_messages(
-                &prompt,
-                tmux_pane.as_deref(),
-                trimmed,
-                &summaries,
-                own_summary.as_deref(),
-            );
-            inject_skill_files(&mut msgs).await;
-            (msgs, true)
-        } else {
-            (msgs, false)
-        }
+            &model,
+        )
+        .await
     };
 
     let pre_send_tokens = count_message_tokens(&messages);
