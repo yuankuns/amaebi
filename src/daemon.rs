@@ -329,7 +329,13 @@ where
         f(&conn)
     })
     .await
-    .map_err(|e| anyhow::anyhow!("database task panicked: {e}"))?
+    .map_err(|e| {
+        if e.is_cancelled() {
+            anyhow::anyhow!("database task was cancelled")
+        } else {
+            anyhow::anyhow!("database task panicked: {e}")
+        }
+    })?
 }
 
 // ---------------------------------------------------------------------------
@@ -589,11 +595,11 @@ struct ConnState<'a> {
 /// Spawn the agentic loop in a separate task and route steer/interrupt frames
 /// from the connection until the loop finishes or the client disconnects.
 ///
-/// Returns `Ok(loop_result)` when the loop completes normally (the caller must
-/// flush pending unsolicited errors and send `Done`/`Error` to the client).
-/// Returns `Err(ConnAction::Break)` when the client disconnects mid-loop.
-/// Returns `Some(loop_result)` when the loop finishes normally, or `None` when
-/// the client disconnects mid-loop (the caller should then return `ConnAction::Break`).
+/// Returns `Some(loop_result)` when the loop finishes and the caller must
+/// flush pending unsolicited errors and send `Done`/`Error` to the client
+/// based on that inner result.
+/// Returns `None` when the client disconnects mid-loop; the caller should
+/// then return `ConnAction::Break`.
 async fn drive_agentic_loop(
     state: &Arc<DaemonState>,
     writer: &Arc<tokio::sync::Mutex<tokio::net::unix::OwnedWriteHalf>>,
@@ -1098,7 +1104,7 @@ fn truncate_chars(s: &str, max: usize) -> String {
     // Fast path: if there is no (max+1)-th character the string is within limit.
     // char_indices().nth(max) is O(max), unlike chars().count() which is O(n).
     if s.char_indices().nth(max).is_none() {
-        return s.to_owned(); // already within limit — no additional allocation
+        return s.to_owned();
     }
     const MARKER: &str = "…[truncated]";
     let marker_len = MARKER.chars().count(); // derived, never drifts from MARKER
