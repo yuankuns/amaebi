@@ -435,11 +435,11 @@ mod tests {
     fn parse_specific_values_single_field() {
         let s = parse_schedule("30 9 15 3 1").unwrap();
         let FieldSpec::Values(ref mins) = s.minute else {
-            panic!("expected Values for minute")
+            unreachable!("expected Values for minute")
         };
         assert_eq!(mins, &[30]);
         let FieldSpec::Values(ref hours) = s.hour else {
-            panic!("expected Values for hour")
+            unreachable!("expected Values for hour")
         };
         assert_eq!(hours, &[9]);
     }
@@ -448,7 +448,7 @@ mod tests {
     fn parse_step_every_15_minutes() {
         let s = parse_schedule("*/15 * * * *").unwrap();
         let FieldSpec::Values(ref mins) = s.minute else {
-            panic!("expected Values")
+            unreachable!("expected Values")
         };
         assert_eq!(mins, &[0, 15, 30, 45]);
     }
@@ -457,7 +457,7 @@ mod tests {
     fn parse_range_9_to_17() {
         let s = parse_schedule("0 9-17 * * *").unwrap();
         let FieldSpec::Values(ref hours) = s.hour else {
-            panic!("expected Values")
+            unreachable!("expected Values")
         };
         assert_eq!(hours, &(9u32..=17).collect::<Vec<_>>());
     }
@@ -466,7 +466,7 @@ mod tests {
     fn parse_comma_list_dom() {
         let s = parse_schedule("0 0 1,15 * *").unwrap();
         let FieldSpec::Values(ref doms) = s.dom else {
-            panic!("expected Values")
+            unreachable!("expected Values")
         };
         assert_eq!(doms, &[1, 15]);
     }
