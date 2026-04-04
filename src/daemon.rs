@@ -2147,16 +2147,30 @@ pub(crate) async fn inject_skill_files(messages: &mut Vec<Message>) {
 
 /// Internal helper used by [`inject_skill_files`] and tests.
 async fn inject_skill_files_from(messages: &mut Vec<Message>, amaebi_home: &std::path::Path) {
-    // Always-injected files: loaded unconditionally at the start of every turn.
+    // Skill files are inserted right after the first system message (index 0) so
+    // the final order is: [system] / [SOUL.md] / [AGENTS.md] / [on-demand docs] /
+    // [history...] / [current prompt].  Skills take highest priority and must
+    // never be displaced by history trimming.
+    //
+    // We collect them in reverse order and insert at position 1 each time so the
+    // first file collected ends up first in the list.
     const FIXED_FILES: &[(&str, &str)] =
-        &[("AGENTS.md", "## Agent Guidelines"), ("SOUL.md", "## Soul")];
+        &[("SOUL.md", "## Soul"), ("AGENTS.md", "## Agent Guidelines")];
+
+    // Insert position: right after the leading system message.
+    // If for some reason messages is empty, append normally.
+    let insert_at = if messages.is_empty() { 0 } else { 1 };
+
+    // Collect fixed-file messages in reverse so inserting at `insert_at` each
+    // time preserves the declared order in the final list.
+    let mut to_insert: Vec<Message> = Vec::new();
     for (filename, header) in FIXED_FILES {
         let path = amaebi_home.join(filename);
         match tokio::fs::read_to_string(&path).await {
             Ok(content) => {
                 let trimmed = content.trim();
                 if !trimmed.is_empty() {
-                    messages.push(Message::system(format!("{header}\n\n{trimmed}")));
+                    to_insert.push(Message::system(format!("{header}\n\n{trimmed}")));
                     tracing::info!(
                         file = %path.display(),
                         header,
@@ -2206,7 +2220,7 @@ async fn inject_skill_files_from(messages: &mut Vec<Message>, amaebi_home: &std:
             .map(|p| format!("- {p}"))
             .collect::<Vec<_>>()
             .join("\n");
-        messages.push(Message::system(format!(
+        to_insert.push(Message::system(format!(
             "## On-demand Operations Docs\n\n\
              The following files can be loaded with read_file when the task involves \
              deployment, configuration, or troubleshooting:\n\n{list}"
@@ -2216,6 +2230,11 @@ async fn inject_skill_files_from(messages: &mut Vec<Message>, amaebi_home: &std:
             count = available.len(),
             "injected on-demand operations docs pointer"
         );
+    }
+
+    // Insert all collected skill messages at the designated position in one shot.
+    for (i, msg) in to_insert.into_iter().enumerate() {
+        messages.insert(insert_at + i, msg);
     }
 }
 // ---------------------------------------------------------------------------
@@ -2655,10 +2674,11 @@ mod tests {
         inject_skill_files_from(&mut messages, dir.path()).await;
         assert_eq!(messages.len(), 2);
         let body = |m: &Message| m.content.as_deref().unwrap_or("").to_owned();
-        assert!(body(&messages[0]).contains("## Agent Guidelines"));
-        assert!(body(&messages[0]).contains("agent guidelines"));
-        assert!(body(&messages[1]).contains("## Soul"));
-        assert!(body(&messages[1]).contains("soul content"));
+        // Order: SOUL.md first, then AGENTS.md (skills before guidelines).
+        assert!(body(&messages[0]).contains("## Soul"));
+        assert!(body(&messages[0]).contains("soul content"));
+        assert!(body(&messages[1]).contains("## Agent Guidelines"));
+        assert!(body(&messages[1]).contains("agent guidelines"));
     }
 
     #[tokio::test]
