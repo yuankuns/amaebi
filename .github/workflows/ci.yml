@@ -13,23 +13,61 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy, rustfmt
-
-      - uses: Swatinem/rust-cache@v2
+      - name: Build dev image
+        run: docker build -t amaebi-dev:bookworm-slim docker/dev
 
       - name: Fmt
-        run: cargo fmt --check
+        run: |
+          docker run --rm \
+            -w "$GITHUB_WORKSPACE" \
+            -v "$GITHUB_WORKSPACE:$GITHUB_WORKSPACE:rw" \
+            -e CARGO_HOME=/opt/cargo \
+            -e RUSTUP_HOME=/opt/rustup \
+            -e HOME=/home/builder \
+            amaebi-dev:bookworm-slim \
+            cargo fmt --check
 
       - name: Clippy
-        run: cargo clippy -- -D warnings
+        run: |
+          docker run --rm \
+            -w "$GITHUB_WORKSPACE" \
+            -v "$GITHUB_WORKSPACE:$GITHUB_WORKSPACE:rw" \
+            -e CARGO_HOME=/opt/cargo \
+            -e RUSTUP_HOME=/opt/rustup \
+            -e HOME=/home/builder \
+            amaebi-dev:bookworm-slim \
+            cargo clippy -- -D warnings
 
       - name: Test
-        run: cargo test
+        run: |
+          docker run --rm \
+            -w "$GITHUB_WORKSPACE" \
+            -v "$GITHUB_WORKSPACE:$GITHUB_WORKSPACE:rw" \
+            -e CARGO_HOME=/opt/cargo \
+            -e RUSTUP_HOME=/opt/rustup \
+            -e HOME=/home/builder \
+            -e RUST_BACKTRACE=1 \
+            amaebi-dev:bookworm-slim \
+            cargo test
 
       - name: Build (release)
-        run: cargo build --release
+        run: |
+          docker run --rm \
+            -w "$GITHUB_WORKSPACE" \
+            -v "$GITHUB_WORKSPACE:$GITHUB_WORKSPACE:rw" \
+            -e CARGO_HOME=/opt/cargo \
+            -e RUSTUP_HOME=/opt/rustup \
+            -e HOME=/home/builder \
+            amaebi-dev:bookworm-slim \
+            cargo build --release
 
       - name: Doc
-        run: cargo doc --no-deps
+        run: |
+          docker run --rm \
+            -w "$GITHUB_WORKSPACE" \
+            -v "$GITHUB_WORKSPACE:$GITHUB_WORKSPACE:rw" \
+            -e CARGO_HOME=/opt/cargo \
+            -e RUSTUP_HOME=/opt/rustup \
+            -e HOME=/home/builder \
+            amaebi-dev:bookworm-slim \
+            cargo doc --no-deps
