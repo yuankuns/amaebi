@@ -82,10 +82,11 @@ fn parse_dev_command(input: &str) -> Option<Vec<DevTask>> {
     Some(tasks)
 }
 
-/// Parse quoted arguments, supporting escaped quotes within quoted strings.
+/// Parse shell-style arguments, supporting both quoted and unquoted tokens.
 ///
-/// Input: `"implement cron" "fix context limit"`
-/// Output: `["implement cron", "fix context limit"]`
+/// - `"implement cron" "fix context limit"` → `["implement cron", "fix context limit"]`
+/// - `foo "bar"` → `["foo", "bar"]`  (mixed quoted/unquoted)
+/// - Escaped quotes inside quoted strings are supported: `"say \"hi\""` → `[r#"say "hi""#]`
 fn parse_quoted_args(input: &str) -> Vec<String> {
     let mut results = Vec::new();
     let mut chars = input.chars().peekable();
@@ -97,22 +98,34 @@ fn parse_quoted_args(input: &str) -> Vec<String> {
             loop {
                 match chars.next() {
                     Some('\\') => {
-                        // Escaped character — take the next char literally.
                         if let Some(escaped) = chars.next() {
                             arg.push(escaped);
                         }
                     }
                     Some('"') => break,
                     Some(c) => arg.push(c),
-                    None => break, // unterminated quote — accept what we have
+                    None => break,
                 }
             }
             let trimmed = arg.trim().to_string();
             if !trimmed.is_empty() {
                 results.push(trimmed);
             }
+        } else if ch.is_whitespace() {
+            chars.next(); // skip whitespace between tokens
         } else {
-            chars.next(); // skip whitespace or other chars between quotes
+            // Unquoted token: collect until whitespace or quote.
+            let mut arg = String::new();
+            while let Some(&c) = chars.peek() {
+                if c.is_whitespace() || c == '"' {
+                    break;
+                }
+                arg.push(c);
+                chars.next();
+            }
+            if !arg.is_empty() {
+                results.push(arg);
+            }
         }
     }
 
@@ -185,7 +198,9 @@ fn hash_based_name(description: &str) -> String {
 /// worktrees and spawn parallel development agents.
 fn build_dev_prompt(tasks: &[DevTask], cwd: &Path) -> String {
     let cwd_display = cwd.display();
-    let home = std::env::var("HOME").unwrap_or_else(|_| "~".to_string());
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_else(|_| "/tmp".to_string());
     let worktree_base = format!("{home}/amaebi-wt");
 
     let mut task_list = String::new();
@@ -201,7 +216,7 @@ fn build_dev_prompt(tasks: &[DevTask], cwd: &Path) -> String {
     let mut worktree_commands = String::new();
     for task in tasks {
         worktree_commands.push_str(&format!(
-            "   shell_command: git worktree add {worktree_base}/{name} -b feat/{name} origin/master\n",
+            "   shell_command: git worktree add \"{worktree_base}/{name}\" -b feat/{name} origin/master\n",
             worktree_base = worktree_base,
             name = task.name,
         ));
@@ -209,19 +224,19 @@ fn build_dev_prompt(tasks: &[DevTask], cwd: &Path) -> String {
 
     let mut spawn_instructions = String::new();
     for task in tasks {
+        // Escape description for safe embedding in the prompt.
+        let escaped_desc = task.description.replace('\\', "\\\\").replace('"', "\\\"");
         spawn_instructions.push_str(&format!(
-            "   - task: \"{description}\\n\\nYou are working in a git worktree. Follow these rules:\\n\
+            "   - task: \"{escaped_desc}\\n\\nYou are working in a git worktree. Follow these rules:\\n\
              1. Read and understand the existing code before making changes\\n\
              2. Implement the requested feature/fix\\n\
              3. Run: cargo fmt && cargo clippy -- -D warnings && cargo test\\n\
              4. Fix any issues until all checks pass\\n\
-             5. Commit with a conventional commit message (feat:/fix:/etc.)\\n\
+             5. Commit with a conventional commit message (feat:, fix:, etc.)\\n\
              6. Report what you did and the branch name\"\n\
-             \x20    workspace: {worktree_base}/{name}\n\
+             \x20    workspace: \"{worktree_base}/{name}\"\n\
              \x20    parallel: true\n\
-             \x20    sandbox: \"noop\"\n\
-             \x20    model: (inherit from current session, do not specify)\n\n",
-            description = task.description,
+             \x20    sandbox: \"noop\"\n\n",
             worktree_base = worktree_base,
             name = task.name,
         ));
@@ -2177,6 +2192,15 @@ mod tests {
         assert_eq!(tasks.len(), 2);
         assert_eq!(tasks[0].description, r#"task with "quotes""#);
         assert_eq!(tasks[1].description, "other");
+    }
+
+    #[test]
+    fn parse_dev_mixed_quoted_unquoted() {
+        let result = parse_dev_command(r#"/dev foo "bar baz""#);
+        let tasks = result.expect("should parse");
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[0].description, "foo");
+        assert_eq!(tasks[1].description, "bar baz");
     }
 
     // -----------------------------------------------------------------------

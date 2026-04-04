@@ -347,7 +347,20 @@ async fn spawn_agent(args: serde_json::Value, ctx: &SpawnContext) -> Result<Stri
 
     // Determine sandbox mode: explicit `sandbox` arg takes priority, then env var,
     // then default to docker.
-    let sandbox_override = args.get("sandbox").and_then(|v| v.as_str());
+    let sandbox_override = match args.get("sandbox") {
+        Some(value) => {
+            let s = value
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("spawn_agent: sandbox must be a string"))?;
+            match s {
+                "docker" | "noop" => Some(s),
+                other => anyhow::bail!(
+                    "spawn_agent: unsupported sandbox {other:?}; expected \"docker\" or \"noop\""
+                ),
+            }
+        }
+        None => None,
+    };
     let using_noop = sandbox_override == Some("noop")
         || (sandbox_override.is_none()
             && std::env::var("AMAEBI_SPAWN_SANDBOX").as_deref() == Ok("noop"));
@@ -586,8 +599,9 @@ pub fn tool_schemas(include_spawn_agent: bool) -> Vec<serde_json::Value> {
             "function": {
                 "name": "spawn_agent",
                 "description": "Spawn a child agent session to complete a task. \
-                                The child runs in an isolated Docker sandbox \
-                                (--network none) with its own workspace.",
+                                By default the child runs in an isolated Docker sandbox \
+                                (--network none). Set sandbox to 'noop' for host-direct \
+                                execution (needed for tasks requiring network or host toolchain).",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -787,13 +801,10 @@ mod tests {
             .as_array()
             .expect("sandbox should have an enum array");
         let values: Vec<&str> = enum_values.iter().filter_map(|v| v.as_str()).collect();
-        assert!(
-            values.contains(&"docker"),
-            "sandbox enum should contain 'docker'"
-        );
-        assert!(
-            values.contains(&"noop"),
-            "sandbox enum should contain 'noop'"
+        assert_eq!(
+            values,
+            vec!["docker", "noop"],
+            "sandbox enum should exactly match the supported values"
         );
     }
 
