@@ -1,8 +1,8 @@
 # amaebi
 
-A tiny, memory-efficient AI assistant for the terminal, powered by GitHub Copilot.
+A tiny, memory-efficient AI assistant for the terminal, backed by Amazon Bedrock and GitHub Copilot.
 
-**amaebi** (甘エビ, sweet shrimp) runs as a lightweight daemon that connects to the GitHub Copilot API. It can run shell commands, read and edit files, interact with tmux panes, schedule autonomous cron jobs, and steer live AI responses mid-flight — all from a single binary under 7 MB.
+**amaebi** (甘エビ, sweet shrimp) runs as a lightweight daemon. It can run shell commands, read and edit files, interact with tmux panes, spawn parallel sub-agents, schedule autonomous cron jobs, and steer live AI responses mid-flight — all from a single binary under 7 MB.
 
 ## Quick Start
 
@@ -15,7 +15,7 @@ git clone https://github.com/yuankuns/amaebi.git
 cd amaebi
 cargo build --release
 
-# Authenticate with GitHub Copilot
+# Authenticate with GitHub Copilot (skip if using Bedrock)
 ./target/release/amaebi auth
 
 # Start the daemon (once; keep it running)
@@ -23,6 +23,9 @@ cargo build --release
 
 # Ask away
 ./target/release/amaebi ask "what's using the most disk space?"
+
+# Or start an interactive chat session
+./target/release/amaebi chat
 ```
 
 Add the binary to your PATH:
@@ -38,16 +41,17 @@ ln -sf $(pwd)/target/release/amaebi ~/.local/bin/amaebi
 amaebi splits into two processes connected by a Unix socket:
 
 ```
-┌──────────┐    Unix socket      ┌───────────────┐    HTTPS/SSE    ┌─────────────┐
-│  Client  │ ◄─────────────────► │    Daemon     │ ◄─────────────► │ Copilot API │
-│ amaebi   │  /tmp/amaebi.sock   │  (persistent) │                 │             │
-│   ask    │                     └───────────────┘                 └─────────────┘
+┌──────────┐    Unix socket      ┌───────────────┐    HTTPS/SSE    ┌──────────────────┐
+│  Client  │ ◄─────────────────► │    Daemon     │ ◄─────────────► │  Copilot API  or │
+│ amaebi   │  /tmp/amaebi.sock   │  (persistent) │                 │  Amazon Bedrock  │
+│ ask/chat │                     └───────────────┘                 └──────────────────┘
 └──────────┘                             │
                                          ▼
                                  ┌───────────────┐
                                  │ Tool Executor │
                                  │ shell · tmux  │
                                  │ read · edit   │
+                                 │ spawn_agent   │
                                  └───────────────┘
                                          │
                               ┌──────────┴──────────┐
@@ -56,14 +60,14 @@ amaebi splits into two processes connected by a Unix socket:
                       (conversation memory)  (async task results)
 ```
 
-- **Client** (`amaebi ask`): Short-lived process. Sends the prompt, streams the response to stdout, and reads stdin for mid-flight steering corrections.
-- **Daemon** (`amaebi daemon`): Persistent process. Manages the Copilot API connection, token caching, tool execution, SQLite-backed session history, and the cron scheduler.
+- **Client** (`amaebi ask` / `amaebi chat`): Short-lived or interactive process. Sends the prompt, streams the response to stdout, and reads stdin for mid-flight steering corrections.
+- **Daemon** (`amaebi daemon`): Persistent process. Manages API connections, token caching, tool execution, SQLite-backed session history, and the cron scheduler.
 
 ---
 
 ## Dual-Channel UX
 
-### Foreground mode (default)
+### Single-shot mode (`ask`)
 
 The CLI stays open and streams output live. You can type corrections mid-flight:
 
@@ -82,6 +86,23 @@ Done. Refactored auth module. 3 new tests added, all passing.
 - Type a line + Enter to inject a correction (steering). The model sees it before its next turn.
 - Press **Ctrl+D** to detach — the task continues in the background; result goes to `amaebi inbox`.
 - Press **Ctrl+C** twice to exit immediately.
+
+### Interactive chat mode (`chat`)
+
+A persistent REPL that keeps context across multiple prompts without re-invoking the binary:
+
+```
+$ amaebi chat
+> explain the retry logic in bedrock.rs
+[...response...]
+> how does it compare to the copilot implementation?
+[...response using the same in-memory context...]
+> /quit
+```
+
+- In-memory context is preserved between turns on the same connection (no per-turn DB round-trips).
+- All the same steering, steer, and detach mechanics work inside chat.
+- Session history is persisted to SQLite on every turn, so you can resume later with `ask --resume`.
 
 ### Detached mode (`--detach`)
 
@@ -151,7 +172,8 @@ amaebi session clear      # evict expired sessions from sessions.json
 | `amaebi ask "<prompt>"` | Send a prompt and stream the reply |
 | `amaebi ask "<prompt>" --detach` | Submit as a background task |
 | `amaebi ask "<prompt>" --resume [uuid]` | Resume with full session history |
-| `amaebi models` | List available Copilot models |
+| `amaebi chat` | Start an interactive multi-turn chat session |
+| `amaebi models` | List available models |
 
 ### Inbox
 
@@ -213,15 +235,33 @@ Runs amaebi as an [Agent Client Protocol](https://github.com/zed-industries/acp)
 
 ## Model Selection
 
+amaebi supports two providers. Prefix the model name with `provider/` to select one explicitly; without a prefix, Copilot is used.
+
 ```bash
-# CLI flag (highest priority)
-amaebi ask --model claude-sonnet-4.6 "explain this error"
+# GitHub Copilot (default)
+amaebi ask --model gpt-4o "explain this error"
+amaebi ask --model copilot/claude-sonnet-4.6 "explain this error"
+
+# Amazon Bedrock
+amaebi ask --model bedrock/claude-sonnet-4.6 "explain this error"
+export AMAEBI_MODEL=bedrock/claude-sonnet-4.6
 
 # Environment variable
 export AMAEBI_MODEL=gpt-4o-mini
 amaebi ask "summarise this file"
 
-# Default: gpt-4o
+# Default: claude-sonnet-4.6
+```
+
+### Amazon Bedrock setup
+
+Set the bearer token and optionally the region before starting the daemon:
+
+```bash
+export AWS_BEARER_TOKEN_BEDROCK=<your-token>
+export AWS_REGION=us-east-1   # default if unset
+amaebi daemon &
+amaebi ask --model bedrock/claude-sonnet-4.6 "hello"
 ```
 
 ---
@@ -237,6 +277,32 @@ The agent autonomously selects from these tools during a task:
 | `edit_file` | Write/overwrite a file |
 | `tmux_capture_pane` | Read the visible text of a tmux pane |
 | `tmux_send_keys` | Send keystrokes to a tmux pane |
+| `spawn_agent` | Launch a parallel sub-agent with its own workspace and tool context |
+
+### `spawn_agent`: parallel sub-agents
+
+The agent can fan out work across multiple independent sub-agents that run concurrently. Each sub-agent has its own sandbox, working directory, and tool context; results are collected and returned to the parent.
+
+```
+$ amaebi ask "review every file in src/ for security issues"
+[tool] spawn_agent {workspace: "src/auth.rs"}
+[tool] spawn_agent {workspace: "src/api.rs"}
+[tool] spawn_agent {workspace: "src/db.rs"}
+... all three run in parallel ...
+Summary: found 2 issues in auth.rs, 1 in db.rs.
+```
+
+### Docker sandbox
+
+Shell commands can be isolated in a Docker container:
+
+```bash
+export AMAEBI_SANDBOX=docker
+export AMAEBI_SANDBOX_IMAGE=amaebi-sandbox:bookworm-slim  # optional override
+amaebi daemon &
+```
+
+When the sandbox is active, `shell_command` runs inside the container instead of directly on the host. Sub-agents spawned via `spawn_agent` each get their own container.
 
 ---
 
@@ -270,8 +336,10 @@ AMAEBI_LOG=debug amaebi daemon 2>daemon.log
 ## Requirements
 
 - Rust 1.85+ (install via [rustup](https://rustup.rs/) — Ubuntu's packaged Rust is too old)
-- A GitHub account with an active [Copilot](https://github.com/features/copilot) subscription
+- **GitHub Copilot** — a GitHub account with an active [Copilot](https://github.com/features/copilot) subscription (run `amaebi auth` to authenticate), **or**
+- **Amazon Bedrock** — set `AWS_BEARER_TOKEN_BEDROCK` (and optionally `AWS_REGION`)
 - tmux (optional — only needed for `tmux_capture_pane` / `tmux_send_keys` tools)
+- Docker (optional — only needed for the sandbox backend)
 
 ---
 
