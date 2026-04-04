@@ -626,7 +626,6 @@ async fn drive_agentic_loop(
         )
         .await
     });
-    let expected = expected_sid.to_owned();
     let result = loop {
         tokio::select! { biased;
             r = &mut loop_handle => {
@@ -644,12 +643,12 @@ async fn drive_agentic_loop(
                 Some(line) => {
                     if let Ok(req) = serde_json::from_str::<Request>(&line) {
                         match req {
-                            Request::Steer { session_id: sid, message } if sid == expected => {
+                            Request::Steer { session_id: sid, message } if sid == expected_sid => {
                                 if !message.is_empty() {
                                     let _ = steer_tx.send(Some(message)).await;
                                 }
                             }
-                            Request::Interrupt { session_id: sid } if sid == expected => {
+                            Request::Interrupt { session_id: sid } if sid == expected_sid => {
                                 let _ = steer_tx.send(None).await;
                             }
                             Request::Steer { .. } | Request::Interrupt { .. } => {
