@@ -312,6 +312,34 @@ pub async fn run(socket: PathBuf) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// Database helper
+// ---------------------------------------------------------------------------
+
+/// Run a blocking database operation on `db` inside `spawn_blocking`.
+///
+/// Locks the connection, calls `f`, and maps any `JoinError` (panic or
+/// cancellation) into an `anyhow` error so callers never need to deal with
+/// `JoinError` directly.
+async fn with_db<F, T>(db: Arc<Mutex<rusqlite::Connection>>, f: F) -> anyhow::Result<T>
+where
+    F: FnOnce(&rusqlite::Connection) -> anyhow::Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(move || {
+        let conn = db.lock().unwrap_or_else(|p| p.into_inner());
+        f(&conn)
+    })
+    .await
+    .map_err(|e| {
+        if e.is_cancelled() {
+            anyhow::anyhow!("database task was cancelled")
+        } else {
+            anyhow::anyhow!("database task panicked: {e}")
+        }
+    })?
+}
+
+// ---------------------------------------------------------------------------
 // Per-connection handler
 // ---------------------------------------------------------------------------
 
@@ -374,51 +402,15 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
 
         match req {
             Request::ClearMemory => {
-                tracing::info!("received memory clear request");
-                let db = Arc::clone(&state.db);
-                let result = tokio::task::spawn_blocking(move || {
-                    let conn = db.lock().unwrap_or_else(|p| p.into_inner());
-                    memory_db::clear(&conn)
-                })
-                .await
-                .unwrap_or_else(|e| Err(anyhow::anyhow!("DB clear panicked: {e}")));
-                if let Err(e) = result {
-                    tracing::warn!(error = %e, "failed to clear memory DB");
-                }
-                let mut w = writer.lock().await;
-                write_frame(&mut *w, &Response::Done).await?;
+                handle_clear_memory(&state, &writer).await?;
             }
 
             Request::StoreMemory { user, assistant } => {
-                store_conversation(&state, "global", &user, &assistant).await;
-                let mut w = writer.lock().await;
-                write_frame(&mut *w, &Response::Done).await?;
+                handle_store_memory(&state, &writer, &user, &assistant).await?;
             }
 
             Request::RetrieveContext { prompt } => {
-                let db = Arc::clone(&state.db);
-                let entries = tokio::task::spawn_blocking(move || {
-                    let conn = db.lock().unwrap_or_else(|p| p.into_inner());
-                    memory_db::retrieve_context(&conn, &prompt, 4, 10)
-                })
-                .await
-                .unwrap_or_else(|e| Err(anyhow::anyhow!("memory read panicked: {e}")))
-                .unwrap_or_else(|e| {
-                    tracing::warn!(error = %e, "failed to retrieve memory context via IPC");
-                    vec![]
-                });
-                let mut w = writer.lock().await;
-                for entry in entries {
-                    write_frame(
-                        &mut *w,
-                        &Response::MemoryEntry {
-                            role: entry.role,
-                            content: truncate_chars(&entry.content, MAX_HISTORY_CHARS),
-                        },
-                    )
-                    .await?;
-                }
-                write_frame(&mut *w, &Response::Done).await?;
+                handle_retrieve_context(&state, &writer, prompt).await?;
             }
 
             Request::Steer { .. } => {
@@ -467,14 +459,11 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                 }
                 let state = Arc::clone(&state);
                 tokio::spawn(async move {
-                    let db = Arc::clone(&state.db);
-                    let sid_c = sid.clone();
-                    let history = tokio::task::spawn_blocking(move || {
-                        let conn = db.lock().unwrap_or_else(|p| p.into_inner());
-                        memory_db::get_session_history(&conn, &sid_c)
+                    let history = with_db(Arc::clone(&state.db), {
+                        let sid = sid.clone();
+                        move |conn| memory_db::get_session_history(conn, &sid)
                     })
                     .await
-                    .unwrap_or_else(|_| Ok(vec![]))
                     .unwrap_or_default();
                     let mut messages =
                         build_messages(&prompt, tmux_pane.as_deref(), &history, &[], None);
@@ -526,154 +515,23 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                 model,
                 session_id,
             } => {
-                tracing::info!(model = %model, session_id = %session_id, prompt_len = prompt.len(), "received resume request");
-                let _resume_session_guard = match claim_session(&state.active_sessions, &session_id)
+                let mut conn_state = ConnState {
+                    frame_rx: &mut frame_rx,
+                    pending_unsolicited: &mut pending_unsolicited,
+                };
+                match handle_resume_request(
+                    &state,
+                    &writer,
+                    &mut conn_state,
+                    prompt,
+                    tmux_pane,
+                    model,
+                    session_id,
+                )
+                .await?
                 {
-                    Ok(g) => g,
-                    Err(()) => {
-                        let mut w = writer.lock().await;
-                        write_frame(
-                            &mut *w,
-                            &Response::Error {
-                                message: format!(
-                                    "session {session_id} is already in use by another connection"
-                                ),
-                            },
-                        )
-                        .await?;
-                        continue 'connection;
-                    }
-                };
-                if let Err(e) = state.tokens.get(&state.http).await {
-                    let mut w = writer.lock().await;
-                    write_frame(
-                        &mut *w,
-                        &Response::Error {
-                            message: format!("authentication error: {e:#}"),
-                        },
-                    )
-                    .await?;
-                    break 'connection;
-                }
-                let (steer_tx, mut steer_rx) = tokio::sync::mpsc::channel::<Option<String>>(16);
-                let expected_sid = session_id.clone();
-                let db = Arc::clone(&state.db);
-                let sid_c = session_id.clone();
-                let (history, summaries, own_summary) =
-                    tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-                        let conn = db.lock().unwrap_or_else(|p| p.into_inner());
-                        Ok((
-                            memory_db::get_session_history(&conn, &sid_c)?,
-                            memory_db::get_recent_summaries(&conn, &sid_c, MAX_SUMMARIES)?,
-                            memory_db::get_session_own_summary(&conn, &sid_c)?,
-                        ))
-                    })
-                    .await
-                    .unwrap_or_else(|e| {
-                        tracing::warn!(error=%e,"resume load panicked");
-                        Ok((vec![], vec![], None))
-                    })
-                    .unwrap_or_else(|e| {
-                        tracing::warn!(error=%e,"resume load failed");
-                        (vec![], vec![], None)
-                    });
-                let mut messages = build_messages(
-                    &prompt,
-                    tmux_pane.as_deref(),
-                    &history,
-                    &summaries,
-                    own_summary.as_deref(),
-                );
-                inject_skill_files(&mut messages).await;
-                let threshold = compaction_threshold_tokens(&model);
-                if count_message_tokens(&messages) > threshold {
-                    let hot = HOT_TAIL_PAIRS * 2;
-                    let trimmed = if history.len() > hot {
-                        &history[history.len() - hot..]
-                    } else {
-                        &history[..]
-                    };
-                    messages = build_messages(
-                        &prompt,
-                        tmux_pane.as_deref(),
-                        trimmed,
-                        &summaries,
-                        own_summary.as_deref(),
-                    );
-                    inject_skill_files(&mut messages).await;
-                }
-                let writer_loop = Arc::clone(&writer);
-                let state_loop = Arc::clone(&state);
-                let model_loop = model.clone();
-                let mut loop_handle = tokio::spawn(async move {
-                    let mut w = writer_loop.lock().await;
-                    run_agentic_loop(
-                        &state_loop,
-                        &model_loop,
-                        messages,
-                        &mut *w,
-                        &mut steer_rx,
-                        true,
-                    )
-                    .await
-                });
-                let result = loop {
-                    tokio::select! { biased;
-                        r = &mut loop_handle => { break r.unwrap_or_else(|e| Err(anyhow::anyhow!("loop panicked: {e}"))); }
-                        f = frame_rx.recv() => { match f {
-                            None => { loop_handle.abort(); break 'connection; }
-                            Some(line) => { if let Ok(req) = serde_json::from_str::<Request>(&line) { match req {
-                                Request::Steer { session_id: sid, message } if sid == expected_sid => { if !message.is_empty() { let _ = steer_tx.send(Some(message)).await; } }
-                                Request::Interrupt { session_id: sid } if sid == expected_sid => { let _ = steer_tx.send(None).await; }
-                                // Steer/Interrupt for a different session: silently ignore per IPC contract.
-                                Request::Steer { .. } | Request::Interrupt { .. } => {
-                                    tracing::debug!("ignoring steer/interrupt for non-active session");
-                                }
-                                _ => {
-                                    tracing::warn!("dropping unsolicited frame during active agentic loop");
-                                    // Defer the error reply: the agentic loop holds the writer
-                                    // lock; awaiting it here would stall Steer routing.  Instead
-                                    // we increment a counter and flush the errors right after the
-                                    // loop returns and releases the lock.
-                                    pending_unsolicited += 1;
-                                }
-                            }}}
-                        }}
-                    }
-                };
-                // Flush deferred busy-errors now that the writer lock is free.
-                if pending_unsolicited > 0 {
-                    let mut w = writer.lock().await;
-                    for _ in 0..pending_unsolicited {
-                        let _ = write_frame(&mut *w, &Response::Error {
-                            message: "busy: another request is already in progress on this connection".into(),
-                        }).await;
-                    }
-                    pending_unsolicited = 0;
-                }
-                match result {
-                    Ok((response_text, _, _)) => {
-                        store_conversation(
-                            &state,
-                            &session_id,
-                            &truncate_chars(&prompt, MAX_PROMPT_CHARS),
-                            &truncate_chars(&response_text, MAX_RESPONSE_CHARS),
-                        )
-                        .await;
-                        let mut w = writer.lock().await;
-                        write_frame(&mut *w, &Response::Done).await?;
-                    }
-                    Err(e) => {
-                        tracing::error!(error = %e, "resume agentic loop error");
-                        let mut w = writer.lock().await;
-                        let _ = write_frame(
-                            &mut *w,
-                            &Response::Error {
-                                message: format!("agent error: {e:#}"),
-                            },
-                        )
-                        .await;
-                    }
+                    ConnAction::Continue => {}
+                    ConnAction::Break => break 'connection,
                 }
             }
 
@@ -683,282 +541,551 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                 model,
                 session_id,
             } => {
-                tracing::info!(pane = ?tmux_pane, model = %model, prompt_len = prompt.len(), "received chat request");
-                let sid = session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-
-                // If the session_id changed, release any prior session claim and
-                // discard carried context before claiming the new session.
-                if carried_session_id.as_deref() != Some(&sid) {
-                    chat_session_guard = None; // releases old claim if any
-                    carried_messages = None;
-                }
-
-                // Claim the session on the first turn (or after a session change).
-                // A second connection that tries to use the same session will get
-                // an error instead of corrupting the shared SQLite history.
-                if chat_session_guard.is_none() {
-                    match claim_session(&state.active_sessions, &sid) {
-                        Ok(g) => chat_session_guard = Some(g),
-                        Err(()) => {
-                            let mut w = writer.lock().await;
-                            write_frame(
-                                &mut *w,
-                                &Response::Error {
-                                    message: format!(
-                                        "session {sid} is already in use by another connection"
-                                    ),
-                                },
-                            )
-                            .await?;
-                            continue 'connection;
-                        }
-                    }
-                }
-
-                if let Err(e) = state.tokens.get(&state.http).await {
-                    let mut w = writer.lock().await;
-                    write_frame(
-                        &mut *w,
-                        &Response::Error {
-                            message: format!("authentication error: {e:#}"),
-                        },
-                    )
-                    .await?;
-                    break 'connection;
-                }
-
-                // First turn: load history from DB.  Subsequent turns: extend carried messages.
-                // Apply token-budget trim either way so long-lived connections stay bounded (comment 6).
-                let (messages, pre_flight_trimmed) = if let Some(mut prev) = carried_messages.take()
+                let mut conn_state = ConnState {
+                    frame_rx: &mut frame_rx,
+                    pending_unsolicited: &mut pending_unsolicited,
+                };
+                match handle_chat_request(
+                    &state,
+                    &writer,
+                    &mut conn_state,
+                    &mut carried_messages,
+                    &mut carried_session_id,
+                    &mut chat_session_guard,
+                    prompt,
+                    tmux_pane,
+                    model,
+                    session_id,
+                )
+                .await?
                 {
-                    prev.push(Message::user(prompt.clone()));
-                    // Do NOT re-inject skill files — they were injected on the
-                    // first turn and are already in `prev`.  Re-injecting every
-                    // turn duplicates system messages and grows context unboundedly.
-                    let threshold_inner = compaction_threshold_tokens(&model);
-                    let trimmed = if count_message_tokens(&prev) > threshold_inner {
-                        // Rebuild from persisted history when over budget
-                        let db2 = Arc::clone(&state.db);
-                        let sid2 = sid.clone();
-                        let (hist2, sum2, own2) =
-                            tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-                                let conn = db2.lock().unwrap_or_else(|p| p.into_inner());
-                                Ok((
-                                    memory_db::get_session_history(&conn, &sid2)?,
-                                    memory_db::get_recent_summaries(&conn, &sid2, MAX_SUMMARIES)?,
-                                    memory_db::get_session_own_summary(&conn, &sid2)?,
-                                ))
-                            })
-                            .await
-                            .unwrap_or_else(|_| Ok((vec![], vec![], None)))
-                            .unwrap_or((vec![], vec![], None));
-                        let hot = HOT_TAIL_PAIRS * 2;
-                        let trimmed_hist = if hist2.len() > hot {
-                            &hist2[hist2.len() - hot..]
-                        } else {
-                            &hist2[..]
-                        };
-                        let mut rebuilt = build_messages(
-                            &prompt,
-                            tmux_pane.as_deref(),
-                            trimmed_hist,
-                            &sum2,
-                            own2.as_deref(),
-                        );
-                        inject_skill_files(&mut rebuilt).await;
-                        (rebuilt, true)
-                    } else {
-                        (prev, false)
-                    };
-                    trimmed
-                } else {
-                    let db = Arc::clone(&state.db);
-                    let sid_c = sid.clone();
-                    let (history, summaries, own_summary) =
-                        tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-                            let conn = db.lock().unwrap_or_else(|p| p.into_inner());
-                            Ok((
-                                memory_db::get_session_history(&conn, &sid_c)?,
-                                memory_db::get_recent_summaries(&conn, &sid_c, MAX_SUMMARIES)?,
-                                memory_db::get_session_own_summary(&conn, &sid_c)?,
-                            ))
-                        })
-                        .await
-                        .unwrap_or_else(|e| {
-                            tracing::warn!(error=%e,"chat history load panicked");
-                            Ok((vec![], vec![], None))
-                        })
-                        .unwrap_or_else(|e| {
-                            tracing::warn!(error=%e,"failed to load chat history");
-                            (vec![], vec![], None)
-                        });
-
-                    if history.is_empty() {
-                        let db = Arc::clone(&state.db);
-                        let sid_c = sid.clone();
-                        let old = tokio::task::spawn_blocking(move || {
-                            let conn = db.lock().unwrap_or_else(|p| p.into_inner());
-                            memory_db::get_sessions_without_summary(&conn, &sid_c, MAX_SUMMARIES)
-                        })
-                        .await
-                        .unwrap_or_else(|_| Ok(vec![]))
-                        .unwrap_or_default();
-                        for old_sid in old {
-                            tokio::spawn(compact_session(
-                                Arc::clone(&state),
-                                old_sid,
-                                model.clone(),
-                                0,
-                            ));
-                        }
-                    }
-
-                    let mut msgs = build_messages(
-                        &prompt,
-                        tmux_pane.as_deref(),
-                        &history,
-                        &summaries,
-                        own_summary.as_deref(),
-                    );
-                    inject_skill_files(&mut msgs).await;
-                    let threshold_inner = compaction_threshold_tokens(&model);
-                    let pft = if count_message_tokens(&msgs) > threshold_inner {
-                        let hot = HOT_TAIL_PAIRS * 2;
-                        let trimmed = if history.len() > hot {
-                            &history[history.len() - hot..]
-                        } else {
-                            &history[..]
-                        };
-                        msgs = build_messages(
-                            &prompt,
-                            tmux_pane.as_deref(),
-                            trimmed,
-                            &summaries,
-                            own_summary.as_deref(),
-                        );
-                        inject_skill_files(&mut msgs).await;
-                        true
-                    } else {
-                        false
-                    };
-                    (msgs, pft)
-                };
-
-                let pre_send_tokens = count_message_tokens(&messages);
-                let threshold = compaction_threshold_tokens(&model);
-                // pre_flight_trimmed restores the original compaction trigger (comment 7):
-                // if we had to trim, compact even if prompt_tokens stays below threshold.
-                let (steer_tx, mut steer_rx) = tokio::sync::mpsc::channel::<Option<String>>(16);
-                let expected_chat_sid = sid.clone();
-
-                let writer_loop = Arc::clone(&writer);
-                let state_loop = Arc::clone(&state);
-                let model_loop = model.clone();
-                let mut loop_handle = tokio::spawn(async move {
-                    let mut w = writer_loop.lock().await;
-                    run_agentic_loop(
-                        &state_loop,
-                        &model_loop,
-                        messages,
-                        &mut *w,
-                        &mut steer_rx,
-                        true,
-                    )
-                    .await
-                });
-
-                let loop_result = loop {
-                    tokio::select! { biased;
-                        r = &mut loop_handle => { break r.unwrap_or_else(|e| Err(anyhow::anyhow!("loop panicked: {e}"))); }
-                        f = frame_rx.recv() => { match f {
-                            None => { loop_handle.abort(); break 'connection; }
-                            Some(line) => { if let Ok(req) = serde_json::from_str::<Request>(&line) { match req {
-                                Request::Steer { session_id: sid, message } if sid == expected_chat_sid => { if !message.is_empty() { let _ = steer_tx.send(Some(message)).await; } }
-                                Request::Interrupt { session_id: sid } if sid == expected_chat_sid => { let _ = steer_tx.send(None).await; }
-                                // Steer/Interrupt for a different session: silently ignore per IPC contract.
-                                Request::Steer { .. } | Request::Interrupt { .. } => {
-                                    tracing::debug!("ignoring steer/interrupt for non-active session");
-                                }
-                                _ => {
-                                    tracing::warn!("dropping unsolicited frame during active chat loop");
-                                    // Defer the error reply (same reason as Resume path above).
-                                    pending_unsolicited += 1;
-                                }
-                            }}}
-                        }}
-                    }
-                };
-
-                // Flush deferred busy-errors now that the writer lock is free.
-                if pending_unsolicited > 0 {
-                    let mut w = writer.lock().await;
-                    for _ in 0..pending_unsolicited {
-                        let _ = write_frame(&mut *w, &Response::Error {
-                            message: "busy: another request is already in progress on this connection".into(),
-                        }).await;
-                    }
-                    pending_unsolicited = 0;
-                }
-
-                match loop_result {
-                    Ok((response_text, prompt_tokens, final_messages)) => {
-                        store_conversation(
-                            &state,
-                            &sid,
-                            &truncate_chars(&prompt, MAX_PROMPT_CHARS),
-                            &truncate_chars(&response_text, MAX_RESPONSE_CHARS),
-                        )
-                        .await;
-                        let effective_tokens = if prompt_tokens > 0 {
-                            prompt_tokens
-                        } else {
-                            pre_send_tokens
-                        };
-                        let mut w = writer.lock().await;
-                        if pre_flight_trimmed || effective_tokens > threshold {
-                            tracing::info!(session=%sid, effective_tokens, threshold, "compacting conversation history");
-                            let _ = write_frame(&mut *w, &Response::Compacting).await;
-                            let already = {
-                                let mut g = state
-                                    .compacting_sessions
-                                    .lock()
-                                    .unwrap_or_else(|p| p.into_inner());
-                                !g.insert(sid.clone())
-                            };
-                            if !already {
-                                tokio::spawn(compact_session(
-                                    Arc::clone(&state),
-                                    sid.clone(),
-                                    model.clone(),
-                                    HOT_TAIL_PAIRS * 2,
-                                ));
-                            }
-                        }
-                        write_frame(&mut *w, &Response::Done).await?;
-                        drop(w);
-                        // Carry messages and session_id for the next turn on this connection.
-                        carried_messages = Some(final_messages);
-                        carried_session_id = Some(sid.clone());
-                    }
-                    Err(e) => {
-                        tracing::error!(error = %e, "agentic loop error");
-                        let mut w = writer.lock().await;
-                        let _ = write_frame(
-                            &mut *w,
-                            &Response::Error {
-                                message: format!("agent error: {e:#}"),
-                            },
-                        )
-                        .await;
-                        carried_messages = None;
-                        carried_session_id = None;
-                    }
+                    ConnAction::Continue => {}
+                    ConnAction::Break => break 'connection,
                 }
             }
         }
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Connection-local state passed into sub-handlers
+// ---------------------------------------------------------------------------
+
+/// Outcome returned by sub-handlers that may need to terminate the connection loop.
+enum ConnAction {
+    /// Continue processing frames on this connection.
+    Continue,
+    /// Break out of the connection loop (client disconnected or fatal auth error).
+    Break,
+}
+
+/// Mutable per-connection state shared between `handle_connection` and sub-handlers.
+struct ConnState<'a> {
+    /// Channel receiving frames from the reader task.
+    frame_rx: &'a mut tokio::sync::mpsc::Receiver<String>,
+    /// Count of unsolicited frames buffered while an agentic loop held the writer lock.
+    pending_unsolicited: &'a mut u32,
+}
+
+// ---------------------------------------------------------------------------
+// Shared agentic-loop driver
+// ---------------------------------------------------------------------------
+
+/// Spawn the agentic loop in a separate task and route steer/interrupt frames
+/// from the connection until the loop finishes or the client disconnects.
+///
+/// Returns `Some(Ok(...))` when the loop finishes successfully, or
+/// `Some(Err(...))` when it finishes with an error. In either case the
+/// caller must flush pending unsolicited errors and send `Done`/`Error`
+/// to the client based on that inner result.
+/// Returns `None` when the client disconnects mid-loop; the caller should
+/// then return `ConnAction::Break`.
+async fn drive_agentic_loop(
+    state: &Arc<DaemonState>,
+    writer: &Arc<tokio::sync::Mutex<tokio::net::unix::OwnedWriteHalf>>,
+    conn_state: &mut ConnState<'_>,
+    expected_sid: &str,
+    messages: Vec<Message>,
+    model: &str,
+) -> Option<anyhow::Result<(String, usize, Vec<Message>)>> {
+    let (steer_tx, mut steer_rx) = tokio::sync::mpsc::channel::<Option<String>>(16);
+    let writer_loop = Arc::clone(writer);
+    let state_loop = Arc::clone(state);
+    let model_loop = model.to_owned();
+    let mut loop_handle = tokio::spawn(async move {
+        let mut w = writer_loop.lock().await;
+        run_agentic_loop(
+            &state_loop,
+            &model_loop,
+            messages,
+            &mut *w,
+            &mut steer_rx,
+            true,
+        )
+        .await
+    });
+    let result = loop {
+        tokio::select! { biased;
+            r = &mut loop_handle => {
+                break match r {
+                    Ok(result) => result,
+                    Err(e) if e.is_cancelled() => Err(anyhow::anyhow!("loop cancelled: {e}")),
+                    Err(e) => Err(anyhow::anyhow!("loop panicked: {e}")),
+                };
+            }
+            f = conn_state.frame_rx.recv() => match f {
+                None => {
+                    loop_handle.abort();
+                    return None;
+                }
+                Some(line) => {
+                    if let Ok(req) = serde_json::from_str::<Request>(&line) {
+                        match req {
+                            Request::Steer { session_id: sid, message } if sid == expected_sid => {
+                                if !message.is_empty() {
+                                    let _ = steer_tx.send(Some(message)).await;
+                                }
+                            }
+                            Request::Interrupt { session_id: sid } if sid == expected_sid => {
+                                let _ = steer_tx.send(None).await;
+                            }
+                            Request::Steer { .. } | Request::Interrupt { .. } => {
+                                tracing::debug!("ignoring steer/interrupt for non-active session");
+                            }
+                            _ => {
+                                tracing::warn!("dropping unsolicited frame during active agentic loop");
+                                *conn_state.pending_unsolicited += 1;
+                            }
+                        }
+                    }
+                }
+            },
+        }
+    };
+    Some(result)
+}
+
+// ---------------------------------------------------------------------------
+// Sub-handlers — one per Request variant
+// ---------------------------------------------------------------------------
+
+/// Handle `Request::ClearMemory`: clear the memory DB and send `Done`.
+async fn handle_clear_memory(
+    state: &DaemonState,
+    writer: &Arc<tokio::sync::Mutex<tokio::net::unix::OwnedWriteHalf>>,
+) -> Result<()> {
+    tracing::info!("received memory clear request");
+    if let Err(e) = with_db(Arc::clone(&state.db), memory_db::clear).await {
+        tracing::warn!(error = %e, "failed to clear memory DB");
+    }
+    let mut w = writer.lock().await;
+    write_frame(&mut *w, &Response::Done).await
+}
+
+/// Handle `Request::StoreMemory`: persist a user/assistant pair and send `Done`.
+async fn handle_store_memory(
+    state: &DaemonState,
+    writer: &Arc<tokio::sync::Mutex<tokio::net::unix::OwnedWriteHalf>>,
+    user: &str,
+    assistant: &str,
+) -> Result<()> {
+    store_conversation(state, "global", user, assistant).await;
+    let mut w = writer.lock().await;
+    write_frame(&mut *w, &Response::Done).await
+}
+
+/// Handle `Request::RetrieveContext`: look up memory entries and stream them to the client.
+async fn handle_retrieve_context(
+    state: &DaemonState,
+    writer: &Arc<tokio::sync::Mutex<tokio::net::unix::OwnedWriteHalf>>,
+    prompt: String,
+) -> Result<()> {
+    let entries = with_db(Arc::clone(&state.db), move |conn| {
+        memory_db::retrieve_context(conn, &prompt, 4, 10)
+    })
+    .await
+    .unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "failed to retrieve memory context via IPC");
+        vec![]
+    });
+    let mut w = writer.lock().await;
+    for entry in entries {
+        write_frame(
+            &mut *w,
+            &Response::MemoryEntry {
+                role: entry.role,
+                content: truncate_chars(&entry.content, MAX_HISTORY_CHARS),
+            },
+        )
+        .await?;
+    }
+    write_frame(&mut *w, &Response::Done).await
+}
+
+/// Handle `Request::Resume`: load history, run the agentic loop, store the result.
+///
+/// Returns `ConnAction::Break` when the client disconnects during the loop or
+/// when authentication fails.
+async fn handle_resume_request(
+    state: &Arc<DaemonState>,
+    writer: &Arc<tokio::sync::Mutex<tokio::net::unix::OwnedWriteHalf>>,
+    conn_state: &mut ConnState<'_>,
+    prompt: String,
+    tmux_pane: Option<String>,
+    model: String,
+    session_id: String,
+) -> Result<ConnAction> {
+    tracing::info!(model = %model, session_id = %session_id, prompt_len = prompt.len(), "received resume request");
+    let _resume_session_guard = match claim_session(&state.active_sessions, &session_id) {
+        Ok(g) => g,
+        Err(()) => {
+            let mut w = writer.lock().await;
+            write_frame(
+                &mut *w,
+                &Response::Error {
+                    message: format!(
+                        "session {session_id} is already in use by another connection"
+                    ),
+                },
+            )
+            .await?;
+            return Ok(ConnAction::Continue);
+        }
+    };
+    if let Err(e) = state.tokens.get(&state.http).await {
+        let mut w = writer.lock().await;
+        write_frame(
+            &mut *w,
+            &Response::Error {
+                message: format!("authentication error: {e:#}"),
+            },
+        )
+        .await?;
+        return Ok(ConnAction::Break);
+    }
+    let (history, summaries, own_summary) = with_db(Arc::clone(&state.db), {
+        let sid = session_id.clone();
+        move |conn| {
+            Ok((
+                memory_db::get_session_history(conn, &sid)?,
+                memory_db::get_recent_summaries(conn, &sid, MAX_SUMMARIES)?,
+                memory_db::get_session_own_summary(conn, &sid)?,
+            ))
+        }
+    })
+    .await
+    .unwrap_or_else(|e| {
+        tracing::warn!(error=%e, "resume load failed");
+        (vec![], vec![], None)
+    });
+    let mut messages = build_messages(
+        &prompt,
+        tmux_pane.as_deref(),
+        &history,
+        &summaries,
+        own_summary.as_deref(),
+    );
+    inject_skill_files(&mut messages).await;
+    let threshold = compaction_threshold_tokens(&model);
+    if count_message_tokens(&messages) > threshold {
+        let hot = HOT_TAIL_PAIRS * 2;
+        let trimmed = if history.len() > hot {
+            &history[history.len() - hot..]
+        } else {
+            &history[..]
+        };
+        messages = build_messages(
+            &prompt,
+            tmux_pane.as_deref(),
+            trimmed,
+            &summaries,
+            own_summary.as_deref(),
+        );
+        inject_skill_files(&mut messages).await;
+    }
+    let Some(result) =
+        drive_agentic_loop(state, writer, conn_state, &session_id, messages, &model).await
+    else {
+        return Ok(ConnAction::Break);
+    };
+    flush_pending_unsolicited(writer, conn_state.pending_unsolicited).await;
+    match result {
+        Ok((response_text, _, _)) => {
+            store_conversation(
+                state,
+                &session_id,
+                &truncate_chars(&prompt, MAX_PROMPT_CHARS),
+                &truncate_chars(&response_text, MAX_RESPONSE_CHARS),
+            )
+            .await;
+            let mut w = writer.lock().await;
+            write_frame(&mut *w, &Response::Done).await?;
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "resume agentic loop error");
+            let mut w = writer.lock().await;
+            let _ = write_frame(
+                &mut *w,
+                &Response::Error {
+                    message: format!("agent error: {e:#}"),
+                },
+            )
+            .await;
+        }
+    }
+    Ok(ConnAction::Continue)
+}
+
+/// Handle `Request::Chat`: manage multi-turn session context, run the agentic loop.
+///
+/// Updates `carried_messages`, `carried_session_id`, and `chat_session_guard` in-place
+/// so the next `Chat` frame on the same connection inherits the in-memory context.
+///
+/// Returns `ConnAction::Break` when the client disconnects or auth fails.
+#[allow(clippy::too_many_arguments)]
+async fn handle_chat_request(
+    state: &Arc<DaemonState>,
+    writer: &Arc<tokio::sync::Mutex<tokio::net::unix::OwnedWriteHalf>>,
+    conn_state: &mut ConnState<'_>,
+    carried_messages: &mut Option<Vec<Message>>,
+    carried_session_id: &mut Option<String>,
+    chat_session_guard: &mut Option<ActiveSessionGuard>,
+    prompt: String,
+    tmux_pane: Option<String>,
+    model: String,
+    session_id: Option<String>,
+) -> Result<ConnAction> {
+    tracing::info!(pane = ?tmux_pane, model = %model, prompt_len = prompt.len(), "received chat request");
+    let sid = session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+    // If the session_id changed, release any prior session claim and discard carried context.
+    if carried_session_id.as_deref() != Some(&sid) {
+        *chat_session_guard = None;
+        *carried_messages = None;
+    }
+
+    // Claim the session on the first turn (or after a session change).
+    if chat_session_guard.is_none() {
+        match claim_session(&state.active_sessions, &sid) {
+            Ok(g) => *chat_session_guard = Some(g),
+            Err(()) => {
+                let mut w = writer.lock().await;
+                write_frame(
+                    &mut *w,
+                    &Response::Error {
+                        message: format!("session {sid} is already in use by another connection"),
+                    },
+                )
+                .await?;
+                return Ok(ConnAction::Continue);
+            }
+        }
+    }
+
+    if let Err(e) = state.tokens.get(&state.http).await {
+        let mut w = writer.lock().await;
+        write_frame(
+            &mut *w,
+            &Response::Error {
+                message: format!("authentication error: {e:#}"),
+            },
+        )
+        .await?;
+        return Ok(ConnAction::Break);
+    }
+
+    // First turn: load history from DB.  Subsequent turns: extend carried messages.
+    // Apply token-budget trim either way so long-lived connections stay bounded.
+    let (messages, pre_flight_trimmed) = if let Some(mut prev) = carried_messages.take() {
+        prev.push(Message::user(prompt.clone()));
+        // Do NOT re-inject skill files — they were injected on the first turn and are
+        // already in `prev`.  Re-injecting every turn grows context unboundedly.
+        let threshold_inner = compaction_threshold_tokens(&model);
+        if count_message_tokens(&prev) > threshold_inner {
+            // Rebuild from persisted history when over budget.
+            let (hist2, sum2, own2) = with_db(Arc::clone(&state.db), {
+                let sid = sid.clone();
+                move |conn| {
+                    Ok((
+                        memory_db::get_session_history(conn, &sid)?,
+                        memory_db::get_recent_summaries(conn, &sid, MAX_SUMMARIES)?,
+                        memory_db::get_session_own_summary(conn, &sid)?,
+                    ))
+                }
+            })
+            .await
+            .unwrap_or((vec![], vec![], None));
+            let hot = HOT_TAIL_PAIRS * 2;
+            let trimmed_hist = if hist2.len() > hot {
+                &hist2[hist2.len() - hot..]
+            } else {
+                &hist2[..]
+            };
+            let mut rebuilt = build_messages(
+                &prompt,
+                tmux_pane.as_deref(),
+                trimmed_hist,
+                &sum2,
+                own2.as_deref(),
+            );
+            inject_skill_files(&mut rebuilt).await;
+            (rebuilt, true)
+        } else {
+            (prev, false)
+        }
+    } else {
+        let (history, summaries, own_summary) = with_db(Arc::clone(&state.db), {
+            let sid = sid.clone();
+            move |conn| {
+                Ok((
+                    memory_db::get_session_history(conn, &sid)?,
+                    memory_db::get_recent_summaries(conn, &sid, MAX_SUMMARIES)?,
+                    memory_db::get_session_own_summary(conn, &sid)?,
+                ))
+            }
+        })
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(error=%e, "failed to load chat history");
+            (vec![], vec![], None)
+        });
+
+        if history.is_empty() {
+            let old = with_db(Arc::clone(&state.db), {
+                let sid = sid.clone();
+                move |conn| memory_db::get_sessions_without_summary(conn, &sid, MAX_SUMMARIES)
+            })
+            .await
+            .unwrap_or_default();
+            for old_sid in old {
+                tokio::spawn(compact_session(
+                    Arc::clone(state),
+                    old_sid,
+                    model.clone(),
+                    0,
+                ));
+            }
+        }
+
+        let mut msgs = build_messages(
+            &prompt,
+            tmux_pane.as_deref(),
+            &history,
+            &summaries,
+            own_summary.as_deref(),
+        );
+        inject_skill_files(&mut msgs).await;
+        let threshold_inner = compaction_threshold_tokens(&model);
+        if count_message_tokens(&msgs) > threshold_inner {
+            let hot = HOT_TAIL_PAIRS * 2;
+            let trimmed = if history.len() > hot {
+                &history[history.len() - hot..]
+            } else {
+                &history[..]
+            };
+            msgs = build_messages(
+                &prompt,
+                tmux_pane.as_deref(),
+                trimmed,
+                &summaries,
+                own_summary.as_deref(),
+            );
+            inject_skill_files(&mut msgs).await;
+            (msgs, true)
+        } else {
+            (msgs, false)
+        }
+    };
+
+    let pre_send_tokens = count_message_tokens(&messages);
+    let threshold = compaction_threshold_tokens(&model);
+    let Some(loop_result) =
+        drive_agentic_loop(state, writer, conn_state, &sid, messages, &model).await
+    else {
+        return Ok(ConnAction::Break);
+    };
+    flush_pending_unsolicited(writer, conn_state.pending_unsolicited).await;
+
+    match loop_result {
+        Ok((response_text, prompt_tokens, final_messages)) => {
+            store_conversation(
+                state,
+                &sid,
+                &truncate_chars(&prompt, MAX_PROMPT_CHARS),
+                &truncate_chars(&response_text, MAX_RESPONSE_CHARS),
+            )
+            .await;
+            let effective_tokens = if prompt_tokens > 0 {
+                prompt_tokens
+            } else {
+                pre_send_tokens
+            };
+            let mut w = writer.lock().await;
+            if pre_flight_trimmed || effective_tokens > threshold {
+                tracing::info!(session=%sid, effective_tokens, threshold, "compacting conversation history");
+                let _ = write_frame(&mut *w, &Response::Compacting).await;
+                let already = {
+                    let mut g = state
+                        .compacting_sessions
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner());
+                    !g.insert(sid.clone())
+                };
+                if !already {
+                    tokio::spawn(compact_session(
+                        Arc::clone(state),
+                        sid.clone(),
+                        model.clone(),
+                        HOT_TAIL_PAIRS * 2,
+                    ));
+                }
+            }
+            write_frame(&mut *w, &Response::Done).await?;
+            drop(w);
+            *carried_messages = Some(final_messages);
+            *carried_session_id = Some(sid.clone());
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "agentic loop error");
+            let mut w = writer.lock().await;
+            let _ = write_frame(
+                &mut *w,
+                &Response::Error {
+                    message: format!("agent error: {e:#}"),
+                },
+            )
+            .await;
+            *carried_messages = None;
+            *carried_session_id = None;
+        }
+    }
+    Ok(ConnAction::Continue)
+}
+
+/// Flush pending unsolicited-frame errors to the client.
+///
+/// Called after an agentic loop releases the writer lock so the deferred
+/// errors can be sent without blocking steer routing.
+async fn flush_pending_unsolicited(
+    writer: &Arc<tokio::sync::Mutex<tokio::net::unix::OwnedWriteHalf>>,
+    pending: &mut u32,
+) {
+    if *pending > 0 {
+        let mut w = writer.lock().await;
+        for _ in 0..*pending {
+            let _ = write_frame(
+                &mut *w,
+                &Response::Error {
+                    message: "busy: another request is already in progress on this connection"
+                        .into(),
+                },
+            )
+            .await;
+        }
+        *pending = 0;
+    }
 }
 
 // ---------------------------------------------------------------------------
