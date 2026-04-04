@@ -2,7 +2,6 @@ use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 
 use crate::ipc::{write_frame, Response};
@@ -35,13 +34,6 @@ pub(crate) fn chat_endpoint(base_url: &str) -> String {
 /// How many times to retry transient failures (5xx, 429, network errors)
 /// before surfacing the error to the caller.
 const MAX_RETRIES: u32 = 3;
-
-/// Base delay for exponential backoff: attempt 0 → 1 s, 1 → 2 s, 2 → 4 s.
-const BACKOFF_BASE_MS: u64 = 1_000;
-
-/// Hard ceiling on a Retry-After value.  Prevents hanging for unreasonably
-/// long server-imposed back-off windows.
-const MAX_RETRY_AFTER_SECS: u64 = 30;
 
 // ---------------------------------------------------------------------------
 // Typed HTTP error — lets callers inspect the status and body
@@ -342,38 +334,11 @@ impl SseAccumulator {
 }
 
 // ---------------------------------------------------------------------------
-// Retry helpers
+// Retry helpers (shared utilities re-exported from retry module)
 // ---------------------------------------------------------------------------
 
-/// Exponential back-off delay for `attempt` (0-indexed).
-///
-/// Returns 1 s, 2 s, 4 s for attempts 0, 1, 2.  The exponent is capped at
-/// 10, so the delay saturates at `BACKOFF_BASE_MS << 10` (about 17 minutes),
-/// but in practice `MAX_RETRIES` is 3 so the maximum used delay is 4 s.
-pub(crate) fn backoff_delay(attempt: u32) -> Duration {
-    Duration::from_millis(BACKOFF_BASE_MS << attempt.min(10))
-}
-
-/// Parse the `Retry-After` response header into a `Duration`.
-///
-/// Accepts an integer number of seconds only (date-form is not handled).
-/// Caps the returned delay at [`MAX_RETRY_AFTER_SECS`] to prevent the daemon
-/// from sleeping for unreasonably long periods.
-pub(crate) fn parse_retry_after(resp: &reqwest::Response) -> Option<Duration> {
-    parse_retry_after_header(resp.headers())
-}
-
-/// Parse the `Retry-After` header from a [`HeaderMap`] into a [`Duration`].
-///
-/// Factored out of [`parse_retry_after`] so it can be tested without
-/// constructing a full `reqwest::Response`.
-pub(crate) fn parse_retry_after_header(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
-    headers
-        .get(reqwest::header::RETRY_AFTER)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse::<u64>().ok())
-        .map(|secs| Duration::from_secs(secs.min(MAX_RETRY_AFTER_SECS)))
-}
+/// Exponential back-off: 1 s, 2 s, 4 s for attempts 0, 1, 2 (capped at 10).
+pub(crate) use crate::retry::backoff_delay;
 
 /// Send a single chat-completions POST to Copilot with a transparent retry
 /// policy for transient failures.
@@ -443,7 +408,8 @@ async fn send_with_retry(
                         body: body_text,
                     }));
                 }
-                let delay = parse_retry_after(&resp).unwrap_or_else(|| backoff_delay(attempt));
+                let delay = crate::retry::parse_retry_after_header(resp.headers())
+                    .unwrap_or_else(|| backoff_delay(attempt));
                 tracing::warn!(
                     attempt,
                     delay_ms = delay.as_millis(),
@@ -631,7 +597,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::retry::{parse_retry_after_header, MAX_RETRY_AFTER_SECS};
     use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
+    use std::time::Duration;
 
     // ---- chat_endpoint -----------------------------------------------------
 

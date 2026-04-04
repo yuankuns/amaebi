@@ -17,6 +17,7 @@ mod memory_db;
 mod models;
 mod provider;
 mod responses;
+mod retry;
 mod sandbox;
 mod session;
 #[cfg(test)]
