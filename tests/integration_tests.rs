@@ -246,6 +246,12 @@ async fn test_compaction_triggered_at_threshold() {
             break;
         }
     }
+    let remaining_responses = server.pending_response_count();
+    assert_eq!(
+        remaining_responses, 0,
+        "mock response queue was not fully drained before Phase 2; {} response(s) still pending",
+        remaining_responses
+    );
     server.take_requests(); // drain seed request log
 
     // --- Phase 2: restart daemon with low threshold ---
@@ -290,12 +296,13 @@ async fn test_compaction_triggered_at_threshold() {
         "expected Compacting frame in responses: {responses:?}"
     );
 
-    // Wait until both responses (chat reply + background summary) have been
-    // consumed from the mock queue.  Using pending_response_count() == 0 is
-    // more reliable than counting captured requests: it directly confirms that
-    // the background compact_session task fetched its response, eliminating the
-    // race where a slow CI runner times out and the summary response is still
-    // queued when the assertion runs.
+    // Wait until both queued responses (chat reply + background summary) have
+    // been claimed by the mock server handlers. Using
+    // pending_response_count() == 0 is more reliable than counting captured
+    // requests for this test because it shows the background compact_session
+    // request has started handling, eliminating the race where a slow CI
+    // runner reaches the assertion while the summary response is still queued.
+    // This does not guarantee that the SSE stream was fully drained.
     let summary_deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
     loop {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -303,6 +310,12 @@ async fn test_compaction_triggered_at_threshold() {
             break;
         }
     }
+    assert_eq!(
+        server.pending_response_count(),
+        0,
+        "expected background summary response to be dequeued before continuing, pending responses: {}",
+        server.pending_response_count()
+    );
 
     let reqs = server.take_requests();
     assert!(
