@@ -493,6 +493,7 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                     }
                     let mut sink = tokio::io::sink();
                     let (_, mut steer_rx) = tokio::sync::mpsc::channel::<Option<String>>(1);
+                    let task_desc = truncate_chars(&prompt, 200);
                     match run_agentic_loop(&state, &model, messages, &mut sink, &mut steer_rx, true)
                         .await
                     {
@@ -504,14 +505,12 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                                 &truncate_chars(&final_text, MAX_RESPONSE_CHARS),
                             )
                             .await;
-                            let task_desc = truncate_chars(&prompt, 200);
                             if let Ok(inbox) = InboxStore::open() {
                                 let _ = inbox.save_report(&sid, &task_desc, &final_text);
                             }
                         }
                         Err(e) => {
                             tracing::error!(error = %e, "detach agentic loop error");
-                            let task_desc = truncate_chars(&prompt, 200);
                             if let Ok(inbox) = InboxStore::open() {
                                 let _ =
                                     inbox.save_report(&sid, &task_desc, &format!("[error] {e:#}"));
