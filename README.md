@@ -306,6 +306,42 @@ When the sandbox is active, `shell_command` runs inside the container instead of
 
 ---
 
+## Skills (Persistent Agent Instructions)
+
+amaebi injects files from `~/.amaebi/` into the agent's context at the start of every turn, letting you give the agent standing instructions without repeating yourself in every prompt.
+
+### Always-injected files
+
+These are loaded unconditionally before each turn:
+
+| File | Purpose |
+|------|---------|
+| `~/.amaebi/AGENTS.md` | Standing agent guidelines — coding style, workflow preferences, rules the agent must follow |
+| `~/.amaebi/SOUL.md` | Personality and tone directives |
+
+Example `~/.amaebi/AGENTS.md`:
+
+```markdown
+- Always run tests before editing production code.
+- Prefer small, focused commits over large sweeping changes.
+- When in doubt, ask before deleting files.
+```
+
+### On-demand operations docs
+
+These files are **not** preloaded (they can be large), but the agent receives their absolute paths so it can `read_file` them when the task requires it:
+
+| File | Purpose |
+|------|---------|
+| `~/.amaebi/OPERATIONS_INDEX.md` | Index of all operations documentation |
+| `~/.amaebi/DEPLOYMENT.md` | Deployment procedures |
+| `~/.amaebi/CONFIG_REFERENCE.md` | Configuration reference |
+| `~/.amaebi/RUNBOOK.md` | Incident runbook |
+
+Files that do not exist are silently skipped — create only the ones you need.
+
+---
+
 ## Data Files
 
 | Path | Purpose |
