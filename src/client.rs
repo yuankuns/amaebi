@@ -195,13 +195,14 @@ fn hash_based_name(description: &str) -> String {
 }
 
 /// Build the orchestration prompt that instructs the parent agent to create
-/// worktrees and spawn parallel development agents.
+/// worktrees and launch Claude Code CLI processes for parallel development.
 fn build_dev_prompt(tasks: &[DevTask], cwd: &Path) -> String {
     let cwd_display = cwd.display();
     let home = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
         .unwrap_or_else(|_| "/tmp".to_string());
     let worktree_base = format!("{home}/amaebi-wt");
+    let claude = std::env::var("CLAUDE").unwrap_or_else(|_| "claude".to_string());
 
     let mut task_list = String::new();
     for (i, task) in tasks.iter().enumerate() {
@@ -216,31 +217,46 @@ fn build_dev_prompt(tasks: &[DevTask], cwd: &Path) -> String {
     let mut worktree_commands = String::new();
     for task in tasks {
         worktree_commands.push_str(&format!(
-            "   shell_command: git worktree add \"{worktree_base}/{name}\" -b feat/{name} origin/master\n",
+            "   git worktree add \"{worktree_base}/{name}\" -b feat/{name} origin/master\n",
             worktree_base = worktree_base,
             name = task.name,
         ));
     }
 
-    let mut spawn_instructions = String::new();
+    // Build the background launch command: run all Claude processes in parallel.
+    let mut launch_parts = Vec::new();
     for task in tasks {
-        // Escape description for safe embedding in the prompt.
-        let escaped_desc = task.description.replace('\\', "\\\\").replace('"', "\\\"");
-        spawn_instructions.push_str(&format!(
-            "   - task: \"{escaped_desc}\\n\\nYou are working in a git worktree. Follow these rules:\\n\
-             1. Read and understand the existing code before making changes\\n\
-             2. Implement the requested feature/fix\\n\
-             3. Run: cargo fmt && cargo clippy -- -D warnings && cargo test\\n\
-             4. Fix any issues until all checks pass\\n\
-             5. Commit with a conventional commit message (feat:, fix:, etc.)\\n\
-             6. Report what you did and the branch name\"\n\
-             \x20    workspace: \"{worktree_base}/{name}\"\n\
-             \x20    parallel: true\n\
-             \x20    sandbox: \"noop\"\n\n",
+        let escaped_desc = task
+            .description
+            .replace('\\', "\\\\")
+            .replace('\'', "'\\''");
+        launch_parts.push(format!(
+            "cd \"{worktree_base}/{name}\" && \
+             {claude} --print \
+             --permission-mode bypassPermissions \
+             -p '{escaped_desc}. \
+             Follow the project CLAUDE.md rules. \
+             After implementation, run: cargo fmt && cargo clippy -- -D warnings && cargo test. \
+             Fix any issues until all checks pass. \
+             Then commit with a conventional commit message (feat:, fix:, etc.). \
+             Report what you did and the branch name.' \
+             > \"{worktree_base}/{name}/claude.log\" 2>&1",
             worktree_base = worktree_base,
             name = task.name,
+            claude = claude,
         ));
     }
+
+    let parallel_cmd = if launch_parts.len() == 1 {
+        launch_parts[0].clone()
+    } else {
+        // Launch all in background, wait for all to finish.
+        let bg_cmds: Vec<String> = launch_parts
+            .iter()
+            .map(|cmd| format!("({cmd}) &"))
+            .collect();
+        format!("{}\nwait", bg_cmds.join("\n"))
+    };
 
     format!(
         "You are orchestrating a parallel development session for a Rust project.\n\
@@ -249,26 +265,24 @@ fn build_dev_prompt(tasks: &[DevTask], cwd: &Path) -> String {
          {task_list}\n\
          ## Instructions\n\
          \n\
-         Execute these steps IN ORDER:\n\
+         Execute these steps IN ORDER using shell_command:\n\
          \n\
-         1. Determine the git repo root:\n\
-         \x20  shell_command: git rev-parse --show-toplevel\n\
+         1. Fetch latest upstream:\n\
+         \x20  cd \"{cwd_display}\" && git fetch origin\n\
          \n\
-         2. Fetch latest upstream:\n\
-         \x20  shell_command: git fetch origin\n\
-         \n\
-         3. Create worktrees (one per task):\n\
+         2. Create worktree base and worktrees:\n\
+         \x20  mkdir -p \"{worktree_base}\"\n\
+         \x20  cd \"{cwd_display}\"\n\
          {worktree_commands}\n\
-         4. Spawn ALL agents in a SINGLE tool-call batch with parallel=true:\n\
-         {spawn_instructions}\
-         5. After ALL agents complete, report:\n\
-         \x20  - For each task: branch name, worktree path, what the agent accomplished\n\
-         \x20  - Any failures\n\
+         3. Launch Claude Code in each worktree (this runs on the host, not in a sandbox):\n\
+         \x20  Use a SINGLE shell_command to run all tasks in parallel:\n\
+         ```\n\
+         {parallel_cmd}\n\
+         ```\n\
          \n\
-         Worktree base directory: {worktree_base}\n\
-         (Create with `mkdir -p` if needed)\n\
-         \n\
-         Current working directory: {cwd_display}",
+         4. After the command completes, read each log file and report:\n\
+         \x20  - For each task: branch name (feat/<name>), worktree path, what Claude accomplished\n\
+         \x20  - Any failures (check the log files at {worktree_base}/<name>/claude.log)\n",
     )
 }
 
@@ -2297,10 +2311,13 @@ mod tests {
         assert!(prompt.contains("fix-context"));
         assert!(prompt.contains("implement cron"));
         assert!(prompt.contains("fix context limit"));
-        assert!(prompt.contains("parallel"));
         assert!(prompt.contains("git worktree add"));
         assert!(prompt.contains("amaebi-wt"));
         assert!(prompt.contains("/home/user/project"));
+        // Should use claude CLI, not spawn_agent
+        assert!(prompt.contains("claude"));
+        assert!(prompt.contains("--print"));
+        assert!(!prompt.contains("spawn_agent"));
     }
 
     #[test]
@@ -2312,5 +2329,24 @@ mod tests {
         let prompt = build_dev_prompt(&tasks, Path::new("/tmp"));
         assert!(prompt.contains("amaebi-wt/my-task"));
         assert!(prompt.contains("feat/my-task"));
+        assert!(prompt.contains("claude.log"));
+    }
+
+    #[test]
+    fn build_dev_prompt_parallel_uses_background() {
+        let tasks = vec![
+            DevTask {
+                name: "task-a".into(),
+                description: "do A".into(),
+            },
+            DevTask {
+                name: "task-b".into(),
+                description: "do B".into(),
+            },
+        ];
+        let prompt = build_dev_prompt(&tasks, Path::new("/tmp"));
+        // Multiple tasks should use background processes + wait
+        assert!(prompt.contains(") &"));
+        assert!(prompt.contains("wait"));
     }
 }
