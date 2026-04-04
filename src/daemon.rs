@@ -413,7 +413,7 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                         &mut *w,
                         &Response::MemoryEntry {
                             role: entry.role,
-                            content: truncate_chars(entry.content, MAX_HISTORY_CHARS),
+                            content: truncate_chars(&entry.content, MAX_HISTORY_CHARS),
                         },
                     )
                     .await?;
@@ -493,6 +493,7 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                     }
                     let mut sink = tokio::io::sink();
                     let (_, mut steer_rx) = tokio::sync::mpsc::channel::<Option<String>>(1);
+                    let task_desc = truncate_chars(&prompt, 200);
                     match run_agentic_loop(&state, &model, messages, &mut sink, &mut steer_rx, true)
                         .await
                     {
@@ -500,18 +501,16 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                             store_conversation(
                                 &state,
                                 &sid,
-                                &truncate_chars(prompt.clone(), MAX_PROMPT_CHARS),
-                                &truncate_chars(final_text.clone(), MAX_RESPONSE_CHARS),
+                                &truncate_chars(&prompt, MAX_PROMPT_CHARS),
+                                &truncate_chars(&final_text, MAX_RESPONSE_CHARS),
                             )
                             .await;
-                            let task_desc = truncate_chars(prompt, 200);
                             if let Ok(inbox) = InboxStore::open() {
                                 let _ = inbox.save_report(&sid, &task_desc, &final_text);
                             }
                         }
                         Err(e) => {
                             tracing::error!(error = %e, "detach agentic loop error");
-                            let task_desc = truncate_chars(prompt, 200);
                             if let Ok(inbox) = InboxStore::open() {
                                 let _ =
                                     inbox.save_report(&sid, &task_desc, &format!("[error] {e:#}"));
@@ -657,8 +656,8 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                         store_conversation(
                             &state,
                             &session_id,
-                            &truncate_chars(prompt.clone(), MAX_PROMPT_CHARS),
-                            &truncate_chars(response_text, MAX_RESPONSE_CHARS),
+                            &truncate_chars(&prompt, MAX_PROMPT_CHARS),
+                            &truncate_chars(&response_text, MAX_RESPONSE_CHARS),
                         )
                         .await;
                         let mut w = writer.lock().await;
@@ -906,8 +905,8 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                         store_conversation(
                             &state,
                             &sid,
-                            &truncate_chars(prompt.clone(), MAX_PROMPT_CHARS),
-                            &truncate_chars(response_text.clone(), MAX_RESPONSE_CHARS),
+                            &truncate_chars(&prompt, MAX_PROMPT_CHARS),
+                            &truncate_chars(&response_text, MAX_RESPONSE_CHARS),
                         )
                         .await;
                         let effective_tokens = if prompt_tokens > 0 {
@@ -979,11 +978,11 @@ const MAX_RESPONSE_CHARS: usize = 8_000;
 ///
 /// Edge case: if `max` is smaller than or equal to the marker length, the
 /// marker itself is truncated to `max` chars.
-fn truncate_chars(s: String, max: usize) -> String {
+fn truncate_chars(s: &str, max: usize) -> String {
     // Fast path: if there is no (max+1)-th character the string is within limit.
     // char_indices().nth(max) is O(max), unlike chars().count() which is O(n).
     if s.char_indices().nth(max).is_none() {
-        return s; // already within limit — no additional allocation
+        return s.to_owned();
     }
     const MARKER: &str = "…[truncated]";
     let marker_len = MARKER.chars().count(); // derived, never drifts from MARKER
@@ -1164,7 +1163,7 @@ async fn compact_session(
     }
 
     for entry in &history {
-        let content = truncate_chars(entry.content.clone(), 1_500);
+        let content = truncate_chars(&entry.content, 1_500);
         match entry.role.as_str() {
             "user" => messages.push(Message::user(content)),
             "assistant" => messages.push(Message::assistant(Some(content), vec![])),
@@ -1847,7 +1846,7 @@ where
                                         output_len = output.len(),
                                         "tool succeeded"
                                     );
-                                    truncate_chars(output, MAX_TOOL_OUTPUT_CHARS)
+                                    truncate_chars(&output, MAX_TOOL_OUTPUT_CHARS)
                                 }
                                 Err(e) => {
                                     tracing::warn!(tool = %tc.name, error = %e, "tool failed");
@@ -1955,7 +1954,7 @@ where
                                     output_len = output.len(),
                                     "tool succeeded"
                                 );
-                                truncate_chars(output, MAX_TOOL_OUTPUT_CHARS)
+                                truncate_chars(&output, MAX_TOOL_OUTPUT_CHARS)
                             }
                             Err(e) => {
                                 tracing::warn!(tool = %tc.name, error = %e, "tool failed");
@@ -2150,7 +2149,7 @@ pub(crate) fn build_messages(
     if !past_summaries.is_empty() {
         system.push_str("\n\nSummaries from past sessions (oldest first):\n");
         for s in past_summaries {
-            system.push_str(&truncate_chars(s.clone(), MAX_SUMMARY_CHARS));
+            system.push_str(&truncate_chars(s, MAX_SUMMARY_CHARS));
             system.push('\n');
         }
     }
@@ -2160,7 +2159,7 @@ pub(crate) fn build_messages(
     // If this session has been partially compacted, prepend the running summary
     // so the model knows what happened before the history window.
     if let Some(summary) = own_summary {
-        let summary = truncate_chars(summary.to_owned(), MAX_SUMMARY_CHARS * 2);
+        let summary = truncate_chars(summary, MAX_SUMMARY_CHARS * 2);
         messages.push(Message::user(
             "[Summary of earlier in this session]".to_owned(),
         ));
@@ -2168,7 +2167,7 @@ pub(crate) fn build_messages(
     }
 
     for entry in history {
-        let content = truncate_chars(entry.content.clone(), MAX_HISTORY_CHARS);
+        let content = truncate_chars(&entry.content, MAX_HISTORY_CHARS);
         match entry.role.as_str() {
             "user" => messages.push(Message::user(content)),
             "assistant" => messages.push(Message::assistant(Some(content), vec![])),
@@ -2276,7 +2275,7 @@ async fn run_cron_job(state: Arc<DaemonState>, job: &cron::CronJob) {
         }
     };
 
-    let task_desc = truncate_chars(job.description.clone(), 200);
+    let task_desc = truncate_chars(&job.description, 200);
 
     // Persist to inbox.
     match InboxStore::open() {
@@ -2338,20 +2337,17 @@ mod tests {
 
     #[test]
     fn truncate_chars_short_string_unchanged() {
-        let s = "hello".to_owned();
-        assert_eq!(truncate_chars(s, 10), "hello");
+        assert_eq!(truncate_chars("hello", 10), "hello");
     }
 
     #[test]
     fn truncate_chars_at_limit_unchanged() {
-        let s = "hello".to_owned();
-        assert_eq!(truncate_chars(s, 5), "hello");
+        assert_eq!(truncate_chars("hello", 5), "hello");
     }
 
     #[test]
     fn truncate_chars_over_limit_appends_marker() {
-        let s = "hello world extra text here".to_owned();
-        let result = truncate_chars(s, 20);
+        let result = truncate_chars("hello world extra text here", 20);
         assert!(result.ends_with("…[truncated]"), "should end with marker");
         assert_eq!(result.chars().count(), 20);
     }
@@ -2360,7 +2356,7 @@ mod tests {
     fn truncate_chars_total_length_never_exceeds_max() {
         let s = "a".repeat(100);
         for max in [14, 20, 50, 99] {
-            let result = truncate_chars(s.clone(), max);
+            let result = truncate_chars(&s, max);
             assert!(
                 result.chars().count() <= max,
                 "max={max}: got {} chars",
@@ -2371,7 +2367,7 @@ mod tests {
 
     #[test]
     fn truncate_chars_max_smaller_than_marker_returns_partial_marker() {
-        let result = truncate_chars("hello world".to_owned(), 3);
+        let result = truncate_chars("hello world", 3);
         assert_eq!(result.chars().count(), 3);
         assert!(result.starts_with('…'));
     }
@@ -2379,20 +2375,20 @@ mod tests {
     #[test]
     fn truncate_chars_respects_unicode_boundaries() {
         let s = "日本語テスト".repeat(5);
-        let result = truncate_chars(s, 20);
+        let result = truncate_chars(&s, 20);
         assert!(result.chars().count() <= 20);
         assert!(result.ends_with("…[truncated]"));
     }
 
     #[test]
     fn truncate_chars_empty_string_unchanged() {
-        assert_eq!(truncate_chars(String::new(), 10), "");
+        assert_eq!(truncate_chars("", 10), "");
     }
 
     #[test]
     fn truncate_chars_multibyte_safe() {
         let s = "日".repeat(25);
-        let result = truncate_chars(s, 20);
+        let result = truncate_chars(&s, 20);
         assert!(result.chars().count() <= 20);
         assert!(result.ends_with("…[truncated]"));
     }
