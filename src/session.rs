@@ -405,7 +405,7 @@ pub fn clear_expired(
         if let Ok(accessed) = chrono::DateTime::parse_from_rfc3339(&rec.last_accessed) {
             let age = now.signed_duration_since(accessed).num_seconds().max(0) as u64;
             if age >= tier_ttl {
-                expired.push((key.clone(), rec.clone()));
+                expired.push((key, rec.clone()));
             }
         }
     }
