@@ -1555,6 +1555,11 @@ mod prompt_input {
     use std::io::{Read, Write};
     use unicode_width::UnicodeWidthChar as _;
 
+    thread_local! {
+        /// Per-thread history buffer shared across `read_line_raw` calls.
+        static HISTORY: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
     /// RAII guard that restores the terminal to its saved settings on drop.
     #[cfg(unix)]
     struct RawModeGuard {
@@ -1641,7 +1646,43 @@ mod prompt_input {
 
     #[cfg(unix)]
     fn read_line_raw_inner(_guard: RawModeGuard) -> std::io::Result<Option<String>> {
-        process_input(&mut std::io::stdin(), &mut std::io::stderr())
+        HISTORY.with(|h| {
+            let history_snapshot: Vec<String> = h.borrow().clone();
+            let result = process_input(
+                &mut std::io::stdin(),
+                &mut std::io::stderr(),
+                &history_snapshot,
+            );
+            if let Ok(Some(ref line)) = result {
+                if !line.is_empty() {
+                    h.borrow_mut().push(line.clone());
+                }
+            }
+            result
+        })
+    }
+
+    /// Redraw the current line after any edit or cursor movement.
+    ///
+    /// Moves to the beginning of the line (`\r`), erases to EOL, re-emits all
+    /// characters, then moves the cursor back from the end to `cursor` position
+    /// using `ESC[nD`.
+    fn redraw<W: Write>(
+        output: &mut W,
+        chars: &[char],
+        widths: &[usize],
+        cursor: usize,
+    ) -> std::io::Result<()> {
+        output.write_all(b"\r\x1b[K")?;
+        for ch in chars {
+            let mut buf = [0u8; 4];
+            output.write_all(ch.encode_utf8(&mut buf).as_bytes())?;
+        }
+        let cols_from_cursor: usize = widths[cursor..].iter().sum();
+        if cols_from_cursor > 0 {
+            write!(output, "\x1b[{cols_from_cursor}D")?;
+        }
+        Ok(())
     }
 
     /// Core line-editor loop.  Separated from the raw-mode setup so it can be
@@ -1651,13 +1692,24 @@ mod prompt_input {
     /// * `Ok(Some(s))` on Enter — `s` contains no trailing newline.
     /// * `Ok(None)` on EOF (Ctrl-D or exhausted reader).
     /// * `Err` with `ErrorKind::Interrupted` on Ctrl-C.
+    ///
+    /// `history` is a slice of prior input lines; up/down arrows navigate it.
     fn process_input<R: Read, W: Write>(
         input: &mut R,
         output: &mut W,
+        history: &[String],
     ) -> std::io::Result<Option<String>> {
         let mut chars: Vec<char> = Vec::new();
         // Display width (columns) of each char, matched by index to `chars`.
         let mut widths: Vec<usize> = Vec::new();
+        // Cursor position: index into `chars` (0 = start, chars.len() = end).
+        let mut cursor: usize = 0;
+
+        // History navigation state.
+        // `hist_idx` == history.len() means "current draft" (not navigating history).
+        let mut hist_idx: usize = history.len();
+        // Draft saved the first time the user presses Up from the live buffer.
+        let mut draft_chars: Vec<char> = Vec::new();
 
         loop {
             let mut byte = [0u8; 1];
@@ -1690,9 +1742,13 @@ mod prompt_input {
                 }
                 // Backspace (DEL = 0x7f on most terminals; BS = 0x08 on some)
                 0x7f | 0x08 => {
-                    if let (Some(_), Some(w)) = (chars.pop(), widths.pop()) {
+                    if cursor > 0 {
+                        let w = widths[cursor - 1];
+                        chars.remove(cursor - 1);
+                        widths.remove(cursor - 1);
+                        cursor -= 1;
                         if w > 0 {
-                            // Normal (non-zero-width) char: erase w display columns.
+                            // Normal (non-zero-width) char: reposition and erase.
                             //
                             // ESC[wD (CUB) is used instead of w×\x08 (BS) because some
                             // terminals snap the cursor to the left boundary of a wide
@@ -1703,19 +1759,26 @@ mod prompt_input {
                             // Known limitation: CUB does not wrap to the previous visual
                             // line on soft-wrapped input.  This editor targets single-line
                             // prompts; multi-line soft-wrap support is out of scope.
-                            write!(output, "\x1b[{w}D\x1b[K")?;
+                            if cursor == chars.len() {
+                                // Cursor is at end — simple inline erase.
+                                write!(output, "\x1b[{w}D\x1b[K")?;
+                            } else {
+                                // Mid-line deletion: full redraw to shift remaining chars.
+                                redraw(output, &chars, &widths, cursor)?;
+                            }
                         } else {
                             // Zero-width combining mark: it was rendered on top of the
                             // preceding base character without advancing the cursor.
                             // Removing it from the buffer leaves its glyph visible;
                             // repaint the base char (and any remaining combining marks
                             // on it) to erase the deleted mark from the display.
-                            if let Some(base_idx) = widths.iter().rposition(|&bw| bw > 0) {
+                            if let Some(base_idx) = widths[..cursor].iter().rposition(|&bw| bw > 0)
+                            {
                                 let base_width = widths[base_idx];
                                 // Move back to start of base char, clear to EOL.
                                 write!(output, "\x1b[{base_width}D\x1b[K")?;
-                                // Re-echo base char + any remaining combining marks.
-                                let repaint: String = chars[base_idx..].iter().collect();
+                                // Re-echo base char + any remaining combining marks up to cursor.
+                                let repaint: String = chars[base_idx..cursor].iter().collect();
                                 output.write_all(repaint.as_bytes())?;
                             }
                             // No preceding base char (mark at start of buffer):
@@ -1723,7 +1786,7 @@ mod prompt_input {
                         }
                     }
                 }
-                // Escape sequences (arrows, function keys) — consume and discard.
+                // Escape sequences (arrows, function keys).
                 //
                 // Limitation: a bare ESC press (no following byte) will block
                 // here until the next character arrives because we read the
@@ -1736,17 +1799,80 @@ mod prompt_input {
                     let mut eb = [0u8; 1];
                     if input.read_exact(&mut eb).is_ok() {
                         match eb[0] {
-                            // CSI sequence (ESC [): read until final byte in
-                            // 0x40–0x7E.
-                            b'[' => loop {
-                                let mut fb = [0u8; 1];
-                                if input.read_exact(&mut fb).is_err() {
-                                    break;
+                            // CSI sequence (ESC [): read until final byte in 0x40–0x7E.
+                            // Track whether any parameter bytes preceded the final byte
+                            // so parametrised sequences (e.g. ESC[1;2H) are not mistaken
+                            // for the bare arrow sequences ESC[A/B/C/D.
+                            b'[' => {
+                                let mut has_params = false;
+                                let final_byte = loop {
+                                    let mut fb = [0u8; 1];
+                                    if input.read_exact(&mut fb).is_err() {
+                                        break None;
+                                    }
+                                    if (0x40..=0x7e).contains(&fb[0]) {
+                                        break Some(fb[0]);
+                                    }
+                                    has_params = true;
+                                };
+                                // Only act on simple (no-parameter) CSI sequences.
+                                if !has_params {
+                                    match final_byte {
+                                        // Left arrow (ESC [ D)
+                                        Some(b'D') => {
+                                            if cursor > 0 {
+                                                cursor -= 1;
+                                                redraw(output, &chars, &widths, cursor)?;
+                                            }
+                                        }
+                                        // Right arrow (ESC [ C)
+                                        Some(b'C') => {
+                                            if cursor < chars.len() {
+                                                cursor += 1;
+                                                redraw(output, &chars, &widths, cursor)?;
+                                            }
+                                        }
+                                        // Up arrow (ESC [ A) — navigate backwards in history
+                                        Some(b'A') => {
+                                            if hist_idx == history.len() {
+                                                // Save current draft before entering history.
+                                                draft_chars = chars.clone();
+                                            }
+                                            if hist_idx > 0 {
+                                                hist_idx -= 1;
+                                                chars = history[hist_idx].chars().collect();
+                                                widths = chars
+                                                    .iter()
+                                                    .map(|c| c.width().unwrap_or(1))
+                                                    .collect();
+                                                cursor = chars.len();
+                                                redraw(output, &chars, &widths, cursor)?;
+                                            }
+                                        }
+                                        // Down arrow (ESC [ B) — navigate forwards in history
+                                        Some(b'B') => {
+                                            if hist_idx < history.len() {
+                                                hist_idx += 1;
+                                                if hist_idx == history.len() {
+                                                    // Restore the saved draft.
+                                                    chars = draft_chars.clone();
+                                                } else {
+                                                    chars = history[hist_idx].chars().collect();
+                                                }
+                                                widths = chars
+                                                    .iter()
+                                                    .map(|c| c.width().unwrap_or(1))
+                                                    .collect();
+                                                cursor = chars.len();
+                                                redraw(output, &chars, &widths, cursor)?;
+                                            }
+                                        }
+                                        // All other simple CSI sequences: discard.
+                                        _ => {}
+                                    }
                                 }
-                                if (0x40..=0x7e).contains(&fb[0]) {
-                                    break;
-                                }
-                            },
+                                // CSI sequences with parameters (e.g. ESC[1;2H): discard.
+                            }
                             // SS3 sequence (ESC O): used by some terminals for
                             // function keys (F1–F4) and keypad.  Always exactly
                             // 3 bytes total (ESC O <final>), so consume one more.
@@ -1763,9 +1889,16 @@ mod prompt_input {
                 }
                 // ASCII printable
                 b @ 0x20..=0x7e => {
-                    output.write_all(&[b])?;
-                    chars.push(b as char);
-                    widths.push(1);
+                    let ch = b as char;
+                    chars.insert(cursor, ch);
+                    widths.insert(cursor, 1);
+                    cursor += 1;
+                    // Cursor at end: echo directly, avoiding an unnecessary full redraw.
+                    if cursor == chars.len() {
+                        output.write_all(&[b])?;
+                    } else {
+                        redraw(output, &chars, &widths, cursor)?;
+                    }
                 }
                 // Valid UTF-8 multi-byte lead bytes only.
                 //
@@ -1802,9 +1935,15 @@ mod prompt_input {
                             // move the cursor for them.  Control/format characters
                             // return None — default those to 1.
                             let w = ch.width().unwrap_or(1);
-                            output.write_all(s.as_bytes())?;
-                            chars.push(ch);
-                            widths.push(w);
+                            chars.insert(cursor, ch);
+                            widths.insert(cursor, w);
+                            cursor += 1;
+                            // Cursor at end: echo directly, avoiding an unnecessary full redraw.
+                            if cursor == chars.len() {
+                                output.write_all(s.as_bytes())?;
+                            } else {
+                                redraw(output, &chars, &widths, cursor)?;
+                            }
                         }
                     }
                     // Silently discard invalid or truncated UTF-8 sequences.
@@ -1830,11 +1969,20 @@ mod prompt_input {
         // Helpers
         // ------------------------------------------------------------------ //
 
-        /// Run `process_input` on a raw byte sequence and return `(result, echoed)`.
+        /// Run `process_input` on a raw byte sequence with empty history.
         fn run(input: &[u8]) -> (std::io::Result<Option<String>>, Vec<u8>) {
+            run_with_history(input, &[])
+        }
+
+        /// Run `process_input` with a given history slice.
+        fn run_with_history(
+            input: &[u8],
+            history: &[&str],
+        ) -> (std::io::Result<Option<String>>, Vec<u8>) {
+            let history_owned: Vec<String> = history.iter().map(|s| s.to_string()).collect();
             let mut reader = Cursor::new(input.to_vec());
             let mut output: Vec<u8> = Vec::new();
-            let result = process_input(&mut reader, &mut output);
+            let result = process_input(&mut reader, &mut output, &history_owned);
             (result, output)
         }
 
@@ -2206,18 +2354,19 @@ mod prompt_input {
         }
 
         // ------------------------------------------------------------------ //
-        // Escape / CSI sequences — must be silently discarded
+        // Escape / CSI sequences
         // ------------------------------------------------------------------ //
 
         #[test]
-        fn arrow_up_csi_sequence_discarded() {
-            // ESC [ A = cursor up — should be ignored
+        fn arrow_up_with_no_history_does_nothing() {
+            // ESC [ A = cursor up — with empty history, leaves subsequent text unchanged
             let (res, _) = run(b"\x1b[Ahello\r");
             assert_eq!(res.unwrap(), Some("hello".to_string()));
         }
 
         #[test]
-        fn arrow_right_csi_sequence_discarded() {
+        fn arrow_right_at_end_does_nothing_to_content() {
+            // Right arrow at end of "hi" should not change the text.
             let (res, _) = run(b"hi\x1b[Cthere\r");
             assert_eq!(res.unwrap(), Some("hithere".to_string()));
         }
@@ -2292,6 +2441,113 @@ mod prompt_input {
             let mut s = String::new();
             super::strip_trailing_newline(&mut s);
             assert_eq!(s, "");
+        }
+
+        // ------------------------------------------------------------------ //
+        // Cursor movement — left/right arrows
+        // ------------------------------------------------------------------ //
+
+        #[test]
+        fn left_arrow_moves_cursor_left_then_insert() {
+            // "ab" + left + "X" + Enter → "aXb"
+            let (res, _) = run(b"ab\x1b[DX\r");
+            assert_eq!(res.unwrap(), Some("aXb".to_string()));
+        }
+
+        #[test]
+        fn left_arrow_at_start_does_nothing() {
+            // Three left arrows on empty buffer, then type "hi" → "hi"
+            let (res, _) = run(b"\x1b[D\x1b[D\x1b[Dhi\r");
+            assert_eq!(res.unwrap(), Some("hi".to_string()));
+        }
+
+        #[test]
+        fn right_arrow_at_end_does_nothing() {
+            // "hi" + right arrow (cursor already at end) + "!" → "hi!"
+            let (res, _) = run(b"hi\x1b[C!\r");
+            assert_eq!(res.unwrap(), Some("hi!".to_string()));
+        }
+
+        #[test]
+        fn left_then_right_returns_to_end() {
+            // "ab" + left + right + "c" → "abc"
+            let (res, _) = run(b"ab\x1b[D\x1b[Cc\r");
+            assert_eq!(res.unwrap(), Some("abc".to_string()));
+        }
+
+        #[test]
+        fn backspace_at_cursor_position_deletes_char_before_cursor() {
+            // "abc" + 2 lefts (cursor=1) + backspace (deletes chars[0]='a') → "bc"
+            let (res, _) = run(b"abc\x1b[D\x1b[D\x7f\r");
+            assert_eq!(res.unwrap(), Some("bc".to_string()));
+        }
+
+        #[test]
+        fn backspace_mid_line_deletes_char_before_cursor() {
+            // "abc" + 1 left (cursor=2) + backspace (deletes chars[1]='b') → "ac"
+            let (res, _) = run(b"abc\x1b[D\x7f\r");
+            assert_eq!(res.unwrap(), Some("ac".to_string()));
+        }
+
+        #[test]
+        fn insert_at_start_of_line() {
+            // Three lefts to go to start, insert 'X' → "Xabc"
+            let (res, _) = run(b"abc\x1b[D\x1b[D\x1b[DX\r");
+            assert_eq!(res.unwrap(), Some("Xabc".to_string()));
+        }
+
+        // ------------------------------------------------------------------ //
+        // History navigation — up/down arrows
+        // ------------------------------------------------------------------ //
+
+        #[test]
+        fn up_arrow_with_empty_history_does_nothing() {
+            // With no history, up arrow changes nothing; typed text stays.
+            let (res, _) = run_with_history(b"\x1b[Aworld\r", &[]);
+            assert_eq!(res.unwrap(), Some("world".to_string()));
+        }
+
+        #[test]
+        fn up_arrow_loads_most_recent_history_entry() {
+            // history = ["prev"], up → "prev", Enter
+            let (res, _) = run_with_history(b"\x1b[A\r", &["prev"]);
+            assert_eq!(res.unwrap(), Some("prev".to_string()));
+        }
+
+        #[test]
+        fn up_arrow_multiple_times_navigates_history() {
+            // history = ["first", "second"], two ups → "first"
+            let (res, _) = run_with_history(b"\x1b[A\x1b[A\r", &["first", "second"]);
+            assert_eq!(res.unwrap(), Some("first".to_string()));
+        }
+
+        #[test]
+        fn up_arrow_at_oldest_entry_does_nothing_further() {
+            // history = ["only"], two ups → still "only"
+            let (res, _) = run_with_history(b"\x1b[A\x1b[A\r", &["only"]);
+            assert_eq!(res.unwrap(), Some("only".to_string()));
+        }
+
+        #[test]
+        fn down_arrow_with_no_history_navigation_does_nothing() {
+            // Down arrow without prior up should leave current text unchanged.
+            let (res, _) = run_with_history(b"hi\x1b[B!\r", &["prev"]);
+            assert_eq!(res.unwrap(), Some("hi!".to_string()));
+        }
+
+        #[test]
+        fn up_then_down_restores_draft() {
+            // Type "draft", up (loads "prev"), down (restores "draft"), Enter
+            let (res, _) = run_with_history(b"draft\x1b[A\x1b[B\r", &["prev"]);
+            assert_eq!(res.unwrap(), Some("draft".to_string()));
+        }
+
+        #[test]
+        fn up_twice_down_once_shows_second_history_entry() {
+            // history = ["first", "second"]
+            // up → "second", up → "first", down → "second", Enter
+            let (res, _) = run_with_history(b"\x1b[A\x1b[A\x1b[B\r", &["first", "second"]);
+            assert_eq!(res.unwrap(), Some("second".to_string()));
         }
     }
 }
