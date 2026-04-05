@@ -2055,17 +2055,13 @@ async fn all_models_use_copilot_endpoint_and_jwt() {
 /// client must receive the final text from that fallback call.
 ///
 /// This is the regression test for the gpt-5.4 / gpt-5.x bug: those models
-/// are not accessible via `/chat/completions` and require the Responses API.
+/// gpt-5.x models are routed directly to the Responses API without a
+/// Chat Completions first-hop.
 #[tokio::test]
 async fn responses_api_fallback_on_unsupported_model() {
     let server = MockLlmServer::start().await;
 
-    // First request hits /chat/completions → 400 unsupported_api_for_model.
-    server.enqueue_error(
-        400,
-        r#"{"error":{"code":"unsupported_api_for_model","message":"model is not accessible via the /chat/completions endpoint"}}"#,
-    );
-    // Second request hits /v1/responses (fallback) → text response.
+    // Only one request expected: directly to /v1/responses (no chat/completions first-hop).
     server.enqueue(ScriptedResponse::text_chunks(vec!["fallback-ok"]));
 
     let daemon = start_daemon(&server.url()).await.expect("start_daemon");
@@ -2081,18 +2077,18 @@ async fn responses_api_fallback_on_unsupported_model() {
         "expected fallback response text; got: {text:?}"
     );
 
-    // Two requests must have been made: one to /chat/completions (400), one to /v1/responses.
+    // Exactly one request must have been made: directly to /v1/responses.
     let reqs = server.take_requests();
     assert_eq!(
         reqs.len(),
-        2,
-        "expected 2 requests (chat completions + responses fallback), got {}",
+        1,
+        "expected 1 request (direct to /v1/responses, no chat/completions first-hop), got {}",
         reqs.len()
     );
 }
 
-/// All gpt-5.x model variants must trigger the Responses API fallback when
-/// /chat/completions returns 400 unsupported_api_for_model.
+/// All gpt-5.x model variants must be routed directly to the Responses API
+/// without a Chat Completions first-hop.
 #[tokio::test]
 async fn responses_api_fallback_all_gpt5_variants() {
     for model in &[
@@ -2102,10 +2098,7 @@ async fn responses_api_fallback_all_gpt5_variants() {
         "copilot/gpt-5-turbo",
     ] {
         let server = MockLlmServer::start().await;
-        server.enqueue_error(
-            400,
-            r#"{"error":{"code":"unsupported_api_for_model","message":"not via chat/completions"}}"#,
-        );
+        // Only one request expected: directly to /v1/responses (no chat/completions first-hop).
         server.enqueue(ScriptedResponse::text_chunks(vec!["responses-ok"]));
 
         let daemon = start_daemon(&server.url()).await.expect("start_daemon");
@@ -2125,8 +2118,8 @@ async fn responses_api_fallback_all_gpt5_variants() {
         let reqs = server.take_requests();
         assert_eq!(
             reqs.len(),
-            2,
-            "model={model}: expected 2 requests (chat/completions + /v1/responses), got {}",
+            1,
+            "model={model}: expected 1 request (direct to /v1/responses), got {}",
             reqs.len()
         );
     }
