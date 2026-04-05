@@ -3,6 +3,8 @@
 ## Git Branching Discipline
 - ALWAYS fetch and rebase/checkout from the ABSOLUTE LATEST `master` before starting any new feature or bugfix.
 - Never work on a stale branch to avoid massive merge conflicts in core files like `daemon.rs`.
+- NEVER push directly to `master`. All changes must go through a pull request. Create a feature branch, push it, and open a PR via `gh pr create`.
+- After opening a PR, check Copilot/human review comments with `gh pr view {N} --comments` and `gh api repos/$(gh repo view --json nameWithOwner -q .nameWithOwner)/pulls/{N}/comments`. For each comment: if it has merit, fix it and push; if it doesn't, reply explaining why the current design is correct.
 
 ## CI and Pre-commit Checks
 - Before EVERY commit that modifies Rust code, you MUST run the following "素质三连" (Triple Check) locally to ensure CI passes:

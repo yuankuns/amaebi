@@ -651,6 +651,17 @@ impl std::error::Error for BedrockHttpError {}
 // HTTP send with retry
 // ---------------------------------------------------------------------------
 
+/// Returns true for Bedrock Claude models that support `thinking.type=adaptive`.
+///
+/// Based on the Anthropic API: adaptive thinking is available for claude-opus-4-6
+/// and claude-sonnet-4-6 (the -4-6 cross-region inference profiles).  Older Claude
+/// 4 / 4.5 models support only the legacy `enabled`+`budget_tokens` form, and
+/// Claude 3.x models have no extended-thinking support at all.
+fn supports_adaptive_thinking(model_id: &str) -> bool {
+    model_id.starts_with("us.anthropic.claude-opus-4-6")
+        || model_id.starts_with("us.anthropic.claude-sonnet-4-6")
+}
+
 async fn send_with_retry(
     http: &reqwest::Client,
     token: &str,
@@ -673,6 +684,10 @@ async fn send_with_retry(
     }
     if !bedrock_tools.is_empty() {
         body["toolConfig"] = serde_json::json!({ "tools": bedrock_tools });
+    }
+    if supports_adaptive_thinking(model_id) {
+        body["additionalModelRequestFields"] =
+            serde_json::json!({ "thinking": { "type": "adaptive" } });
     }
 
     let url = converse_stream_endpoint(region, model_id);
@@ -901,8 +916,11 @@ where
                 .get("contentBlockIndex")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0);
-            // Check if this block is a toolUse.
+            // Check if this block is a thinking or toolUse block.
             if let Some(start) = payload.get("start") {
+                if start.get("thinking").is_some() {
+                    tracing::debug!(block_index = idx, "Bedrock: thinking block started");
+                }
                 if let Some(tool_use) = start.get("toolUse") {
                     let id = tool_use
                         .get("toolUseId")
@@ -933,6 +951,14 @@ where
                 .unwrap_or(0);
 
             if let Some(delta) = payload.get("delta") {
+                // Thinking delta — log the token count so the user can confirm it's active.
+                if let Some(thinking) = delta.get("thinking").and_then(|v| v.as_str()) {
+                    tracing::debug!(
+                        block_index = idx,
+                        thinking_chars = thinking.len(),
+                        "Bedrock: thinking delta"
+                    );
+                }
                 // Text delta.
                 if let Some(t) = delta.get("text").and_then(|v| v.as_str()) {
                     text.push_str(t);
@@ -1049,6 +1075,42 @@ where
 mod tests {
     use super::*;
     use crate::copilot::{ApiToolCall, ApiToolCallFunction};
+
+    // ---- supports_adaptive_thinking -----------------------------------------
+
+    #[test]
+    fn adaptive_thinking_enabled_for_opus_4_6() {
+        assert!(supports_adaptive_thinking(
+            "us.anthropic.claude-opus-4-6-v1"
+        ));
+        assert!(supports_adaptive_thinking("us.anthropic.claude-opus-4-6"));
+    }
+
+    #[test]
+    fn adaptive_thinking_enabled_for_sonnet_4_6() {
+        assert!(supports_adaptive_thinking("us.anthropic.claude-sonnet-4-6"));
+        assert!(supports_adaptive_thinking(
+            "us.anthropic.claude-sonnet-4-6-v1:0"
+        ));
+    }
+
+    #[test]
+    fn adaptive_thinking_disabled_for_older_models() {
+        assert!(!supports_adaptive_thinking(
+            "us.anthropic.claude-opus-4-5-20251101-v1:0"
+        ));
+        assert!(!supports_adaptive_thinking(
+            "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
+        ));
+        assert!(!supports_adaptive_thinking(
+            "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+        ));
+        assert!(!supports_adaptive_thinking(
+            "us.anthropic.claude-3-5-haiku-20241022-v1:0"
+        ));
+        assert!(!supports_adaptive_thinking("gpt-4o"));
+        assert!(!supports_adaptive_thinking(""));
+    }
 
     // ---- to_bedrock_request: message conversion ---------------------------
 
