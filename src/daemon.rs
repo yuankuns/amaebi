@@ -504,16 +504,20 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                 session_id,
             } => {
                 tracing::info!(model = %model, prompt_len = prompt.len(), "received detach request");
-                if let Err(e) = state.tokens.get(&state.http).await {
-                    let mut w = writer.lock().await;
-                    write_frame(
-                        &mut *w,
-                        &Response::Error {
-                            message: format!("authentication error: {e:#}"),
-                        },
-                    )
-                    .await?;
-                    break 'connection;
+                if crate::provider::resolve(&model).provider
+                    == crate::provider::ProviderKind::Copilot
+                {
+                    if let Err(e) = state.tokens.get(&state.http).await {
+                        let mut w = writer.lock().await;
+                        write_frame(
+                            &mut *w,
+                            &Response::Error {
+                                message: format!("authentication error: {e:#}"),
+                            },
+                        )
+                        .await?;
+                        break 'connection;
+                    }
                 }
                 let sid = session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
                 {
@@ -817,16 +821,18 @@ async fn handle_resume_request(
             return Ok(ConnAction::Continue);
         }
     };
-    if let Err(e) = state.tokens.get(&state.http).await {
-        let mut w = writer.lock().await;
-        write_frame(
-            &mut *w,
-            &Response::Error {
-                message: format!("authentication error: {e:#}"),
-            },
-        )
-        .await?;
-        return Ok(ConnAction::Break);
+    if crate::provider::resolve(&model).provider == crate::provider::ProviderKind::Copilot {
+        if let Err(e) = state.tokens.get(&state.http).await {
+            let mut w = writer.lock().await;
+            write_frame(
+                &mut *w,
+                &Response::Error {
+                    message: format!("authentication error: {e:#}"),
+                },
+            )
+            .await?;
+            return Ok(ConnAction::Break);
+        }
     }
     let (history, summaries, own_summary) = load_session_state(state, &session_id).await;
     let (messages, _) = build_and_trim_messages(
@@ -917,16 +923,18 @@ async fn handle_chat_request(
         }
     }
 
-    if let Err(e) = state.tokens.get(&state.http).await {
-        let mut w = writer.lock().await;
-        write_frame(
-            &mut *w,
-            &Response::Error {
-                message: format!("authentication error: {e:#}"),
-            },
-        )
-        .await?;
-        return Ok(ConnAction::Break);
+    if crate::provider::resolve(&model).provider == crate::provider::ProviderKind::Copilot {
+        if let Err(e) = state.tokens.get(&state.http).await {
+            let mut w = writer.lock().await;
+            write_frame(
+                &mut *w,
+                &Response::Error {
+                    message: format!("authentication error: {e:#}"),
+                },
+            )
+            .await?;
+            return Ok(ConnAction::Break);
+        }
     }
 
     // First turn: load history from DB.  Subsequent turns: extend carried messages.
