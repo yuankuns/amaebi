@@ -658,7 +658,8 @@ impl std::error::Error for BedrockHttpError {}
 /// 4 / 4.5 models support only the legacy `enabled`+`budget_tokens` form, and
 /// Claude 3.x models have no extended-thinking support at all.
 fn supports_adaptive_thinking(model_id: &str) -> bool {
-    model_id.contains("claude-opus-4-6") || model_id.contains("claude-sonnet-4-6")
+    model_id.starts_with("us.anthropic.claude-opus-4-6")
+        || model_id.starts_with("us.anthropic.claude-sonnet-4-6")
 }
 
 async fn send_with_retry(
@@ -1074,6 +1075,42 @@ where
 mod tests {
     use super::*;
     use crate::copilot::{ApiToolCall, ApiToolCallFunction};
+
+    // ---- supports_adaptive_thinking -----------------------------------------
+
+    #[test]
+    fn adaptive_thinking_enabled_for_opus_4_6() {
+        assert!(supports_adaptive_thinking(
+            "us.anthropic.claude-opus-4-6-v1"
+        ));
+        assert!(supports_adaptive_thinking("us.anthropic.claude-opus-4-6"));
+    }
+
+    #[test]
+    fn adaptive_thinking_enabled_for_sonnet_4_6() {
+        assert!(supports_adaptive_thinking("us.anthropic.claude-sonnet-4-6"));
+        assert!(supports_adaptive_thinking(
+            "us.anthropic.claude-sonnet-4-6-v1:0"
+        ));
+    }
+
+    #[test]
+    fn adaptive_thinking_disabled_for_older_models() {
+        assert!(!supports_adaptive_thinking(
+            "us.anthropic.claude-opus-4-5-20251101-v1:0"
+        ));
+        assert!(!supports_adaptive_thinking(
+            "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
+        ));
+        assert!(!supports_adaptive_thinking(
+            "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+        ));
+        assert!(!supports_adaptive_thinking(
+            "us.anthropic.claude-3-5-haiku-20241022-v1:0"
+        ));
+        assert!(!supports_adaptive_thinking("gpt-4o"));
+        assert!(!supports_adaptive_thinking(""));
+    }
 
     // ---- to_bedrock_request: message conversion ---------------------------
 
