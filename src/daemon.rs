@@ -270,6 +270,16 @@ fn compaction_threshold_tokens(model: &str) -> usize {
 }
 
 // ---------------------------------------------------------------------------
+// Provider auth helpers
+// ---------------------------------------------------------------------------
+
+/// Returns true when the resolved provider for `model` is Copilot, meaning a
+/// token pre-flight check is required before dispatching the request.
+fn needs_copilot_auth(model: &str) -> bool {
+    crate::provider::resolve(model).provider == crate::provider::ProviderKind::Copilot
+}
+
+// ---------------------------------------------------------------------------
 // Listener loop
 // ---------------------------------------------------------------------------
 
@@ -504,16 +514,18 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                 session_id,
             } => {
                 tracing::info!(model = %model, prompt_len = prompt.len(), "received detach request");
-                if let Err(e) = state.tokens.get(&state.http).await {
-                    let mut w = writer.lock().await;
-                    write_frame(
-                        &mut *w,
-                        &Response::Error {
-                            message: format!("authentication error: {e:#}"),
-                        },
-                    )
-                    .await?;
-                    break 'connection;
+                if needs_copilot_auth(&model) {
+                    if let Err(e) = state.tokens.get(&state.http).await {
+                        let mut w = writer.lock().await;
+                        write_frame(
+                            &mut *w,
+                            &Response::Error {
+                                message: format!("authentication error: {e:#}"),
+                            },
+                        )
+                        .await?;
+                        break 'connection;
+                    }
                 }
                 let sid = session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
                 {
@@ -817,16 +829,18 @@ async fn handle_resume_request(
             return Ok(ConnAction::Continue);
         }
     };
-    if let Err(e) = state.tokens.get(&state.http).await {
-        let mut w = writer.lock().await;
-        write_frame(
-            &mut *w,
-            &Response::Error {
-                message: format!("authentication error: {e:#}"),
-            },
-        )
-        .await?;
-        return Ok(ConnAction::Break);
+    if needs_copilot_auth(&model) {
+        if let Err(e) = state.tokens.get(&state.http).await {
+            let mut w = writer.lock().await;
+            write_frame(
+                &mut *w,
+                &Response::Error {
+                    message: format!("authentication error: {e:#}"),
+                },
+            )
+            .await?;
+            return Ok(ConnAction::Break);
+        }
     }
     let (history, summaries, own_summary) = load_session_state(state, &session_id).await;
     let (messages, _) = build_and_trim_messages(
@@ -917,16 +931,18 @@ async fn handle_chat_request(
         }
     }
 
-    if let Err(e) = state.tokens.get(&state.http).await {
-        let mut w = writer.lock().await;
-        write_frame(
-            &mut *w,
-            &Response::Error {
-                message: format!("authentication error: {e:#}"),
-            },
-        )
-        .await?;
-        return Ok(ConnAction::Break);
+    if needs_copilot_auth(&model) {
+        if let Err(e) = state.tokens.get(&state.http).await {
+            let mut w = writer.lock().await;
+            write_frame(
+                &mut *w,
+                &Response::Error {
+                    message: format!("authentication error: {e:#}"),
+                },
+            )
+            .await?;
+            return Ok(ConnAction::Break);
+        }
     }
 
     // First turn: load history from DB.  Subsequent turns: extend carried messages.
@@ -3047,5 +3063,31 @@ mod tests {
             "user",
             "without steer text there must be no trailing user message"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // needs_copilot_auth tests
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn bedrock_models_do_not_require_copilot_auth() {
+        // Bedrock inference profiles must NOT trigger Copilot token pre-flight.
+        assert!(!needs_copilot_auth(
+            "us.anthropic.claude-opus-4-6-20251101-v1:0"
+        ));
+        assert!(!needs_copilot_auth(
+            "us.anthropic.claude-sonnet-4-6-20251101-v1:0"
+        ));
+        assert!(!needs_copilot_auth(
+            "us.anthropic.claude-3-5-sonnet-20241022-v2:0"
+        ));
+    }
+
+    #[test]
+    fn copilot_models_require_copilot_auth() {
+        // Models explicitly routed through the Copilot provider must trigger auth.
+        assert!(needs_copilot_auth("copilot/claude-opus-4-6-20251101"));
+        assert!(needs_copilot_auth("copilot/claude-sonnet-4-5"));
+        assert!(needs_copilot_auth("copilot/gpt-4o"));
     }
 }
