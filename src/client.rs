@@ -1553,11 +1553,19 @@ async fn start_daemon(socket: &std::path::Path) -> Result<()> {
 /// number of erase columns on backspace.
 mod prompt_input {
     use std::io::{Read, Write};
+    use std::sync::{Mutex, OnceLock};
     use unicode_width::UnicodeWidthChar as _;
 
-    thread_local! {
-        /// Per-thread history buffer shared across `read_line_raw` calls.
-        static HISTORY: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// Maximum number of entries kept in the prompt history.
+    const MAX_HISTORY: usize = 1000;
+
+    /// Process-wide history buffer.  Using a `static` instead of `thread_local!`
+    /// ensures history persists across `tokio::task::spawn_blocking` calls, which
+    /// are not guaranteed to reuse the same OS thread.
+    static HISTORY: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+
+    fn history_store() -> &'static Mutex<Vec<String>> {
+        HISTORY.get_or_init(|| Mutex::new(Vec::new()))
     }
 
     /// RAII guard that restores the terminal to its saved settings on drop.
@@ -1646,34 +1654,44 @@ mod prompt_input {
 
     #[cfg(unix)]
     fn read_line_raw_inner(_guard: RawModeGuard) -> std::io::Result<Option<String>> {
-        HISTORY.with(|h| {
-            let history_snapshot: Vec<String> = h.borrow().clone();
-            let result = process_input(
-                &mut std::io::stdin(),
-                &mut std::io::stderr(),
-                &history_snapshot,
-            );
-            if let Ok(Some(ref line)) = result {
-                if !line.is_empty() {
-                    h.borrow_mut().push(line.clone());
+        // Snapshot history while holding the lock for the minimum time, then
+        // release it before blocking on I/O so other threads are not stalled.
+        let history_snapshot: Vec<String> = history_store()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        let result = process_input(
+            &mut std::io::stdin(),
+            &mut std::io::stderr(),
+            &history_snapshot,
+            "> ",
+        );
+        if let Ok(Some(ref line)) = result {
+            if !line.is_empty() {
+                let mut hist = history_store().lock().unwrap_or_else(|p| p.into_inner());
+                if hist.len() >= MAX_HISTORY {
+                    hist.remove(0);
                 }
+                hist.push(line.clone());
             }
-            result
-        })
+        }
+        result
     }
 
     /// Redraw the current line after any edit or cursor movement.
     ///
-    /// Moves to the beginning of the line (`\r`), erases to EOL, re-emits all
-    /// characters, then moves the cursor back from the end to `cursor` position
-    /// using `ESC[nD`.
+    /// Moves to the beginning of the line (`\r`), erases to EOL, reprints
+    /// `prompt` and all `chars`, then moves the cursor back from the end to
+    /// the `cursor` index so the visual cursor sits at the right position.
     fn redraw<W: Write>(
         output: &mut W,
+        prompt: &str,
         chars: &[char],
         widths: &[usize],
         cursor: usize,
     ) -> std::io::Result<()> {
         output.write_all(b"\r\x1b[K")?;
+        output.write_all(prompt.as_bytes())?;
         for ch in chars {
             let mut buf = [0u8; 4];
             output.write_all(ch.encode_utf8(&mut buf).as_bytes())?;
@@ -1694,10 +1712,13 @@ mod prompt_input {
     /// * `Err` with `ErrorKind::Interrupted` on Ctrl-C.
     ///
     /// `history` is a slice of prior input lines; up/down arrows navigate it.
+    /// `prompt` is the prefix string already displayed on the current line; it
+    /// is reprinted on every redraw so cursor movements do not erase it.
     fn process_input<R: Read, W: Write>(
         input: &mut R,
         output: &mut W,
         history: &[String],
+        prompt: &str,
     ) -> std::io::Result<Option<String>> {
         let mut chars: Vec<char> = Vec::new();
         // Display width (columns) of each char, matched by index to `chars`.
@@ -1764,22 +1785,15 @@ mod prompt_input {
                                 write!(output, "\x1b[{w}D\x1b[K")?;
                             } else {
                                 // Mid-line deletion: full redraw to shift remaining chars.
-                                redraw(output, &chars, &widths, cursor)?;
+                                redraw(output, prompt, &chars, &widths, cursor)?;
                             }
                         } else {
                             // Zero-width combining mark: it was rendered on top of the
                             // preceding base character without advancing the cursor.
-                            // Removing it from the buffer leaves its glyph visible;
-                            // repaint the base char (and any remaining combining marks
-                            // on it) to erase the deleted mark from the display.
-                            if let Some(base_idx) = widths[..cursor].iter().rposition(|&bw| bw > 0)
-                            {
-                                let base_width = widths[base_idx];
-                                // Move back to start of base char, clear to EOL.
-                                write!(output, "\x1b[{base_width}D\x1b[K")?;
-                                // Re-echo base char + any remaining combining marks up to cursor.
-                                let repaint: String = chars[base_idx..cursor].iter().collect();
-                                output.write_all(repaint.as_bytes())?;
+                            // Use a full redraw so that characters after the cursor are
+                            // also repainted (inline erase would leave them erased).
+                            if widths[..cursor].iter().any(|&bw| bw > 0) {
+                                redraw(output, prompt, &chars, &widths, cursor)?;
                             }
                             // No preceding base char (mark at start of buffer):
                             // nothing to repaint.
@@ -1822,14 +1836,14 @@ mod prompt_input {
                                         Some(b'D') => {
                                             if cursor > 0 {
                                                 cursor -= 1;
-                                                redraw(output, &chars, &widths, cursor)?;
+                                                redraw(output, prompt, &chars, &widths, cursor)?;
                                             }
                                         }
                                         // Right arrow (ESC [ C)
                                         Some(b'C') => {
                                             if cursor < chars.len() {
                                                 cursor += 1;
-                                                redraw(output, &chars, &widths, cursor)?;
+                                                redraw(output, prompt, &chars, &widths, cursor)?;
                                             }
                                         }
                                         // Up arrow (ESC [ A) — navigate backwards in history
@@ -1846,7 +1860,7 @@ mod prompt_input {
                                                     .map(|c| c.width().unwrap_or(1))
                                                     .collect();
                                                 cursor = chars.len();
-                                                redraw(output, &chars, &widths, cursor)?;
+                                                redraw(output, prompt, &chars, &widths, cursor)?;
                                             }
                                         }
                                         // Down arrow (ESC [ B) — navigate forwards in history
@@ -1864,7 +1878,7 @@ mod prompt_input {
                                                     .map(|c| c.width().unwrap_or(1))
                                                     .collect();
                                                 cursor = chars.len();
-                                                redraw(output, &chars, &widths, cursor)?;
+                                                redraw(output, prompt, &chars, &widths, cursor)?;
                                             }
                                         }
                                         // All other simple CSI sequences: discard.
@@ -1897,7 +1911,7 @@ mod prompt_input {
                     if cursor == chars.len() {
                         output.write_all(&[b])?;
                     } else {
-                        redraw(output, &chars, &widths, cursor)?;
+                        redraw(output, prompt, &chars, &widths, cursor)?;
                     }
                 }
                 // Valid UTF-8 multi-byte lead bytes only.
@@ -1942,7 +1956,7 @@ mod prompt_input {
                             if cursor == chars.len() {
                                 output.write_all(s.as_bytes())?;
                             } else {
-                                redraw(output, &chars, &widths, cursor)?;
+                                redraw(output, prompt, &chars, &widths, cursor)?;
                             }
                         }
                     }
@@ -1982,7 +1996,7 @@ mod prompt_input {
             let history_owned: Vec<String> = history.iter().map(|s| s.to_string()).collect();
             let mut reader = Cursor::new(input.to_vec());
             let mut output: Vec<u8> = Vec::new();
-            let result = process_input(&mut reader, &mut output, &history_owned);
+            let result = process_input(&mut reader, &mut output, &history_owned, "");
             (result, output)
         }
 
@@ -2299,14 +2313,14 @@ mod prompt_input {
 
             // Echo: 'e' (1) + U+0301 (2) = 3 bytes, then the repaint sequence.
             let after_char = &echo[3..]; // skip 'e' + 2-byte combining mark
-                                         // Repaint: ESC[1D ESC[K (move back base_width=1, clear EOL) …
+                                         // Repaint via redraw(): \r ESC[K (go to col 0, clear EOL) …
             assert!(
-                after_char.starts_with(b"\x1b[1D\x1b[K"),
-                "zero-width backspace must repaint base with ESC[1D ESC[K; got: {:?}",
+                after_char.starts_with(b"\r\x1b[K"),
+                "zero-width backspace must redraw with \\r ESC[K; got: {:?}",
                 &after_char[..after_char.len().min(15)]
             );
             // … then re-echo 'e' to restore the base char without the accent.
-            let after_erase = &after_char[b"\x1b[1D\x1b[K".len()..];
+            let after_erase = &after_char[b"\r\x1b[K".len()..];
             assert!(
                 after_erase.starts_with(b"e"),
                 "base char 'e' must be re-echoed after combining mark erase; got: {:?}",
@@ -2332,13 +2346,14 @@ mod prompt_input {
 
             // Echo: 'e'(1) + U+0301(2) + U+0302(2) = 5 bytes, then repaint.
             let after_chars = &echo[5..];
+            // Repaint via redraw(): \r ESC[K (go to col 0, clear EOL) …
             assert!(
-                after_chars.starts_with(b"\x1b[1D\x1b[K"),
-                "backspace of second mark should emit ESC[1D ESC[K; got: {:?}",
+                after_chars.starts_with(b"\r\x1b[K"),
+                "backspace of second mark should emit \\r ESC[K; got: {:?}",
                 &after_chars[..after_chars.len().min(15)]
             );
             // Re-echo must include 'e' + U+0301 but not U+0302.
-            let after_erase = &after_chars[b"\x1b[1D\x1b[K".len()..];
+            let after_erase = &after_chars[b"\r\x1b[K".len()..];
             let expected: &[u8] = "e\u{0301}".as_bytes(); // 'e' + 0xCC 0x81
             assert!(
                 after_erase.starts_with(expected),
