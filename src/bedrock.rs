@@ -668,7 +668,8 @@ fn supports_adaptive_thinking(model_id: &str) -> bool {
 /// Matches the reference implementation: claude-sonnet-4 family and opus-4-6.
 /// The model_id must be a bare resolved Bedrock ID (no `[1m]` suffix).
 pub(crate) fn supports_1m_context(model_id: &str) -> bool {
-    model_id.contains("claude-sonnet-4") || model_id.contains("claude-opus-4-6")
+    model_id.starts_with("us.anthropic.claude-sonnet-4")
+        || model_id.starts_with("us.anthropic.claude-opus-4-6")
 }
 
 #[allow(clippy::too_many_arguments)]

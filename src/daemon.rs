@@ -220,16 +220,19 @@ fn count_message_tokens(messages: &[Message]) -> usize {
 /// Falls back to a conservative 32 k for unknown models so we never send
 /// more tokens than the server can handle.
 fn context_limit_for_model(model: &str) -> usize {
-    // Check for the [1m] opt-in suffix before resolving the model ID.
-    // We must operate on the raw string here so the flag survives alias resolution.
-    if model.ends_with("[1m]") {
-        let bare = resolved_model_id(model); // strips [1m] via provider::resolve
-        if crate::bedrock::supports_1m_context(&bare) {
-            return 1_000_000;
-        }
+    // Resolve once to get the provider, model ID, and use_1m flag together.
+    // Gating on provider == Bedrock prevents Copilot model IDs that contain
+    // "claude-sonnet-4" / "claude-opus-4-6" (e.g. copilot/claude-sonnet-4[1m])
+    // from incorrectly receiving a 1M token budget.
+    let spec = crate::provider::resolve(model);
+    if spec.provider == crate::provider::ProviderKind::Bedrock
+        && spec.use_1m
+        && crate::bedrock::supports_1m_context(&spec.model_id)
+    {
+        return 1_000_000;
     }
 
-    let model = resolved_model_id(model);
+    let model = spec.model_id;
     // Ordered longest-prefix-first so that e.g. "gpt-4-turbo" beats "gpt-4".
     const TABLE: &[(&str, usize)] = &[
         // Bedrock model IDs (cross-region us.anthropic.* format): 200k context.
@@ -2693,6 +2696,20 @@ mod tests {
     fn context_limit_1m_suffix_unsupported_model_falls_back() {
         // Haiku does not support 1M — suffix is ignored, returns standard limit.
         assert_eq!(context_limit_for_model("claude-haiku-3.5[1m]"), 200_000);
+    }
+
+    #[test]
+    fn context_limit_1m_suffix_copilot_does_not_get_1m_budget() {
+        // Copilot provider does not support 1M — even a Claude model ID with
+        // [1m] must not receive a 1M token budget.
+        assert_eq!(
+            context_limit_for_model("copilot/claude-sonnet-4-5[1m]"),
+            200_000
+        );
+        assert_eq!(
+            context_limit_for_model("copilot/claude-opus-4.6[1m]"),
+            200_000
+        );
     }
 
     #[test]

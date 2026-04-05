@@ -128,8 +128,10 @@ pub fn resolve(raw: &str) -> ModelSpec {
                     provider: ProviderKind::Copilot,
                     model_id: model.to_owned(),
                     display_name,
-                    // Copilot does not support 1M context — ignore the suffix.
-                    use_1m: false,
+                    // Preserve the user's opt-in so the daemon can warn and log
+                    // accurately; the Copilot execution path ignores it at
+                    // runtime because Copilot does not support 1M context.
+                    use_1m,
                 };
             }
             "bedrock" => {
@@ -295,13 +297,14 @@ mod tests {
     }
 
     #[test]
-    fn resolve_1m_suffix_copilot_ignored() {
-        // Copilot does not support 1M — use_1m must be false regardless of suffix.
+    fn resolve_1m_suffix_copilot_preserves_flag() {
+        // Copilot does not support 1M at runtime, but use_1m is preserved so
+        // the daemon can warn and log accurately.
         let spec = resolve("copilot/claude-opus-4.6[1m]");
         assert_eq!(spec.provider, ProviderKind::Copilot);
         assert_eq!(spec.model_id, "claude-opus-4.6");
         assert_eq!(spec.display_name, "copilot/claude-opus-4.6[1m]");
-        assert!(!spec.use_1m);
+        assert!(spec.use_1m);
     }
 
     #[test]
