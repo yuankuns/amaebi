@@ -33,6 +33,108 @@ impl std::fmt::Display for Interrupted {
 impl std::error::Error for Interrupted {}
 
 // ---------------------------------------------------------------------------
+// Markdown rendering
+// ---------------------------------------------------------------------------
+
+/// Streaming-friendly state machine that buffers raw Markdown text chunks and
+/// emits complete render units (paragraphs, code blocks, tables) that can be
+/// pretty-printed with [`termimad`].
+#[derive(Default)]
+struct MarkdownBuffer {
+    buf: String,
+    state: MdState,
+    /// Byte offset into `buf` up to which lines have already been scanned.
+    scanned: usize,
+}
+
+#[derive(Default, PartialEq, Debug)]
+enum MdState {
+    #[default]
+    Normal,
+    InCodeBlock,
+    InTable,
+}
+
+impl MarkdownBuffer {
+    fn push(&mut self, chunk: &str) {
+        self.buf.push_str(chunk);
+        self.scan_new_lines();
+    }
+
+    /// Scan only lines that have been appended since the last call, updating state.
+    fn scan_new_lines(&mut self) {
+        // Walk only the unscanned suffix, but we must back up to the start of
+        // the current (possibly incomplete) last line so we don't miss a line
+        // whose newline just arrived in this chunk.
+        let scan_from = self.buf[..self.scanned].rfind('\n').map_or(0, |p| p + 1);
+        let mut is_first_line = scan_from == 0 && self.scanned == 0;
+        for line in self.buf[scan_from..].lines() {
+            let trimmed = line.trim();
+            match &self.state {
+                MdState::Normal => {
+                    if trimmed.starts_with("```") {
+                        self.state = MdState::InCodeBlock;
+                    } else if trimmed.starts_with('|') {
+                        self.state = MdState::InTable;
+                    }
+                }
+                MdState::InCodeBlock => {
+                    if !is_first_line && trimmed.starts_with("```") {
+                        self.state = MdState::Normal;
+                    }
+                }
+                MdState::InTable => {
+                    if !trimmed.starts_with('|') && !trimmed.is_empty() {
+                        self.state = MdState::Normal;
+                    }
+                }
+            }
+            is_first_line = false;
+        }
+        // Advance scanned to the start of the last (possibly incomplete) line.
+        self.scanned = self.buf.rfind('\n').map_or(0, |p| p + 1);
+    }
+
+    fn flush_if_ready(&mut self) -> Option<String> {
+        if self.state != MdState::Normal {
+            return None;
+        }
+        if let Some(idx) = self.buf.find("\n\n") {
+            let para = self.buf[..idx + 2].to_string();
+            self.buf = self.buf[idx + 2..].to_string();
+            // scanned offset must be adjusted for the drained prefix.
+            self.scanned = self.scanned.saturating_sub(idx + 2);
+            if !para.trim().is_empty() {
+                return Some(para);
+            }
+        }
+        None
+    }
+
+    fn flush_all(&mut self) -> Option<String> {
+        if self.buf.trim().is_empty() {
+            self.buf.clear();
+            self.scanned = 0;
+            self.state = MdState::Normal;
+            return None;
+        }
+        let out = std::mem::take(&mut self.buf);
+        self.scanned = 0;
+        self.state = MdState::Normal;
+        Some(out)
+    }
+}
+
+fn render_markdown(text: &str) -> String {
+    if std::io::stdout().is_terminal() {
+        let skin = termimad::MadSkin::default();
+        skin.term_text(text).to_string()
+    } else {
+        text.to_string()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // /dev command parsing and prompt synthesis
 // ---------------------------------------------------------------------------
 
@@ -350,6 +452,7 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
     let mut steer_buffer: VecDeque<Response> = VecDeque::new();
     // Set to true when eviction occurs so flush_steer_buffer can print a truncation notice.
     let mut buffer_truncated = false;
+    let mut md_buf = MarkdownBuffer::default();
 
     // Stdin reader — only created when stdin is a TTY (interactive terminal).
     // Piped invocations (`echo "fix" | amaebi ask "..."`) have stdin as a
@@ -420,14 +523,23 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
                         if steer_pending {
                             push_steer_buffer(&mut steer_buffer, &mut buffer_truncated, Response::Text { chunk });
                         } else {
-                            stdout
-                                .write_all(chunk.as_bytes())
-                                .await
-                                .context("writing to stdout")?;
-                            stdout.flush().await.context("flushing stdout")?;
+                            md_buf.push(&chunk);
+                            if let Some(ready) = md_buf.flush_if_ready() {
+                                let out = render_markdown(&ready);
+                                stdout
+                                    .write_all(out.as_bytes())
+                                    .await
+                                    .context("writing to stdout")?;
+                                stdout.flush().await.context("flushing stdout")?;
+                            }
                         }
                     }
                     Response::Done => {
+                        if let Some(remaining) = md_buf.flush_all() {
+                            let out = render_markdown(&remaining);
+                            let _ = stdout.write_all(out.as_bytes()).await;
+                            let _ = stdout.flush().await;
+                        }
                         // Flush any buffered frames before exiting.
                         flush_steer_buffer(&mut steer_buffer, &mut buffer_truncated, &mut stdout).await?;
                         break;
@@ -628,6 +740,7 @@ pub async fn run_chat_loop(
     // Text chunks buffered while a steer correction is being typed so that
     // streaming output does not interleave with user input.
     let mut steer_text_buf: Vec<String> = Vec::new();
+    let mut md_buf = MarkdownBuffer::default();
 
     'session: loop {
         let prompt = match next_prompt.take() {
@@ -713,11 +826,19 @@ pub async fn run_chat_loop(
                                 // interleave with the correction prompt.
                                 steer_text_buf.push(chunk);
                             } else {
-                                stdout.write_all(chunk.as_bytes()).await?;
-                                stdout.flush().await?;
+                                md_buf.push(&chunk);
+                                if let Some(ready) = md_buf.flush_if_ready() {
+                                    let out = render_markdown(&ready);
+                                    stdout.write_all(out.as_bytes()).await?;
+                                    stdout.flush().await?;
+                                }
                             }
                         }
                         Response::Done => {
+                            if let Some(remaining) = md_buf.flush_all() {
+                                let out = render_markdown(&remaining);
+                                let _ = stdout.write_all(out.as_bytes()).await;
+                            }
                             // Flush any text that arrived while steer was pending.
                             for chunk in steer_text_buf.drain(..) {
                                 stdout.write_all(chunk.as_bytes()).await?;
@@ -748,9 +869,13 @@ pub async fn run_chat_loop(
                         }
                         Response::SteerAck => {
                             steer_pending = false;
-                            // Flush text buffered while the steer was pending.
+                            // Flush text buffered while steer was pending through md_buf.
                             for chunk in steer_text_buf.drain(..) {
-                                let _ = stdout.write_all(chunk.as_bytes()).await;
+                                md_buf.push(&chunk);
+                                if let Some(ready) = md_buf.flush_if_ready() {
+                                    let out = render_markdown(&ready);
+                                    let _ = stdout.write_all(out.as_bytes()).await;
+                                }
                             }
                             let _ = stdout.flush().await;
                         }
@@ -917,6 +1042,7 @@ pub async fn run_resume(
     let mut steer_buffer: VecDeque<Response> = VecDeque::new();
     // Set to true when eviction occurs so flush_steer_buffer can print a truncation notice.
     let mut buffer_truncated = false;
+    let mut md_buf = MarkdownBuffer::default();
 
     let use_stdin = std::io::stdin().is_terminal();
     let mut stdin_lines: Option<BufReader<tokio::io::Stdin>> = if use_stdin {
@@ -967,11 +1093,20 @@ pub async fn run_resume(
                         if steer_pending {
                             push_steer_buffer(&mut steer_buffer, &mut buffer_truncated, Response::Text { chunk });
                         } else {
-                            stdout.write_all(chunk.as_bytes()).await.context("writing to stdout")?;
-                            stdout.flush().await.context("flushing stdout")?;
+                            md_buf.push(&chunk);
+                            if let Some(ready) = md_buf.flush_if_ready() {
+                                let out = render_markdown(&ready);
+                                stdout.write_all(out.as_bytes()).await.context("writing to stdout")?;
+                                stdout.flush().await.context("flushing stdout")?;
+                            }
                         }
                     }
                     Response::Done => {
+                        if let Some(remaining) = md_buf.flush_all() {
+                            let out = render_markdown(&remaining);
+                            let _ = stdout.write_all(out.as_bytes()).await;
+                            let _ = stdout.flush().await;
+                        }
                         // Flush any buffered frames before exiting.
                         flush_steer_buffer(&mut steer_buffer, &mut buffer_truncated, &mut stdout).await?;
                         break;
@@ -2348,5 +2483,49 @@ mod tests {
         // Multiple tasks should use background processes + wait
         assert!(prompt.contains(") &"));
         assert!(prompt.contains("wait"));
+    }
+
+    // -----------------------------------------------------------------------
+    // MarkdownBuffer state machine
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn paragraph_flush_on_double_newline() {
+        let mut buf = MarkdownBuffer::default();
+        buf.push("Hello world");
+        assert_eq!(buf.flush_if_ready(), None);
+        buf.push("\n\nNext paragraph");
+        let flushed = buf.flush_if_ready().expect("should flush paragraph");
+        assert!(flushed.contains("Hello world"));
+        assert_eq!(buf.buf, "Next paragraph");
+    }
+
+    #[test]
+    fn code_block_not_flushed_mid_block() {
+        let mut buf = MarkdownBuffer::default();
+        buf.push("```rust\nfn main() {}\n");
+        assert_eq!(buf.flush_if_ready(), None);
+        buf.push("let x = 1;\n");
+        assert_eq!(buf.flush_if_ready(), None);
+        assert_eq!(buf.state, MdState::InCodeBlock);
+    }
+
+    #[test]
+    fn table_buffered_until_non_pipe_line() {
+        let mut buf = MarkdownBuffer::default();
+        buf.push("| col1 | col2 |\n| --- | --- |\n| a | b |\n");
+        assert_eq!(buf.flush_if_ready(), None);
+        assert_eq!(buf.state, MdState::InTable);
+        buf.push("after table\n");
+        assert_eq!(buf.state, MdState::Normal);
+    }
+
+    #[test]
+    fn flush_all_returns_remaining() {
+        let mut buf = MarkdownBuffer::default();
+        buf.push("Some text without double newline");
+        let out = buf.flush_all().expect("flush_all should return content");
+        assert!(out.contains("Some text without double newline"));
+        assert_eq!(buf.flush_all(), None);
     }
 }
