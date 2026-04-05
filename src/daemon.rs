@@ -376,9 +376,12 @@ async fn load_session_state(
 }
 
 /// Build a message list from session state, trim to the token budget, and
-/// inject skill files.  Does a single `inject_skill_files` call — always at
-/// the end — so the injected content is never wasted on a list that gets
-/// rebuilt.
+/// inject skill files.
+///
+/// Injects skill files into the full-history list first so the threshold check
+/// accounts for their token cost (AGENTS.md/SOUL.md can be large).  If the
+/// result still exceeds the budget, rebuilds with the hot-tail history slice
+/// and injects again so the returned messages always include the skill files.
 async fn build_and_trim_messages(
     prompt: &str,
     tmux_pane: Option<&str>,
@@ -2147,16 +2150,22 @@ pub(crate) async fn inject_skill_files(messages: &mut Vec<Message>) {
 
 /// Internal helper used by [`inject_skill_files`] and tests.
 async fn inject_skill_files_from(messages: &mut Vec<Message>, amaebi_home: &std::path::Path) {
-    // Skill files are inserted right after the first system message (index 0) so
-    // the final order is: [system] / [SOUL.md] / [AGENTS.md] / [on-demand docs] /
-    // [history...] / [current prompt].  Skills take highest priority and must
-    // never be displaced by history trimming.
+    // Skill files are inserted right after the first system message so the
+    // final prompt order is:
+    //   [system] / [SOUL.md] / [AGENTS.md] / [on-demand docs] /
+    //   [own_summary (user+assistant, if any)] / [history...] / [current prompt]
+    // Skills take highest priority and must never be displaced by history trimming.
     const FIXED_FILES: &[(&str, &str)] =
         &[("SOUL.md", "## Soul"), ("AGENTS.md", "## Agent Guidelines")];
 
-    // Insert position: right after the leading system message.
-    // If messages is empty (e.g. in tests that call this directly), insert at 0.
-    let insert_at = if messages.is_empty() { 0 } else { 1 };
+    // Find the insertion point: right after the first system-role message.
+    // Falls back to 0 if the list is empty or has no system message (e.g. in
+    // unit tests that call this helper directly with an empty vec).
+    let insert_at = messages
+        .iter()
+        .position(|m| m.role == "system")
+        .map(|i| i + 1)
+        .unwrap_or(0);
 
     // Collect skill messages in declared order, then splice them in at
     // insert_at so they appear contiguously in the right place.
