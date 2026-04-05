@@ -61,7 +61,9 @@ fn max_output_tokens_for_model(model: &str) -> usize {
 fn response_max_tokens(model: &str) -> usize {
     let model_id = &resolved_model_id(model);
     let model_max = max_output_tokens_for_model(model_id);
-    let context_budget = context_limit_for_model(model_id) / 2;
+    // Pass the raw model string (preserving [1m]) so context_limit_for_model
+    // can return 1_000_000 when the suffix is present.
+    let context_budget = context_limit_for_model(model) / 2;
     let result = model_max.min(context_budget);
     tracing::debug!(
         model,
@@ -218,6 +220,15 @@ fn count_message_tokens(messages: &[Message]) -> usize {
 /// Falls back to a conservative 32 k for unknown models so we never send
 /// more tokens than the server can handle.
 fn context_limit_for_model(model: &str) -> usize {
+    // Check for the [1m] opt-in suffix before resolving the model ID.
+    // We must operate on the raw string here so the flag survives alias resolution.
+    if model.ends_with("[1m]") {
+        let bare = resolved_model_id(model); // strips [1m] via provider::resolve
+        if crate::bedrock::supports_1m_context(&bare) {
+            return 1_000_000;
+        }
+    }
+
     let model = resolved_model_id(model);
     // Ordered longest-prefix-first so that e.g. "gpt-4-turbo" beats "gpt-4".
     const TABLE: &[(&str, usize)] = &[
@@ -1404,6 +1415,7 @@ where
         provider = %spec.provider,
         model_id = %spec.model_id,
         display = %spec.display_name,
+        use_1m = spec.use_1m,
         "invoke_model: resolved provider"
     );
 
@@ -1411,7 +1423,7 @@ where
         crate::provider::ProviderKind::Bedrock => {
             crate::bedrock::stream_chat(
                 &state.http,
-                &spec.model_id,
+                &spec,
                 messages,
                 tools,
                 max_completion_tokens,
@@ -1421,6 +1433,21 @@ where
         }
 
         crate::provider::ProviderKind::Copilot => {
+            if spec.use_1m {
+                tracing::warn!(
+                    display = %spec.display_name,
+                    "1M context is not supported via Copilot; proceeding with standard context window"
+                );
+                write_frame(
+                    writer,
+                    &crate::ipc::Response::Text {
+                        chunk: "[warning] 1M context ([1m]) is not supported via Copilot; \
+                                proceeding with standard context window.\n"
+                            .into(),
+                    },
+                )
+                .await?;
+            }
             invoke_copilot(
                 state,
                 &spec.model_id,
@@ -2645,6 +2672,37 @@ mod tests {
         assert_eq!(context_limit_for_model("o1-preview"), 200_000);
         assert_eq!(context_limit_for_model("o3-mini"), 200_000);
         assert_eq!(context_limit_for_model("claude-3-5-sonnet"), 200_000);
+    }
+
+    #[test]
+    fn context_limit_1m_suffix_supported_models() {
+        // Supported models with [1m] suffix return 1_000_000.
+        assert_eq!(context_limit_for_model("claude-sonnet-4.6[1m]"), 1_000_000);
+        assert_eq!(context_limit_for_model("claude-opus-4.6[1m]"), 1_000_000);
+        assert_eq!(
+            context_limit_for_model("us.anthropic.claude-sonnet-4-6[1m]"),
+            1_000_000
+        );
+        assert_eq!(
+            context_limit_for_model("bedrock/us.anthropic.claude-sonnet-4-6[1m]"),
+            1_000_000
+        );
+    }
+
+    #[test]
+    fn context_limit_1m_suffix_unsupported_model_falls_back() {
+        // Haiku does not support 1M — suffix is ignored, returns standard limit.
+        assert_eq!(context_limit_for_model("claude-haiku-3.5[1m]"), 200_000);
+    }
+
+    #[test]
+    fn context_limit_no_1m_suffix_unchanged() {
+        // Without suffix, supported models still return standard 200k.
+        assert_eq!(context_limit_for_model("claude-sonnet-4.6"), 200_000);
+        assert_eq!(
+            context_limit_for_model("us.anthropic.claude-sonnet-4-6"),
+            200_000
+        );
     }
 
     #[test]
