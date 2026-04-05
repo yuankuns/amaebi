@@ -295,10 +295,14 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
 
     let (reader, mut writer) = tokio::io::split(stream);
 
-    // Resolve model: CLI flag > AMAEBI_MODEL env var > default.
-    let model = model
-        .or_else(|| std::env::var("AMAEBI_MODEL").ok())
-        .unwrap_or_else(|| crate::provider::DEFAULT_MODEL.to_string());
+    // Resolve model: CLI flag > SOUL.md frontmatter > AMAEBI_MODEL env var > default.
+    let model = if let Some(m) = model {
+        m
+    } else if let Some(m) = crate::daemon::skill_model_override().await {
+        m
+    } else {
+        std::env::var("AMAEBI_MODEL").unwrap_or_else(|_| crate::provider::DEFAULT_MODEL.to_string())
+    };
 
     // Resolve the session UUID for the current working directory.
     // Wrapped in spawn_blocking because session::get_or_create does file I/O.
@@ -575,9 +579,13 @@ pub async fn run_chat_loop(
 ) -> Result<()> {
     let mut sigint = signal(SignalKind::interrupt()).context("setting up SIGINT handler")?;
 
-    let model = model
-        .or_else(|| std::env::var("AMAEBI_MODEL").ok())
-        .unwrap_or_else(|| crate::provider::DEFAULT_MODEL.to_string());
+    let model = if let Some(m) = model {
+        m
+    } else if let Some(m) = crate::daemon::skill_model_override().await {
+        m
+    } else {
+        std::env::var("AMAEBI_MODEL").unwrap_or_else(|_| crate::provider::DEFAULT_MODEL.to_string())
+    };
 
     let cwd = std::env::current_dir().context("getting current directory")?;
     let cwd_for_session = cwd.clone();
@@ -824,9 +832,13 @@ pub async fn run_detach(socket: PathBuf, prompt: String, model: Option<String>) 
     let stream = connect_or_start_daemon(&socket).await?;
     let (reader, mut writer) = tokio::io::split(stream);
 
-    let model = model
-        .or_else(|| std::env::var("AMAEBI_MODEL").ok())
-        .unwrap_or_else(|| crate::provider::DEFAULT_MODEL.to_string());
+    let model = if let Some(m) = model {
+        m
+    } else if let Some(m) = crate::daemon::skill_model_override().await {
+        m
+    } else {
+        std::env::var("AMAEBI_MODEL").unwrap_or_else(|_| crate::provider::DEFAULT_MODEL.to_string())
+    };
 
     let cwd = std::env::current_dir().context("getting current directory")?;
     let session_id = tokio::task::spawn_blocking(move || session::get_or_create(&cwd))
@@ -889,9 +901,13 @@ pub async fn run_resume(
     let stream = connect_or_start_daemon(&socket).await?;
     let (reader, mut writer) = tokio::io::split(stream);
 
-    let model = model
-        .or_else(|| std::env::var("AMAEBI_MODEL").ok())
-        .unwrap_or_else(|| crate::provider::DEFAULT_MODEL.to_string());
+    let model = if let Some(m) = model {
+        m
+    } else if let Some(m) = crate::daemon::skill_model_override().await {
+        m
+    } else {
+        std::env::var("AMAEBI_MODEL").unwrap_or_else(|_| crate::provider::DEFAULT_MODEL.to_string())
+    };
 
     let req = Request::Resume {
         prompt,

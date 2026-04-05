@@ -364,10 +364,14 @@ impl acp::Agent for AmaebiAgent {
 /// `socket` is the path to a running daemon's Unix socket.  Memory operations
 /// are routed through it so the daemon remains the sole SQLite writer.
 pub async fn run(model: Option<String>, socket: PathBuf) -> Result<()> {
-    let model: Arc<str> = model
-        .or_else(|| std::env::var("AMAEBI_MODEL").ok())
-        .unwrap_or_else(|| crate::provider::DEFAULT_MODEL.to_string())
-        .into();
+    let model: Arc<str> = if let Some(m) = model {
+        m
+    } else if let Some(m) = crate::daemon::skill_model_override().await {
+        m
+    } else {
+        std::env::var("AMAEBI_MODEL").unwrap_or_else(|_| crate::provider::DEFAULT_MODEL.to_string())
+    }
+    .into();
 
     let state = Arc::new(
         DaemonState::new()

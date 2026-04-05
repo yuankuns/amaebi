@@ -2137,6 +2137,56 @@ where
 
 /// Read global config files from `~/.amaebi/` and inject them as system messages.
 ///
+/// Parse a YAML-style frontmatter block at the start of `content` and return
+/// the value of the `model:` key, if present.
+///
+/// Recognises the standard `---\n...\n---` delimiter.  The value may be
+/// quoted or unquoted; `model: inherit` is treated as "no override" and
+/// returns `None`.  All other values are returned as-is so the caller can
+/// feed them into the normal provider resolution pipeline.
+///
+/// # Examples
+/// ```text
+/// ---
+/// model: claude-opus-4.6
+/// ---
+/// # SOUL.md …
+/// ```
+fn parse_frontmatter_model(content: &str) -> Option<String> {
+    let s = content.trim_start();
+    if !s.starts_with("---") {
+        return None;
+    }
+    let after_open = s[3..].strip_prefix('\n').unwrap_or(&s[3..]);
+    let end = after_open.find("\n---")?;
+    for line in after_open[..end].lines() {
+        if let Some(rest) = line.strip_prefix("model:") {
+            let value = rest.trim().trim_matches('"').trim_matches('\'');
+            if !value.is_empty() && value != "inherit" {
+                return Some(value.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Return the model override declared in `~/.amaebi/SOUL.md` frontmatter, if any.
+///
+/// This allows skill authors to pin a session to a specific model — e.g. a
+/// supervisor SOUL.md can require `model: claude-opus-4.6` while routine chat
+/// sessions fall back to the cheaper default.  Priority in the caller:
+///
+/// ```text
+/// --model CLI flag  >  SOUL.md frontmatter  >  AMAEBI_MODEL env  >  default
+/// ```
+pub(crate) async fn skill_model_override() -> Option<String> {
+    let home = amaebi_home().ok()?;
+    let content = tokio::fs::read_to_string(home.join("SOUL.md")).await.ok()?;
+    let model = parse_frontmatter_model(&content)?;
+    tracing::debug!(model, "skill model override from SOUL.md frontmatter");
+    Some(model)
+}
+
 /// Loads `AGENTS.md` and `SOUL.md` from the user's amaebi home directory
 /// (`~/.amaebi/`).  Files that do not exist or are whitespace-only are
 /// silently skipped.  No per-project or CWD-relative files are read.
@@ -2392,9 +2442,11 @@ async fn run_cron_job(state: Arc<DaemonState>, job: &cron::CronJob) {
     // Generate a fresh session UUID for this run.
     let session_id = uuid::Uuid::new_v4().to_string();
 
-    // Resolve model from env var (same default as CLI client).
-    let model = std::env::var("AMAEBI_MODEL")
-        .unwrap_or_else(|_| crate::provider::DEFAULT_MODEL.to_string());
+    // Resolve model: SOUL.md frontmatter > AMAEBI_MODEL env var > default.
+    let model = skill_model_override()
+        .await
+        .or_else(|| std::env::var("AMAEBI_MODEL").ok())
+        .unwrap_or_else(|| crate::provider::DEFAULT_MODEL.to_string());
 
     let mut messages = build_messages(&job.description, None, &[], &[], None);
     inject_skill_files(&mut messages).await;
@@ -2446,6 +2498,55 @@ async fn run_cron_job(state: Arc<DaemonState>, job: &cron::CronJob) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- parse_frontmatter_model --------------------------------------------
+
+    #[test]
+    fn frontmatter_model_unquoted() {
+        let src = "---\nmodel: claude-opus-4.6\n---\n# SOUL";
+        assert_eq!(
+            parse_frontmatter_model(src),
+            Some("claude-opus-4.6".to_string())
+        );
+    }
+
+    #[test]
+    fn frontmatter_model_double_quoted() {
+        let src = "---\nmodel: \"claude-sonnet-4.6\"\n---\n# content";
+        assert_eq!(
+            parse_frontmatter_model(src),
+            Some("claude-sonnet-4.6".to_string())
+        );
+    }
+
+    #[test]
+    fn frontmatter_model_inherit_returns_none() {
+        let src = "---\nmodel: inherit\n---\n# content";
+        assert_eq!(parse_frontmatter_model(src), None);
+    }
+
+    #[test]
+    fn frontmatter_no_model_key_returns_none() {
+        let src = "---\ndescription: A supervisor agent\n---\n# content";
+        assert_eq!(parse_frontmatter_model(src), None);
+    }
+
+    #[test]
+    fn frontmatter_missing_delimiter_returns_none() {
+        let src = "# No frontmatter here\nmodel: claude-opus-4.6";
+        assert_eq!(parse_frontmatter_model(src), None);
+    }
+
+    #[test]
+    fn frontmatter_leading_whitespace_ignored() {
+        let src = "\n\n---\nmodel: claude-opus-4.6\n---\n";
+        assert_eq!(
+            parse_frontmatter_model(src),
+            Some("claude-opus-4.6".to_string())
+        );
+    }
+
+    // ---- make_db_entry (existing) -------------------------------------------
 
     fn make_db_entry(id: i64, role: &str, content: &str) -> memory_db::DbMemoryEntry {
         memory_db::DbMemoryEntry {
