@@ -915,8 +915,11 @@ where
                 .get("contentBlockIndex")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0);
-            // Check if this block is a toolUse.
+            // Check if this block is a thinking or toolUse block.
             if let Some(start) = payload.get("start") {
+                if start.get("thinking").is_some() {
+                    tracing::debug!(block_index = idx, "Bedrock: thinking block started");
+                }
                 if let Some(tool_use) = start.get("toolUse") {
                     let id = tool_use
                         .get("toolUseId")
@@ -947,6 +950,14 @@ where
                 .unwrap_or(0);
 
             if let Some(delta) = payload.get("delta") {
+                // Thinking delta — log the token count so the user can confirm it's active.
+                if let Some(thinking) = delta.get("thinking").and_then(|v| v.as_str()) {
+                    tracing::debug!(
+                        block_index = idx,
+                        thinking_chars = thinking.len(),
+                        "Bedrock: thinking delta"
+                    );
+                }
                 // Text delta.
                 if let Some(t) = delta.get("text").and_then(|v| v.as_str()) {
                     text.push_str(t);
