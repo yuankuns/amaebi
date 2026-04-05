@@ -2151,18 +2151,15 @@ async fn inject_skill_files_from(messages: &mut Vec<Message>, amaebi_home: &std:
     // the final order is: [system] / [SOUL.md] / [AGENTS.md] / [on-demand docs] /
     // [history...] / [current prompt].  Skills take highest priority and must
     // never be displaced by history trimming.
-    //
-    // We collect them in reverse order and insert at position 1 each time so the
-    // first file collected ends up first in the list.
     const FIXED_FILES: &[(&str, &str)] =
         &[("SOUL.md", "## Soul"), ("AGENTS.md", "## Agent Guidelines")];
 
     // Insert position: right after the leading system message.
-    // If for some reason messages is empty, append normally.
+    // If messages is empty (e.g. in tests that call this directly), insert at 0.
     let insert_at = if messages.is_empty() { 0 } else { 1 };
 
-    // Collect fixed-file messages in reverse so inserting at `insert_at` each
-    // time preserves the declared order in the final list.
+    // Collect skill messages in declared order, then splice them in at
+    // insert_at so they appear contiguously in the right place.
     let mut to_insert: Vec<Message> = Vec::new();
     for (filename, header) in FIXED_FILES {
         let path = amaebi_home.join(filename);
@@ -2679,6 +2676,39 @@ mod tests {
         assert!(body(&messages[0]).contains("soul content"));
         assert!(body(&messages[1]).contains("## Agent Guidelines"));
         assert!(body(&messages[1]).contains("agent guidelines"));
+    }
+
+    #[tokio::test]
+    async fn skill_files_inserted_after_system_message() {
+        // When messages already contains a system message (and a user message),
+        // skill files must be inserted at index 1, preserving [system] /
+        // [SOUL.md] / [AGENTS.md] / [user...] order.
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("SOUL.md"), "soul content").unwrap();
+        std::fs::write(dir.path().join("AGENTS.md"), "agent guidelines").unwrap();
+        let mut messages = vec![
+            Message::system("base system".to_owned()),
+            Message::user("user turn".to_owned()),
+        ];
+        inject_skill_files_from(&mut messages, dir.path()).await;
+        assert_eq!(messages.len(), 4);
+        let body = |m: &Message| m.content.as_deref().unwrap_or("").to_owned();
+        assert!(
+            body(&messages[0]).contains("base system"),
+            "system must stay at index 0"
+        );
+        assert!(
+            body(&messages[1]).contains("## Soul"),
+            "SOUL.md must be at index 1"
+        );
+        assert!(
+            body(&messages[2]).contains("## Agent Guidelines"),
+            "AGENTS.md must be at index 2"
+        );
+        assert!(
+            body(&messages[3]).contains("user turn"),
+            "user message must stay last"
+        );
     }
 
     #[tokio::test]
