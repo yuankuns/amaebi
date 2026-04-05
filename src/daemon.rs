@@ -339,6 +339,75 @@ where
     })?
 }
 
+/// Return the last `HOT_TAIL_PAIRS * 2` entries of `history`, or the whole
+/// slice when it is shorter.  Used to trim over-budget message lists.
+fn hot_tail(history: &[memory_db::DbMemoryEntry]) -> &[memory_db::DbMemoryEntry] {
+    let hot = HOT_TAIL_PAIRS * 2;
+    if history.len() > hot {
+        &history[history.len() - hot..]
+    } else {
+        history
+    }
+}
+
+/// Load the three pieces of session state needed to build a message list.
+///
+/// Returns `(history, summaries, own_summary)`.  On error, logs a warning and
+/// returns empty defaults so the caller can still proceed with a fresh context.
+async fn load_session_state(
+    state: &Arc<DaemonState>,
+    session_id: &str,
+) -> (Vec<memory_db::DbMemoryEntry>, Vec<String>, Option<String>) {
+    with_db(Arc::clone(&state.db), {
+        let sid = session_id.to_owned();
+        move |conn| {
+            Ok((
+                memory_db::get_session_history(conn, &sid)?,
+                memory_db::get_recent_summaries(conn, &sid, MAX_SUMMARIES)?,
+                memory_db::get_session_own_summary(conn, &sid)?,
+            ))
+        }
+    })
+    .await
+    .unwrap_or_else(|e| {
+        tracing::warn!(error = %e, session_id, "failed to load session state");
+        (vec![], vec![], None)
+    })
+}
+
+/// Build a message list from session state, trim to the token budget, and
+/// inject skill files.
+///
+/// Injects skill files into the full-history list first so the threshold check
+/// accounts for their token cost (AGENTS.md/SOUL.md can be large).  If the
+/// result still exceeds the budget, rebuilds with the hot-tail history slice
+/// and injects again so the returned messages always include the skill files.
+async fn build_and_trim_messages(
+    prompt: &str,
+    tmux_pane: Option<&str>,
+    history: &[memory_db::DbMemoryEntry],
+    summaries: &[String],
+    own_summary: Option<&str>,
+    model: &str,
+) -> (Vec<Message>, bool) {
+    let threshold = compaction_threshold_tokens(model);
+    // Load skill files once — reused in both the full and trimmed builds so
+    // disk reads and log lines are not duplicated on a threshold-triggered rebuild.
+    let skill_msgs = load_skill_messages().await;
+    // Build with full history and splice in skill files so the threshold check
+    // accounts for their token cost (AGENTS.md / SOUL.md can be large).
+    let mut msgs = build_messages(prompt, tmux_pane, history, summaries, own_summary);
+    splice_skill_messages(&mut msgs, skill_msgs.clone());
+    if count_message_tokens(&msgs) > threshold {
+        // Rebuild with trimmed history and re-splice the already-loaded skill files.
+        msgs = build_messages(prompt, tmux_pane, hot_tail(history), summaries, own_summary);
+        splice_skill_messages(&mut msgs, skill_msgs);
+        (msgs, true)
+    } else {
+        (msgs, false)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Per-connection handler
 // ---------------------------------------------------------------------------
@@ -465,21 +534,15 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                     })
                     .await
                     .unwrap_or_default();
-                    let mut messages =
-                        build_messages(&prompt, tmux_pane.as_deref(), &history, &[], None);
-                    inject_skill_files(&mut messages).await;
-                    let threshold = compaction_threshold_tokens(&model);
-                    if count_message_tokens(&messages) > threshold {
-                        let hot = HOT_TAIL_PAIRS * 2;
-                        let trimmed = if history.len() > hot {
-                            &history[history.len() - hot..]
-                        } else {
-                            &history[..]
-                        };
-                        messages =
-                            build_messages(&prompt, tmux_pane.as_deref(), trimmed, &[], None);
-                        inject_skill_files(&mut messages).await;
-                    }
+                    let (messages, _) = build_and_trim_messages(
+                        &prompt,
+                        tmux_pane.as_deref(),
+                        &history,
+                        &[],
+                        None,
+                        &model,
+                    )
+                    .await;
                     let mut sink = tokio::io::sink();
                     let (_, mut steer_rx) = tokio::sync::mpsc::channel::<Option<String>>(1);
                     let task_desc = truncate_chars(&prompt, 200);
@@ -765,46 +828,16 @@ async fn handle_resume_request(
         .await?;
         return Ok(ConnAction::Break);
     }
-    let (history, summaries, own_summary) = with_db(Arc::clone(&state.db), {
-        let sid = session_id.clone();
-        move |conn| {
-            Ok((
-                memory_db::get_session_history(conn, &sid)?,
-                memory_db::get_recent_summaries(conn, &sid, MAX_SUMMARIES)?,
-                memory_db::get_session_own_summary(conn, &sid)?,
-            ))
-        }
-    })
-    .await
-    .unwrap_or_else(|e| {
-        tracing::warn!(error=%e, "resume load failed");
-        (vec![], vec![], None)
-    });
-    let mut messages = build_messages(
+    let (history, summaries, own_summary) = load_session_state(state, &session_id).await;
+    let (messages, _) = build_and_trim_messages(
         &prompt,
         tmux_pane.as_deref(),
         &history,
         &summaries,
         own_summary.as_deref(),
-    );
-    inject_skill_files(&mut messages).await;
-    let threshold = compaction_threshold_tokens(&model);
-    if count_message_tokens(&messages) > threshold {
-        let hot = HOT_TAIL_PAIRS * 2;
-        let trimmed = if history.len() > hot {
-            &history[history.len() - hot..]
-        } else {
-            &history[..]
-        };
-        messages = build_messages(
-            &prompt,
-            tmux_pane.as_deref(),
-            trimmed,
-            &summaries,
-            own_summary.as_deref(),
-        );
-        inject_skill_files(&mut messages).await;
-    }
+        &model,
+    )
+    .await;
     let Some(result) =
         drive_agentic_loop(state, writer, conn_state, &session_id, messages, &model).await
     else {
@@ -905,28 +938,11 @@ async fn handle_chat_request(
         let threshold_inner = compaction_threshold_tokens(&model);
         if count_message_tokens(&prev) > threshold_inner {
             // Rebuild from persisted history when over budget.
-            let (hist2, sum2, own2) = with_db(Arc::clone(&state.db), {
-                let sid = sid.clone();
-                move |conn| {
-                    Ok((
-                        memory_db::get_session_history(conn, &sid)?,
-                        memory_db::get_recent_summaries(conn, &sid, MAX_SUMMARIES)?,
-                        memory_db::get_session_own_summary(conn, &sid)?,
-                    ))
-                }
-            })
-            .await
-            .unwrap_or((vec![], vec![], None));
-            let hot = HOT_TAIL_PAIRS * 2;
-            let trimmed_hist = if hist2.len() > hot {
-                &hist2[hist2.len() - hot..]
-            } else {
-                &hist2[..]
-            };
+            let (hist2, sum2, own2) = load_session_state(state, &sid).await;
             let mut rebuilt = build_messages(
                 &prompt,
                 tmux_pane.as_deref(),
-                trimmed_hist,
+                hot_tail(&hist2),
                 &sum2,
                 own2.as_deref(),
             );
@@ -936,21 +952,7 @@ async fn handle_chat_request(
             (prev, false)
         }
     } else {
-        let (history, summaries, own_summary) = with_db(Arc::clone(&state.db), {
-            let sid = sid.clone();
-            move |conn| {
-                Ok((
-                    memory_db::get_session_history(conn, &sid)?,
-                    memory_db::get_recent_summaries(conn, &sid, MAX_SUMMARIES)?,
-                    memory_db::get_session_own_summary(conn, &sid)?,
-                ))
-            }
-        })
-        .await
-        .unwrap_or_else(|e| {
-            tracing::warn!(error=%e, "failed to load chat history");
-            (vec![], vec![], None)
-        });
+        let (history, summaries, own_summary) = load_session_state(state, &sid).await;
 
         if history.is_empty() {
             let old = with_db(Arc::clone(&state.db), {
@@ -969,34 +971,15 @@ async fn handle_chat_request(
             }
         }
 
-        let mut msgs = build_messages(
+        build_and_trim_messages(
             &prompt,
             tmux_pane.as_deref(),
             &history,
             &summaries,
             own_summary.as_deref(),
-        );
-        inject_skill_files(&mut msgs).await;
-        let threshold_inner = compaction_threshold_tokens(&model);
-        if count_message_tokens(&msgs) > threshold_inner {
-            let hot = HOT_TAIL_PAIRS * 2;
-            let trimmed = if history.len() > hot {
-                &history[history.len() - hot..]
-            } else {
-                &history[..]
-            };
-            msgs = build_messages(
-                &prompt,
-                tmux_pane.as_deref(),
-                trimmed,
-                &summaries,
-                own_summary.as_deref(),
-            );
-            inject_skill_files(&mut msgs).await;
-            (msgs, true)
-        } else {
-            (msgs, false)
-        }
+            &model,
+        )
+        .await
     };
 
     let pre_send_tokens = count_message_tokens(&messages);
@@ -2158,28 +2141,57 @@ where
 /// (`~/.amaebi/`).  Files that do not exist or are whitespace-only are
 /// silently skipped.  No per-project or CWD-relative files are read.
 pub(crate) async fn inject_skill_files(messages: &mut Vec<Message>) {
+    let skill_msgs = load_skill_messages().await;
+    splice_skill_messages(messages, skill_msgs);
+}
+
+/// Load skill messages from `~/.amaebi/` without modifying any message list.
+///
+/// Returns the messages that would be injected by [`inject_skill_files`].
+/// Callers that need to inject into multiple lists (e.g. after a rebuild) can
+/// call this once and reuse the result with [`splice_skill_messages`].
+async fn load_skill_messages() -> Vec<Message> {
     let home = match amaebi_home() {
         Ok(p) => p,
         Err(e) => {
             tracing::debug!(error = %e, "could not resolve amaebi home for skill injection");
-            return;
+            return vec![];
         }
     };
-    inject_skill_files_from(messages, &home).await;
+    load_skill_messages_from(&home).await
 }
 
-/// Internal helper used by [`inject_skill_files`] and tests.
-async fn inject_skill_files_from(messages: &mut Vec<Message>, amaebi_home: &std::path::Path) {
-    // Always-injected files: loaded unconditionally at the start of every turn.
+/// Splice a pre-loaded set of skill messages into `messages` at the correct position.
+fn splice_skill_messages(messages: &mut Vec<Message>, skill_msgs: Vec<Message>) {
+    if skill_msgs.is_empty() {
+        return;
+    }
+    let insert_at = messages
+        .iter()
+        .position(|m| m.role == "system")
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    messages.splice(insert_at..insert_at, skill_msgs);
+}
+
+/// Load skill messages from `amaebi_home` without modifying any message list.
+/// Used by [`load_skill_messages`] and tests.
+async fn load_skill_messages_from(amaebi_home: &std::path::Path) -> Vec<Message> {
+    // Final prompt order once spliced in:
+    //   [system] / [SOUL.md] / [AGENTS.md] / [on-demand docs] /
+    //   [own_summary (user+assistant, if any)] / [history...] / [current prompt]
+    // Skills take highest priority and must never be displaced by history trimming.
     const FIXED_FILES: &[(&str, &str)] =
-        &[("AGENTS.md", "## Agent Guidelines"), ("SOUL.md", "## Soul")];
+        &[("SOUL.md", "## Soul"), ("AGENTS.md", "## Agent Guidelines")];
+
+    let mut msgs: Vec<Message> = Vec::new();
     for (filename, header) in FIXED_FILES {
         let path = amaebi_home.join(filename);
         match tokio::fs::read_to_string(&path).await {
             Ok(content) => {
                 let trimmed = content.trim();
                 if !trimmed.is_empty() {
-                    messages.push(Message::system(format!("{header}\n\n{trimmed}")));
+                    msgs.push(Message::system(format!("{header}\n\n{trimmed}")));
                     tracing::info!(
                         file = %path.display(),
                         header,
@@ -2229,7 +2241,7 @@ async fn inject_skill_files_from(messages: &mut Vec<Message>, amaebi_home: &std:
             .map(|p| format!("- {p}"))
             .collect::<Vec<_>>()
             .join("\n");
-        messages.push(Message::system(format!(
+        msgs.push(Message::system(format!(
             "## On-demand Operations Docs\n\n\
              The following files can be loaded with read_file when the task involves \
              deployment, configuration, or troubleshooting:\n\n{list}"
@@ -2240,6 +2252,8 @@ async fn inject_skill_files_from(messages: &mut Vec<Message>, amaebi_home: &std:
             "injected on-demand operations docs pointer"
         );
     }
+
+    msgs
 }
 // ---------------------------------------------------------------------------
 // Message construction
@@ -2675,13 +2689,53 @@ mod tests {
         std::fs::write(dir.path().join("AGENTS.md"), "agent guidelines").unwrap();
         std::fs::write(dir.path().join("SOUL.md"), "soul content").unwrap();
         let mut messages: Vec<Message> = vec![];
-        inject_skill_files_from(&mut messages, dir.path()).await;
+        {
+            let s = load_skill_messages_from(dir.path()).await;
+            splice_skill_messages(&mut messages, s);
+        };
         assert_eq!(messages.len(), 2);
         let body = |m: &Message| m.content.as_deref().unwrap_or("").to_owned();
-        assert!(body(&messages[0]).contains("## Agent Guidelines"));
-        assert!(body(&messages[0]).contains("agent guidelines"));
-        assert!(body(&messages[1]).contains("## Soul"));
-        assert!(body(&messages[1]).contains("soul content"));
+        // Order: SOUL.md first, then AGENTS.md (skills before guidelines).
+        assert!(body(&messages[0]).contains("## Soul"));
+        assert!(body(&messages[0]).contains("soul content"));
+        assert!(body(&messages[1]).contains("## Agent Guidelines"));
+        assert!(body(&messages[1]).contains("agent guidelines"));
+    }
+
+    #[tokio::test]
+    async fn skill_files_inserted_after_system_message() {
+        // When messages already contains a system message (and a user message),
+        // skill files must be inserted at index 1, preserving [system] /
+        // [SOUL.md] / [AGENTS.md] / [user...] order.
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("SOUL.md"), "soul content").unwrap();
+        std::fs::write(dir.path().join("AGENTS.md"), "agent guidelines").unwrap();
+        let mut messages = vec![
+            Message::system("base system".to_owned()),
+            Message::user("user turn".to_owned()),
+        ];
+        {
+            let s = load_skill_messages_from(dir.path()).await;
+            splice_skill_messages(&mut messages, s);
+        };
+        assert_eq!(messages.len(), 4);
+        let body = |m: &Message| m.content.as_deref().unwrap_or("").to_owned();
+        assert!(
+            body(&messages[0]).contains("base system"),
+            "system must stay at index 0"
+        );
+        assert!(
+            body(&messages[1]).contains("## Soul"),
+            "SOUL.md must be at index 1"
+        );
+        assert!(
+            body(&messages[2]).contains("## Agent Guidelines"),
+            "AGENTS.md must be at index 2"
+        );
+        assert!(
+            body(&messages[3]).contains("user turn"),
+            "user message must stay last"
+        );
     }
 
     #[tokio::test]
@@ -2692,7 +2746,10 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         std::fs::write(dir.path().join("DEV_WORKFLOW.md"), "workflow rules").unwrap();
         let mut messages: Vec<Message> = vec![];
-        inject_skill_files_from(&mut messages, dir.path()).await;
+        {
+            let s = load_skill_messages_from(dir.path()).await;
+            splice_skill_messages(&mut messages, s);
+        };
         assert!(
             messages.is_empty(),
             "DEV_WORKFLOW.md must not be auto-injected as a fixed file"
@@ -2703,7 +2760,10 @@ mod tests {
     async fn skill_files_absent_produces_no_messages() {
         let dir = tempfile::TempDir::new().unwrap();
         let mut messages: Vec<Message> = vec![];
-        inject_skill_files_from(&mut messages, dir.path()).await;
+        {
+            let s = load_skill_messages_from(dir.path()).await;
+            splice_skill_messages(&mut messages, s);
+        };
         assert!(messages.is_empty());
     }
 
@@ -2712,7 +2772,10 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         std::fs::write(dir.path().join("AGENTS.md"), "   \n  ").unwrap();
         let mut messages: Vec<Message> = vec![];
-        inject_skill_files_from(&mut messages, dir.path()).await;
+        {
+            let s = load_skill_messages_from(dir.path()).await;
+            splice_skill_messages(&mut messages, s);
+        };
         assert!(
             messages.is_empty(),
             "whitespace-only file must not inject a message"
@@ -2724,7 +2787,10 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         std::fs::write(dir.path().join("SOUL.md"), "soul only").unwrap();
         let mut messages: Vec<Message> = vec![];
-        inject_skill_files_from(&mut messages, dir.path()).await;
+        {
+            let s = load_skill_messages_from(dir.path()).await;
+            splice_skill_messages(&mut messages, s);
+        };
         assert_eq!(messages.len(), 1);
         assert!(messages[0]
             .content
@@ -2739,7 +2805,10 @@ mod tests {
         std::fs::write(dir.path().join("OPERATIONS_INDEX.md"), "ops index").unwrap();
         std::fs::write(dir.path().join("DEPLOYMENT.md"), "deploy steps").unwrap();
         let mut messages: Vec<Message> = vec![];
-        inject_skill_files_from(&mut messages, dir.path()).await;
+        {
+            let s = load_skill_messages_from(dir.path()).await;
+            splice_skill_messages(&mut messages, s);
+        };
         assert_eq!(messages.len(), 1, "one on-demand pointer message expected");
         let body = messages[0].content.as_deref().unwrap_or("");
         assert!(body.contains("## On-demand Operations Docs"));
@@ -2754,7 +2823,10 @@ mod tests {
         // Only a non-on-demand file present — no pointer message expected.
         std::fs::write(dir.path().join("AGENTS.md"), "guidelines").unwrap();
         let mut messages: Vec<Message> = vec![];
-        inject_skill_files_from(&mut messages, dir.path()).await;
+        {
+            let s = load_skill_messages_from(dir.path()).await;
+            splice_skill_messages(&mut messages, s);
+        };
         let has_ondemand = messages.iter().any(|m| {
             m.content
                 .as_deref()
