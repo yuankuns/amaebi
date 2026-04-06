@@ -810,7 +810,10 @@ pub async fn run_chat_loop(
         let prompt = match next_prompt.take() {
             Some(p) => p,
             None => {
-                // read_line_raw prints PROMPT and flushes stderr internally.
+                if std::io::stderr().is_terminal() {
+                    eprint!("{}", prompt_input::PROMPT);
+                    let _ = tokio::io::stderr().flush().await;
+                }
                 // Use the raw-mode reader so wide (CJK) characters are erased
                 // correctly on backspace: the terminal line-discipline only emits
                 // one `\b \b` per backspace, leaving a ghost column for 2-wide
@@ -863,11 +866,11 @@ pub async fn run_chat_loop(
                     }
                     steer_pending = true;
                     if std::io::stderr().is_terminal() {
-                        // read_line_raw will print PROMPT; just show the banner.
                         eprintln!("\n^C interrupted. Enter correction (empty line to cancel): ");
+                        eprint!("{}", prompt_input::PROMPT);
+                        let _ = tokio::io::stderr().flush().await;
                     }
                     if steer_task.is_none() {
-                        // read_line_raw prints PROMPT and flushes stderr internally.
                         steer_task = Some(tokio::task::spawn_blocking(
                             prompt_input::read_line_raw,
                         ));
@@ -941,12 +944,16 @@ pub async fn run_chat_loop(
                             }
                         }
                         Response::WaitingForInput { prompt: extra } => {
-                            if std::io::stderr().is_terminal() && !extra.is_empty() {
-                                eprintln!("\n{extra}");
+                            // Show the prompt and set steer_pending so the next
+                            // iteration of the select! loop reads stdin via the
+                            // existing steer arm — keeping SIGINT responsive.
+                            if std::io::stderr().is_terminal() {
+                                if !extra.is_empty() { eprintln!("\n{extra}"); }
+                                eprint!("{}", prompt_input::PROMPT);
+                                let _ = tokio::io::stderr().flush().await;
                             }
                             steer_pending = true;
                             if steer_task.is_none() {
-                                // read_line_raw prints PROMPT and flushes stderr internally.
                                 steer_task = Some(tokio::task::spawn_blocking(
                                     prompt_input::read_line_raw,
                                 ));
@@ -1654,25 +1661,15 @@ mod prompt_input {
 
     /// Read one line from stdin with correct wide-character backspace handling.
     ///
-    /// Prints `PROMPT` to stderr before reading when stderr is a TTY.
-    ///
     /// * `Ok(Some(s))` — user pressed Enter; `s` has no trailing newline.
     /// * `Ok(None)` — Ctrl-D (EOF).
     /// * `Err(e)` with `e.kind() == Interrupted` — Ctrl-C.
     ///
-    /// Uses raw mode only when both stdin and stderr are TTYs (raw mode echoes
-    /// to stderr, so a non-TTY stderr would make input invisible).  Falls back
-    /// to plain `read_line` otherwise.
+    /// Falls back to plain `read_line` when stdin is not a TTY.
     pub fn read_line_raw() -> std::io::Result<Option<String>> {
         use std::io::IsTerminal as _;
 
-        let stderr_is_tty = std::io::stderr().is_terminal();
-        if stderr_is_tty {
-            eprint!("{PROMPT}");
-            let _ = std::io::stderr().flush();
-        }
-
-        if !std::io::stdin().is_terminal() || !stderr_is_tty {
+        if !std::io::stdin().is_terminal() {
             return read_line_cooked();
         }
 
