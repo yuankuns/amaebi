@@ -830,7 +830,7 @@ pub async fn run_chat_loop(
             Some(p) => p,
             None => {
                 if std::io::stderr().is_terminal() {
-                    eprint!("> ");
+                    eprint!("{}", prompt_input::PROMPT);
                     let _ = tokio::io::stderr().flush().await;
                 }
                 // Use the raw-mode reader so wide (CJK) characters are erased
@@ -1554,8 +1554,13 @@ async fn start_daemon(socket: &std::path::Path) -> Result<()> {
 mod prompt_input {
     use std::collections::VecDeque;
     use std::io::{Read, Write};
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::{Arc, Mutex, OnceLock};
     use unicode_width::UnicodeWidthChar as _;
+
+    /// The prompt prefix displayed before each input line.  Defined here as a
+    /// single source of truth so the outer chat loop and the internal `redraw()`
+    /// always print exactly the same string.
+    pub(super) const PROMPT: &str = "> ";
 
     /// Maximum number of entries kept in the prompt history.
     const MAX_HISTORY: usize = 1000;
@@ -1565,9 +1570,11 @@ mod prompt_input {
     /// are not guaranteed to reuse the same OS thread.
     ///
     /// `VecDeque` gives O(1) front-eviction when the buffer is full.
-    static HISTORY: OnceLock<Mutex<VecDeque<String>>> = OnceLock::new();
+    /// `Arc<str>` entries mean history snapshots only clone the pointer, not the
+    /// string bytes, keeping each snapshot O(n arcs) rather than O(total bytes).
+    static HISTORY: OnceLock<Mutex<VecDeque<Arc<str>>>> = OnceLock::new();
 
-    fn history_store() -> &'static Mutex<VecDeque<String>> {
+    fn history_store() -> &'static Mutex<VecDeque<Arc<str>>> {
         HISTORY.get_or_init(|| Mutex::new(VecDeque::new()))
     }
 
@@ -1659,7 +1666,8 @@ mod prompt_input {
     fn read_line_raw_inner(_guard: RawModeGuard) -> std::io::Result<Option<String>> {
         // Snapshot history while holding the lock for the minimum time, then
         // release it before blocking on I/O so other threads are not stalled.
-        let history_snapshot: Vec<String> = history_store()
+        // Cloning Arc<str> entries is O(n arcs), not O(total string bytes).
+        let history_snapshot: Vec<Arc<str>> = history_store()
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .iter()
@@ -1669,7 +1677,7 @@ mod prompt_input {
             &mut std::io::stdin(),
             &mut std::io::stderr(),
             &history_snapshot,
-            "> ",
+            PROMPT,
         );
         if let Ok(Some(ref line)) = result {
             if !line.is_empty() {
@@ -1677,7 +1685,7 @@ mod prompt_input {
                 if hist.len() >= MAX_HISTORY {
                     hist.pop_front();
                 }
-                hist.push_back(line.clone());
+                hist.push_back(Arc::from(line.as_str()));
             }
         }
         result
@@ -1722,7 +1730,7 @@ mod prompt_input {
     fn process_input<R: Read, W: Write>(
         input: &mut R,
         output: &mut W,
-        history: &[String],
+        history: &[Arc<str>],
         prompt: &str,
     ) -> std::io::Result<Option<String>> {
         let mut chars: Vec<char> = Vec::new();
@@ -1986,7 +1994,7 @@ mod prompt_input {
 
     #[cfg(test)]
     mod tests {
-        use super::process_input;
+        use super::{process_input, Arc};
         use std::io::Cursor;
         use unicode_width::UnicodeWidthChar as _;
 
@@ -2004,7 +2012,7 @@ mod prompt_input {
             input: &[u8],
             history: &[&str],
         ) -> (std::io::Result<Option<String>>, Vec<u8>) {
-            let history_owned: Vec<String> = history.iter().map(|s| s.to_string()).collect();
+            let history_owned: Vec<Arc<str>> = history.iter().map(|s| Arc::from(*s)).collect();
             let mut reader = Cursor::new(input.to_vec());
             let mut output: Vec<u8> = Vec::new();
             let result = process_input(&mut reader, &mut output, &history_owned, "");
