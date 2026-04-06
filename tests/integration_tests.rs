@@ -2050,47 +2050,56 @@ async fn all_models_use_copilot_endpoint_and_jwt() {
     }
 }
 
-/// When `/chat/completions` returns `400 unsupported_api_for_model`, the daemon
-/// must transparently retry via the Responses API (`/v1/responses`) and the
-/// client must receive the final text from that fallback call.
-///
-/// This is the regression test for the gpt-5.4 / gpt-5.x bug: those models
-/// gpt-5.x models are routed directly to the Responses API without a
-/// Chat Completions first-hop.
+/// gpt-5.4 must be routed directly to the Responses API without a first-hop
+/// to `/chat/completions`, sending exactly one request in Responses API wire
+/// format (`input` / `max_output_tokens`).
 #[tokio::test]
-async fn responses_api_fallback_on_unsupported_model() {
+async fn gpt5_direct_to_responses_api() {
     let server = MockLlmServer::start().await;
 
-    // Only one request expected: directly to /v1/responses (no chat/completions first-hop).
-    server.enqueue(ScriptedResponse::text_chunks(vec!["fallback-ok"]));
+    // Only one response queued — direct Responses API call, no /chat/completions.
+    server.enqueue(ScriptedResponse::text_chunks(vec!["responses-ok"]));
 
     let daemon = start_daemon(&server.url()).await.expect("start_daemon");
     let client = connect_client(&daemon.socket);
 
-    let responses = send_message_with_session(&client, "hello", "sess-fallback", "copilot/gpt-5.4")
-        .await
-        .expect("send_message");
+    let responses =
+        send_message_with_session(&client, "hello", "sess-gpt5-direct", "copilot/gpt-5.4")
+            .await
+            .expect("send_message");
 
     let text = collect_text(&responses);
     assert!(
-        text.contains("fallback-ok"),
-        "expected fallback response text; got: {text:?}"
+        text.contains("responses-ok"),
+        "expected Responses API response text; got: {text:?}"
     );
 
-    // Exactly one request must have been made: directly to /v1/responses.
+    // Exactly one request — no /chat/completions first-hop.
     let reqs = server.take_requests();
     assert_eq!(
         reqs.len(),
         1,
-        "expected 1 request (direct to /v1/responses, no chat/completions first-hop), got {}",
+        "expected 1 request (direct Responses API, no first-hop), got {}",
         reqs.len()
+    );
+
+    // Verify Responses API wire format.
+    assert!(
+        reqs[0].body.get("input").is_some(),
+        "expected Responses API format (input field); got: {:?}",
+        reqs[0].body
+    );
+    assert!(
+        reqs[0].body.get("max_output_tokens").is_some(),
+        "expected Responses API format (max_output_tokens field); got: {:?}",
+        reqs[0].body
     );
 }
 
 /// All gpt-5.x model variants must be routed directly to the Responses API
-/// without a Chat Completions first-hop.
+/// without a Chat Completions first-hop, using Responses API wire format.
 #[tokio::test]
-async fn responses_api_fallback_all_gpt5_variants() {
+async fn gpt5_all_variants_direct_to_responses_api() {
     for model in &[
         "copilot/gpt-5.4",
         "copilot/gpt-5.4-mini",
@@ -2098,7 +2107,6 @@ async fn responses_api_fallback_all_gpt5_variants() {
         "copilot/gpt-5-turbo",
     ] {
         let server = MockLlmServer::start().await;
-        // Only one request expected: directly to /v1/responses (no chat/completions first-hop).
         server.enqueue(ScriptedResponse::text_chunks(vec!["responses-ok"]));
 
         let daemon = start_daemon(&server.url()).await.expect("start_daemon");
@@ -2115,12 +2123,25 @@ async fn responses_api_fallback_all_gpt5_variants() {
             "model={model}: expected Responses API text; got: {text:?}"
         );
 
+        // Exactly one request — no /chat/completions first-hop.
         let reqs = server.take_requests();
         assert_eq!(
             reqs.len(),
             1,
-            "model={model}: expected 1 request (direct to /v1/responses), got {}",
+            "model={model}: expected 1 request (direct Responses API, no first-hop), got {}",
             reqs.len()
+        );
+
+        // Verify Responses API wire format.
+        assert!(
+            reqs[0].body.get("input").is_some(),
+            "model={model}: expected Responses API format (input field); got: {:?}",
+            reqs[0].body
+        );
+        assert!(
+            reqs[0].body.get("max_output_tokens").is_some(),
+            "model={model}: expected Responses API format (max_output_tokens field); got: {:?}",
+            reqs[0].body
         );
     }
 }
