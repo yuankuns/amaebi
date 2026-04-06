@@ -793,30 +793,11 @@ pub async fn run_chat_loop(
     let mut lines = BufReader::new(read_half).lines();
 
     let mut stdout = tokio::io::stdout();
-    // Single BufReader for stdin — reused across all steer reads so buffered
-    // bytes are never dropped between reads.
-    //
-    // Stdin-mixing note: the outer prompt loop reads stdin via
-    // `prompt_input::read_line_raw` (a spawn_blocking call that reads
-    // std::io::stdin() byte-by-byte in raw mode), while this tokio BufReader
-    // reads the same underlying fd in cooked mode for steer corrections.
-    //
-    // In theory, the BufReader could read ahead and buffer bytes that belong
-    // to the *next* prompt — stranding them inside the BufReader and making
-    // the raw-mode reader see a truncated line.  In practice this does not
-    // happen because:
-    //   1. The two readers are strictly sequential: the raw-mode prompt reader
-    //      only runs when no agent turn is active, and this BufReader is only
-    //      polled inside the inner select! loop while a turn is in flight.
-    //      They never run concurrently.
-    //   2. Steer corrections are line-oriented: the BufReader calls read_line
-    //      and returns exactly one newline-terminated line.  In canonical
-    //      (cooked) mode the kernel delivers exactly one line per read, so the
-    //      BufReader's internal buffer is always empty after read_line returns.
-    //   3. Even if the user types ahead during a turn, the kernel buffers those
-    //      bytes in the line-discipline, not in our BufReader.  They become
-    //      available on the next read_exact call in the raw-mode reader.
-    let mut stdin = BufReader::new(tokio::io::stdin());
+    // In-flight spawn_blocking task for reading a steer correction in raw mode.
+    // Spawned when steer_pending becomes true; awaited in the inner select! arm.
+    // Using raw mode (same as the main prompt) gives the user history navigation
+    // and CJK-width-correct backspace inside steer corrections too.
+    let mut steer_task: Option<tokio::task::JoinHandle<std::io::Result<Option<String>>>> = None;
     let mut next_prompt = initial_prompt;
     let mut last_ctrl_c: Option<Instant> = None;
     let mut steer_pending = false;
@@ -830,7 +811,7 @@ pub async fn run_chat_loop(
             Some(p) => p,
             None => {
                 if std::io::stderr().is_terminal() {
-                    eprint!("> ");
+                    eprint!("{}", prompt_input::PROMPT);
                     let _ = tokio::io::stderr().flush().await;
                 }
                 // Use the raw-mode reader so wide (CJK) characters are erased
@@ -886,8 +867,13 @@ pub async fn run_chat_loop(
                     steer_pending = true;
                     if std::io::stderr().is_terminal() {
                         eprintln!("\n^C interrupted. Enter correction (empty line to cancel): ");
-                        eprint!(">");
+                        eprint!("{}", prompt_input::PROMPT);
                         let _ = tokio::io::stderr().flush().await;
+                    }
+                    if steer_task.is_none() {
+                        steer_task = Some(tokio::task::spawn_blocking(
+                            prompt_input::read_line_raw,
+                        ));
                     }
                     let interrupt_req = Request::Interrupt { session_id: session_id.clone() };
                     if let Ok(mut frame) = serde_json::to_string(&interrupt_req) {
@@ -961,10 +947,17 @@ pub async fn run_chat_loop(
                             // Show the prompt and set steer_pending so the next
                             // iteration of the select! loop reads stdin via the
                             // existing steer arm — keeping SIGINT responsive.
-                            if !extra.is_empty() { eprintln!("\n{extra}"); }
-                            eprint!(">");
-                            let _ = tokio::io::stderr().flush().await;
+                            if std::io::stderr().is_terminal() {
+                                if !extra.is_empty() { eprintln!("\n{extra}"); }
+                                eprint!("{}", prompt_input::PROMPT);
+                                let _ = tokio::io::stderr().flush().await;
+                            }
                             steer_pending = true;
+                            if steer_task.is_none() {
+                                steer_task = Some(tokio::task::spawn_blocking(
+                                    prompt_input::read_line_raw,
+                                ));
+                            }
                         }
                         Response::SteerAck => {
                             steer_pending = false;
@@ -991,25 +984,31 @@ pub async fn run_chat_loop(
                     }
                 }
 
-                line = async {
-                    if steer_pending {
-                        let mut buf = String::new();
-                        let n = tokio::io::AsyncBufReadExt::read_line(
-                            &mut stdin, &mut buf
-                        ).await.unwrap_or(0); // EOF/error = treat as no input
-                        if n > 0 { Some(buf) } else { None }
-                    } else {
-                        std::future::pending::<Option<String>>().await
+                steer_result = async {
+                    match steer_task.as_mut() {
+                        Some(h) => h.await.map_err(std::io::Error::other),
+                        None => std::future::pending().await,
                     }
                 } => {
-                    if let Some(text) = line {
-                        let trimmed = text.trim_end_matches('\n').trim_end_matches('\r');
-                        if trimmed.is_empty() {
+                    steer_task = None;
+                    match steer_result {
+                        // User typed a non-empty line — send as steer correction.
+                        Ok(Ok(Some(text))) if !text.trim().is_empty() => {
+                            let steer_req = Request::Steer {
+                                session_id: session_id.clone(),
+                                message: text.trim().to_owned(),
+                            };
+                            if let Ok(mut frame) = serde_json::to_string(&steer_req) {
+                                frame.push('\n');
+                                let _ = write_half.write_all(frame.as_bytes()).await;
+                            }
                             steer_pending = false;
-                            last_ctrl_c = None; // cancelling steer resets the double-Ctrl-C window
-                            // No Steer frame sent on cancel: the daemon's WAITING_FOR_INPUT
-                            // path now treats the already-sent Interrupt (None) as a cancel
-                            // signal, so no follow-up message is needed.
+                            last_ctrl_c = None;
+                        }
+                        // Empty line — cancel steer.
+                        Ok(Ok(Some(_))) => {
+                            steer_pending = false;
+                            last_ctrl_c = None;
                             // Flush buffered text through md_buf now that steer is cancelled.
                             for chunk in steer_text_buf.drain(..) {
                                 md_buf.push(&chunk);
@@ -1019,24 +1018,43 @@ pub async fn run_chat_loop(
                                 }
                             }
                             let _ = stdout.flush().await;
-                        } else {
-                            let steer_req = Request::Steer {
-                                session_id: session_id.clone(),
-                                message: trimmed.to_owned(),
-                            };
-                            if let Ok(mut frame) = serde_json::to_string(&steer_req) {
-                                frame.push('\n');
-                                let _ = write_half.write_all(frame.as_bytes()).await;
-                            }
-                            steer_pending = false;
-                            last_ctrl_c = None;
                         }
-                    } else {
-                        break 'session;
+                        // I/O error from the steer read.
+                        Ok(Err(e)) => {
+                            if e.kind() == std::io::ErrorKind::Interrupted {
+                                // Ctrl-C during steer input — cancel.
+                                steer_pending = false;
+                                last_ctrl_c = None;
+                                for chunk in steer_text_buf.drain(..) {
+                                    md_buf.push(&chunk);
+                                    while let Some(ready) = md_buf.flush_if_ready() {
+                                        let out = render_markdown(&ready);
+                                        let _ = stdout.write_all(out.as_bytes()).await;
+                                    }
+                                }
+                                let _ = stdout.flush().await;
+                            } else {
+                                // Real I/O error — surface and exit.
+                                return Err(
+                                    anyhow::Error::new(e).context("steer input error")
+                                );
+                            }
+                        }
+                        // EOF (Ctrl-D) or task panic — exit session.
+                        Ok(Ok(None)) | Err(_) => break 'session,
                     }
                 }
             }
         }
+    }
+
+    // If a steer task was in-flight when the session ended its JoinHandle is
+    // dropped here, detaching the blocking thread.  That thread is stuck in
+    // read_exact and will never drop its RawModeGuard.  Restore the terminal
+    // immediately so the shell gets a sane state.
+    #[cfg(unix)]
+    if steer_task.is_some() {
+        prompt_input::restore_terminal_now();
     }
 
     if std::io::stderr().is_terminal() {
@@ -1552,8 +1570,59 @@ async fn start_daemon(socket: &std::path::Path) -> Result<()> {
 /// read so it can track each character's display width and emit the correct
 /// number of erase columns on backspace.
 mod prompt_input {
+    use std::collections::VecDeque;
     use std::io::{Read, Write};
+    use std::sync::{Arc, Mutex, OnceLock};
     use unicode_width::UnicodeWidthChar as _;
+
+    /// The prompt prefix displayed before each input line.  Defined here as a
+    /// single source of truth so the outer chat loop and the internal `redraw()`
+    /// always print exactly the same string.
+    pub(super) const PROMPT: &str = "> ";
+
+    /// Maximum number of entries kept in the prompt history.
+    const MAX_HISTORY: usize = 1000;
+
+    /// Process-wide history buffer.  Using a `static` instead of `thread_local!`
+    /// ensures history persists across `tokio::task::spawn_blocking` calls, which
+    /// are not guaranteed to reuse the same OS thread.
+    ///
+    /// `VecDeque` gives O(1) front-eviction when the buffer is full.
+    /// `Arc<str>` entries mean history snapshots only clone the pointer, not the
+    /// string bytes, keeping each snapshot O(n arcs) rather than O(total bytes).
+    static HISTORY: OnceLock<Mutex<VecDeque<Arc<str>>>> = OnceLock::new();
+
+    fn history_store() -> &'static Mutex<VecDeque<Arc<str>>> {
+        HISTORY.get_or_init(|| Mutex::new(VecDeque::new()))
+    }
+
+    /// Saved original terminal state set when raw mode is entered, cleared on exit.
+    /// Allows `restore_terminal_now()` to recover the terminal if the session exits
+    /// while a `spawn_blocking(read_line_raw)` task is still in flight (the detached
+    /// thread holds `RawModeGuard` but is blocked in `read_exact` indefinitely).
+    #[cfg(unix)]
+    static SAVED_ORIG_TERM: OnceLock<Mutex<Option<(std::os::unix::io::RawFd, libc::termios)>>> =
+        OnceLock::new();
+
+    #[cfg(unix)]
+    fn saved_orig_term() -> &'static Mutex<Option<(std::os::unix::io::RawFd, libc::termios)>> {
+        SAVED_ORIG_TERM.get_or_init(|| Mutex::new(None))
+    }
+
+    /// Restore the terminal to the state saved when raw mode was last entered.
+    /// No-op if raw mode is not currently active.  Safe to call from async context.
+    #[cfg(unix)]
+    pub fn restore_terminal_now() {
+        if let Some((fd, orig)) = *saved_orig_term().lock().unwrap_or_else(|p| p.into_inner()) {
+            let rc = unsafe { libc::tcsetattr(fd, libc::TCSANOW, &orig) };
+            if rc != 0 {
+                eprintln!(
+                    "warning: failed to restore terminal settings: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+        }
+    }
 
     /// RAII guard that restores the terminal to its saved settings on drop.
     #[cfg(unix)]
@@ -1576,6 +1645,7 @@ mod prompt_input {
             if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw) } != 0 {
                 return Err(std::io::Error::last_os_error());
             }
+            *saved_orig_term().lock().unwrap_or_else(|p| p.into_inner()) = Some((fd, orig));
             Ok(Self { fd, orig })
         }
     }
@@ -1583,6 +1653,7 @@ mod prompt_input {
     #[cfg(unix)]
     impl Drop for RawModeGuard {
         fn drop(&mut self) {
+            *saved_orig_term().lock().unwrap_or_else(|p| p.into_inner()) = None;
             // Best-effort restore; ignore errors during drop.
             unsafe { libc::tcsetattr(self.fd, libc::TCSANOW, &self.orig) };
         }
@@ -1641,7 +1712,56 @@ mod prompt_input {
 
     #[cfg(unix)]
     fn read_line_raw_inner(_guard: RawModeGuard) -> std::io::Result<Option<String>> {
-        process_input(&mut std::io::stdin(), &mut std::io::stderr())
+        // Snapshot history while holding the lock for the minimum time, then
+        // release it before blocking on I/O so other threads are not stalled.
+        // Cloning Arc<str> entries is O(n arcs), not O(total string bytes).
+        let history_snapshot: Vec<Arc<str>> = history_store()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .cloned()
+            .collect();
+        let result = process_input(
+            &mut std::io::stdin(),
+            &mut std::io::stderr(),
+            &history_snapshot,
+            PROMPT,
+        );
+        if let Ok(Some(ref line)) = result {
+            if !line.is_empty() {
+                let mut hist = history_store().lock().unwrap_or_else(|p| p.into_inner());
+                if hist.len() >= MAX_HISTORY {
+                    hist.pop_front();
+                }
+                hist.push_back(Arc::from(line.as_str()));
+            }
+        }
+        result
+    }
+
+    /// Redraw the current line after any edit or cursor movement.
+    ///
+    /// Moves to the beginning of the line (`\r`), erases to EOL, reprints
+    /// `prompt` and all `chars`, then moves the cursor back from the end to
+    /// the `cursor` index so the visual cursor sits at the right position.
+    fn redraw<W: Write>(
+        output: &mut W,
+        prompt: &str,
+        chars: &[char],
+        widths: &[usize],
+        cursor: usize,
+    ) -> std::io::Result<()> {
+        output.write_all(b"\r\x1b[K")?;
+        output.write_all(prompt.as_bytes())?;
+        for ch in chars {
+            let mut buf = [0u8; 4];
+            output.write_all(ch.encode_utf8(&mut buf).as_bytes())?;
+        }
+        let cols_from_cursor: usize = widths[cursor..].iter().sum();
+        if cols_from_cursor > 0 {
+            write!(output, "\x1b[{cols_from_cursor}D")?;
+        }
+        Ok(())
     }
 
     /// Core line-editor loop.  Separated from the raw-mode setup so it can be
@@ -1651,13 +1771,29 @@ mod prompt_input {
     /// * `Ok(Some(s))` on Enter — `s` contains no trailing newline.
     /// * `Ok(None)` on EOF (Ctrl-D or exhausted reader).
     /// * `Err` with `ErrorKind::Interrupted` on Ctrl-C.
+    ///
+    /// `history` is a slice of prior input lines; up/down arrows navigate it.
+    /// `prompt` is the prefix string already displayed on the current line; it
+    /// is reprinted on every redraw so cursor movements do not erase it.
     fn process_input<R: Read, W: Write>(
         input: &mut R,
         output: &mut W,
+        history: &[Arc<str>],
+        prompt: &str,
     ) -> std::io::Result<Option<String>> {
         let mut chars: Vec<char> = Vec::new();
         // Display width (columns) of each char, matched by index to `chars`.
         let mut widths: Vec<usize> = Vec::new();
+        // Cursor position: index into `chars` (0 = start, chars.len() = end).
+        let mut cursor: usize = 0;
+
+        // History navigation state.
+        // `hist_idx` == history.len() means "current draft" (not navigating history).
+        let mut hist_idx: usize = history.len();
+        // Draft saved the first time the user presses Up from the live buffer,
+        // including the cursor position so returning from history restores it.
+        let mut draft_chars: Vec<char> = Vec::new();
+        let mut draft_cursor: usize = 0;
 
         loop {
             let mut byte = [0u8; 1];
@@ -1690,9 +1826,13 @@ mod prompt_input {
                 }
                 // Backspace (DEL = 0x7f on most terminals; BS = 0x08 on some)
                 0x7f | 0x08 => {
-                    if let (Some(_), Some(w)) = (chars.pop(), widths.pop()) {
+                    if cursor > 0 {
+                        let w = widths[cursor - 1];
+                        chars.remove(cursor - 1);
+                        widths.remove(cursor - 1);
+                        cursor -= 1;
                         if w > 0 {
-                            // Normal (non-zero-width) char: erase w display columns.
+                            // Normal (non-zero-width) char: reposition and erase.
                             //
                             // ESC[wD (CUB) is used instead of w×\x08 (BS) because some
                             // terminals snap the cursor to the left boundary of a wide
@@ -1703,27 +1843,26 @@ mod prompt_input {
                             // Known limitation: CUB does not wrap to the previous visual
                             // line on soft-wrapped input.  This editor targets single-line
                             // prompts; multi-line soft-wrap support is out of scope.
-                            write!(output, "\x1b[{w}D\x1b[K")?;
+                            if cursor == chars.len() {
+                                // Cursor is at end — simple inline erase.
+                                write!(output, "\x1b[{w}D\x1b[K")?;
+                            } else {
+                                // Mid-line deletion: full redraw to shift remaining chars.
+                                redraw(output, prompt, &chars, &widths, cursor)?;
+                            }
                         } else {
                             // Zero-width combining mark: it was rendered on top of the
                             // preceding base character without advancing the cursor.
-                            // Removing it from the buffer leaves its glyph visible;
-                            // repaint the base char (and any remaining combining marks
-                            // on it) to erase the deleted mark from the display.
-                            if let Some(base_idx) = widths.iter().rposition(|&bw| bw > 0) {
-                                let base_width = widths[base_idx];
-                                // Move back to start of base char, clear to EOL.
-                                write!(output, "\x1b[{base_width}D\x1b[K")?;
-                                // Re-echo base char + any remaining combining marks.
-                                let repaint: String = chars[base_idx..].iter().collect();
-                                output.write_all(repaint.as_bytes())?;
-                            }
-                            // No preceding base char (mark at start of buffer):
-                            // nothing to repaint.
+                            // Always do a full redraw: if there was a preceding base char
+                            // we need to repaint it cleanly; if the mark was the very
+                            // first character it may have combined visually with the
+                            // trailing character of the prompt, so reprinting the prompt
+                            // via redraw() is the only way to restore it.
+                            redraw(output, prompt, &chars, &widths, cursor)?;
                         }
                     }
                 }
-                // Escape sequences (arrows, function keys) — consume and discard.
+                // Escape sequences (arrows, function keys).
                 //
                 // Limitation: a bare ESC press (no following byte) will block
                 // here until the next character arrives because we read the
@@ -1736,17 +1875,113 @@ mod prompt_input {
                     let mut eb = [0u8; 1];
                     if input.read_exact(&mut eb).is_ok() {
                         match eb[0] {
-                            // CSI sequence (ESC [): read until final byte in
-                            // 0x40–0x7E.
-                            b'[' => loop {
-                                let mut fb = [0u8; 1];
-                                if input.read_exact(&mut fb).is_err() {
-                                    break;
+                            // CSI sequence (ESC [): read parameter bytes (0x30–0x3F) then
+                            // the final byte (0x40–0x7E).  Accumulate params
+                            // so we can distinguish bare sequences (arrows) from
+                            // parametrised ones (ESC[1~ / ESC[4~, etc.).
+                            b'[' => {
+                                let mut params: Vec<u8> = Vec::new();
+                                let final_byte = loop {
+                                    let mut fb = [0u8; 1];
+                                    if input.read_exact(&mut fb).is_err() {
+                                        break None;
+                                    }
+                                    if (0x40..=0x7e).contains(&fb[0]) {
+                                        break Some(fb[0]);
+                                    }
+                                    params.push(fb[0]);
+                                };
+                                match (final_byte, params.as_slice()) {
+                                    // Left arrow (ESC [ D)
+                                    (Some(b'D'), []) => {
+                                        if cursor > 0 {
+                                            cursor -= 1;
+                                            redraw(output, prompt, &chars, &widths, cursor)?;
+                                        }
+                                    }
+                                    // Right arrow (ESC [ C)
+                                    (Some(b'C'), []) => {
+                                        if cursor < chars.len() {
+                                            cursor += 1;
+                                            redraw(output, prompt, &chars, &widths, cursor)?;
+                                        }
+                                    }
+                                    // Up arrow (ESC [ A) — navigate backwards in history
+                                    (Some(b'A'), []) => {
+                                        if hist_idx == history.len() {
+                                            // Save current draft (chars and cursor) before
+                                            // entering history so it can be restored intact.
+                                            draft_chars = chars.clone();
+                                            draft_cursor = cursor;
+                                        }
+                                        if hist_idx > 0 {
+                                            hist_idx -= 1;
+                                            chars = history[hist_idx].chars().collect();
+                                            widths = chars
+                                                .iter()
+                                                .map(|c| c.width().unwrap_or(1))
+                                                .collect();
+                                            cursor = chars.len();
+                                            redraw(output, prompt, &chars, &widths, cursor)?;
+                                        }
+                                    }
+                                    // Down arrow (ESC [ B) — navigate forwards in history
+                                    (Some(b'B'), []) => {
+                                        if hist_idx < history.len() {
+                                            hist_idx += 1;
+                                            if hist_idx == history.len() {
+                                                // Restore the saved draft, including the
+                                                // cursor position the user had when they
+                                                // pressed Up.
+                                                chars = draft_chars.clone();
+                                                cursor = draft_cursor;
+                                            } else {
+                                                chars = history[hist_idx].chars().collect();
+                                                cursor = chars.len();
+                                            }
+                                            widths = chars
+                                                .iter()
+                                                .map(|c| c.width().unwrap_or(1))
+                                                .collect();
+                                            redraw(output, prompt, &chars, &widths, cursor)?;
+                                        }
+                                    }
+                                    // Home: ESC [ H  (VT220) or ESC [ 1 ~ (xterm)
+                                    (Some(b'H'), []) | (Some(b'~'), b"1") => {
+                                        if cursor > 0 {
+                                            cursor = 0;
+                                            redraw(output, prompt, &chars, &widths, cursor)?;
+                                        }
+                                    }
+                                    // End: ESC [ F  (VT220) or ESC [ 4 ~ (xterm)
+                                    (Some(b'F'), []) | (Some(b'~'), b"4") => {
+                                        if cursor < chars.len() {
+                                            cursor = chars.len();
+                                            redraw(output, prompt, &chars, &widths, cursor)?;
+                                        }
+                                    }
+                                    // Delete (forward): ESC [ 3 ~
+                                    (Some(b'~'), b"3") => {
+                                        if cursor < chars.len() {
+                                            let w = widths[cursor];
+                                            chars.remove(cursor);
+                                            widths.remove(cursor);
+                                            // Use DCH (ESC[P) only for a simple 1-wide char at
+                                            // end-of-line.  Zero-width combining marks (w == 0)
+                                            // and wide CJK chars (w > 1) need a full redraw to
+                                            // avoid deleting the wrong terminal cell or leaving
+                                            // visual artifacts.  Mid-line deletions always redraw.
+                                            if cursor == chars.len() && w == 1 {
+                                                write!(output, "\x1b[P")?;
+                                            } else {
+                                                redraw(output, prompt, &chars, &widths, cursor)?;
+                                            }
+                                        }
+                                    }
+                                    // All other CSI sequences: discard.
+                                    _ => {}
                                 }
-                                if (0x40..=0x7e).contains(&fb[0]) {
-                                    break;
-                                }
-                            },
+                            }
                             // SS3 sequence (ESC O): used by some terminals for
                             // function keys (F1–F4) and keypad.  Always exactly
                             // 3 bytes total (ESC O <final>), so consume one more.
@@ -1763,9 +1998,16 @@ mod prompt_input {
                 }
                 // ASCII printable
                 b @ 0x20..=0x7e => {
-                    output.write_all(&[b])?;
-                    chars.push(b as char);
-                    widths.push(1);
+                    let ch = b as char;
+                    chars.insert(cursor, ch);
+                    widths.insert(cursor, 1);
+                    cursor += 1;
+                    // Cursor at end: echo directly, avoiding an unnecessary full redraw.
+                    if cursor == chars.len() {
+                        output.write_all(&[b])?;
+                    } else {
+                        redraw(output, prompt, &chars, &widths, cursor)?;
+                    }
                 }
                 // Valid UTF-8 multi-byte lead bytes only.
                 //
@@ -1802,9 +2044,15 @@ mod prompt_input {
                             // move the cursor for them.  Control/format characters
                             // return None — default those to 1.
                             let w = ch.width().unwrap_or(1);
-                            output.write_all(s.as_bytes())?;
-                            chars.push(ch);
-                            widths.push(w);
+                            chars.insert(cursor, ch);
+                            widths.insert(cursor, w);
+                            cursor += 1;
+                            // Cursor at end: echo directly, avoiding an unnecessary full redraw.
+                            if cursor == chars.len() {
+                                output.write_all(s.as_bytes())?;
+                            } else {
+                                redraw(output, prompt, &chars, &widths, cursor)?;
+                            }
                         }
                     }
                     // Silently discard invalid or truncated UTF-8 sequences.
@@ -1822,7 +2070,7 @@ mod prompt_input {
 
     #[cfg(test)]
     mod tests {
-        use super::process_input;
+        use super::{process_input, Arc};
         use std::io::Cursor;
         use unicode_width::UnicodeWidthChar as _;
 
@@ -1830,11 +2078,20 @@ mod prompt_input {
         // Helpers
         // ------------------------------------------------------------------ //
 
-        /// Run `process_input` on a raw byte sequence and return `(result, echoed)`.
+        /// Run `process_input` on a raw byte sequence with empty history.
         fn run(input: &[u8]) -> (std::io::Result<Option<String>>, Vec<u8>) {
+            run_with_history(input, &[])
+        }
+
+        /// Run `process_input` with a given history slice.
+        fn run_with_history(
+            input: &[u8],
+            history: &[&str],
+        ) -> (std::io::Result<Option<String>>, Vec<u8>) {
+            let history_owned: Vec<Arc<str>> = history.iter().map(|s| Arc::from(*s)).collect();
             let mut reader = Cursor::new(input.to_vec());
             let mut output: Vec<u8> = Vec::new();
-            let result = process_input(&mut reader, &mut output);
+            let result = process_input(&mut reader, &mut output, &history_owned, "");
             (result, output)
         }
 
@@ -2151,14 +2408,14 @@ mod prompt_input {
 
             // Echo: 'e' (1) + U+0301 (2) = 3 bytes, then the repaint sequence.
             let after_char = &echo[3..]; // skip 'e' + 2-byte combining mark
-                                         // Repaint: ESC[1D ESC[K (move back base_width=1, clear EOL) …
+                                         // Repaint via redraw(): \r ESC[K (go to col 0, clear EOL) …
             assert!(
-                after_char.starts_with(b"\x1b[1D\x1b[K"),
-                "zero-width backspace must repaint base with ESC[1D ESC[K; got: {:?}",
+                after_char.starts_with(b"\r\x1b[K"),
+                "zero-width backspace must redraw with \\r ESC[K; got: {:?}",
                 &after_char[..after_char.len().min(15)]
             );
             // … then re-echo 'e' to restore the base char without the accent.
-            let after_erase = &after_char[b"\x1b[1D\x1b[K".len()..];
+            let after_erase = &after_char[b"\r\x1b[K".len()..];
             assert!(
                 after_erase.starts_with(b"e"),
                 "base char 'e' must be re-echoed after combining mark erase; got: {:?}",
@@ -2184,13 +2441,14 @@ mod prompt_input {
 
             // Echo: 'e'(1) + U+0301(2) + U+0302(2) = 5 bytes, then repaint.
             let after_chars = &echo[5..];
+            // Repaint via redraw(): \r ESC[K (go to col 0, clear EOL) …
             assert!(
-                after_chars.starts_with(b"\x1b[1D\x1b[K"),
-                "backspace of second mark should emit ESC[1D ESC[K; got: {:?}",
+                after_chars.starts_with(b"\r\x1b[K"),
+                "backspace of second mark should emit \\r ESC[K; got: {:?}",
                 &after_chars[..after_chars.len().min(15)]
             );
             // Re-echo must include 'e' + U+0301 but not U+0302.
-            let after_erase = &after_chars[b"\x1b[1D\x1b[K".len()..];
+            let after_erase = &after_chars[b"\r\x1b[K".len()..];
             let expected: &[u8] = "e\u{0301}".as_bytes(); // 'e' + 0xCC 0x81
             assert!(
                 after_erase.starts_with(expected),
@@ -2206,18 +2464,19 @@ mod prompt_input {
         }
 
         // ------------------------------------------------------------------ //
-        // Escape / CSI sequences — must be silently discarded
+        // Escape / CSI sequences
         // ------------------------------------------------------------------ //
 
         #[test]
-        fn arrow_up_csi_sequence_discarded() {
-            // ESC [ A = cursor up — should be ignored
+        fn arrow_up_with_no_history_does_nothing() {
+            // ESC [ A = cursor up — with empty history, leaves subsequent text unchanged
             let (res, _) = run(b"\x1b[Ahello\r");
             assert_eq!(res.unwrap(), Some("hello".to_string()));
         }
 
         #[test]
-        fn arrow_right_csi_sequence_discarded() {
+        fn arrow_right_at_end_does_nothing_to_content() {
+            // Right arrow at end of "hi" should not change the text.
             let (res, _) = run(b"hi\x1b[Cthere\r");
             assert_eq!(res.unwrap(), Some("hithere".to_string()));
         }
@@ -2292,6 +2551,181 @@ mod prompt_input {
             let mut s = String::new();
             super::strip_trailing_newline(&mut s);
             assert_eq!(s, "");
+        }
+
+        // ------------------------------------------------------------------ //
+        // Cursor movement — left/right arrows
+        // ------------------------------------------------------------------ //
+
+        #[test]
+        fn left_arrow_moves_cursor_left_then_insert() {
+            // "ab" + left + "X" + Enter → "aXb"
+            let (res, _) = run(b"ab\x1b[DX\r");
+            assert_eq!(res.unwrap(), Some("aXb".to_string()));
+        }
+
+        #[test]
+        fn left_arrow_at_start_does_nothing() {
+            // Three left arrows on empty buffer, then type "hi" → "hi"
+            let (res, _) = run(b"\x1b[D\x1b[D\x1b[Dhi\r");
+            assert_eq!(res.unwrap(), Some("hi".to_string()));
+        }
+
+        #[test]
+        fn right_arrow_at_end_does_nothing() {
+            // "hi" + right arrow (cursor already at end) + "!" → "hi!"
+            let (res, _) = run(b"hi\x1b[C!\r");
+            assert_eq!(res.unwrap(), Some("hi!".to_string()));
+        }
+
+        #[test]
+        fn left_then_right_returns_to_end() {
+            // "ab" + left + right + "c" → "abc"
+            let (res, _) = run(b"ab\x1b[D\x1b[Cc\r");
+            assert_eq!(res.unwrap(), Some("abc".to_string()));
+        }
+
+        #[test]
+        fn backspace_at_cursor_position_deletes_char_before_cursor() {
+            // "abc" + 2 lefts (cursor=1) + backspace (deletes chars[0]='a') → "bc"
+            let (res, _) = run(b"abc\x1b[D\x1b[D\x7f\r");
+            assert_eq!(res.unwrap(), Some("bc".to_string()));
+        }
+
+        #[test]
+        fn backspace_mid_line_deletes_char_before_cursor() {
+            // "abc" + 1 left (cursor=2) + backspace (deletes chars[1]='b') → "ac"
+            let (res, _) = run(b"abc\x1b[D\x7f\r");
+            assert_eq!(res.unwrap(), Some("ac".to_string()));
+        }
+
+        // ------------------------------------------------------------------ //
+        // Home / End
+        // ------------------------------------------------------------------ //
+
+        #[test]
+        fn home_vt_moves_cursor_to_start() {
+            // "abc" + Home (ESC[H) + "X" → "Xabc"
+            let (res, _) = run(b"abc\x1b[HX\r");
+            assert_eq!(res.unwrap(), Some("Xabc".to_string()));
+        }
+
+        #[test]
+        fn home_xterm_tilde_moves_cursor_to_start() {
+            // "abc" + Home (ESC[1~) + "X" → "Xabc"
+            let (res, _) = run(b"abc\x1b[1~X\r");
+            assert_eq!(res.unwrap(), Some("Xabc".to_string()));
+        }
+
+        #[test]
+        fn end_vt_moves_cursor_to_end() {
+            // "abc" + 2 lefts + End (ESC[F) + "Z" → "abcZ"
+            let (res, _) = run(b"abc\x1b[D\x1b[D\x1b[FZ\r");
+            assert_eq!(res.unwrap(), Some("abcZ".to_string()));
+        }
+
+        #[test]
+        fn end_xterm_tilde_moves_cursor_to_end() {
+            // "abc" + 2 lefts + End (ESC[4~) + "Z" → "abcZ"
+            let (res, _) = run(b"abc\x1b[D\x1b[D\x1b[4~Z\r");
+            assert_eq!(res.unwrap(), Some("abcZ".to_string()));
+        }
+
+        #[test]
+        fn home_at_start_does_nothing() {
+            let (res, _) = run(b"\x1b[Habc\r");
+            assert_eq!(res.unwrap(), Some("abc".to_string()));
+        }
+
+        #[test]
+        fn end_at_end_does_nothing() {
+            let (res, _) = run(b"abc\x1b[Fz\r");
+            assert_eq!(res.unwrap(), Some("abcz".to_string()));
+        }
+
+        // ------------------------------------------------------------------ //
+        // Delete (forward)
+        // ------------------------------------------------------------------ //
+
+        #[test]
+        fn delete_at_end_does_nothing() {
+            let (res, _) = run(b"abc\x1b[3~\r");
+            assert_eq!(res.unwrap(), Some("abc".to_string()));
+        }
+
+        #[test]
+        fn delete_removes_char_under_cursor() {
+            // "abc" + 2 lefts (cursor=1) + Delete → "ac"
+            let (res, _) = run(b"abc\x1b[D\x1b[D\x1b[3~\r");
+            assert_eq!(res.unwrap(), Some("ac".to_string()));
+        }
+
+        #[test]
+        fn delete_at_start_removes_first_char() {
+            // Home + Delete on "abc" → "bc"
+            let (res, _) = run(b"abc\x1b[H\x1b[3~\r");
+            assert_eq!(res.unwrap(), Some("bc".to_string()));
+        }
+
+        #[test]
+        fn insert_at_start_of_line() {
+            // Three lefts to go to start, insert 'X' → "Xabc"
+            let (res, _) = run(b"abc\x1b[D\x1b[D\x1b[DX\r");
+            assert_eq!(res.unwrap(), Some("Xabc".to_string()));
+        }
+
+        // ------------------------------------------------------------------ //
+        // History navigation — up/down arrows
+        // ------------------------------------------------------------------ //
+
+        #[test]
+        fn up_arrow_with_empty_history_does_nothing() {
+            // With no history, up arrow changes nothing; typed text stays.
+            let (res, _) = run_with_history(b"\x1b[Aworld\r", &[]);
+            assert_eq!(res.unwrap(), Some("world".to_string()));
+        }
+
+        #[test]
+        fn up_arrow_loads_most_recent_history_entry() {
+            // history = ["prev"], up → "prev", Enter
+            let (res, _) = run_with_history(b"\x1b[A\r", &["prev"]);
+            assert_eq!(res.unwrap(), Some("prev".to_string()));
+        }
+
+        #[test]
+        fn up_arrow_multiple_times_navigates_history() {
+            // history = ["first", "second"], two ups → "first"
+            let (res, _) = run_with_history(b"\x1b[A\x1b[A\r", &["first", "second"]);
+            assert_eq!(res.unwrap(), Some("first".to_string()));
+        }
+
+        #[test]
+        fn up_arrow_at_oldest_entry_does_nothing_further() {
+            // history = ["only"], two ups → still "only"
+            let (res, _) = run_with_history(b"\x1b[A\x1b[A\r", &["only"]);
+            assert_eq!(res.unwrap(), Some("only".to_string()));
+        }
+
+        #[test]
+        fn down_arrow_with_no_history_navigation_does_nothing() {
+            // Down arrow without prior up should leave current text unchanged.
+            let (res, _) = run_with_history(b"hi\x1b[B!\r", &["prev"]);
+            assert_eq!(res.unwrap(), Some("hi!".to_string()));
+        }
+
+        #[test]
+        fn up_then_down_restores_draft() {
+            // Type "draft", up (loads "prev"), down (restores "draft"), Enter
+            let (res, _) = run_with_history(b"draft\x1b[A\x1b[B\r", &["prev"]);
+            assert_eq!(res.unwrap(), Some("draft".to_string()));
+        }
+
+        #[test]
+        fn up_twice_down_once_shows_second_history_entry() {
+            // history = ["first", "second"]
+            // up → "second", up → "first", down → "second", Enter
+            let (res, _) = run_with_history(b"\x1b[A\x1b[A\x1b[B\r", &["first", "second"]);
+            assert_eq!(res.unwrap(), Some("second".to_string()));
         }
     }
 }
