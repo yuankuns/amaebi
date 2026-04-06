@@ -1552,6 +1552,7 @@ async fn start_daemon(socket: &std::path::Path) -> Result<()> {
 /// read so it can track each character's display width and emit the correct
 /// number of erase columns on backspace.
 mod prompt_input {
+    use std::collections::VecDeque;
     use std::io::{Read, Write};
     use std::sync::{Mutex, OnceLock};
     use unicode_width::UnicodeWidthChar as _;
@@ -1562,10 +1563,12 @@ mod prompt_input {
     /// Process-wide history buffer.  Using a `static` instead of `thread_local!`
     /// ensures history persists across `tokio::task::spawn_blocking` calls, which
     /// are not guaranteed to reuse the same OS thread.
-    static HISTORY: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+    ///
+    /// `VecDeque` gives O(1) front-eviction when the buffer is full.
+    static HISTORY: OnceLock<Mutex<VecDeque<String>>> = OnceLock::new();
 
-    fn history_store() -> &'static Mutex<Vec<String>> {
-        HISTORY.get_or_init(|| Mutex::new(Vec::new()))
+    fn history_store() -> &'static Mutex<VecDeque<String>> {
+        HISTORY.get_or_init(|| Mutex::new(VecDeque::new()))
     }
 
     /// RAII guard that restores the terminal to its saved settings on drop.
@@ -1659,7 +1662,9 @@ mod prompt_input {
         let history_snapshot: Vec<String> = history_store()
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .clone();
+            .iter()
+            .cloned()
+            .collect();
         let result = process_input(
             &mut std::io::stdin(),
             &mut std::io::stderr(),
@@ -1670,9 +1675,9 @@ mod prompt_input {
             if !line.is_empty() {
                 let mut hist = history_store().lock().unwrap_or_else(|p| p.into_inner());
                 if hist.len() >= MAX_HISTORY {
-                    hist.remove(0);
+                    hist.pop_front();
                 }
-                hist.push(line.clone());
+                hist.push_back(line.clone());
             }
         }
         result
@@ -1729,8 +1734,10 @@ mod prompt_input {
         // History navigation state.
         // `hist_idx` == history.len() means "current draft" (not navigating history).
         let mut hist_idx: usize = history.len();
-        // Draft saved the first time the user presses Up from the live buffer.
+        // Draft saved the first time the user presses Up from the live buffer,
+        // including the cursor position so returning from history restores it.
         let mut draft_chars: Vec<char> = Vec::new();
+        let mut draft_cursor: usize = 0;
 
         loop {
             let mut byte = [0u8; 1];
@@ -1790,13 +1797,12 @@ mod prompt_input {
                         } else {
                             // Zero-width combining mark: it was rendered on top of the
                             // preceding base character without advancing the cursor.
-                            // Use a full redraw so that characters after the cursor are
-                            // also repainted (inline erase would leave them erased).
-                            if widths[..cursor].iter().any(|&bw| bw > 0) {
-                                redraw(output, prompt, &chars, &widths, cursor)?;
-                            }
-                            // No preceding base char (mark at start of buffer):
-                            // nothing to repaint.
+                            // Always do a full redraw: if there was a preceding base char
+                            // we need to repaint it cleanly; if the mark was the very
+                            // first character it may have combined visually with the
+                            // trailing character of the prompt, so reprinting the prompt
+                            // via redraw() is the only way to restore it.
+                            redraw(output, prompt, &chars, &widths, cursor)?;
                         }
                     }
                 }
@@ -1849,8 +1855,10 @@ mod prompt_input {
                                         // Up arrow (ESC [ A) — navigate backwards in history
                                         Some(b'A') => {
                                             if hist_idx == history.len() {
-                                                // Save current draft before entering history.
+                                                // Save current draft (chars and cursor) before
+                                                // entering history so it can be restored intact.
                                                 draft_chars = chars.clone();
+                                                draft_cursor = cursor;
                                             }
                                             if hist_idx > 0 {
                                                 hist_idx -= 1;
@@ -1868,16 +1876,19 @@ mod prompt_input {
                                             if hist_idx < history.len() {
                                                 hist_idx += 1;
                                                 if hist_idx == history.len() {
-                                                    // Restore the saved draft.
+                                                    // Restore the saved draft, including the
+                                                    // cursor position the user had when they
+                                                    // pressed Up.
                                                     chars = draft_chars.clone();
+                                                    cursor = draft_cursor;
                                                 } else {
                                                     chars = history[hist_idx].chars().collect();
+                                                    cursor = chars.len();
                                                 }
                                                 widths = chars
                                                     .iter()
                                                     .map(|c| c.width().unwrap_or(1))
                                                     .collect();
-                                                cursor = chars.len();
                                                 redraw(output, prompt, &chars, &widths, cursor)?;
                                             }
                                         }
