@@ -7,27 +7,84 @@
 
 set -euo pipefail
 
-# Extract the bash command from the tool input.
-TOOL_CMD=$(python3 -c "
-import os, json
+# python3 is required to parse CLAUDE_TOOL_INPUT; fail closed if missing.
+if ! command -v python3 >/dev/null 2>&1; then
+    echo "[hook] error: python3 is required to parse CLAUDE_TOOL_INPUT" >&2
+    exit 1
+fi
+
+# Extract the bash command from the tool input; fail closed on parse error.
+if ! TOOL_CMD=$(python3 -c "
+import json, os, sys
 raw = os.environ.get('CLAUDE_TOOL_INPUT', '{}')
 try:
-    print(json.loads(raw).get('command', ''))
+    payload = json.loads(raw)
 except Exception:
-    print('')
-" 2>/dev/null || true)
+    sys.exit(1)
+if not isinstance(payload, dict):
+    sys.exit(1)
+command = payload.get('command')
+if not isinstance(command, str):
+    sys.exit(1)
+print(command)
+"); then
+    echo "[hook] error: failed to parse CLAUDE_TOOL_INPUT" >&2
+    exit 1
+fi
 
-# Only intercept actual commit invocations; skip --no-verify and --help.
-case "$TOOL_CMD" in
-    *"git commit"*)
-        if echo "$TOOL_CMD" | grep -qE '(--no-verify|-n[[:space:]]|--help|-h[[:space:]])'; then
-            exit 0
-        fi
-        ;;
-    *)
-        exit 0
-        ;;
-esac
+# Use token-level parsing to detect 'git commit', correctly handling global
+# git options before the subcommand (e.g. git -c foo=bar commit, git --no-pager commit).
+SHOULD_RUN=$(python3 -c "
+import shlex, sys
+
+try:
+    argv = shlex.split('''$TOOL_CMD''')
+except Exception:
+    print('0')
+    sys.exit(0)
+
+if not argv or argv[0] != 'git':
+    print('0')
+    sys.exit(0)
+
+# Global git options that consume the next token as a value.
+global_opts_with_value = {'-c', '-C', '--git-dir', '--work-tree',
+                          '--namespace', '--super-prefix', '--config-env'}
+
+i = 1
+while i < len(argv):
+    token = argv[i]
+    if token == 'commit':
+        break
+    if token == '--':
+        print('0')
+        sys.exit(0)
+    if token.startswith('-'):
+        opt = token.split('=', 1)[0]
+        if opt in global_opts_with_value and '=' not in token:
+            i += 2
+        else:
+            i += 1
+        continue
+    # Non-option, non-'commit' token — some other subcommand.
+    print('0')
+    sys.exit(0)
+
+if i >= len(argv) or argv[i] != 'commit':
+    print('0')
+    sys.exit(0)
+
+# Check commit-level bypass flags as exact tokens.
+commit_args = argv[i + 1:]
+if any(arg in ('--no-verify', '-n', '--help', '-h') for arg in commit_args):
+    print('0')
+else:
+    print('1')
+" 2>/dev/null || echo "0")
+
+if [ "$SHOULD_RUN" != "1" ]; then
+    exit 0
+fi
 
 REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
 cd "$REPO_ROOT"
