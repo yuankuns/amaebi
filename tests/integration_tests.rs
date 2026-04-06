@@ -2241,6 +2241,61 @@ async fn gemini_models_route_via_copilot_and_succeed() {
 // Verifies that when /chat/completions returns 400 unsupported_api_for_model
 // the daemon automatically retries via /v1/responses and delivers the
 // response to the client.
+// ---------------------------------------------------------------------------
+
+/// When `/chat/completions` returns `400 unsupported_api_for_model` for a
+/// non-gpt-5 model the daemon must transparently retry via `/v1/responses`
+/// and deliver the response to the client.
+///
+/// gpt-4o is used here because it goes through the chat-first path; gpt-5.x
+/// skips chat/completions entirely so it cannot exercise this fallback.
+#[tokio::test]
+async fn chat_completions_400_falls_back_to_responses_api() {
+    let server = MockLlmServer::start().await;
+
+    // First request: /chat/completions returns 400 unsupported_api_for_model.
+    server.enqueue_error(
+        400,
+        r#"{"error":{"code":"unsupported_api_for_model","message":"model not supported via chat completions"}}"#,
+    );
+    // Second request: /v1/responses succeeds.
+    server.enqueue(ScriptedResponse::text_chunks(vec!["fallback-ok"]));
+
+    let daemon = start_daemon(&server.url()).await.expect("start_daemon");
+    let client = connect_client(&daemon.socket);
+
+    let responses = send_message_with_session(&client, "hello", "sess-fallback", "copilot/gpt-4o")
+        .await
+        .expect("send_message");
+
+    let text = collect_text(&responses);
+    assert!(
+        text.contains("fallback-ok"),
+        "expected fallback response text; got: {text:?}"
+    );
+
+    // Two requests: the failed chat/completions attempt + the successful
+    // Responses API retry.
+    let reqs = server.take_requests();
+    assert_eq!(
+        reqs.len(),
+        2,
+        "expected 2 requests (chat/completions failure + Responses API retry), got {}",
+        reqs.len()
+    );
+
+    // The retry request must use Responses API wire format.
+    assert!(
+        reqs[1].body.get("input").is_some(),
+        "expected Responses API format (input field) on retry; got: {:?}",
+        reqs[1].body
+    );
+    assert!(
+        reqs[1].body.get("max_output_tokens").is_some(),
+        "expected Responses API format (max_output_tokens) on retry; got: {:?}",
+        reqs[1].body
+    );
+}
 
 // ===========================================================================
 // amaebi chat long-connection regression tests
