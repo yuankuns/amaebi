@@ -1247,7 +1247,7 @@ mod tests {
 
     #[test]
     fn amrf_1m_only_for_model_without_adaptive_thinking() {
-        // claude-opus-4-1 does not support adaptive thinking but does support 1M.
+        // claude-sonnet-4 does not support adaptive thinking but does support 1M.
         let amrf = build_additional_model_request_fields(
             "us.anthropic.claude-sonnet-4-20250514-v1:0",
             true,
