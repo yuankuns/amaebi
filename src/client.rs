@@ -1894,6 +1894,20 @@ mod prompt_input {
                                             redraw(output, prompt, &chars, &widths, cursor)?;
                                         }
                                     }
+                                    // Delete (forward): ESC [ 3 ~
+                                    (Some(b'~'), b"3") => {
+                                        if cursor < chars.len() {
+                                            let w = widths[cursor];
+                                            chars.remove(cursor);
+                                            widths.remove(cursor);
+                                            if cursor == chars.len() {
+                                                // Cursor is now at end — erase the character in place.
+                                                write!(output, "\x1b[{w}P")?;
+                                            } else {
+                                                redraw(output, prompt, &chars, &widths, cursor)?;
+                                            }
+                                        }
+                                    }
                                     // All other CSI sequences: discard.
                                     _ => {}
                                 }
@@ -2557,6 +2571,30 @@ mod prompt_input {
         fn end_at_end_does_nothing() {
             let (res, _) = run(b"abc\x1b[Fz\r");
             assert_eq!(res.unwrap(), Some("abcz".to_string()));
+        }
+
+        // ------------------------------------------------------------------ //
+        // Delete (forward)
+        // ------------------------------------------------------------------ //
+
+        #[test]
+        fn delete_at_end_does_nothing() {
+            let (res, _) = run(b"abc\x1b[3~\r");
+            assert_eq!(res.unwrap(), Some("abc".to_string()));
+        }
+
+        #[test]
+        fn delete_removes_char_under_cursor() {
+            // "abc" + 2 lefts (cursor=1) + Delete → "ac"
+            let (res, _) = run(b"abc\x1b[D\x1b[D\x1b[3~\r");
+            assert_eq!(res.unwrap(), Some("ac".to_string()));
+        }
+
+        #[test]
+        fn delete_at_start_removes_first_char() {
+            // Home + Delete on "abc" → "bc"
+            let (res, _) = run(b"abc\x1b[H\x1b[3~\r");
+            assert_eq!(res.unwrap(), Some("bc".to_string()));
         }
 
         #[test]
