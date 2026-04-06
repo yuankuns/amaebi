@@ -61,14 +61,19 @@ impl MarkdownBuffer {
         self.scan_new_lines();
     }
 
-    /// Scan only lines that have been appended since the last call, updating state.
+    /// Scan only newly completed lines, updating `self.state`.
+    ///
+    /// Only processes lines that are newline-terminated so that a partial
+    /// fence (`` ``` `` without its `\n`) never toggles state prematurely.
+    /// The next call picks up the line once its terminating newline arrives.
     fn scan_new_lines(&mut self) {
-        // Walk only the unscanned suffix, but we must back up to the start of
-        // the current (possibly incomplete) last line so we don't miss a line
-        // whose newline just arrived in this chunk.
-        let scan_from = self.buf[..self.scanned].rfind('\n').map_or(0, |p| p + 1);
-        let mut is_first_line = scan_from == 0 && self.scanned == 0;
-        for line in self.buf[scan_from..].lines() {
+        // Only scan up to the last `\n`; the trailing incomplete line (if any)
+        // will be processed when its newline arrives.
+        let complete_end = self.buf.rfind('\n').map_or(0, |p| p + 1);
+        if complete_end <= self.scanned {
+            return;
+        }
+        for line in self.buf[self.scanned..complete_end].lines() {
             let trimmed = line.trim();
             match &self.state {
                 MdState::Normal => {
@@ -79,7 +84,7 @@ impl MarkdownBuffer {
                     }
                 }
                 MdState::InCodeBlock => {
-                    if !is_first_line && trimmed.starts_with("```") {
+                    if trimmed.starts_with("```") {
                         self.state = MdState::Normal;
                     }
                 }
@@ -89,21 +94,65 @@ impl MarkdownBuffer {
                     }
                 }
             }
-            is_first_line = false;
         }
-        // Advance scanned to the start of the last (possibly incomplete) line.
-        self.scanned = self.buf.rfind('\n').map_or(0, |p| p + 1);
+        self.scanned = complete_end;
+    }
+
+    /// Return the end byte offset of the first safe flush boundary, or `None`.
+    ///
+    /// Scans the buffer from the start tracking state transitions line by
+    /// line.  A blank line is a safe boundary only when the parser is in
+    /// `MdState::Normal` at that point, so `\n\n` sequences inside a code
+    /// block or table are never returned as flush boundaries — even when the
+    /// block is later closed within the same buffer.
+    fn safe_flush_boundary(&self) -> Option<usize> {
+        let mut state = MdState::Normal;
+        let mut offset = 0usize;
+
+        while offset < self.buf.len() {
+            let rel_nl = self.buf[offset..].find('\n')?;
+            let line_end = offset + rel_nl + 1;
+            let trimmed = self.buf[offset..line_end]
+                .trim_end_matches('\n')
+                .trim_end_matches('\r')
+                .trim();
+
+            match state {
+                MdState::Normal => {
+                    if trimmed.starts_with("```") {
+                        state = MdState::InCodeBlock;
+                    } else if trimmed.starts_with('|') {
+                        state = MdState::InTable;
+                    }
+                }
+                MdState::InCodeBlock => {
+                    if trimmed.starts_with("```") {
+                        state = MdState::Normal;
+                    }
+                }
+                MdState::InTable => {
+                    if !trimmed.starts_with('|') && !trimmed.is_empty() {
+                        state = MdState::Normal;
+                    }
+                }
+            }
+
+            // A blank line while in Normal state is a paragraph boundary.
+            if trimmed.is_empty() && state == MdState::Normal {
+                return Some(line_end);
+            }
+
+            offset = line_end;
+        }
+
+        None
     }
 
     fn flush_if_ready(&mut self) -> Option<String> {
-        if self.state != MdState::Normal {
-            return None;
-        }
-        if let Some(idx) = self.buf.find("\n\n") {
-            let para = self.buf[..idx + 2].to_string();
-            self.buf = self.buf[idx + 2..].to_string();
-            // scanned offset must be adjusted for the drained prefix.
-            self.scanned = self.scanned.saturating_sub(idx + 2);
+        if let Some(end) = self.safe_flush_boundary() {
+            let para = self.buf[..end].to_string();
+            self.buf = self.buf[end..].to_string();
+            self.scanned = self.scanned.saturating_sub(end);
             if !para.trim().is_empty() {
                 return Some(para);
             }
@@ -835,13 +884,14 @@ pub async fn run_chat_loop(
                             }
                         }
                         Response::Done => {
+                            // Drain any steer-buffered text through md_buf before
+                            // flush_all so the final output is markdown-rendered.
+                            for chunk in steer_text_buf.drain(..) {
+                                md_buf.push(&chunk);
+                            }
                             if let Some(remaining) = md_buf.flush_all() {
                                 let out = render_markdown(&remaining);
                                 let _ = stdout.write_all(out.as_bytes()).await;
-                            }
-                            // Flush any text that arrived while steer was pending.
-                            for chunk in steer_text_buf.drain(..) {
-                                stdout.write_all(chunk.as_bytes()).await?;
                             }
                             stdout.write_all(b"\n").await?;
                             stdout.flush().await?;
@@ -905,9 +955,13 @@ pub async fn run_chat_loop(
                             // No Steer frame sent on cancel: the daemon's WAITING_FOR_INPUT
                             // path now treats the already-sent Interrupt (None) as a cancel
                             // signal, so no follow-up message is needed.
-                            // Flush buffered text now that steer is cancelled.
+                            // Flush buffered text through md_buf now that steer is cancelled.
                             for chunk in steer_text_buf.drain(..) {
-                                let _ = stdout.write_all(chunk.as_bytes()).await;
+                                md_buf.push(&chunk);
+                                while let Some(ready) = md_buf.flush_if_ready() {
+                                    let out = render_markdown(&ready);
+                                    let _ = stdout.write_all(out.as_bytes()).await;
+                                }
                             }
                             let _ = stdout.flush().await;
                         } else {
@@ -1297,16 +1351,30 @@ async fn flush_steer_buffer(
         eprintln!("\n[some output was truncated]");
         *truncated = false;
     }
+    // Collect all buffered text through a local MarkdownBuffer so the
+    // suppressed output is rendered consistently with the normal streaming
+    // path.  Non-text frames are flushed first so that any preceding markdown
+    // content is fully emitted before tool/compacting notices appear.
+    let mut md_buf = MarkdownBuffer::default();
     for resp in buffer.drain(..) {
         match resp {
             Response::Text { chunk } => {
-                stdout
-                    .write_all(chunk.as_bytes())
-                    .await
-                    .context("writing buffered text to stdout")?;
-                stdout.flush().await.context("flushing stdout")?;
+                md_buf.push(&chunk);
+                while let Some(ready) = md_buf.flush_if_ready() {
+                    let out = render_markdown(&ready);
+                    stdout
+                        .write_all(out.as_bytes())
+                        .await
+                        .context("writing buffered text to stdout")?;
+                }
             }
             Response::ToolUse { name, detail } => {
+                // Flush any pending markdown before printing the tool notice.
+                if let Some(remaining) = md_buf.flush_all() {
+                    let out = render_markdown(&remaining);
+                    let _ = stdout.write_all(out.as_bytes()).await;
+                    let _ = stdout.flush().await;
+                }
                 eprintln!();
                 match name.as_str() {
                     "shell_command" => eprintln!("```bash\n$ {detail}\n```"),
@@ -1318,6 +1386,11 @@ async fn flush_steer_buffer(
                 }
             }
             Response::Compacting => {
+                if let Some(remaining) = md_buf.flush_all() {
+                    let out = render_markdown(&remaining);
+                    let _ = stdout.write_all(out.as_bytes()).await;
+                    let _ = stdout.flush().await;
+                }
                 if std::io::stderr().is_terminal() {
                     eprintln!("\n\x1b[1;5;34m[compacting conversation history…]\x1b[0m");
                 } else {
@@ -1337,6 +1410,15 @@ async fn flush_steer_buffer(
             _ => {}
         }
     }
+    // Flush any remaining markdown (e.g. last paragraph without trailing \n).
+    if let Some(remaining) = md_buf.flush_all() {
+        let out = render_markdown(&remaining);
+        let _ = stdout.write_all(out.as_bytes()).await;
+    }
+    stdout
+        .flush()
+        .await
+        .context("flushing stdout after steer buffer")?;
     Ok(())
 }
 
@@ -2527,5 +2609,71 @@ mod tests {
         let out = buf.flush_all().expect("flush_all should return content");
         assert!(out.contains("Some text without double newline"));
         assert_eq!(buf.flush_all(), None);
+    }
+
+    /// A code block that contains an internal blank line must not be flushed
+    /// mid-block, even when the entire block arrives in a single chunk and the
+    /// final state after `scan_new_lines` is `Normal`.
+    #[test]
+    fn code_block_with_internal_blank_line_not_flushed_mid_block() {
+        let mut buf = MarkdownBuffer::default();
+        // One chunk: complete code block with an internal blank line.
+        buf.push("```rust\nfn a() {}\n\nfn b() {}\n```\n\n");
+        let flushed = buf
+            .flush_if_ready()
+            .expect("should flush the complete code block");
+        assert!(
+            flushed.contains("fn a()"),
+            "expected full code block; got: {flushed:?}"
+        );
+        assert!(
+            flushed.contains("fn b()"),
+            "expected full code block; got: {flushed:?}"
+        );
+        // The internal \n\n must NOT have split the block.
+        assert!(
+            flushed.contains("```rust"),
+            "opening fence must be in the flushed unit"
+        );
+    }
+
+    /// A fence line (`` ``` ``) that arrives without its terminating `\n` must
+    /// not toggle state.  When the `\n` arrives in the next chunk the state
+    /// machine should transition exactly once.
+    #[test]
+    fn fence_split_across_chunks_does_not_toggle_state() {
+        let mut buf = MarkdownBuffer::default();
+
+        // Opening fence arrives without its newline — state must stay Normal.
+        buf.push("```rust");
+        assert_eq!(
+            buf.state,
+            MdState::Normal,
+            "incomplete opening fence must not change state"
+        );
+
+        // Newline arrives — now the fence is complete.
+        buf.push("\n");
+        assert_eq!(
+            buf.state,
+            MdState::InCodeBlock,
+            "complete opening fence must enter InCodeBlock"
+        );
+
+        // Some code, then the closing fence without its newline.
+        buf.push("let x = 1;\n```");
+        assert_eq!(
+            buf.state,
+            MdState::InCodeBlock,
+            "incomplete closing fence must not exit InCodeBlock"
+        );
+
+        // Newline completes the closing fence.
+        buf.push("\n");
+        assert_eq!(
+            buf.state,
+            MdState::Normal,
+            "complete closing fence must exit InCodeBlock"
+        );
     }
 }
