@@ -1388,15 +1388,22 @@ fn is_unsupported_via_chat_completions(e: &anyhow::Error) -> bool {
         })
 }
 
+/// Returns `true` for models that must be routed directly to the Responses API
+/// and do not support Chat Completions at all (e.g. the gpt-5 family).
+fn requires_responses_api(model: &str) -> bool {
+    model == "gpt-5" || model.starts_with("gpt-5.") || model.starts_with("gpt-5-")
+}
+
 /// Send one model turn, dispatching to the correct provider backend.
 ///
 /// The raw `model` string is resolved via [`crate::provider::resolve`] to
 /// determine the provider (Copilot or Bedrock) and the actual model ID.
 ///
-/// **Copilot** path (existing behaviour):
+/// **Copilot** path:
 /// 1. The base URL is derived from the `proxy-ep` field in the Copilot JWT.
-/// 2. Tries `/v1/chat/completions` first.
-/// 3. Falls back to `/v1/responses` on 400 `unsupported_api_for_model`.
+/// 2. gpt-5.x models go directly to `/v1/responses`.
+/// 3. All other models try `/v1/chat/completions` first, falling back to
+///    `/v1/responses` on 400 `unsupported_api_for_model`.
 /// 4. Auth errors (401/403) evict the token cache and retry once.
 ///
 /// **Bedrock** path:
@@ -1464,8 +1471,71 @@ where
     }
 }
 
-/// Copilot-specific model invocation with Chat Completions / Responses API
-/// fallback and auth-error retry.
+/// Call the Responses API with `tok`, evicting the token cache and retrying
+/// once on a 401/403 auth error.  Centralises retry/telemetry logic so both
+/// the gpt-5.x direct path and the chat-completions fallback path stay in sync.
+async fn stream_via_responses_with_auth_retry<W>(
+    state: &DaemonState,
+    tok: &crate::auth::CopilotToken,
+    model: &str,
+    messages: &[Message],
+    tools: &[serde_json::Value],
+    max_completion_tokens: usize,
+    writer: &mut W,
+) -> Result<copilot::CopilotResponse>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    let r = crate::responses::stream_chat(
+        &state.http,
+        &tok.value,
+        &tok.base_url,
+        model,
+        messages,
+        tools,
+        max_completion_tokens,
+        writer,
+    )
+    .await;
+    match r {
+        Ok(r) => Ok(r),
+        Err(e) => {
+            let is_auth = e
+                .downcast_ref::<copilot::CopilotHttpError>()
+                .is_some_and(|he| matches!(he.status.as_u16(), 401 | 403));
+            if is_auth {
+                tracing::warn!(
+                    error = %e,
+                    "Responses API auth error; evicting token and retrying"
+                );
+                state.tokens.invalidate().await;
+                let fresh = state
+                    .tokens
+                    .get(&state.http)
+                    .await
+                    .context("fetching fresh token after Responses API auth error")?;
+                crate::responses::stream_chat(
+                    &state.http,
+                    &fresh.value,
+                    &fresh.base_url,
+                    model,
+                    messages,
+                    tools,
+                    max_completion_tokens,
+                    writer,
+                )
+                .await
+            } else {
+                Err(e)
+            }
+        }
+    }
+}
+
+/// Copilot-specific model invocation.  gpt-5.x models are routed directly to
+/// the Responses API; all other models try Chat Completions first, falling
+/// back to Responses API on `unsupported_api_for_model`.  Auth errors evict
+/// the token cache and retry once.
 async fn invoke_copilot<W>(
     state: &DaemonState,
     model: &str,
@@ -1482,6 +1552,22 @@ where
         .get(&state.http)
         .await
         .context("refreshing Copilot API token")?;
+
+    // Models in the gpt-5 family do not support Chat Completions at all.
+    // Skip the first-hop attempt and go directly to the Responses API.
+    if requires_responses_api(model) {
+        tracing::debug!(model, "routing directly to Responses API (gpt-5 family)");
+        return stream_via_responses_with_auth_retry(
+            state,
+            &tok,
+            model,
+            messages,
+            tools,
+            max_completion_tokens,
+            writer,
+        )
+        .await;
+    }
 
     let result = copilot::stream_chat(
         &state.http,
@@ -1505,52 +1591,16 @@ where
                 model,
                 "model not accessible via /chat/completions; retrying via Responses API"
             );
-            let r = crate::responses::stream_chat(
-                &state.http,
-                &tok.value,
-                &tok.base_url,
+            stream_via_responses_with_auth_retry(
+                state,
+                &tok,
                 model,
                 messages,
                 tools,
                 max_completion_tokens,
                 writer,
             )
-            .await;
-            // The Responses API can also return 401/403 on token expiry.
-            // Evict the cache and retry once with a fresh token.
-            match r {
-                Ok(r) => Ok(r),
-                Err(e2) => {
-                    let is_auth = e2
-                        .downcast_ref::<copilot::CopilotHttpError>()
-                        .is_some_and(|he| matches!(he.status.as_u16(), 401 | 403));
-                    if is_auth {
-                        tracing::warn!(
-                            error = %e2,
-                            "Responses API auth error; evicting token and retrying"
-                        );
-                        state.tokens.invalidate().await;
-                        let fresh = state
-                            .tokens
-                            .get(&state.http)
-                            .await
-                            .context("fetching fresh token after Responses API auth error")?;
-                        crate::responses::stream_chat(
-                            &state.http,
-                            &fresh.value,
-                            &fresh.base_url,
-                            model,
-                            messages,
-                            tools,
-                            max_completion_tokens,
-                            writer,
-                        )
-                        .await
-                    } else {
-                        Err(e2)
-                    }
-                }
-            }
+            .await
         }
 
         // Auth error — evict the token cache and retry once with a fresh token.
@@ -1582,10 +1632,9 @@ where
                 match r2 {
                     Ok(r) => Ok(r),
                     Err(ref e2) if is_unsupported_via_chat_completions(e2) => {
-                        crate::responses::stream_chat(
-                            &state.http,
-                            &fresh.value,
-                            &fresh.base_url,
+                        stream_via_responses_with_auth_retry(
+                            state,
+                            &fresh,
                             model,
                             messages,
                             tools,
@@ -3164,5 +3213,24 @@ mod tests {
         assert!(needs_copilot_auth("copilot/claude-opus-4-6-20251101"));
         assert!(needs_copilot_auth("copilot/claude-sonnet-4-5"));
         assert!(needs_copilot_auth("copilot/gpt-4o"));
+    }
+
+    // ------------------------------------------------------------------
+    // requires_responses_api tests
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn gpt_5_4_requires_responses_api() {
+        assert!(requires_responses_api("gpt-5.4"));
+    }
+
+    #[test]
+    fn gpt_4o_does_not_require_responses_api() {
+        assert!(!requires_responses_api("gpt-4o"));
+    }
+
+    #[test]
+    fn gpt_5_mini_requires_responses_api() {
+        assert!(requires_responses_api("gpt-5-mini"));
     }
 }
