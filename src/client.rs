@@ -870,9 +870,11 @@ pub async fn run_chat_loop(
                         eprint!("{}", prompt_input::PROMPT);
                         let _ = tokio::io::stderr().flush().await;
                     }
-                    steer_task = Some(tokio::task::spawn_blocking(
-                        prompt_input::read_line_raw,
-                    ));
+                    if steer_task.is_none() {
+                        steer_task = Some(tokio::task::spawn_blocking(
+                            prompt_input::read_line_raw,
+                        ));
+                    }
                     let interrupt_req = Request::Interrupt { session_id: session_id.clone() };
                     if let Ok(mut frame) = serde_json::to_string(&interrupt_req) {
                         frame.push('\n');
@@ -949,9 +951,11 @@ pub async fn run_chat_loop(
                             eprint!("{}", prompt_input::PROMPT);
                             let _ = tokio::io::stderr().flush().await;
                             steer_pending = true;
-                            steer_task = Some(tokio::task::spawn_blocking(
-                                prompt_input::read_line_raw,
-                            ));
+                            if steer_task.is_none() {
+                                steer_task = Some(tokio::task::spawn_blocking(
+                                    prompt_input::read_line_raw,
+                                ));
+                            }
                         }
                         Response::SteerAck => {
                             steer_pending = false;
