@@ -347,22 +347,34 @@ pub fn connect_client(socket: &Path) -> ClientHandle {
 }
 
 /// Send a chat message with a specific session_id and model.
+///
+/// Retries automatically when the daemon responds with "already in use" —
+/// this races when a prior connection on the same session hasn't been reaped
+/// yet by the daemon's connection task.  The window is typically < 10 ms so
+/// a short back-off resolves it without flaking.
 pub async fn send_message_with_session(
     client: &ClientHandle,
     prompt: &str,
     session_id: &str,
     model: &str,
 ) -> Result<Vec<Response>> {
-    send_request(
-        client,
-        &Request::Chat {
-            prompt: prompt.to_string(),
-            tmux_pane: None,
-            session_id: Some(session_id.to_string()),
-            model: model.to_string(),
-        },
-    )
-    .await
+    let req = Request::Chat {
+        prompt: prompt.to_string(),
+        tmux_pane: None,
+        session_id: Some(session_id.to_string()),
+        model: model.to_string(),
+    };
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+    loop {
+        let responses = send_request(client, &req).await?;
+        let in_use = responses.iter().any(
+            |r| matches!(r, Response::Error { message } if message.contains("already in use")),
+        );
+        if !in_use || tokio::time::Instant::now() >= deadline {
+            return Ok(responses);
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+    }
 }
 
 /// Send a resume request with a specific session_id and model.
