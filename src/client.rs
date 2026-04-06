@@ -947,9 +947,11 @@ pub async fn run_chat_loop(
                             // Show the prompt and set steer_pending so the next
                             // iteration of the select! loop reads stdin via the
                             // existing steer arm — keeping SIGINT responsive.
-                            if !extra.is_empty() { eprintln!("\n{extra}"); }
-                            eprint!("{}", prompt_input::PROMPT);
-                            let _ = tokio::io::stderr().flush().await;
+                            if std::io::stderr().is_terminal() {
+                                if !extra.is_empty() { eprintln!("\n{extra}"); }
+                                eprint!("{}", prompt_input::PROMPT);
+                                let _ = tokio::io::stderr().flush().await;
+                            }
                             steer_pending = true;
                             if steer_task.is_none() {
                                 steer_task = Some(tokio::task::spawn_blocking(
@@ -1003,8 +1005,8 @@ pub async fn run_chat_loop(
                             steer_pending = false;
                             last_ctrl_c = None;
                         }
-                        // Empty line or Ctrl-C during steer — cancel.
-                        Ok(Ok(Some(_))) | Ok(Err(_)) => {
+                        // Empty line — cancel steer.
+                        Ok(Ok(Some(_))) => {
                             steer_pending = false;
                             last_ctrl_c = None;
                             // Flush buffered text through md_buf now that steer is cancelled.
@@ -1016,6 +1018,27 @@ pub async fn run_chat_loop(
                                 }
                             }
                             let _ = stdout.flush().await;
+                        }
+                        // I/O error from the steer read.
+                        Ok(Err(e)) => {
+                            if e.kind() == std::io::ErrorKind::Interrupted {
+                                // Ctrl-C during steer input — cancel.
+                                steer_pending = false;
+                                last_ctrl_c = None;
+                                for chunk in steer_text_buf.drain(..) {
+                                    md_buf.push(&chunk);
+                                    while let Some(ready) = md_buf.flush_if_ready() {
+                                        let out = render_markdown(&ready);
+                                        let _ = stdout.write_all(out.as_bytes()).await;
+                                    }
+                                }
+                                let _ = stdout.flush().await;
+                            } else {
+                                // Real I/O error — surface and exit.
+                                return Err(
+                                    anyhow::Error::new(e).context("steer input error")
+                                );
+                            }
                         }
                         // EOF (Ctrl-D) or task panic — exit session.
                         Ok(Ok(None)) | Err(_) => break 'session,
@@ -1591,7 +1614,13 @@ mod prompt_input {
     #[cfg(unix)]
     pub fn restore_terminal_now() {
         if let Some((fd, orig)) = *saved_orig_term().lock().unwrap_or_else(|p| p.into_inner()) {
-            unsafe { libc::tcsetattr(fd, libc::TCSANOW, &orig) };
+            let rc = unsafe { libc::tcsetattr(fd, libc::TCSANOW, &orig) };
+            if rc != 0 {
+                eprintln!(
+                    "warning: failed to restore terminal settings: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
         }
     }
 
