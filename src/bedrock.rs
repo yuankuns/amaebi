@@ -662,6 +662,43 @@ fn supports_adaptive_thinking(model_id: &str) -> bool {
         || model_id.starts_with("us.anthropic.claude-sonnet-4-6")
 }
 
+/// Returns true for Bedrock Claude models that support the 1M context window
+/// via the `context-1m-2025-08-07` Anthropic beta value passed in
+/// `additionalModelRequestFields.anthropic_beta` of the Bedrock request body.
+///
+/// Matches the reference implementation: claude-sonnet-4 family and opus-4-6.
+/// The model_id must be a bare resolved Bedrock ID (no `[1m]` suffix).
+pub(crate) fn supports_1m_context(model_id: &str) -> bool {
+    model_id.starts_with("us.anthropic.claude-sonnet-4")
+        || model_id.starts_with("us.anthropic.claude-opus-4-6")
+}
+
+/// Build the `additionalModelRequestFields` map for a Bedrock request.
+///
+/// Merges all per-model feature flags (adaptive thinking, 1M context) into a
+/// single JSON object so that adding one flag never silently drops another.
+/// Returns an empty map when no flags apply so callers can skip the field.
+fn build_additional_model_request_fields(
+    model_id: &str,
+    use_1m: bool,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut amrf = serde_json::Map::new();
+    if supports_adaptive_thinking(model_id) {
+        amrf.insert(
+            "thinking".to_owned(),
+            serde_json::json!({ "type": "adaptive" }),
+        );
+    }
+    if use_1m && supports_1m_context(model_id) {
+        amrf.insert(
+            "anthropic_beta".to_owned(),
+            serde_json::json!(["context-1m-2025-08-07"]),
+        );
+    }
+    amrf
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn send_with_retry(
     http: &reqwest::Client,
     token: &str,
@@ -670,6 +707,7 @@ async fn send_with_retry(
     messages: &[Message],
     tools: &[serde_json::Value],
     max_tokens: usize,
+    use_1m: bool,
 ) -> Result<reqwest::Response> {
     let parts = to_bedrock_request(messages);
     let bedrock_tools = to_bedrock_tools(tools);
@@ -685,9 +723,12 @@ async fn send_with_retry(
     if !bedrock_tools.is_empty() {
         body["toolConfig"] = serde_json::json!({ "tools": bedrock_tools });
     }
-    if supports_adaptive_thinking(model_id) {
-        body["additionalModelRequestFields"] =
-            serde_json::json!({ "thinking": { "type": "adaptive" } });
+
+    // Build additionalModelRequestFields by merging all per-model flags so
+    // that adding a second flag never silently drops the first.
+    let amrf = build_additional_model_request_fields(model_id, use_1m);
+    if !amrf.is_empty() {
+        body["additionalModelRequestFields"] = serde_json::Value::Object(amrf);
     }
 
     let url = converse_stream_endpoint(region, model_id);
@@ -1040,10 +1081,9 @@ where
 /// Reads `AWS_BEARER_TOKEN_BEDROCK` and `AWS_REGION` from the environment.
 /// Text chunks are forwarded to `writer` as `Response::Text` frames as they
 /// arrive.  Returns a [`CopilotResponse`] describing the full turn result.
-#[allow(clippy::too_many_arguments)]
 pub async fn stream_chat<W>(
     http: &reqwest::Client,
-    model_id: &str,
+    spec: &crate::provider::ModelSpec,
     messages: &[Message],
     tools: &[serde_json::Value],
     max_tokens: usize,
@@ -1057,13 +1097,24 @@ where
 
     tracing::debug!(
         messages = messages.len(),
-        model = model_id,
+        model = %spec.display_name,
+        model_id = %spec.model_id,
+        use_1m = spec.use_1m,
         region = %region,
         "sending Bedrock ConverseStream request"
     );
 
-    let resp =
-        send_with_retry(http, &token, &region, model_id, messages, tools, max_tokens).await?;
+    let resp = send_with_retry(
+        http,
+        &token,
+        &region,
+        &spec.model_id,
+        messages,
+        tools,
+        max_tokens,
+        spec.use_1m,
+    )
+    .await?;
     parse_converse_stream(resp, writer).await
 }
 
@@ -1110,6 +1161,102 @@ mod tests {
         ));
         assert!(!supports_adaptive_thinking("gpt-4o"));
         assert!(!supports_adaptive_thinking(""));
+    }
+
+    // ---- supports_1m_context ------------------------------------------------
+
+    #[test]
+    fn supports_1m_context_sonnet_family() {
+        assert!(supports_1m_context("us.anthropic.claude-sonnet-4-6"));
+        assert!(supports_1m_context("us.anthropic.claude-sonnet-4-6-v1:0"));
+        assert!(supports_1m_context(
+            "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
+        ));
+        assert!(supports_1m_context(
+            "us.anthropic.claude-sonnet-4-20250514-v1:0"
+        ));
+    }
+
+    #[test]
+    fn supports_1m_context_opus_4_6() {
+        assert!(supports_1m_context("us.anthropic.claude-opus-4-6-v1"));
+        assert!(supports_1m_context("us.anthropic.claude-opus-4-6"));
+    }
+
+    #[test]
+    fn supports_1m_context_rejects_haiku_and_older_opus() {
+        assert!(!supports_1m_context(
+            "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+        ));
+        assert!(!supports_1m_context(
+            "us.anthropic.claude-3-5-haiku-20241022-v1:0"
+        ));
+        assert!(!supports_1m_context(
+            "us.anthropic.claude-opus-4-5-20251101-v1:0"
+        ));
+        assert!(!supports_1m_context(
+            "us.anthropic.claude-opus-4-1-20250805-v1:0"
+        ));
+        assert!(!supports_1m_context("gpt-4o"));
+        assert!(!supports_1m_context(""));
+    }
+
+    // ---- build_additional_model_request_fields ------------------------------
+
+    #[test]
+    fn amrf_injects_both_thinking_and_1m_for_supported_model() {
+        // claude-sonnet-4-6 supports both adaptive thinking and 1M context.
+        let amrf = build_additional_model_request_fields("us.anthropic.claude-sonnet-4-6", true);
+        assert!(
+            amrf.contains_key("thinking"),
+            "adaptive thinking must be present"
+        );
+        assert!(
+            amrf.contains_key("anthropic_beta"),
+            "1M beta must be present"
+        );
+        assert_eq!(
+            amrf["anthropic_beta"],
+            serde_json::json!(["context-1m-2025-08-07"])
+        );
+        assert_eq!(amrf["thinking"], serde_json::json!({ "type": "adaptive" }));
+    }
+
+    #[test]
+    fn amrf_no_1m_beta_when_use_1m_false() {
+        let amrf = build_additional_model_request_fields("us.anthropic.claude-sonnet-4-6", false);
+        assert!(
+            amrf.contains_key("thinking"),
+            "adaptive thinking still present"
+        );
+        assert!(
+            !amrf.contains_key("anthropic_beta"),
+            "1M beta must not be present"
+        );
+    }
+
+    #[test]
+    fn amrf_empty_for_unsupported_model() {
+        // Haiku supports neither adaptive thinking nor 1M context.
+        let amrf = build_additional_model_request_fields(
+            "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+            true,
+        );
+        assert!(amrf.is_empty(), "no fields expected for haiku");
+    }
+
+    #[test]
+    fn amrf_1m_only_for_model_without_adaptive_thinking() {
+        // claude-sonnet-4 does not support adaptive thinking but does support 1M.
+        let amrf = build_additional_model_request_fields(
+            "us.anthropic.claude-sonnet-4-20250514-v1:0",
+            true,
+        );
+        assert!(
+            !amrf.contains_key("thinking"),
+            "no adaptive thinking for sonnet-4"
+        );
+        assert!(amrf.contains_key("anthropic_beta"), "1M beta present");
     }
 
     // ---- to_bedrock_request: message conversion ---------------------------

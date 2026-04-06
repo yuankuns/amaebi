@@ -227,6 +227,15 @@ async fn test_compaction_triggered_at_threshold() {
         )
         .await
         .unwrap_or_else(|e| panic!("seed turn {i} failed: {e}"));
+        // Verify the mock LLM was actually called and returned the expected text.
+        // This catches the case where the daemon returns an Error frame without
+        // calling the LLM (which would leave the queued response unconsumed and
+        // cause the Phase 2 drain assertion to fail).
+        let seed_text = collect_text(&r);
+        assert!(
+            seed_text.contains(&format!("Seed {i}.")),
+            "seed turn {i}: expected 'Seed {i}.' in response, got: {seed_text:?}\nframes: {r:?}"
+        );
         assert!(
             !r.iter()
                 .any(|f| matches!(f, support::helpers::Response::Compacting)),
@@ -234,11 +243,10 @@ async fn test_compaction_triggered_at_threshold() {
         );
     }
 
-    // Wait until every seed response has been consumed from the mock queue
-    // before killing the seed daemon.  On slow CI runners there is a window
-    // between the client receiving Done and the daemon's HTTP response being
-    // fully read; if we kill the daemon inside that window the mock server may
-    // not have drained the response, leaving it in the queue for Phase 2.
+    // All 4 seed turns verified correct content — the mock was called for each
+    // turn, so all queued responses have been consumed.  A short drain wait
+    // still guards the rare window where the daemon's HTTP response stream
+    // hasn't been fully closed yet on a slow CI runner.
     let drain_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;

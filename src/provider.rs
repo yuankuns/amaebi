@@ -36,6 +36,10 @@ pub struct ModelSpec {
     pub model_id: String,
     /// The raw string the user typed — used for logging and display.
     pub display_name: String,
+    /// Whether the user requested 1M context via the `[1m]` suffix.
+    ///
+    /// Only meaningful for Bedrock — Copilot does not support 1M context.
+    pub use_1m: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -108,13 +112,26 @@ pub const DEFAULT_MODEL: &str = "claude-sonnet-4.6";
 pub fn resolve(raw: &str) -> ModelSpec {
     let display_name = raw.to_owned();
 
-    if let Some((prefix, model)) = raw.split_once('/') {
+    // Strip the `[1m]` opt-in suffix before routing and alias resolution.
+    // The flag is preserved in `display_name` and `use_1m`.
+    let use_1m = raw.ends_with("[1m]");
+    let bare: &str = if use_1m {
+        &raw[..raw.len() - "[1m]".len()]
+    } else {
+        raw
+    };
+
+    if let Some((prefix, model)) = bare.split_once('/') {
         match prefix {
             "copilot" => {
                 return ModelSpec {
                     provider: ProviderKind::Copilot,
                     model_id: model.to_owned(),
                     display_name,
+                    // Preserve the user's opt-in so the daemon can warn and log
+                    // accurately; the Copilot execution path ignores it at
+                    // runtime because Copilot does not support 1M context.
+                    use_1m,
                 };
             }
             "bedrock" => {
@@ -122,6 +139,7 @@ pub fn resolve(raw: &str) -> ModelSpec {
                     provider: ProviderKind::Bedrock,
                     model_id: resolve_bedrock_alias(model),
                     display_name,
+                    use_1m,
                 };
             }
             _ => {
@@ -134,8 +152,9 @@ pub fn resolve(raw: &str) -> ModelSpec {
     // No recognised prefix → default provider (Bedrock) with alias resolution.
     ModelSpec {
         provider: ProviderKind::Bedrock,
-        model_id: resolve_bedrock_alias(raw),
+        model_id: resolve_bedrock_alias(bare),
         display_name,
+        use_1m,
     }
 }
 
@@ -252,6 +271,46 @@ mod tests {
     fn alias_full_id_passthrough() {
         let full = "us.anthropic.claude-sonnet-4-6-v1:0";
         assert_eq!(resolve_bedrock_alias(full), full);
+    }
+
+    // ---- 1M suffix --------------------------------------------------------
+
+    #[test]
+    fn resolve_1m_suffix_bedrock_alias() {
+        let spec = resolve("claude-sonnet-4.6[1m]");
+        assert_eq!(spec.provider, ProviderKind::Bedrock);
+        assert_eq!(spec.model_id, "us.anthropic.claude-sonnet-4-6");
+        assert_eq!(spec.display_name, "claude-sonnet-4.6[1m]");
+        assert!(spec.use_1m);
+    }
+
+    #[test]
+    fn resolve_1m_suffix_bedrock_prefix() {
+        let spec = resolve("bedrock/us.anthropic.claude-sonnet-4-6[1m]");
+        assert_eq!(spec.provider, ProviderKind::Bedrock);
+        assert_eq!(spec.model_id, "us.anthropic.claude-sonnet-4-6");
+        assert_eq!(
+            spec.display_name,
+            "bedrock/us.anthropic.claude-sonnet-4-6[1m]"
+        );
+        assert!(spec.use_1m);
+    }
+
+    #[test]
+    fn resolve_1m_suffix_copilot_preserves_flag() {
+        // Copilot does not support 1M at runtime, but use_1m is preserved so
+        // the daemon can warn and log accurately.
+        let spec = resolve("copilot/claude-opus-4.6[1m]");
+        assert_eq!(spec.provider, ProviderKind::Copilot);
+        assert_eq!(spec.model_id, "claude-opus-4.6");
+        assert_eq!(spec.display_name, "copilot/claude-opus-4.6[1m]");
+        assert!(spec.use_1m);
+    }
+
+    #[test]
+    fn resolve_no_1m_suffix_use_1m_false() {
+        let spec = resolve("claude-sonnet-4.6");
+        assert!(!spec.use_1m);
     }
 
     // ---- Display ----------------------------------------------------------
