@@ -633,7 +633,7 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
                             // Tool notifications go to stderr so stdout stays clean for the AI response.
                             eprintln!();
                             match name.as_str() {
-                                "shell_command" => eprintln!("```bash\n$ {detail}\n```"),
+                                "shell_command" => eprint!("{}", render_markdown(&format!("```bash\n$ {detail}\n```\n"))),
                                 "read_file" => eprintln!("📄 {detail}"),
                                 "edit_file" => eprintln!("✏️  {detail}"),
                                 "tmux_send_keys" => eprintln!("⌨️  send-keys: {detail}"),
@@ -950,7 +950,7 @@ pub async fn run_chat_loop(
                             }
                             if std::io::stderr().is_terminal() {
                                 match name.as_str() {
-                                    "shell_command" => eprintln!("```bash\n$ {detail}\n```"),
+                                    "shell_command" => eprint!("{}", render_markdown(&format!("```bash\n$ {detail}\n```\n"))),
                                     "read_file"     => eprintln!("📄 {detail}"),
                                     "edit_file"     => eprintln!("✏️  {detail}"),
                                     _ => eprintln!("🔧 {name}: {detail}"),
@@ -1231,7 +1231,7 @@ pub async fn run_resume(
                         } else {
                             eprintln!();
                             match name.as_str() {
-                                "shell_command" => eprintln!("```bash\n$ {detail}\n```"),
+                                "shell_command" => eprint!("{}", render_markdown(&format!("```bash\n$ {detail}\n```\n"))),
                                 "read_file" => eprintln!("📄 {detail}"),
                                 "edit_file" => eprintln!("✏️  {detail}"),
                                 "tmux_send_keys" => eprintln!("⌨️  send-keys: {detail}"),
