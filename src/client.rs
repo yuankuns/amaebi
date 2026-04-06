@@ -793,30 +793,11 @@ pub async fn run_chat_loop(
     let mut lines = BufReader::new(read_half).lines();
 
     let mut stdout = tokio::io::stdout();
-    // Single BufReader for stdin — reused across all steer reads so buffered
-    // bytes are never dropped between reads.
-    //
-    // Stdin-mixing note: the outer prompt loop reads stdin via
-    // `prompt_input::read_line_raw` (a spawn_blocking call that reads
-    // std::io::stdin() byte-by-byte in raw mode), while this tokio BufReader
-    // reads the same underlying fd in cooked mode for steer corrections.
-    //
-    // In theory, the BufReader could read ahead and buffer bytes that belong
-    // to the *next* prompt — stranding them inside the BufReader and making
-    // the raw-mode reader see a truncated line.  In practice this does not
-    // happen because:
-    //   1. The two readers are strictly sequential: the raw-mode prompt reader
-    //      only runs when no agent turn is active, and this BufReader is only
-    //      polled inside the inner select! loop while a turn is in flight.
-    //      They never run concurrently.
-    //   2. Steer corrections are line-oriented: the BufReader calls read_line
-    //      and returns exactly one newline-terminated line.  In canonical
-    //      (cooked) mode the kernel delivers exactly one line per read, so the
-    //      BufReader's internal buffer is always empty after read_line returns.
-    //   3. Even if the user types ahead during a turn, the kernel buffers those
-    //      bytes in the line-discipline, not in our BufReader.  They become
-    //      available on the next read_exact call in the raw-mode reader.
-    let mut stdin = BufReader::new(tokio::io::stdin());
+    // In-flight spawn_blocking task for reading a steer correction in raw mode.
+    // Spawned when steer_pending becomes true; awaited in the inner select! arm.
+    // Using raw mode (same as the main prompt) gives the user history navigation
+    // and CJK-width-correct backspace inside steer corrections too.
+    let mut steer_task: Option<tokio::task::JoinHandle<std::io::Result<Option<String>>>> = None;
     let mut next_prompt = initial_prompt;
     let mut last_ctrl_c: Option<Instant> = None;
     let mut steer_pending = false;
@@ -886,9 +867,12 @@ pub async fn run_chat_loop(
                     steer_pending = true;
                     if std::io::stderr().is_terminal() {
                         eprintln!("\n^C interrupted. Enter correction (empty line to cancel): ");
-                        eprint!(">");
+                        eprint!("{}", prompt_input::PROMPT);
                         let _ = tokio::io::stderr().flush().await;
                     }
+                    steer_task = Some(tokio::task::spawn_blocking(
+                        prompt_input::read_line_raw,
+                    ));
                     let interrupt_req = Request::Interrupt { session_id: session_id.clone() };
                     if let Ok(mut frame) = serde_json::to_string(&interrupt_req) {
                         frame.push('\n');
@@ -962,9 +946,12 @@ pub async fn run_chat_loop(
                             // iteration of the select! loop reads stdin via the
                             // existing steer arm — keeping SIGINT responsive.
                             if !extra.is_empty() { eprintln!("\n{extra}"); }
-                            eprint!(">");
+                            eprint!("{}", prompt_input::PROMPT);
                             let _ = tokio::io::stderr().flush().await;
                             steer_pending = true;
+                            steer_task = Some(tokio::task::spawn_blocking(
+                                prompt_input::read_line_raw,
+                            ));
                         }
                         Response::SteerAck => {
                             steer_pending = false;
@@ -991,25 +978,31 @@ pub async fn run_chat_loop(
                     }
                 }
 
-                line = async {
-                    if steer_pending {
-                        let mut buf = String::new();
-                        let n = tokio::io::AsyncBufReadExt::read_line(
-                            &mut stdin, &mut buf
-                        ).await.unwrap_or(0); // EOF/error = treat as no input
-                        if n > 0 { Some(buf) } else { None }
-                    } else {
-                        std::future::pending::<Option<String>>().await
+                steer_result = async {
+                    match steer_task.as_mut() {
+                        Some(h) => h.await.map_err(std::io::Error::other),
+                        None => std::future::pending().await,
                     }
                 } => {
-                    if let Some(text) = line {
-                        let trimmed = text.trim_end_matches('\n').trim_end_matches('\r');
-                        if trimmed.is_empty() {
+                    steer_task = None;
+                    match steer_result {
+                        // User typed a non-empty line — send as steer correction.
+                        Ok(Ok(Some(text))) if !text.trim().is_empty() => {
+                            let steer_req = Request::Steer {
+                                session_id: session_id.clone(),
+                                message: text.trim().to_owned(),
+                            };
+                            if let Ok(mut frame) = serde_json::to_string(&steer_req) {
+                                frame.push('\n');
+                                let _ = write_half.write_all(frame.as_bytes()).await;
+                            }
                             steer_pending = false;
-                            last_ctrl_c = None; // cancelling steer resets the double-Ctrl-C window
-                            // No Steer frame sent on cancel: the daemon's WAITING_FOR_INPUT
-                            // path now treats the already-sent Interrupt (None) as a cancel
-                            // signal, so no follow-up message is needed.
+                            last_ctrl_c = None;
+                        }
+                        // Empty line or Ctrl-C during steer — cancel.
+                        Ok(Ok(Some(_))) | Ok(Err(_)) => {
+                            steer_pending = false;
+                            last_ctrl_c = None;
                             // Flush buffered text through md_buf now that steer is cancelled.
                             for chunk in steer_text_buf.drain(..) {
                                 md_buf.push(&chunk);
@@ -1019,20 +1012,9 @@ pub async fn run_chat_loop(
                                 }
                             }
                             let _ = stdout.flush().await;
-                        } else {
-                            let steer_req = Request::Steer {
-                                session_id: session_id.clone(),
-                                message: trimmed.to_owned(),
-                            };
-                            if let Ok(mut frame) = serde_json::to_string(&steer_req) {
-                                frame.push('\n');
-                                let _ = write_half.write_all(frame.as_bytes()).await;
-                            }
-                            steer_pending = false;
-                            last_ctrl_c = None;
                         }
-                    } else {
-                        break 'session;
+                        // EOF (Ctrl-D) or task panic — exit session.
+                        Ok(Ok(None)) | Err(_) => break 'session,
                     }
                 }
             }
@@ -1827,12 +1809,12 @@ mod prompt_input {
                     let mut eb = [0u8; 1];
                     if input.read_exact(&mut eb).is_ok() {
                         match eb[0] {
-                            // CSI sequence (ESC [): read until final byte in 0x40–0x7E.
-                            // Track whether any parameter bytes preceded the final byte
-                            // so parametrised sequences (e.g. ESC[1;2H) are not mistaken
-                            // for the bare arrow sequences ESC[A/B/C/D.
+                            // CSI sequence (ESC [): read parameter bytes (0x30–0x3F) then
+                            // the final byte (0x40–0x7E).  Accumulate params
+                            // so we can distinguish bare sequences (arrows) from
+                            // parametrised ones (ESC[1~ / ESC[4~, etc.).
                             b'[' => {
-                                let mut has_params = false;
+                                let mut params: Vec<u8> = Vec::new();
                                 let final_byte = loop {
                                     let mut fb = [0u8; 1];
                                     if input.read_exact(&mut fb).is_err() {
@@ -1841,70 +1823,80 @@ mod prompt_input {
                                     if (0x40..=0x7e).contains(&fb[0]) {
                                         break Some(fb[0]);
                                     }
-                                    has_params = true;
+                                    params.push(fb[0]);
                                 };
-                                // Only act on simple (no-parameter) CSI sequences.
-                                if !has_params {
-                                    match final_byte {
-                                        // Left arrow (ESC [ D)
-                                        Some(b'D') => {
-                                            if cursor > 0 {
-                                                cursor -= 1;
-                                                redraw(output, prompt, &chars, &widths, cursor)?;
-                                            }
+                                match (final_byte, params.as_slice()) {
+                                    // Left arrow (ESC [ D)
+                                    (Some(b'D'), []) => {
+                                        if cursor > 0 {
+                                            cursor -= 1;
+                                            redraw(output, prompt, &chars, &widths, cursor)?;
                                         }
-                                        // Right arrow (ESC [ C)
-                                        Some(b'C') => {
-                                            if cursor < chars.len() {
-                                                cursor += 1;
-                                                redraw(output, prompt, &chars, &widths, cursor)?;
-                                            }
-                                        }
-                                        // Up arrow (ESC [ A) — navigate backwards in history
-                                        Some(b'A') => {
-                                            if hist_idx == history.len() {
-                                                // Save current draft (chars and cursor) before
-                                                // entering history so it can be restored intact.
-                                                draft_chars = chars.clone();
-                                                draft_cursor = cursor;
-                                            }
-                                            if hist_idx > 0 {
-                                                hist_idx -= 1;
-                                                chars = history[hist_idx].chars().collect();
-                                                widths = chars
-                                                    .iter()
-                                                    .map(|c| c.width().unwrap_or(1))
-                                                    .collect();
-                                                cursor = chars.len();
-                                                redraw(output, prompt, &chars, &widths, cursor)?;
-                                            }
-                                        }
-                                        // Down arrow (ESC [ B) — navigate forwards in history
-                                        Some(b'B') => {
-                                            if hist_idx < history.len() {
-                                                hist_idx += 1;
-                                                if hist_idx == history.len() {
-                                                    // Restore the saved draft, including the
-                                                    // cursor position the user had when they
-                                                    // pressed Up.
-                                                    chars = draft_chars.clone();
-                                                    cursor = draft_cursor;
-                                                } else {
-                                                    chars = history[hist_idx].chars().collect();
-                                                    cursor = chars.len();
-                                                }
-                                                widths = chars
-                                                    .iter()
-                                                    .map(|c| c.width().unwrap_or(1))
-                                                    .collect();
-                                                redraw(output, prompt, &chars, &widths, cursor)?;
-                                            }
-                                        }
-                                        // All other simple CSI sequences: discard.
-                                        _ => {}
                                     }
+                                    // Right arrow (ESC [ C)
+                                    (Some(b'C'), []) => {
+                                        if cursor < chars.len() {
+                                            cursor += 1;
+                                            redraw(output, prompt, &chars, &widths, cursor)?;
+                                        }
+                                    }
+                                    // Up arrow (ESC [ A) — navigate backwards in history
+                                    (Some(b'A'), []) => {
+                                        if hist_idx == history.len() {
+                                            // Save current draft (chars and cursor) before
+                                            // entering history so it can be restored intact.
+                                            draft_chars = chars.clone();
+                                            draft_cursor = cursor;
+                                        }
+                                        if hist_idx > 0 {
+                                            hist_idx -= 1;
+                                            chars = history[hist_idx].chars().collect();
+                                            widths = chars
+                                                .iter()
+                                                .map(|c| c.width().unwrap_or(1))
+                                                .collect();
+                                            cursor = chars.len();
+                                            redraw(output, prompt, &chars, &widths, cursor)?;
+                                        }
+                                    }
+                                    // Down arrow (ESC [ B) — navigate forwards in history
+                                    (Some(b'B'), []) => {
+                                        if hist_idx < history.len() {
+                                            hist_idx += 1;
+                                            if hist_idx == history.len() {
+                                                // Restore the saved draft, including the
+                                                // cursor position the user had when they
+                                                // pressed Up.
+                                                chars = draft_chars.clone();
+                                                cursor = draft_cursor;
+                                            } else {
+                                                chars = history[hist_idx].chars().collect();
+                                                cursor = chars.len();
+                                            }
+                                            widths = chars
+                                                .iter()
+                                                .map(|c| c.width().unwrap_or(1))
+                                                .collect();
+                                            redraw(output, prompt, &chars, &widths, cursor)?;
+                                        }
+                                    }
+                                    // Home: ESC [ H  (VT220) or ESC [ 1 ~ (xterm)
+                                    (Some(b'H'), []) | (Some(b'~'), b"1") => {
+                                        if cursor > 0 {
+                                            cursor = 0;
+                                            redraw(output, prompt, &chars, &widths, cursor)?;
+                                        }
+                                    }
+                                    // End: ESC [ F  (VT220) or ESC [ 4 ~ (xterm)
+                                    (Some(b'F'), []) | (Some(b'~'), b"4") => {
+                                        if cursor < chars.len() {
+                                            cursor = chars.len();
+                                            redraw(output, prompt, &chars, &widths, cursor)?;
+                                        }
+                                    }
+                                    // All other CSI sequences: discard.
+                                    _ => {}
                                 }
-                                // CSI sequences with parameters (e.g. ESC[1;2H): discard.
                             }
                             // SS3 sequence (ESC O): used by some terminals for
                             // function keys (F1–F4) and keypad.  Always exactly
@@ -2521,6 +2513,50 @@ mod prompt_input {
             // "abc" + 1 left (cursor=2) + backspace (deletes chars[1]='b') → "ac"
             let (res, _) = run(b"abc\x1b[D\x7f\r");
             assert_eq!(res.unwrap(), Some("ac".to_string()));
+        }
+
+        // ------------------------------------------------------------------ //
+        // Home / End
+        // ------------------------------------------------------------------ //
+
+        #[test]
+        fn home_vt_moves_cursor_to_start() {
+            // "abc" + Home (ESC[H) + "X" → "Xabc"
+            let (res, _) = run(b"abc\x1b[HX\r");
+            assert_eq!(res.unwrap(), Some("Xabc".to_string()));
+        }
+
+        #[test]
+        fn home_xterm_tilde_moves_cursor_to_start() {
+            // "abc" + Home (ESC[1~) + "X" → "Xabc"
+            let (res, _) = run(b"abc\x1b[1~X\r");
+            assert_eq!(res.unwrap(), Some("Xabc".to_string()));
+        }
+
+        #[test]
+        fn end_vt_moves_cursor_to_end() {
+            // "abc" + 2 lefts + End (ESC[F) + "Z" → "abcZ"
+            let (res, _) = run(b"abc\x1b[D\x1b[D\x1b[FZ\r");
+            assert_eq!(res.unwrap(), Some("abcZ".to_string()));
+        }
+
+        #[test]
+        fn end_xterm_tilde_moves_cursor_to_end() {
+            // "abc" + 2 lefts + End (ESC[4~) + "Z" → "abcZ"
+            let (res, _) = run(b"abc\x1b[D\x1b[D\x1b[4~Z\r");
+            assert_eq!(res.unwrap(), Some("abcZ".to_string()));
+        }
+
+        #[test]
+        fn home_at_start_does_nothing() {
+            let (res, _) = run(b"\x1b[Habc\r");
+            assert_eq!(res.unwrap(), Some("abc".to_string()));
+        }
+
+        #[test]
+        fn end_at_end_does_nothing() {
+            let (res, _) = run(b"abc\x1b[Fz\r");
+            assert_eq!(res.unwrap(), Some("abcz".to_string()));
         }
 
         #[test]
