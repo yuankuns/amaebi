@@ -1025,6 +1025,15 @@ pub async fn run_chat_loop(
         }
     }
 
+    // If a steer task was in-flight when the session ended its JoinHandle is
+    // dropped here, detaching the blocking thread.  That thread is stuck in
+    // read_exact and will never drop its RawModeGuard.  Restore the terminal
+    // immediately so the shell gets a sane state.
+    #[cfg(unix)]
+    if steer_task.is_some() {
+        prompt_input::restore_terminal_now();
+    }
+
     if std::io::stderr().is_terminal() {
         eprintln!("\nSession ended. ID: {session_id}");
     }
@@ -1564,6 +1573,28 @@ mod prompt_input {
         HISTORY.get_or_init(|| Mutex::new(VecDeque::new()))
     }
 
+    /// Saved original terminal state set when raw mode is entered, cleared on exit.
+    /// Allows `restore_terminal_now()` to recover the terminal if the session exits
+    /// while a `spawn_blocking(read_line_raw)` task is still in flight (the detached
+    /// thread holds `RawModeGuard` but is blocked in `read_exact` indefinitely).
+    #[cfg(unix)]
+    static SAVED_ORIG_TERM: OnceLock<Mutex<Option<(std::os::unix::io::RawFd, libc::termios)>>> =
+        OnceLock::new();
+
+    #[cfg(unix)]
+    fn saved_orig_term() -> &'static Mutex<Option<(std::os::unix::io::RawFd, libc::termios)>> {
+        SAVED_ORIG_TERM.get_or_init(|| Mutex::new(None))
+    }
+
+    /// Restore the terminal to the state saved when raw mode was last entered.
+    /// No-op if raw mode is not currently active.  Safe to call from async context.
+    #[cfg(unix)]
+    pub fn restore_terminal_now() {
+        if let Some((fd, orig)) = *saved_orig_term().lock().unwrap_or_else(|p| p.into_inner()) {
+            unsafe { libc::tcsetattr(fd, libc::TCSANOW, &orig) };
+        }
+    }
+
     /// RAII guard that restores the terminal to its saved settings on drop.
     #[cfg(unix)]
     struct RawModeGuard {
@@ -1585,6 +1616,7 @@ mod prompt_input {
             if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw) } != 0 {
                 return Err(std::io::Error::last_os_error());
             }
+            *saved_orig_term().lock().unwrap_or_else(|p| p.into_inner()) = Some((fd, orig));
             Ok(Self { fd, orig })
         }
     }
@@ -1592,6 +1624,7 @@ mod prompt_input {
     #[cfg(unix)]
     impl Drop for RawModeGuard {
         fn drop(&mut self) {
+            *saved_orig_term().lock().unwrap_or_else(|p| p.into_inner()) = None;
             // Best-effort restore; ignore errors during drop.
             unsafe { libc::tcsetattr(self.fd, libc::TCSANOW, &self.orig) };
         }
@@ -1904,9 +1937,13 @@ mod prompt_input {
                                             let w = widths[cursor];
                                             chars.remove(cursor);
                                             widths.remove(cursor);
-                                            if cursor == chars.len() {
-                                                // Cursor is now at end — erase the character in place.
-                                                write!(output, "\x1b[{w}P")?;
+                                            // Use DCH (ESC[P) only for a simple 1-wide char at
+                                            // end-of-line.  Zero-width combining marks (w == 0)
+                                            // and wide CJK chars (w > 1) need a full redraw to
+                                            // avoid deleting the wrong terminal cell or leaving
+                                            // visual artifacts.  Mid-line deletions always redraw.
+                                            if cursor == chars.len() && w == 1 {
+                                                write!(output, "\x1b[P")?;
                                             } else {
                                                 redraw(output, prompt, &chars, &widths, cursor)?;
                                             }
