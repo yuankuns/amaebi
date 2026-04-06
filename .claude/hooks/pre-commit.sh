@@ -2,33 +2,35 @@
 # .claude/hooks/pre-commit.sh
 #
 # PreToolUse hook: runs scripts/test.sh --docker before every `git commit`.
-# Called by Claude Code with CLAUDE_TOOL_INPUT set to the Bash tool's JSON input.
+# Called by Claude Code with hook JSON piped to stdin.
 # Exit non-zero to block the commit and surface the failure to Claude.
 
 set -euo pipefail
 
-# python3 is required to parse CLAUDE_TOOL_INPUT; fail closed if missing.
+# python3 is required to parse stdin JSON; fail closed if missing.
 if ! command -v python3 >/dev/null 2>&1; then
-    echo "[hook] error: python3 is required to parse CLAUDE_TOOL_INPUT" >&2
+    echo "[hook] error: python3 is required" >&2
     exit 1
 fi
 
-# Extract the bash command from the tool input; fail closed on parse error.
+# Read hook input from stdin; extract the bash command. Fail closed on error.
 if ! TOOL_CMD=$(python3 -c "
-import json, os, sys
-raw = os.environ.get('CLAUDE_TOOL_INPUT', '{}')
+import json, sys
 try:
-    payload = json.loads(raw)
+    payload = json.load(sys.stdin)
 except Exception:
     sys.exit(1)
 if not isinstance(payload, dict):
     sys.exit(1)
-command = payload.get('command')
+tool_input = payload.get('tool_input', {})
+if not isinstance(tool_input, dict):
+    sys.exit(1)
+command = tool_input.get('command')
 if not isinstance(command, str):
     sys.exit(1)
 print(command)
 "); then
-    echo "[hook] error: failed to parse CLAUDE_TOOL_INPUT" >&2
+    echo "[hook] error: failed to parse hook input from stdin" >&2
     exit 1
 fi
 
