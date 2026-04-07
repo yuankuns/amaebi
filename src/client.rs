@@ -1739,13 +1739,9 @@ mod prompt_input {
         result
     }
 
-    /// Redraw the current line after any edit or cursor movement.
-    ///
-    /// Moves to the beginning of the line (`\r`), erases to EOL, reprints
-    /// `prompt` and all `chars`, then moves the cursor back from the end to
-    /// the `cursor` index so the visual cursor sits at the right position.
-    /// Returns the terminal width in columns by querying stderr with TIOCGWINSZ.
-    /// Falls back to 80 if the ioctl fails (e.g. in tests or redirected stderr).
+    /// Returns the terminal width in columns by querying stderr with `TIOCGWINSZ`.
+    /// Falls back to 80 if the ioctl fails (e.g. in tests or when stderr is redirected).
+    #[cfg(unix)]
     fn terminal_cols() -> usize {
         unsafe {
             let mut ws = std::mem::zeroed::<libc::winsize>();
@@ -1757,6 +1753,17 @@ mod prompt_input {
         }
     }
 
+    #[cfg(not(unix))]
+    fn terminal_cols() -> usize {
+        80
+    }
+
+    /// Redraw the current line after any edit or cursor movement.
+    ///
+    /// Moves up to the first visual line of the prompt, erases to end of
+    /// display (multi-line input) or end of line (single-line input), reprints
+    /// `prompt` and all `chars`, then repositions the terminal cursor to
+    /// `cursor`.  `term_cols` is the terminal width used for line-wrap math.
     fn redraw<W: Write>(
         output: &mut W,
         prompt: &str,
@@ -2708,6 +2715,42 @@ mod prompt_input {
         fn end_at_end_does_nothing() {
             let (res, _) = run(b"abc\x1b[Fz\r");
             assert_eq!(res.unwrap(), Some("abcz".to_string()));
+        }
+
+        // ------------------------------------------------------------------ //
+        // Multi-line redraw (content wider than term_cols)
+        // ------------------------------------------------------------------ //
+
+        #[test]
+        fn multi_line_redraw_uses_erase_display() {
+            // 81 'a' chars wraps past col 80 (term_cols fallback = 80).
+            // A left arrow triggers redraw with end_visual_line = 1,
+            // so the output must contain ESC[J (erase to end of display).
+            let mut input: Vec<u8> = vec![b'a'; 81];
+            input.extend_from_slice(b"\x1b[D\r"); // left arrow + Enter
+            let (res, output) = run(&input);
+            assert_eq!(res.unwrap(), Some("a".repeat(81)));
+            assert!(
+                output.windows(3).any(|w| w == b"\x1b[J"),
+                "expected ESC[J for multi-line erase, got: {:?}",
+                output
+            );
+        }
+
+        #[test]
+        fn multi_line_redraw_cross_line_cursor_reposition() {
+            // 82 'a' chars + Home moves cursor to col 0, line 0.
+            // end_visual_line = 1, cursor_visual_line = 0 → CUU needed.
+            let mut input: Vec<u8> = vec![b'a'; 82];
+            input.extend_from_slice(b"\x1b[H\r"); // Home + Enter
+            let (res, output) = run(&input);
+            assert_eq!(res.unwrap(), Some("a".repeat(82)));
+            // Must contain CUU (ESC [ n A) to move cursor up across visual lines.
+            assert!(
+                output.windows(4).any(|w| w == b"\x1b[1A"),
+                "expected ESC[1A (CUU) for cross-line cursor reposition, got: {:?}",
+                output
+            );
         }
 
         // ------------------------------------------------------------------ //
