@@ -1726,6 +1726,7 @@ mod prompt_input {
             &mut std::io::stderr(),
             &history_snapshot,
             PROMPT,
+            terminal_cols(),
         );
         if let Ok(Some(ref line)) = result {
             if !line.is_empty() {
@@ -1779,8 +1780,19 @@ mod prompt_input {
         let cursor_col_abs = prompt_cols + cols_before_cursor;
         let end_col_abs = prompt_cols + total_char_width;
 
-        let cursor_visual_line = cursor_col_abs / term_cols;
-        let end_visual_line = end_col_abs / term_cols;
+        // ANSI terminals use a "pending wrap" flag: a character printed in the
+        // last column stays on that line until the next printable char.  So a
+        // cursor or end position that is an exact multiple of term_cols is still
+        // on the *previous* visual line, not the next one.
+        let visual_line_of = |col: usize| {
+            if col == 0 {
+                0
+            } else {
+                (col - 1) / term_cols
+            }
+        };
+        let cursor_visual_line = visual_line_of(cursor_col_abs);
+        let end_visual_line = visual_line_of(end_col_abs);
 
         // Move up to the first visual line of this prompt before clearing.
         if cursor_visual_line > 0 {
@@ -1838,8 +1850,8 @@ mod prompt_input {
         output: &mut W,
         history: &[Arc<str>],
         prompt: &str,
+        term_cols: usize,
     ) -> std::io::Result<Option<String>> {
-        let term_cols = terminal_cols();
         let mut chars: Vec<char> = Vec::new();
         // Display width (columns) of each char, matched by index to `chars`.
         let mut widths: Vec<usize> = Vec::new();
@@ -2165,7 +2177,7 @@ mod prompt_input {
             let history_owned: Vec<Arc<str>> = history.iter().map(|s| Arc::from(*s)).collect();
             let mut reader = Cursor::new(input.to_vec());
             let mut output: Vec<u8> = Vec::new();
-            let result = process_input(&mut reader, &mut output, &history_owned, "");
+            let result = process_input(&mut reader, &mut output, &history_owned, "", 80);
             (result, output)
         }
 
