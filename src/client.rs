@@ -1744,23 +1744,74 @@ mod prompt_input {
     /// Moves to the beginning of the line (`\r`), erases to EOL, reprints
     /// `prompt` and all `chars`, then moves the cursor back from the end to
     /// the `cursor` index so the visual cursor sits at the right position.
+    /// Returns the terminal width in columns by querying stderr with TIOCGWINSZ.
+    /// Falls back to 80 if the ioctl fails (e.g. in tests or redirected stderr).
+    fn terminal_cols() -> usize {
+        unsafe {
+            let mut ws = std::mem::zeroed::<libc::winsize>();
+            if libc::ioctl(libc::STDERR_FILENO, libc::TIOCGWINSZ, &mut ws) == 0 && ws.ws_col > 0 {
+                ws.ws_col as usize
+            } else {
+                80
+            }
+        }
+    }
+
     fn redraw<W: Write>(
         output: &mut W,
         prompt: &str,
         chars: &[char],
         widths: &[usize],
         cursor: usize,
+        term_cols: usize,
     ) -> std::io::Result<()> {
-        output.write_all(b"\r\x1b[K")?;
+        let prompt_cols: usize = prompt.chars().map(|c| c.width().unwrap_or(1)).sum();
+        let cols_before_cursor: usize = widths[..cursor].iter().sum();
+        let total_char_width: usize = widths.iter().sum();
+
+        let cursor_col_abs = prompt_cols + cols_before_cursor;
+        let end_col_abs = prompt_cols + total_char_width;
+
+        let cursor_visual_line = cursor_col_abs / term_cols;
+        let end_visual_line = end_col_abs / term_cols;
+
+        // Move up to the first visual line of this prompt before clearing.
+        if cursor_visual_line > 0 {
+            write!(output, "\x1b[{cursor_visual_line}A")?;
+        }
+
+        // Erase: if content spans multiple visual lines use ED (erase to end of
+        // display) so wrapped lines are fully cleared; otherwise EL suffices.
+        if end_visual_line > 0 {
+            output.write_all(b"\r\x1b[J")?;
+        } else {
+            output.write_all(b"\r\x1b[K")?;
+        }
+
+        // Reprint prompt and all characters.
         output.write_all(prompt.as_bytes())?;
         for ch in chars {
             let mut buf = [0u8; 4];
             output.write_all(ch.encode_utf8(&mut buf).as_bytes())?;
         }
+
+        // Reposition the terminal cursor to `cursor`.
+        // After printing all chars the terminal cursor sits at end_visual_line.
         let cols_from_cursor: usize = widths[cursor..].iter().sum();
         if cols_from_cursor > 0 {
-            write!(output, "\x1b[{cols_from_cursor}D")?;
+            let lines_above_end = end_visual_line - cursor_visual_line;
+            if lines_above_end == 0 {
+                // Same visual line — simple backward move.
+                write!(output, "\x1b[{cols_from_cursor}D")?;
+            } else {
+                // Move up from end_visual_line to cursor_visual_line, then
+                // jump to the exact column with CHA (1-based).
+                write!(output, "\x1b[{lines_above_end}A")?;
+                let target_col = cursor_col_abs % term_cols + 1;
+                write!(output, "\x1b[{target_col}G")?;
+            }
         }
+
         Ok(())
     }
 
@@ -1781,6 +1832,7 @@ mod prompt_input {
         history: &[Arc<str>],
         prompt: &str,
     ) -> std::io::Result<Option<String>> {
+        let term_cols = terminal_cols();
         let mut chars: Vec<char> = Vec::new();
         // Display width (columns) of each char, matched by index to `chars`.
         let mut widths: Vec<usize> = Vec::new();
@@ -1848,7 +1900,7 @@ mod prompt_input {
                                 write!(output, "\x1b[{w}D\x1b[K")?;
                             } else {
                                 // Mid-line deletion: full redraw to shift remaining chars.
-                                redraw(output, prompt, &chars, &widths, cursor)?;
+                                redraw(output, prompt, &chars, &widths, cursor, term_cols)?;
                             }
                         } else {
                             // Zero-width combining mark: it was rendered on top of the
@@ -1858,7 +1910,7 @@ mod prompt_input {
                             // first character it may have combined visually with the
                             // trailing character of the prompt, so reprinting the prompt
                             // via redraw() is the only way to restore it.
-                            redraw(output, prompt, &chars, &widths, cursor)?;
+                            redraw(output, prompt, &chars, &widths, cursor, term_cols)?;
                         }
                     }
                 }
@@ -1896,14 +1948,18 @@ mod prompt_input {
                                     (Some(b'D'), []) => {
                                         if cursor > 0 {
                                             cursor -= 1;
-                                            redraw(output, prompt, &chars, &widths, cursor)?;
+                                            redraw(
+                                                output, prompt, &chars, &widths, cursor, term_cols,
+                                            )?;
                                         }
                                     }
                                     // Right arrow (ESC [ C)
                                     (Some(b'C'), []) => {
                                         if cursor < chars.len() {
                                             cursor += 1;
-                                            redraw(output, prompt, &chars, &widths, cursor)?;
+                                            redraw(
+                                                output, prompt, &chars, &widths, cursor, term_cols,
+                                            )?;
                                         }
                                     }
                                     // Up arrow (ESC [ A) — navigate backwards in history
@@ -1922,7 +1978,9 @@ mod prompt_input {
                                                 .map(|c| c.width().unwrap_or(1))
                                                 .collect();
                                             cursor = chars.len();
-                                            redraw(output, prompt, &chars, &widths, cursor)?;
+                                            redraw(
+                                                output, prompt, &chars, &widths, cursor, term_cols,
+                                            )?;
                                         }
                                     }
                                     // Down arrow (ESC [ B) — navigate forwards in history
@@ -1943,21 +2001,27 @@ mod prompt_input {
                                                 .iter()
                                                 .map(|c| c.width().unwrap_or(1))
                                                 .collect();
-                                            redraw(output, prompt, &chars, &widths, cursor)?;
+                                            redraw(
+                                                output, prompt, &chars, &widths, cursor, term_cols,
+                                            )?;
                                         }
                                     }
                                     // Home: ESC [ H  (VT220) or ESC [ 1 ~ (xterm)
                                     (Some(b'H'), []) | (Some(b'~'), b"1") => {
                                         if cursor > 0 {
                                             cursor = 0;
-                                            redraw(output, prompt, &chars, &widths, cursor)?;
+                                            redraw(
+                                                output, prompt, &chars, &widths, cursor, term_cols,
+                                            )?;
                                         }
                                     }
                                     // End: ESC [ F  (VT220) or ESC [ 4 ~ (xterm)
                                     (Some(b'F'), []) | (Some(b'~'), b"4") => {
                                         if cursor < chars.len() {
                                             cursor = chars.len();
-                                            redraw(output, prompt, &chars, &widths, cursor)?;
+                                            redraw(
+                                                output, prompt, &chars, &widths, cursor, term_cols,
+                                            )?;
                                         }
                                     }
                                     // Delete (forward): ESC [ 3 ~
@@ -1974,7 +2038,10 @@ mod prompt_input {
                                             if cursor == chars.len() && w == 1 {
                                                 write!(output, "\x1b[P")?;
                                             } else {
-                                                redraw(output, prompt, &chars, &widths, cursor)?;
+                                                redraw(
+                                                    output, prompt, &chars, &widths, cursor,
+                                                    term_cols,
+                                                )?;
                                             }
                                         }
                                     }
@@ -2006,7 +2073,7 @@ mod prompt_input {
                     if cursor == chars.len() {
                         output.write_all(&[b])?;
                     } else {
-                        redraw(output, prompt, &chars, &widths, cursor)?;
+                        redraw(output, prompt, &chars, &widths, cursor, term_cols)?;
                     }
                 }
                 // Valid UTF-8 multi-byte lead bytes only.
@@ -2051,7 +2118,7 @@ mod prompt_input {
                             if cursor == chars.len() {
                                 output.write_all(s.as_bytes())?;
                             } else {
-                                redraw(output, prompt, &chars, &widths, cursor)?;
+                                redraw(output, prompt, &chars, &widths, cursor, term_cols)?;
                             }
                         }
                     }
