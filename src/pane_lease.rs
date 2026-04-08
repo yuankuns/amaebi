@@ -27,6 +27,9 @@ use std::fs::{File, OpenOptions};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+
 use anyhow::{Context, Result};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
@@ -151,11 +154,11 @@ fn open_lock_file() -> Result<File> {
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("creating directory {}", dir.display()))?;
     let path = lock_path()?;
-    OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(&path)
+    let mut opts = OpenOptions::new();
+    opts.create(true).truncate(false).write(true);
+    #[cfg(unix)]
+    opts.mode(0o600);
+    opts.open(&path)
         .with_context(|| format!("opening lock file {}", path.display()))
 }
 
@@ -170,7 +173,13 @@ fn read_state_unlocked() -> Result<PaneState> {
     }
     let contents =
         std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-    serde_json::from_str(&contents).context("parsing tmux-state.json")
+    if contents.trim().is_empty() {
+        return Ok(PaneState::new());
+    }
+    // Tolerate corrupt JSON: reset to empty state rather than hard-erroring.
+    // A corrupt file is treated the same as a missing one — the panes will
+    // be re-discovered on the next `ensure_idle_panes` call.
+    Ok(serde_json::from_str(&contents).unwrap_or_default())
 }
 
 fn write_state_unlocked(state: &PaneState) -> Result<()> {
@@ -180,7 +189,14 @@ fn write_state_unlocked(state: &PaneState) -> Result<()> {
             .with_context(|| format!("creating directory {}", parent.display()))?;
     }
     let contents = serde_json::to_string_pretty(state)?;
-    std::fs::write(&path, contents).with_context(|| format!("writing {}", path.display()))
+
+    // Atomic write: write to a temp file then rename so readers never see a
+    // partially-written file.
+    let tmp_path = path.with_extension("tmp");
+    std::fs::write(&tmp_path, &contents)
+        .with_context(|| format!("writing tmp {}", tmp_path.display()))?;
+    std::fs::rename(&tmp_path, &path)
+        .with_context(|| format!("renaming {} → {}", tmp_path.display(), path.display()))
 }
 
 // ---------------------------------------------------------------------------
@@ -204,6 +220,7 @@ pub fn read_state() -> Result<PaneState> {
 ///
 /// Returns the `pane_id` of the acquired pane.  If `worktree` is provided it
 /// is checked against all currently Busy panes for uniqueness.
+#[allow(dead_code)]
 pub fn acquire_first_idle(
     task_id: &str,
     session_id: &str,
@@ -365,9 +382,9 @@ pub fn heartbeat(pane_id: &str) -> Result<()> {
 
 /// Rename a tmux pane's title.
 ///
-/// Uses `tmux select-pane -t <pane_id> -T <title>`.  Silently succeeds when
-/// tmux is not running (non-zero exit is returned as `Err` but callers may
-/// choose to ignore it).
+/// Uses `tmux select-pane -t <pane_id> -T <title>`.  Returns `Err` when tmux
+/// is not running or returns a non-zero exit code.  Callers may choose to
+/// ignore the error in non-tmux environments.
 pub fn rename_pane(pane_id: &str, title: &str) -> Result<()> {
     let output = std::process::Command::new("tmux")
         .args(["select-pane", "-t", pane_id, "-T", title])
@@ -385,6 +402,9 @@ pub fn rename_pane(pane_id: &str, title: &str) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 /// Ensure at least `needed` Idle panes exist.
+///
+/// Prefer [`ensure_and_acquire_idle`] for single-request use to avoid a
+/// TOCTOU race.  This function is retained for bulk pre-warming use cases.
 ///
 /// If the current number of Idle panes is insufficient, this function splits
 /// existing tmux windows to create new panes (up to [`MAX_PANES`] total).
@@ -404,6 +424,7 @@ pub fn rename_pane(pane_id: &str, title: &str) -> Result<()> {
 ///   fails (no `$TMUX` set).
 /// - `anyhow::Error` with `"no tmux window available to split"` when all
 ///   split attempts fail (extremely rare).
+#[allow(dead_code)]
 pub fn ensure_idle_panes(needed: usize) -> Result<()> {
     if needed == 0 {
         return Ok(());
@@ -505,6 +526,32 @@ fn ensure_idle_panes_locked(needed: usize) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Atomically ensure at least `needed` Idle panes exist **and** acquire the
+/// first idle pane for the given task — all within a single `LOCK_EX`.
+///
+/// This eliminates the TOCTOU race between `ensure_idle_panes` and
+/// `acquire_first_idle` when multiple `ClaudeLaunch` requests arrive
+/// concurrently.
+pub fn ensure_and_acquire_idle(
+    task_id: &str,
+    session_id: &str,
+    worktree: Option<&str>,
+) -> Result<String> {
+    let lock = open_lock_file()?;
+    lock.lock_exclusive()
+        .context("acquiring flock for ensure_and_acquire_idle")?;
+
+    // Ensure at least 1 idle pane exists (expand if necessary).
+    ensure_idle_panes_locked(1)?;
+
+    // Acquire the first idle pane.
+    let pane_id = acquire_first_idle_locked(task_id, session_id, worktree)?;
+
+    lock.unlock()
+        .context("releasing flock after ensure_and_acquire_idle")?;
+    Ok(pane_id)
 }
 
 // ---------------------------------------------------------------------------

@@ -204,7 +204,7 @@ fn render_markdown(text: &str) -> String {
 /// A task parsed from the `/claude` command.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ClaudeTask {
-    /// User-supplied task label (derived from description if not given with --id).
+    /// Short task label derived from the description.
     task_id: String,
     /// Task description / opening prompt.
     description: String,
@@ -229,7 +229,7 @@ fn parse_claude_command(input: &str) -> Option<Vec<ClaudeTask>> {
         return None;
     }
 
-    // Tokenise (shell-style quoting).
+    // Tokenise (shell-style quoting); each entry is (token, was_quoted).
     let tokens = parse_quoted_args(rest);
     if tokens.is_empty() {
         return None;
@@ -237,30 +237,48 @@ fn parse_claude_command(input: &str) -> Option<Vec<ClaudeTask>> {
 
     let mut worktree: Option<String> = None;
     let mut auto_enter = true;
-    let mut descriptions: Vec<String> = Vec::new();
+    // (description, was_quoted) pairs for non-flag tokens.
+    let mut desc_tokens: Vec<(String, bool)> = Vec::new();
 
     let mut i = 0;
     while i < tokens.len() {
-        match tokens[i].as_str() {
+        match tokens[i].0.as_str() {
             "--worktree" => {
                 i += 1;
-                if i < tokens.len() {
-                    worktree = Some(tokens[i].clone());
+                // Require a non-flag value to follow --worktree.
+                if i >= tokens.len() || tokens[i].0.starts_with("--") {
+                    return None; // missing value
                 }
+                worktree = Some(tokens[i].0.clone());
             }
             "--no-enter" => {
                 auto_enter = false;
             }
             tok => {
-                descriptions.push(tok.to_string());
+                desc_tokens.push((tok.to_string(), tokens[i].1));
             }
         }
         i += 1;
     }
 
-    if descriptions.is_empty() {
+    if desc_tokens.is_empty() {
         return None;
     }
+
+    // Build task list.  Quoted tokens each become a separate task.  Unquoted
+    // tokens are joined as a single task (e.g. `/claude write some code` →
+    // one task "write some code", not three separate tasks).
+    let all_quoted = desc_tokens.iter().all(|(_, q)| *q);
+    let descriptions: Vec<String> = if all_quoted || desc_tokens.len() == 1 {
+        desc_tokens.into_iter().map(|(s, _)| s).collect()
+    } else {
+        // Mix of quoted and unquoted, or all unquoted: join as one description.
+        vec![desc_tokens
+            .into_iter()
+            .map(|(s, _)| s)
+            .collect::<Vec<_>>()
+            .join(" ")]
+    };
 
     let tasks: Vec<ClaudeTask> = descriptions
         .into_iter()
@@ -316,10 +334,14 @@ fn make_task_id(description: &str, idx: usize) -> String {
 
 /// Parse shell-style arguments, supporting both quoted and unquoted tokens.
 ///
-/// - `"implement cron" "fix context limit"` → `["implement cron", "fix context limit"]`
-/// - `foo "bar"` → `["foo", "bar"]`  (mixed quoted/unquoted)
+/// Returns `(token, was_quoted)` pairs so callers can distinguish
+/// `"foo" "bar"` (two separately-quoted tasks) from `foo bar` (one task whose
+/// words were split by whitespace).
+///
+/// - `"implement cron" "fix context limit"` → two quoted tokens
+/// - `foo "bar"` → one unquoted + one quoted token
 /// - Escaped quotes inside quoted strings: `"say \"hi\""` → `[r#"say "hi""#]`
-fn parse_quoted_args(input: &str) -> Vec<String> {
+fn parse_quoted_args(input: &str) -> Vec<(String, bool)> {
     let mut results = Vec::new();
     let mut chars = input.chars().peekable();
 
@@ -341,7 +363,7 @@ fn parse_quoted_args(input: &str) -> Vec<String> {
             }
             let trimmed = arg.trim().to_string();
             if !trimmed.is_empty() {
-                results.push(trimmed);
+                results.push((trimmed, true));
             }
         } else if ch.is_whitespace() {
             chars.next();
@@ -355,7 +377,7 @@ fn parse_quoted_args(input: &str) -> Vec<String> {
                 chars.next();
             }
             if !arg.is_empty() {
-                results.push(arg);
+                results.push((arg, false));
             }
         }
     }
@@ -3270,13 +3292,12 @@ mod tests {
     }
 
     #[test]
-    fn parse_claude_unquoted_tokens_become_separate_tasks() {
+    fn parse_claude_unquoted_tokens_join_as_single_task() {
         let result = parse_claude_command("/claude implement something");
         let tasks = result.expect("should parse");
-        // Unquoted: each whitespace-separated token is a separate task.
-        assert_eq!(tasks.len(), 2);
-        assert_eq!(tasks[0].description, "implement");
-        assert_eq!(tasks[1].description, "something");
+        // Unquoted words are joined into one task (avoids surprising N-task launch).
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].description, "implement something");
     }
 
     #[test]

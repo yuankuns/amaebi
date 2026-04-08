@@ -12,6 +12,7 @@ use crate::inbox::InboxStore;
 use crate::ipc::{write_frame, Request, Response};
 use crate::memory_db;
 use crate::pane_lease;
+use crate::session;
 use crate::tools::{self, ToolExecutor};
 
 /// Resolve the raw model string to the API-level model ID for token lookups.
@@ -809,59 +810,58 @@ async fn handle_claude_launch(
         return Ok(());
     }
 
-    let needed = tasks.len();
-
-    // Ensure enough idle panes exist (auto-expand via tmux split-window).
-    let expand_result = tokio::task::spawn_blocking(move || pane_lease::ensure_idle_panes(needed))
-        .await
-        .context("ensure_idle_panes task panicked")?;
-
-    if let Err(e) = expand_result {
-        // Detect capacity errors specifically so we can send the typed response.
-        if let Some(cap) = e.downcast_ref::<pane_lease::CapacityError>() {
-            let mut w = writer.lock().await;
-            write_frame(
-                &mut *w,
-                &Response::CapacityError {
-                    requested: cap.requested,
-                    max_panes: cap.max_panes,
-                    current_busy: cap.current_busy,
-                },
-            )
-            .await?;
-            write_frame(&mut *w, &Response::Done).await?;
-            return Ok(());
-        }
-        let mut w = writer.lock().await;
-        write_frame(
-            &mut *w,
-            &Response::Error {
-                message: format!("[error] {e:#}"),
-            },
-        )
-        .await?;
-        write_frame(&mut *w, &Response::Done).await?;
-        return Ok(());
-    }
-
     // Acquire a lease and launch a chat session for each task.
+    // `ensure_and_acquire_idle` holds a single LOCK_EX for both the
+    // ensure-idle-panes expansion and the acquire, eliminating the TOCTOU race.
     for task in tasks {
         let task_id = task.task_id.clone();
         let worktree = task.worktree.clone();
-        let session_id = uuid::Uuid::new_v4().to_string();
-        let sid_for_lease = session_id.clone();
+        let description = task.description.clone();
+        let auto_enter = task.auto_enter;
         let tid_for_lease = task_id.clone();
         let wt_for_lease = worktree.clone();
 
+        // Compute the session UUID the launched `amaebi chat` will use, so
+        // the PaneAssigned response carries the real session ID rather than a
+        // random placeholder.
+        let session_dir = worktree
+            .as_deref()
+            .map(std::path::Path::new)
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+        let session_id = tokio::task::spawn_blocking(move || session::get_or_create(&session_dir))
+            .await
+            .context("session::get_or_create panicked")?
+            .context("resolving session ID")?;
+
+        let sid_for_lease = session_id.clone();
         let pane_result = tokio::task::spawn_blocking(move || {
-            pane_lease::acquire_first_idle(&tid_for_lease, &sid_for_lease, wt_for_lease.as_deref())
+            pane_lease::ensure_and_acquire_idle(
+                &tid_for_lease,
+                &sid_for_lease,
+                wt_for_lease.as_deref(),
+            )
         })
         .await
-        .context("acquire_first_idle task panicked")?;
+        .context("ensure_and_acquire_idle task panicked")?;
 
         let pane_id = match pane_result {
             Ok(p) => p,
             Err(e) => {
+                // Surface CapacityError as the typed response.
+                if let Some(cap) = e.downcast_ref::<pane_lease::CapacityError>() {
+                    let mut w = writer.lock().await;
+                    write_frame(
+                        &mut *w,
+                        &Response::CapacityError {
+                            requested: cap.requested,
+                            max_panes: cap.max_panes,
+                            current_busy: cap.current_busy,
+                        },
+                    )
+                    .await?;
+                    continue;
+                }
                 let mut w = writer.lock().await;
                 write_frame(
                     &mut *w,
@@ -890,21 +890,34 @@ async fn handle_claude_launch(
             .and_then(|p| p.to_str().map(str::to_string))
             .unwrap_or_else(|| "amaebi".to_string());
 
+        // Build the shell command string and assemble tmux send-keys args.
+        // The description is passed as the opening prompt to `amaebi chat`.
         let cmd = if let Some(ref wt) = worktree {
-            format!("cd {} && {} chat", shell_escape(wt), amaebi_cmd)
+            format!(
+                "cd {} && {} chat {}",
+                shell_escape(wt),
+                shell_escape(&amaebi_cmd),
+                shell_escape(&description)
+            )
         } else {
-            format!("{} chat", amaebi_cmd)
+            format!(
+                "{} chat {}",
+                shell_escape(&amaebi_cmd),
+                shell_escape(&description)
+            )
         };
 
-        let enter_suffix = if task.auto_enter { " Enter" } else { "" };
-        let keys_arg = format!("{cmd}{enter_suffix}");
         let send_pane = pane_id.clone();
 
-        // Send the command to the pane.
+        // Send the command to the pane. "Enter" must be a separate argument —
+        // passing it as part of the keys string would send the literal text
+        // " Enter" rather than pressing the Enter key.
         tokio::task::spawn_blocking(move || {
-            let _ = std::process::Command::new("tmux")
-                .args(["send-keys", "-t", &send_pane, &keys_arg])
-                .output();
+            let mut cmd_args = vec!["send-keys", "-t", &send_pane, &cmd];
+            if auto_enter {
+                cmd_args.push("Enter");
+            }
+            let _ = std::process::Command::new("tmux").args(&cmd_args).output();
         })
         .await
         .ok();
