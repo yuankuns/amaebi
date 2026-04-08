@@ -1826,7 +1826,11 @@ mod prompt_input {
                 // Move up from end_visual_line to cursor_visual_line, then
                 // jump to the exact column with CHA (1-based).
                 write!(output, "\x1b[{lines_above_end}A")?;
-                let target_col = cursor_col_abs % term_cols + 1;
+                // CHA is 1-based.  Use the same pending-wrap adjustment as
+                // visual_line_of: a cursor at an exact column multiple sits at
+                // the last column of the previous line, not column 1 of the
+                // next, so saturating_sub(1) before the modulo is required.
+                let target_col = cursor_col_abs.saturating_sub(1) % term_cols + 1;
                 write!(output, "\x1b[{target_col}G")?;
             }
         }
@@ -2761,6 +2765,23 @@ mod prompt_input {
             assert!(
                 output.windows(4).any(|w| w == b"\x1b[1A"),
                 "expected ESC[1A (CUU) for cross-line cursor reposition, got: {:?}",
+                output
+            );
+        }
+
+        #[test]
+        fn multi_line_redraw_cursor_at_exact_wrap_boundary() {
+            // 81 'a' chars, cursor moves left once: cursor lands at col 80
+            // (exact multiple of term_cols=80, pending-wrap position).
+            // CHA should emit ESC[80G, not ESC[1G.
+            let mut input: Vec<u8> = vec![b'a'; 81];
+            input.extend_from_slice(b"\x1b[D\r"); // left arrow + Enter
+            let (res, output) = run(&input);
+            assert_eq!(res.unwrap(), Some("a".repeat(81)));
+            // ESC[80G — cursor at last column of line 0, not column 1.
+            assert!(
+                output.windows(5).any(|w| w == b"\x1b[80G"),
+                "expected ESC[80G for wrap-boundary CHA, got: {:?}",
                 output
             );
         }
