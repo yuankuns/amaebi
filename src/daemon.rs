@@ -11,6 +11,7 @@ use crate::cron;
 use crate::inbox::InboxStore;
 use crate::ipc::{write_frame, Request, Response};
 use crate::memory_db;
+use crate::pane_lease;
 use crate::tools::{self, ToolExecutor};
 
 /// Resolve the raw model string to the API-level model ID for token lookups.
@@ -677,6 +678,10 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                     ConnAction::Break => break 'connection,
                 }
             }
+
+            Request::ClaudeLaunch { tasks } => {
+                handle_claude_launch(&writer, tasks).await?;
+            }
         }
     }
 
@@ -784,6 +789,147 @@ async fn drive_agentic_loop(
 // ---------------------------------------------------------------------------
 // Sub-handlers — one per Request variant
 // ---------------------------------------------------------------------------
+
+/// Handle `Request::ClaudeLaunch`: assign tmux panes and launch amaebi chat
+/// sessions for each task.
+///
+/// Steps for each task:
+/// 1. `ensure_idle_panes(n)` — auto-expand pane pool if needed.
+/// 2. For each task: `acquire_first_idle` → get a pane.
+/// 3. Rename the pane title to `"amaebi | <task_id>"`.
+/// 4. Send `tmux send-keys` to start `amaebi chat` (in the worktree if set).
+/// 5. Stream `Response::PaneAssigned` for each task, then `Response::Done`.
+async fn handle_claude_launch(
+    writer: &Arc<tokio::sync::Mutex<tokio::net::unix::OwnedWriteHalf>>,
+    tasks: Vec<crate::ipc::TaskSpec>,
+) -> Result<()> {
+    if tasks.is_empty() {
+        let mut w = writer.lock().await;
+        write_frame(&mut *w, &Response::Done).await?;
+        return Ok(());
+    }
+
+    let needed = tasks.len();
+
+    // Ensure enough idle panes exist (auto-expand via tmux split-window).
+    let expand_result = tokio::task::spawn_blocking(move || pane_lease::ensure_idle_panes(needed))
+        .await
+        .context("ensure_idle_panes task panicked")?;
+
+    if let Err(e) = expand_result {
+        // Detect capacity errors specifically so we can send the typed response.
+        if let Some(cap) = e.downcast_ref::<pane_lease::CapacityError>() {
+            let mut w = writer.lock().await;
+            write_frame(
+                &mut *w,
+                &Response::CapacityError {
+                    requested: cap.requested,
+                    max_panes: cap.max_panes,
+                    current_busy: cap.current_busy,
+                },
+            )
+            .await?;
+            write_frame(&mut *w, &Response::Done).await?;
+            return Ok(());
+        }
+        let mut w = writer.lock().await;
+        write_frame(
+            &mut *w,
+            &Response::Error {
+                message: format!("[error] {e:#}"),
+            },
+        )
+        .await?;
+        write_frame(&mut *w, &Response::Done).await?;
+        return Ok(());
+    }
+
+    // Acquire a lease and launch a chat session for each task.
+    for task in tasks {
+        let task_id = task.task_id.clone();
+        let worktree = task.worktree.clone();
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let sid_for_lease = session_id.clone();
+        let tid_for_lease = task_id.clone();
+        let wt_for_lease = worktree.clone();
+
+        let pane_result = tokio::task::spawn_blocking(move || {
+            pane_lease::acquire_first_idle(&tid_for_lease, &sid_for_lease, wt_for_lease.as_deref())
+        })
+        .await
+        .context("acquire_first_idle task panicked")?;
+
+        let pane_id = match pane_result {
+            Ok(p) => p,
+            Err(e) => {
+                let mut w = writer.lock().await;
+                write_frame(
+                    &mut *w,
+                    &Response::Error {
+                        message: format!("[error] {e:#}"),
+                    },
+                )
+                .await?;
+                continue;
+            }
+        };
+
+        // Rename the pane for visibility.
+        let rename_pane = pane_id.clone();
+        let rename_title = format!("amaebi | {}", task_id);
+        tokio::task::spawn_blocking(move || {
+            // Best-effort — ignore errors (non-tmux environments).
+            let _ = pane_lease::rename_pane(&rename_pane, &rename_title);
+        })
+        .await
+        .ok();
+
+        // Build the command to inject into the pane.
+        let amaebi_cmd = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.to_str().map(str::to_string))
+            .unwrap_or_else(|| "amaebi".to_string());
+
+        let cmd = if let Some(ref wt) = worktree {
+            format!("cd {} && {} chat", shell_escape(wt), amaebi_cmd)
+        } else {
+            format!("{} chat", amaebi_cmd)
+        };
+
+        let enter_suffix = if task.auto_enter { " Enter" } else { "" };
+        let keys_arg = format!("{cmd}{enter_suffix}");
+        let send_pane = pane_id.clone();
+
+        // Send the command to the pane.
+        tokio::task::spawn_blocking(move || {
+            let _ = std::process::Command::new("tmux")
+                .args(["send-keys", "-t", &send_pane, &keys_arg])
+                .output();
+        })
+        .await
+        .ok();
+
+        let mut w = writer.lock().await;
+        write_frame(
+            &mut *w,
+            &Response::PaneAssigned {
+                task_id: task.task_id,
+                pane_id,
+                session_id,
+            },
+        )
+        .await?;
+    }
+
+    let mut w = writer.lock().await;
+    write_frame(&mut *w, &Response::Done).await?;
+    Ok(())
+}
+
+/// Escape a string for safe use as a single shell argument (single-quote wrapping).
+fn shell_escape(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
 
 /// Handle `Request::ClearMemory`: clear the memory DB and send `Done`.
 async fn handle_clear_memory(

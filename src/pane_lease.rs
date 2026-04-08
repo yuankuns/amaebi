@@ -1,0 +1,827 @@
+//! Pane lease management for tmux-based parallel Claude sessions.
+//!
+//! Provides atomic acquisition, release, and auto-expansion of tmux panes so
+//! that multiple `amaebi` instances launched via `/claude` cannot steal the
+//! same pane from each other.
+//!
+//! ## State file
+//!
+//! Pane state is persisted in `~/.amaebi/tmux-state.json` (a `HashMap<pane_id,
+//! PaneLease>`) protected by an exclusive `flock` on
+//! `~/.amaebi/tmux-state.lock`.  The JSON format is intentional: the file is a
+//! runtime/operational state store similar to `sessions.json`, where multiple
+//! CLI processes may need to check the lock quickly.
+//!
+//! ## Thread / process safety
+//!
+//! Every mutating operation acquires `LOCK_EX` for the duration of the
+//! read-modify-write cycle.  [`ensure_idle_panes`] holds the lock for the
+//! entire expansion loop (including any `tmux split-window` calls) so two
+//! concurrent `ClaudeLaunch` requests never create duplicate panes.
+//!
+//! All public functions are **synchronous** and must be called from inside
+//! `tokio::task::spawn_blocking` when used from async code.
+
+use std::collections::HashMap;
+use std::fs::{File, OpenOptions};
+use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use anyhow::{Context, Result};
+use fs2::FileExt;
+use serde::{Deserialize, Serialize};
+
+/// Maximum total number of panes (Idle + Busy) that the daemon will manage.
+pub const MAX_PANES: usize = 16;
+
+/// Seconds after which a Busy pane whose heartbeat has not been refreshed is
+/// treated as Idle (allows dead processes to release their pane automatically).
+pub const LEASE_TTL_SECS: u64 = 120;
+
+// ---------------------------------------------------------------------------
+// Data types
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PaneStatus {
+    Idle,
+    Busy,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PaneLease {
+    /// tmux pane ID, e.g. `"%3"`.
+    pub pane_id: String,
+    /// tmux window ID that contains this pane, e.g. `"@2"`.
+    pub window_id: String,
+    pub status: PaneStatus,
+    /// User-supplied task label (e.g. `"pr-123"`).
+    pub task_id: Option<String>,
+    /// amaebi session UUID assigned when the lease was acquired.
+    pub session_id: Option<String>,
+    /// Absolute path to the git worktree for this task (uniqueness key).
+    pub worktree: Option<String>,
+    /// Unix timestamp of the last heartbeat (or acquisition time).
+    pub heartbeat_at: u64,
+}
+
+impl PaneLease {
+    pub fn new_idle(pane_id: String, window_id: String) -> Self {
+        Self {
+            pane_id,
+            window_id,
+            status: PaneStatus::Idle,
+            task_id: None,
+            session_id: None,
+            worktree: None,
+            heartbeat_at: now_secs(),
+        }
+    }
+
+    /// Returns the *effective* status, treating expired Busy leases as Idle.
+    pub fn effective_status(&self) -> PaneStatus {
+        if self.status == PaneStatus::Busy
+            && now_secs().saturating_sub(self.heartbeat_at) > LEASE_TTL_SECS
+        {
+            PaneStatus::Idle
+        } else {
+            self.status.clone()
+        }
+    }
+}
+
+/// Keyed by `pane_id`.
+pub type PaneState = HashMap<String, PaneLease>;
+
+// ---------------------------------------------------------------------------
+// Error type for capacity violations
+// ---------------------------------------------------------------------------
+
+/// Returned by [`ensure_idle_panes`] when adding the requested panes would
+/// push the total past [`MAX_PANES`].
+#[derive(Debug)]
+pub struct CapacityError {
+    pub requested: usize,
+    pub max_panes: usize,
+    pub current_busy: usize,
+}
+
+impl std::fmt::Display for CapacityError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "capacity limit reached: max_panes={}, busy={}, requested={}; \
+             free existing panes to continue",
+            self.max_panes, self.current_busy, self.requested
+        )
+    }
+}
+
+impl std::error::Error for CapacityError {}
+
+// ---------------------------------------------------------------------------
+// Path helpers
+// ---------------------------------------------------------------------------
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn amaebi_dir() -> Result<PathBuf> {
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .context("HOME environment variable not set")?;
+    Ok(PathBuf::from(home).join(".amaebi"))
+}
+
+fn state_path() -> Result<PathBuf> {
+    Ok(amaebi_dir()?.join("tmux-state.json"))
+}
+
+fn lock_path() -> Result<PathBuf> {
+    Ok(amaebi_dir()?.join("tmux-state.lock"))
+}
+
+fn open_lock_file() -> Result<File> {
+    let dir = amaebi_dir()?;
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("creating directory {}", dir.display()))?;
+    let path = lock_path()?;
+    OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("opening lock file {}", path.display()))
+}
+
+// ---------------------------------------------------------------------------
+// Raw (unlocked) state I/O
+// ---------------------------------------------------------------------------
+
+fn read_state_unlocked() -> Result<PaneState> {
+    let path = state_path()?;
+    if !path.exists() {
+        return Ok(PaneState::new());
+    }
+    let contents =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    serde_json::from_str(&contents).context("parsing tmux-state.json")
+}
+
+fn write_state_unlocked(state: &PaneState) -> Result<()> {
+    let path = state_path()?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating directory {}", parent.display()))?;
+    }
+    let contents = serde_json::to_string_pretty(state)?;
+    std::fs::write(&path, contents).with_context(|| format!("writing {}", path.display()))
+}
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+/// Read the current pane state (acquires a shared lock, read-only).
+///
+/// Used by `amaebi pane list` (P1) and for heartbeat monitoring.
+#[allow(dead_code)]
+pub fn read_state() -> Result<PaneState> {
+    let lock = open_lock_file()?;
+    lock.lock_shared()
+        .context("acquiring shared flock for read_state")?;
+    let state = read_state_unlocked()?;
+    lock.unlock().context("releasing flock after read_state")?;
+    Ok(state)
+}
+
+/// Acquire a lease on the **first available idle pane** for the given task.
+///
+/// Returns the `pane_id` of the acquired pane.  If `worktree` is provided it
+/// is checked against all currently Busy panes for uniqueness.
+pub fn acquire_first_idle(
+    task_id: &str,
+    session_id: &str,
+    worktree: Option<&str>,
+) -> Result<String> {
+    let lock = open_lock_file()?;
+    lock.lock_exclusive()
+        .context("acquiring flock for acquire_first_idle")?;
+
+    let result = acquire_first_idle_locked(task_id, session_id, worktree);
+
+    lock.unlock()
+        .context("releasing flock after acquire_first_idle")?;
+    result
+}
+
+fn acquire_first_idle_locked(
+    task_id: &str,
+    session_id: &str,
+    worktree: Option<&str>,
+) -> Result<String> {
+    let mut state = read_state_unlocked()?;
+
+    // Worktree uniqueness check.
+    if let Some(wt) = worktree {
+        for (pid, l) in &state {
+            if l.effective_status() == PaneStatus::Busy && l.worktree.as_deref() == Some(wt) {
+                anyhow::bail!(
+                    "worktree {} already held by task {:?} on pane {}",
+                    wt,
+                    l.task_id,
+                    pid
+                );
+            }
+        }
+    }
+
+    // Find first idle pane.
+    let pane_id = state
+        .values()
+        .find(|l| l.effective_status() == PaneStatus::Idle)
+        .map(|l| l.pane_id.clone())
+        .ok_or_else(|| anyhow::anyhow!("no idle panes available"))?;
+
+    let lease = state.get_mut(&pane_id).unwrap();
+    lease.status = PaneStatus::Busy;
+    lease.task_id = Some(task_id.to_string());
+    lease.session_id = Some(session_id.to_string());
+    lease.worktree = worktree.map(str::to_string);
+    lease.heartbeat_at = now_secs();
+
+    write_state_unlocked(&state)?;
+    Ok(pane_id)
+}
+
+/// Acquire a lease on a **specific pane** by ID.
+///
+/// Returns `Err` if the pane is already Busy (and not expired), or if the
+/// `worktree` conflicts with another Busy pane.
+#[allow(dead_code)]
+pub fn acquire_lease(
+    pane_id: &str,
+    task_id: &str,
+    session_id: &str,
+    worktree: Option<&str>,
+) -> Result<()> {
+    let lock = open_lock_file()?;
+    lock.lock_exclusive()
+        .context("acquiring flock for acquire_lease")?;
+
+    let result = (|| {
+        let mut state = read_state_unlocked()?;
+
+        let lease = state
+            .get(pane_id)
+            .ok_or_else(|| anyhow::anyhow!("pane {pane_id} not found in state"))?;
+
+        if lease.effective_status() == PaneStatus::Busy {
+            anyhow::bail!("pane {} is busy (task: {:?})", pane_id, lease.task_id);
+        }
+
+        // Worktree uniqueness check.
+        if let Some(wt) = worktree {
+            for (pid, l) in &state {
+                if pid != pane_id
+                    && l.effective_status() == PaneStatus::Busy
+                    && l.worktree.as_deref() == Some(wt)
+                {
+                    anyhow::bail!(
+                        "worktree {} already held by task {:?} on pane {}",
+                        wt,
+                        l.task_id,
+                        pid
+                    );
+                }
+            }
+        }
+
+        let lease = state.get_mut(pane_id).unwrap();
+        lease.status = PaneStatus::Busy;
+        lease.task_id = Some(task_id.to_string());
+        lease.session_id = Some(session_id.to_string());
+        lease.worktree = worktree.map(str::to_string);
+        lease.heartbeat_at = now_secs();
+
+        write_state_unlocked(&state)?;
+        Ok(())
+    })();
+
+    lock.unlock()
+        .context("releasing flock after acquire_lease")?;
+    result
+}
+
+/// Release the lease on a pane, marking it as Idle and clearing task metadata.
+#[allow(dead_code)]
+pub fn release_lease(pane_id: &str) -> Result<()> {
+    let lock = open_lock_file()?;
+    lock.lock_exclusive()
+        .context("acquiring flock for release_lease")?;
+
+    let result = (|| {
+        let mut state = read_state_unlocked()?;
+        if let Some(lease) = state.get_mut(pane_id) {
+            lease.status = PaneStatus::Idle;
+            lease.task_id = None;
+            lease.session_id = None;
+            lease.worktree = None;
+            lease.heartbeat_at = now_secs();
+        }
+        write_state_unlocked(&state)?;
+        Ok(())
+    })();
+
+    lock.unlock()
+        .context("releasing flock after release_lease")?;
+    result
+}
+
+/// Refresh the heartbeat timestamp for a Busy pane to prevent TTL expiry.
+#[allow(dead_code)]
+pub fn heartbeat(pane_id: &str) -> Result<()> {
+    let lock = open_lock_file()?;
+    lock.lock_exclusive()
+        .context("acquiring flock for heartbeat")?;
+
+    let result = (|| {
+        let mut state = read_state_unlocked()?;
+        if let Some(lease) = state.get_mut(pane_id) {
+            lease.heartbeat_at = now_secs();
+        }
+        write_state_unlocked(&state)?;
+        Ok(())
+    })();
+
+    lock.unlock().context("releasing flock after heartbeat")?;
+    result
+}
+
+/// Rename a tmux pane's title.
+///
+/// Uses `tmux select-pane -t <pane_id> -T <title>`.  Silently succeeds when
+/// tmux is not running (non-zero exit is returned as `Err` but callers may
+/// choose to ignore it).
+pub fn rename_pane(pane_id: &str, title: &str) -> Result<()> {
+    let output = std::process::Command::new("tmux")
+        .args(["select-pane", "-t", pane_id, "-T", title])
+        .output()
+        .context("spawning tmux select-pane")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("tmux select-pane -T failed: {stderr}");
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Auto-expansion
+// ---------------------------------------------------------------------------
+
+/// Ensure at least `needed` Idle panes exist.
+///
+/// If the current number of Idle panes is insufficient, this function splits
+/// existing tmux windows to create new panes (up to [`MAX_PANES`] total).
+/// The entire operation runs inside a single `LOCK_EX`, so concurrent calls
+/// never create duplicate panes.
+///
+/// **Priority order for splitting:**
+/// 1. Windows that contain *no* Busy panes (least disruptive).
+/// 2. Any remaining window (contains at least one Busy pane).
+/// 3. If total + deficit would exceed `MAX_PANES` → `Err(CapacityError)`.
+///
+/// # Errors
+///
+/// - [`CapacityError`] (as a boxed `anyhow::Error`) when capacity would be
+///   exceeded.
+/// - `anyhow::Error` with `"not in a tmux session"` when `tmux list-windows`
+///   fails (no `$TMUX` set).
+/// - `anyhow::Error` with `"no tmux window available to split"` when all
+///   split attempts fail (extremely rare).
+pub fn ensure_idle_panes(needed: usize) -> Result<()> {
+    if needed == 0 {
+        return Ok(());
+    }
+
+    let lock = open_lock_file()?;
+    lock.lock_exclusive()
+        .context("acquiring flock for ensure_idle_panes")?;
+
+    let result = ensure_idle_panes_locked(needed);
+
+    lock.unlock()
+        .context("releasing flock after ensure_idle_panes")?;
+    result
+}
+
+fn ensure_idle_panes_locked(needed: usize) -> Result<()> {
+    let mut state = read_state_unlocked()?;
+
+    let idle_count = state
+        .values()
+        .filter(|l| l.effective_status() == PaneStatus::Idle)
+        .count();
+
+    if idle_count >= needed {
+        return Ok(());
+    }
+
+    let mut deficit = needed - idle_count;
+    let total = state.len();
+    let busy_count = state
+        .values()
+        .filter(|l| l.effective_status() == PaneStatus::Busy)
+        .count();
+
+    if total + deficit > MAX_PANES {
+        return Err(anyhow::Error::new(CapacityError {
+            requested: needed,
+            max_panes: MAX_PANES,
+            current_busy: busy_count,
+        }));
+    }
+
+    let all_windows = tmux_list_windows_sync().context("listing tmux windows")?;
+
+    if all_windows.is_empty() {
+        anyhow::bail!("not in a tmux session; /claude requires tmux");
+    }
+
+    // Window IDs that have at least one Busy pane (owned strings to avoid
+    // borrowing `state` while we mutate it below).
+    let busy_window_ids: std::collections::HashSet<String> = state
+        .values()
+        .filter(|l| l.effective_status() == PaneStatus::Busy)
+        .map(|l| l.window_id.clone())
+        .collect();
+
+    // Step 1: prefer windows with no Busy panes.
+    for win in all_windows.iter().filter(|w| !busy_window_ids.contains(*w)) {
+        if deficit == 0 || state.len() >= MAX_PANES {
+            break;
+        }
+        match tmux_split_window_sync(win) {
+            Ok(new_pane) => {
+                state.insert(new_pane.clone(), PaneLease::new_idle(new_pane, win.clone()));
+                deficit -= 1;
+            }
+            Err(e) => {
+                tracing::warn!(window = %win, error = %e, "failed to split tmux window");
+            }
+        }
+    }
+
+    // Step 2: fall back to windows with Busy panes.
+    if deficit > 0 {
+        for win in all_windows.iter().filter(|w| busy_window_ids.contains(*w)) {
+            if deficit == 0 || state.len() >= MAX_PANES {
+                break;
+            }
+            match tmux_split_window_sync(win) {
+                Ok(new_pane) => {
+                    state.insert(new_pane.clone(), PaneLease::new_idle(new_pane, win.clone()));
+                    deficit -= 1;
+                }
+                Err(e) => {
+                    tracing::warn!(window = %win, error = %e, "failed to split tmux window");
+                }
+            }
+        }
+    }
+
+    write_state_unlocked(&state)?;
+
+    if deficit > 0 {
+        anyhow::bail!(
+            "no tmux window available to split; \
+             create a new window with 'tmux new-window'"
+        );
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Private tmux helpers (sync, safe to call inside spawn_blocking / flock)
+// ---------------------------------------------------------------------------
+
+/// Run `tmux list-windows -F "#{window_id}"` and return a list of window IDs.
+fn tmux_list_windows_sync() -> Result<Vec<String>> {
+    let output = std::process::Command::new("tmux")
+        .args(["list-windows", "-F", "#{window_id}"])
+        .output()
+        .context("spawning tmux list-windows")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("tmux list-windows failed: {stderr}");
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+/// Run `tmux split-window -t <window_id> -d -P -F "#{pane_id}"` and return
+/// the new pane's ID.
+fn tmux_split_window_sync(window_id: &str) -> Result<String> {
+    let output = std::process::Command::new("tmux")
+        .args([
+            "split-window",
+            "-t",
+            window_id,
+            "-d",
+            "-P",
+            "-F",
+            "#{pane_id}",
+        ])
+        .output()
+        .context("spawning tmux split-window")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("tmux split-window failed: {stderr}");
+    }
+    let pane_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if pane_id.is_empty() {
+        anyhow::bail!("tmux split-window produced no pane ID");
+    }
+    Ok(pane_id)
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Mutex to serialize tests that mutate the HOME env var.
+    static HOME_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn make_idle(pane_id: &str, window_id: &str) -> PaneLease {
+        PaneLease::new_idle(pane_id.to_string(), window_id.to_string())
+    }
+
+    fn make_busy(pane_id: &str, window_id: &str, worktree: Option<&str>) -> PaneLease {
+        PaneLease {
+            pane_id: pane_id.to_string(),
+            window_id: window_id.to_string(),
+            status: PaneStatus::Busy,
+            task_id: Some("task-1".to_string()),
+            session_id: Some("sess-1".to_string()),
+            worktree: worktree.map(str::to_string),
+            heartbeat_at: now_secs(),
+        }
+    }
+
+    // ── effective_status ──────────────────────────────────────────────────
+
+    #[test]
+    fn effective_status_idle_is_idle() {
+        let l = make_idle("%0", "@0");
+        assert_eq!(l.effective_status(), PaneStatus::Idle);
+    }
+
+    #[test]
+    fn effective_status_busy_fresh_is_busy() {
+        let l = make_busy("%0", "@0", None);
+        assert_eq!(l.effective_status(), PaneStatus::Busy);
+    }
+
+    #[test]
+    fn effective_status_busy_expired_becomes_idle() {
+        let mut l = make_busy("%0", "@0", None);
+        // Expire the heartbeat.
+        l.heartbeat_at = now_secs().saturating_sub(LEASE_TTL_SECS + 1);
+        assert_eq!(l.effective_status(), PaneStatus::Idle);
+    }
+
+    #[test]
+    fn effective_status_busy_at_boundary_still_busy() {
+        let mut l = make_busy("%0", "@0", None);
+        // Exactly at TTL boundary — should still be Busy.
+        l.heartbeat_at = now_secs().saturating_sub(LEASE_TTL_SECS);
+        assert_eq!(l.effective_status(), PaneStatus::Busy);
+    }
+
+    // ── serialization ─────────────────────────────────────────────────────
+
+    #[test]
+    fn pane_lease_round_trip() {
+        let l = make_busy("%3", "@2", Some("/home/user/repo-wt/task1"));
+        let json = serde_json::to_string(&l).expect("serialize");
+        let back: PaneLease = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.pane_id, "%3");
+        assert_eq!(back.window_id, "@2");
+        assert_eq!(back.worktree.as_deref(), Some("/home/user/repo-wt/task1"));
+        assert_eq!(back.status, PaneStatus::Busy);
+    }
+
+    #[test]
+    fn pane_state_round_trip() {
+        let mut state: PaneState = HashMap::new();
+        state.insert("%0".to_string(), make_idle("%0", "@0"));
+        state.insert("%1".to_string(), make_busy("%1", "@0", None));
+
+        let json = serde_json::to_string_pretty(&state).expect("serialize");
+        let back: PaneState = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.len(), 2);
+        assert_eq!(back["%0"].effective_status(), PaneStatus::Idle);
+        assert_eq!(back["%1"].effective_status(), PaneStatus::Busy);
+    }
+
+    // ── CapacityError display ─────────────────────────────────────────────
+
+    #[test]
+    fn capacity_error_display() {
+        let e = CapacityError {
+            requested: 3,
+            max_panes: 16,
+            current_busy: 14,
+        };
+        let s = e.to_string();
+        assert!(s.contains("max_panes=16"), "got: {s}");
+        assert!(s.contains("busy=14"), "got: {s}");
+        assert!(s.contains("requested=3"), "got: {s}");
+    }
+
+    // ── file-based state ops (use tempdir via HOME override) ───────────────
+
+    // Helper: redirect HOME to a tempdir, run f(), restore HOME.
+    fn with_temp_home<F, R>(f: F) -> R
+    where
+        F: FnOnce() -> R,
+    {
+        // Recover from a poisoned mutex (a previous test panicked while holding
+        // it) so remaining tests can still run.
+        let _guard = HOME_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let orig = std::env::var("HOME").ok();
+        // Safety: we hold the HOME_MUTEX so no other test can mutate HOME.
+        unsafe { std::env::set_var("HOME", dir.path()) };
+        let result = f();
+        match orig {
+            Some(h) => unsafe { std::env::set_var("HOME", &h) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+        result
+    }
+
+    #[test]
+    fn acquire_lease_on_idle_pane_succeeds() {
+        with_temp_home(|| {
+            // Seed one idle pane directly.
+            let mut state: PaneState = HashMap::new();
+            state.insert("%0".to_string(), make_idle("%0", "@0"));
+            write_state_unlocked(&state).expect("seed state");
+
+            acquire_lease("%0", "task-x", "sess-x", None).expect("acquire");
+
+            let s = read_state_unlocked().expect("read back");
+            assert_eq!(s["%0"].effective_status(), PaneStatus::Busy);
+            assert_eq!(s["%0"].task_id.as_deref(), Some("task-x"));
+        });
+    }
+
+    #[test]
+    fn acquire_lease_on_busy_pane_returns_err() {
+        with_temp_home(|| {
+            let mut state: PaneState = HashMap::new();
+            state.insert("%0".to_string(), make_busy("%0", "@0", None));
+            write_state_unlocked(&state).expect("seed state");
+
+            let err = acquire_lease("%0", "task-y", "sess-y", None);
+            assert!(err.is_err(), "expected Err for busy pane");
+        });
+    }
+
+    #[test]
+    fn acquire_lease_on_expired_busy_pane_succeeds() {
+        with_temp_home(|| {
+            let mut expired = make_busy("%0", "@0", None);
+            expired.heartbeat_at = now_secs().saturating_sub(LEASE_TTL_SECS + 1);
+            let mut state: PaneState = HashMap::new();
+            state.insert("%0".to_string(), expired);
+            write_state_unlocked(&state).expect("seed state");
+
+            acquire_lease("%0", "task-new", "sess-new", None).expect("should succeed after expiry");
+
+            let s = read_state_unlocked().expect("read back");
+            assert_eq!(s["%0"].task_id.as_deref(), Some("task-new"));
+        });
+    }
+
+    #[test]
+    fn acquire_first_idle_finds_idle_pane() {
+        with_temp_home(|| {
+            let mut state: PaneState = HashMap::new();
+            state.insert("%0".to_string(), make_busy("%0", "@0", None));
+            state.insert("%1".to_string(), make_idle("%1", "@0"));
+            write_state_unlocked(&state).expect("seed state");
+
+            let pane = acquire_first_idle("t", "s", None).expect("acquire first idle");
+            assert_eq!(pane, "%1");
+        });
+    }
+
+    #[test]
+    fn acquire_first_idle_rejects_duplicate_worktree() {
+        with_temp_home(|| {
+            let mut state: PaneState = HashMap::new();
+            state.insert(
+                "%0".to_string(),
+                make_busy("%0", "@0", Some("/repo/wt/task1")),
+            );
+            state.insert("%1".to_string(), make_idle("%1", "@0"));
+            write_state_unlocked(&state).expect("seed state");
+
+            let err = acquire_first_idle("t2", "s2", Some("/repo/wt/task1"));
+            assert!(err.is_err(), "expected Err for duplicate worktree");
+        });
+    }
+
+    #[test]
+    fn release_lease_marks_pane_idle() {
+        with_temp_home(|| {
+            let mut state: PaneState = HashMap::new();
+            state.insert("%0".to_string(), make_busy("%0", "@0", None));
+            write_state_unlocked(&state).expect("seed state");
+
+            release_lease("%0").expect("release");
+
+            let s = read_state_unlocked().expect("read back");
+            assert_eq!(s["%0"].effective_status(), PaneStatus::Idle);
+            assert!(s["%0"].task_id.is_none());
+        });
+    }
+
+    #[test]
+    fn heartbeat_updates_timestamp() {
+        with_temp_home(|| {
+            let mut lease = make_busy("%0", "@0", None);
+            // Set an old heartbeat.
+            lease.heartbeat_at = 1000;
+            let mut state: PaneState = HashMap::new();
+            state.insert("%0".to_string(), lease);
+            write_state_unlocked(&state).expect("seed state");
+
+            heartbeat("%0").expect("heartbeat");
+
+            let s = read_state_unlocked().expect("read back");
+            assert!(
+                s["%0"].heartbeat_at > 1000,
+                "heartbeat should have been updated"
+            );
+        });
+    }
+
+    #[test]
+    fn ensure_idle_panes_capacity_exceeded_returns_err() {
+        with_temp_home(|| {
+            // Fill all MAX_PANES slots with Busy leases.
+            let mut state: PaneState = HashMap::new();
+            for i in 0..MAX_PANES {
+                let pid = format!("%{i}");
+                state.insert(pid.clone(), make_busy(&pid, "@0", None));
+            }
+            write_state_unlocked(&state).expect("seed state");
+
+            // Acquiring the lock before calling the internal helper so we can
+            // test the logic without real tmux.
+            let lock = open_lock_file().expect("open lock");
+            lock.lock_exclusive().expect("flock");
+            let result = ensure_idle_panes_locked(1);
+            lock.unlock().expect("unlock");
+
+            let err = result.expect_err("should be Err");
+            let cap = err.downcast_ref::<CapacityError>().expect("CapacityError");
+            assert_eq!(cap.max_panes, MAX_PANES);
+            assert_eq!(cap.requested, 1);
+        });
+    }
+
+    #[test]
+    fn ensure_idle_panes_noop_when_enough_idle() {
+        with_temp_home(|| {
+            let mut state: PaneState = HashMap::new();
+            state.insert("%0".to_string(), make_idle("%0", "@0"));
+            state.insert("%1".to_string(), make_idle("%1", "@0"));
+            write_state_unlocked(&state).expect("seed state");
+
+            let lock = open_lock_file().expect("open lock");
+            lock.lock_exclusive().expect("flock");
+            // 2 idle panes, need 2 → no-op, no tmux calls.
+            let result = ensure_idle_panes_locked(2);
+            lock.unlock().expect("unlock");
+
+            result.expect("should succeed without calling tmux");
+        });
+    }
+}

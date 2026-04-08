@@ -1,3 +1,18 @@
+/// A single task specification for [`Request::ClaudeLaunch`].
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+pub struct TaskSpec {
+    /// User-supplied label, e.g. `"pr-123"` or `"issue-76"`.
+    pub task_id: String,
+    /// Description sent to the Claude session as the opening prompt.
+    pub description: String,
+    /// Optional absolute path to a git worktree for this task.
+    /// Enforced as unique across all currently Busy panes.
+    pub worktree: Option<String>,
+    /// If `false`, the command is injected into the pane without a trailing
+    /// Enter key (useful for commands the user wants to review first).
+    pub auto_enter: bool,
+}
+
 /// A message sent from the client to the daemon over the Unix socket.
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -92,6 +107,17 @@ pub enum Request {
     /// The daemon responds with zero or more [`Response::MemoryEntry`] frames
     /// followed by a single [`Response::Done`] frame.
     RetrieveContext { prompt: String },
+    /// Launch one or more independent `chat ↔ Claude` pairs in separate tmux
+    /// panes.
+    ///
+    /// The daemon acquires pane leases (auto-expanding tmux panes if needed),
+    /// starts each session, and responds with one [`Response::PaneAssigned`]
+    /// per task followed by [`Response::Done`].  If the pane capacity limit
+    /// would be exceeded it responds with [`Response::CapacityError`] instead.
+    ClaudeLaunch {
+        /// The tasks to launch in parallel.
+        tasks: Vec<TaskSpec>,
+    },
 }
 
 /// A single frame streamed from the daemon back to the client.
@@ -144,6 +170,29 @@ pub enum Response {
         /// was not part of the streamed text (e.g. a synthesised prompt);
         /// the client should print this text before the `>` cursor.
         prompt: String,
+    },
+    /// One tmux pane has been successfully assigned to a task launched via
+    /// [`Request::ClaudeLaunch`].
+    ///
+    /// The client receives one frame per task, in submission order, before the
+    /// final [`Response::Done`].
+    PaneAssigned {
+        /// The task label supplied in [`TaskSpec::task_id`].
+        task_id: String,
+        /// tmux pane ID, e.g. `"%3"`.
+        pane_id: String,
+        /// amaebi session UUID for the new chat session running in the pane.
+        session_id: String,
+    },
+    /// The [`Request::ClaudeLaunch`] was rejected because adding the requested
+    /// panes would exceed the configured maximum.
+    CapacityError {
+        /// Number of panes that were requested.
+        requested: usize,
+        /// Configured maximum total pane count.
+        max_panes: usize,
+        /// Number of panes currently in Busy state.
+        current_busy: usize,
     },
 }
 
@@ -439,6 +488,8 @@ mod tests {
             r#"{"type":"memory_entry","role":"user","content":"hi"}"#,
             r#"{"type":"waiting_for_input","prompt":"Which language?"}"#,
             r#"{"type":"compacting"}"#,
+            r#"{"type":"pane_assigned","task_id":"pr-1","pane_id":"%3","session_id":"uuid-abc"}"#,
+            r#"{"type":"capacity_error","requested":3,"max_panes":16,"current_busy":14}"#,
         ];
         for frame in frames {
             let r: Response = serde_json::from_str(frame).unwrap();
@@ -453,8 +504,95 @@ mod tests {
                     | Response::MemoryEntry { .. }
                     | Response::WaitingForInput { .. }
                     | Response::Compacting
+                    | Response::PaneAssigned { .. }
+                    | Response::CapacityError { .. }
             ));
         }
+    }
+
+    // ---- ClaudeLaunch / TaskSpec ------------------------------------------
+
+    #[test]
+    fn task_spec_round_trip() {
+        let spec = TaskSpec {
+            task_id: "pr-123".into(),
+            description: "implement feature X".into(),
+            worktree: Some("/home/user/repo-wt/feat-x".into()),
+            auto_enter: true,
+        };
+        let json = serde_json::to_string(&spec).unwrap();
+        let back: TaskSpec = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.task_id, "pr-123");
+        assert_eq!(back.description, "implement feature X");
+        assert_eq!(back.worktree.as_deref(), Some("/home/user/repo-wt/feat-x"));
+        assert!(back.auto_enter);
+    }
+
+    #[test]
+    fn request_claude_launch_round_trip() {
+        let req = Request::ClaudeLaunch {
+            tasks: vec![
+                TaskSpec {
+                    task_id: "t1".into(),
+                    description: "do A".into(),
+                    worktree: None,
+                    auto_enter: true,
+                },
+                TaskSpec {
+                    task_id: "t2".into(),
+                    description: "do B".into(),
+                    worktree: Some("/wt/b".into()),
+                    auto_enter: false,
+                },
+            ],
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["type"], "claude_launch");
+        assert_eq!(v["tasks"][0]["task_id"], "t1");
+        assert_eq!(v["tasks"][1]["worktree"], "/wt/b");
+
+        let back: Request = serde_json::from_str(&json).unwrap();
+        let Request::ClaudeLaunch { tasks } = back else {
+            panic!("expected ClaudeLaunch");
+        };
+        assert_eq!(tasks.len(), 2);
+    }
+
+    #[test]
+    fn response_pane_assigned_round_trip() {
+        let r = Response::PaneAssigned {
+            task_id: "pr-123".into(),
+            pane_id: "%3".into(),
+            session_id: "uuid-xyz".into(),
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["type"], "pane_assigned");
+        assert_eq!(v["task_id"], "pr-123");
+        assert_eq!(v["pane_id"], "%3");
+        assert_eq!(v["session_id"], "uuid-xyz");
+
+        let back: Response = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, Response::PaneAssigned { .. }));
+    }
+
+    #[test]
+    fn response_capacity_error_round_trip() {
+        let r = Response::CapacityError {
+            requested: 3,
+            max_panes: 16,
+            current_busy: 14,
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["type"], "capacity_error");
+        assert_eq!(v["requested"], 3);
+        assert_eq!(v["max_panes"], 16);
+        assert_eq!(v["current_busy"], 14);
+
+        let back: Response = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, Response::CapacityError { .. }));
     }
 
     // ---- write_frame -----------------------------------------------------
