@@ -109,6 +109,7 @@ impl ToolExecutor for LocalExecutor {
             "tmux_capture_pane" => tmux_capture_pane(args).await,
             "tmux_send_keys" => tmux_send_keys(args).await,
             "tmux_wait" => tmux_wait(args).await,
+            "wait_for_file" => wait_for_file(args).await,
             "read_file" => read_file(args).await,
             "edit_file" => edit_file(args).await,
             "spawn_agent" => match &self.spawn_ctx {
@@ -291,6 +292,31 @@ async fn tmux_wait(args: serde_json::Value) -> Result<String> {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         let sleep_dur = std::time::Duration::from_secs(poll_secs).min(remaining);
         tokio::time::sleep(sleep_dur).await;
+    }
+}
+
+/// Block until `path` exists on the filesystem, then return `"found"`.
+///
+/// Useful for scripts that drop a sentinel file on completion, avoiding the
+/// need for the LLM to call `tmux_capture_pane` in a polling loop.
+async fn wait_for_file(args: serde_json::Value) -> Result<String> {
+    let path = args["path"]
+        .as_str()
+        .context("wait_for_file: missing string argument 'path'")?;
+    let timeout_secs = args["timeout_secs"].as_u64().unwrap_or(300);
+    let poll_ms = args["poll_interval_ms"].as_u64().unwrap_or(500);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    loop {
+        if tokio::fs::metadata(path).await.is_ok() {
+            return Ok("found".to_owned());
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Ok(format!(
+                "timeout: '{path}' did not appear within {timeout_secs}s"
+            ));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(poll_ms).min(remaining)).await;
     }
 }
 
@@ -694,6 +720,34 @@ pub fn tool_schemas(include_spawn_agent: bool) -> Vec<serde_json::Value> {
         serde_json::json!({
             "type": "function",
             "function": {
+                "name": "wait_for_file",
+                "description": "Block until a file appears at the given path, then return \"found\". \
+                                Returns a timeout message if the file does not appear within timeout_secs. \
+                                Use this instead of polling tmux_capture_pane when a script can write \
+                                a sentinel file on completion.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Absolute or relative path of the file to wait for."
+                        },
+                        "timeout_secs": {
+                            "type": "integer",
+                            "description": "Maximum seconds to wait before returning timeout message. Default: 300."
+                        },
+                        "poll_interval_ms": {
+                            "type": "integer",
+                            "description": "How often to check for the file, in milliseconds. Default: 500."
+                        }
+                    },
+                    "required": ["path"]
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
                 "name": "read_file",
                 "description": "Read the full contents of a file on disk.",
                 "parameters": {
@@ -828,6 +882,7 @@ mod tests {
             "tmux_capture_pane",
             "tmux_send_keys",
             "tmux_wait",
+            "wait_for_file",
             "read_file",
             "edit_file",
             "spawn_agent",
