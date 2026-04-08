@@ -108,6 +108,7 @@ impl ToolExecutor for LocalExecutor {
             }
             "tmux_capture_pane" => tmux_capture_pane(args).await,
             "tmux_send_keys" => tmux_send_keys(args).await,
+            "tmux_wait" => tmux_wait(args).await,
             "read_file" => read_file(args).await,
             "edit_file" => edit_file(args).await,
             "spawn_agent" => match &self.spawn_ctx {
@@ -224,6 +225,47 @@ async fn tmux_send_keys(args: serde_json::Value) -> Result<String> {
     }
 
     Ok(format!("sent keys to pane {target}"))
+}
+
+/// Poll a tmux pane until its output has been stable for `idle_secs`, then
+/// return the final pane content.
+///
+/// Instead of the LLM calling `tmux_capture_pane` in a loop (burning one LLM
+/// turn per poll), a single `tmux_wait` call blocks until the command running
+/// in the pane appears to have finished.  Returns immediately if the pane is
+/// already idle.
+async fn tmux_wait(args: serde_json::Value) -> Result<String> {
+    let target = args["target"].as_str().unwrap_or("%0");
+    let idle_secs = args["idle_secs"].as_u64().unwrap_or(3);
+    let timeout_secs = args["timeout_secs"].as_u64().unwrap_or(600);
+    let poll_secs = args["poll_interval_secs"].as_u64().unwrap_or(2);
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    let mut last_content = String::new();
+    let mut stable_since = tokio::time::Instant::now();
+
+    loop {
+        let output = Command::new("tmux")
+            .args(["capture-pane", "-t", target, "-p"])
+            .output()
+            .await
+            .context("tmux_wait: capture-pane failed")?;
+        let content = String::from_utf8_lossy(&output.stdout).into_owned();
+
+        if content != last_content {
+            last_content = content;
+            stable_since = tokio::time::Instant::now();
+        } else if stable_since.elapsed().as_secs() >= idle_secs {
+            return Ok(last_content);
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(format!(
+                "timeout after {timeout_secs}s — last pane output:\n{last_content}"
+            ));
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(poll_secs)).await;
+    }
 }
 
 /// Read the full contents of a file.
@@ -557,6 +599,38 @@ pub fn tool_schemas(include_spawn_agent: bool) -> Vec<serde_json::Value> {
         serde_json::json!({
             "type": "function",
             "function": {
+                "name": "tmux_wait",
+                "description": "Poll a tmux pane until its output has been stable for idle_secs, \
+                                then return the final pane content. Use this instead of calling \
+                                tmux_capture_pane in a loop while waiting for a long-running command \
+                                (e.g. a build) to finish.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "target": {
+                            "type": "string",
+                            "description": "Tmux pane target (e.g. \"%0\", \"session:window.pane\"). Default: \"%0\"."
+                        },
+                        "idle_secs": {
+                            "type": "integer",
+                            "description": "Seconds of unchanged output before returning. Default: 3."
+                        },
+                        "timeout_secs": {
+                            "type": "integer",
+                            "description": "Hard timeout in seconds before giving up. Default: 600."
+                        },
+                        "poll_interval_secs": {
+                            "type": "integer",
+                            "description": "How often to sample the pane, in seconds. Default: 2."
+                        }
+                    },
+                    "required": []
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
                 "name": "read_file",
                 "description": "Read the full contents of a file on disk.",
                 "parameters": {
@@ -686,6 +760,7 @@ mod tests {
             "shell_command",
             "tmux_capture_pane",
             "tmux_send_keys",
+            "tmux_wait",
             "read_file",
             "edit_file",
             "spawn_agent",
