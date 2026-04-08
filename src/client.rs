@@ -1804,9 +1804,12 @@ mod prompt_input {
             write!(output, "\x1b[{from_line}A")?;
         }
 
-        // Erase: if content spans multiple visual lines use ED (erase to end of
-        // display) so wrapped lines are fully cleared; otherwise EL suffices.
-        if end_visual_line > 0 {
+        // Erase: use ED (erase to end of display) when either the new content
+        // spans multiple visual lines OR the terminal cursor was on a line below
+        // line 0 before this redraw (from_line > 0 means old content may have
+        // wrapped and those lower lines must be cleared even if the new content
+        // fits on one line).  EL suffices only for purely single-line rewrites.
+        if end_visual_line > 0 || from_line > 0 {
             output.write_all(b"\r\x1b[J")?;
         } else {
             output.write_all(b"\r\x1b[K")?;
@@ -2870,6 +2873,28 @@ mod prompt_input {
             assert!(
                 output.windows(5).any(|w| w == b"\x1b[80G"),
                 "expected ESC[80G for wrap-boundary CHA, got: {:?}",
+                output
+            );
+        }
+
+        #[test]
+        fn history_multiline_to_short_clears_lower_lines() {
+            // Reproduce: first history entry is short ("hello"), current buffer
+            // is a long multi-line text (81 'a' chars, wraps to line 1 with
+            // term_cols=80).  Pressing Up should replace the multi-line display
+            // with "hello" and clear the wrapped lines below — verified by the
+            // presence of ESC[J (erase to end of display) in the redraw output.
+            let long_text = "a".repeat(81);
+            // Start with multi-line text already typed; press Up to go to "hello".
+            let mut input: Vec<u8> = long_text.bytes().collect();
+            input.extend_from_slice(b"\x1b[A\r"); // Up arrow + Enter
+            let (res, output) = run_with_history(&input, &["hello"]);
+            assert_eq!(res.unwrap(), Some("hello".to_string()));
+            // The redraw replacing the 81-char text with "hello" must use ED,
+            // not EL, so that the second visual line is erased.
+            assert!(
+                output.windows(3).any(|w| w == b"\x1b[J"),
+                "expected ESC[J when replacing multi-line buffer with short history entry, got: {:?}",
                 output
             );
         }
