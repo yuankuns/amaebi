@@ -1726,6 +1726,7 @@ mod prompt_input {
             &mut std::io::stderr(),
             &history_snapshot,
             PROMPT,
+            terminal_cols(),
         );
         if let Ok(Some(ref line)) = result {
             if !line.is_empty() {
@@ -1739,28 +1740,114 @@ mod prompt_input {
         result
     }
 
+    /// Returns the terminal width in columns by querying stderr with `TIOCGWINSZ`.
+    /// Falls back to 80 if the ioctl fails (e.g. in tests or when stderr is redirected).
+    #[cfg(unix)]
+    fn terminal_cols() -> usize {
+        unsafe {
+            let mut ws = std::mem::zeroed::<libc::winsize>();
+            if libc::ioctl(libc::STDERR_FILENO, libc::TIOCGWINSZ, &mut ws) == 0 && ws.ws_col > 0 {
+                ws.ws_col as usize
+            } else {
+                80
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn terminal_cols() -> usize {
+        80
+    }
+
     /// Redraw the current line after any edit or cursor movement.
     ///
-    /// Moves to the beginning of the line (`\r`), erases to EOL, reprints
-    /// `prompt` and all `chars`, then moves the cursor back from the end to
-    /// the `cursor` index so the visual cursor sits at the right position.
+    /// Moves up to the first visual line of the prompt, erases to end of
+    /// display (multi-line input) or end of line (single-line input), reprints
+    /// `prompt` and all `chars`, then repositions the terminal cursor to
+    /// `cursor`.  `term_cols` is the terminal width used for line-wrap math.
+    #[allow(clippy::too_many_arguments)]
     fn redraw<W: Write>(
         output: &mut W,
         prompt: &str,
         chars: &[char],
         widths: &[usize],
         cursor: usize,
+        term_cols: usize,
+        from_line: usize,
+        old_end_line: usize,
     ) -> std::io::Result<()> {
-        output.write_all(b"\r\x1b[K")?;
+        let prompt_cols: usize = prompt.chars().map(|c| c.width().unwrap_or(1)).sum();
+        let cols_before_cursor: usize = widths[..cursor].iter().sum();
+        let total_char_width: usize = widths.iter().sum();
+
+        let cursor_col_abs = prompt_cols + cols_before_cursor;
+        let end_col_abs = prompt_cols + total_char_width;
+
+        // ANSI terminals use a "pending wrap" flag: a character printed in the
+        // last column stays on that line until the next printable char.  So a
+        // cursor or end position that is an exact multiple of term_cols is still
+        // on the *previous* visual line, not the next one.
+        let visual_line_of = |col: usize| {
+            if col == 0 {
+                0
+            } else {
+                (col - 1) / term_cols
+            }
+        };
+        let cursor_visual_line = visual_line_of(cursor_col_abs);
+        let end_visual_line = visual_line_of(end_col_abs);
+
+        // Move up to the first visual line of this prompt before clearing.
+        // Use `from_line` (the actual terminal cursor line) rather than the
+        // new cursor's visual line: when the user presses Home the new cursor
+        // is on line 0 but the terminal cursor is still on line 1, so we must
+        // move up by `from_line` lines to reach the top of the prompt.
+        if from_line > 0 {
+            write!(output, "\x1b[{from_line}A")?;
+        }
+
+        // Erase: use ED (erase to end of display) when the old or new content
+        // spans multiple visual lines.  We need the larger of:
+        //   - end_visual_line: how many lines the new content needs
+        //   - old_end_line:    how many lines the old content occupied
+        //                      (independent of where the cursor was; e.g. the
+        //                      user pressed Home before navigating history, so
+        //                      from_line==0 but old wrapped lines still exist)
+        // EL (\r\x1b[K) suffices only when both old and new fit on one line.
+        if end_visual_line > 0 || old_end_line > 0 {
+            output.write_all(b"\r\x1b[J")?;
+        } else {
+            output.write_all(b"\r\x1b[K")?;
+        }
+
+        // Reprint prompt and all characters.
         output.write_all(prompt.as_bytes())?;
         for ch in chars {
             let mut buf = [0u8; 4];
             output.write_all(ch.encode_utf8(&mut buf).as_bytes())?;
         }
+
+        // Reposition the terminal cursor to `cursor`.
+        // After printing all chars the terminal cursor sits at end_visual_line.
         let cols_from_cursor: usize = widths[cursor..].iter().sum();
         if cols_from_cursor > 0 {
-            write!(output, "\x1b[{cols_from_cursor}D")?;
+            let lines_above_end = end_visual_line - cursor_visual_line;
+            if lines_above_end == 0 {
+                // Same visual line — simple backward move.
+                write!(output, "\x1b[{cols_from_cursor}D")?;
+            } else {
+                // Move up from end_visual_line to cursor_visual_line, then
+                // jump to the exact column with CHA (1-based).
+                write!(output, "\x1b[{lines_above_end}A")?;
+                // CHA is 1-based.  Use the same pending-wrap adjustment as
+                // visual_line_of: a cursor at an exact column multiple sits at
+                // the last column of the previous line, not column 1 of the
+                // next, so saturating_sub(1) before the modulo is required.
+                let target_col = cursor_col_abs.saturating_sub(1) % term_cols + 1;
+                write!(output, "\x1b[{target_col}G")?;
+            }
         }
+
         Ok(())
     }
 
@@ -1780,13 +1867,16 @@ mod prompt_input {
         output: &mut W,
         history: &[Arc<str>],
         prompt: &str,
+        term_cols: usize,
     ) -> std::io::Result<Option<String>> {
+        let prompt_cols: usize = prompt.chars().map(|c| c.width().unwrap_or(1)).sum();
+        // See redraw() for why (col-1)/term_cols is used instead of col/term_cols.
+        let visual_line_of = |col: usize| if col == 0 { 0 } else { (col - 1) / term_cols };
         let mut chars: Vec<char> = Vec::new();
         // Display width (columns) of each char, matched by index to `chars`.
         let mut widths: Vec<usize> = Vec::new();
         // Cursor position: index into `chars` (0 = start, chars.len() = end).
         let mut cursor: usize = 0;
-
         // History navigation state.
         // `hist_idx` == history.len() means "current draft" (not navigating history).
         let mut hist_idx: usize = history.len();
@@ -1796,6 +1886,18 @@ mod prompt_input {
         let mut draft_cursor: usize = 0;
 
         loop {
+            // Visual line (0-based) where the terminal cursor currently sits.
+            // Every key handler in this iteration leaves the terminal cursor at
+            // `cursor`'s position, so at the top of each iteration `cursor`
+            // reflects the terminal position from the previous iteration.
+            let terminal_line =
+                visual_line_of(prompt_cols + widths[..cursor].iter().sum::<usize>());
+            // Visual line of the last character in the buffer (the full extent
+            // of the old content on screen).  Needed by redraw() so it can
+            // choose ED over EL even when the cursor is at position 0 (e.g.
+            // after Home) but wrapped lines still occupy lines 1+.
+            let terminal_end_line = visual_line_of(prompt_cols + widths.iter().sum::<usize>());
+
             let mut byte = [0u8; 1];
             match input.read_exact(&mut byte) {
                 Ok(()) => {}
@@ -1848,7 +1950,16 @@ mod prompt_input {
                                 write!(output, "\x1b[{w}D\x1b[K")?;
                             } else {
                                 // Mid-line deletion: full redraw to shift remaining chars.
-                                redraw(output, prompt, &chars, &widths, cursor)?;
+                                redraw(
+                                    output,
+                                    prompt,
+                                    &chars,
+                                    &widths,
+                                    cursor,
+                                    term_cols,
+                                    terminal_line,
+                                    terminal_end_line,
+                                )?;
                             }
                         } else {
                             // Zero-width combining mark: it was rendered on top of the
@@ -1858,7 +1969,16 @@ mod prompt_input {
                             // first character it may have combined visually with the
                             // trailing character of the prompt, so reprinting the prompt
                             // via redraw() is the only way to restore it.
-                            redraw(output, prompt, &chars, &widths, cursor)?;
+                            redraw(
+                                output,
+                                prompt,
+                                &chars,
+                                &widths,
+                                cursor,
+                                term_cols,
+                                terminal_line,
+                                terminal_end_line,
+                            )?;
                         }
                     }
                 }
@@ -1896,14 +2016,32 @@ mod prompt_input {
                                     (Some(b'D'), []) => {
                                         if cursor > 0 {
                                             cursor -= 1;
-                                            redraw(output, prompt, &chars, &widths, cursor)?;
+                                            redraw(
+                                                output,
+                                                prompt,
+                                                &chars,
+                                                &widths,
+                                                cursor,
+                                                term_cols,
+                                                terminal_line,
+                                                terminal_end_line,
+                                            )?;
                                         }
                                     }
                                     // Right arrow (ESC [ C)
                                     (Some(b'C'), []) => {
                                         if cursor < chars.len() {
                                             cursor += 1;
-                                            redraw(output, prompt, &chars, &widths, cursor)?;
+                                            redraw(
+                                                output,
+                                                prompt,
+                                                &chars,
+                                                &widths,
+                                                cursor,
+                                                term_cols,
+                                                terminal_line,
+                                                terminal_end_line,
+                                            )?;
                                         }
                                     }
                                     // Up arrow (ESC [ A) — navigate backwards in history
@@ -1922,7 +2060,16 @@ mod prompt_input {
                                                 .map(|c| c.width().unwrap_or(1))
                                                 .collect();
                                             cursor = chars.len();
-                                            redraw(output, prompt, &chars, &widths, cursor)?;
+                                            redraw(
+                                                output,
+                                                prompt,
+                                                &chars,
+                                                &widths,
+                                                cursor,
+                                                term_cols,
+                                                terminal_line,
+                                                terminal_end_line,
+                                            )?;
                                         }
                                     }
                                     // Down arrow (ESC [ B) — navigate forwards in history
@@ -1943,21 +2090,48 @@ mod prompt_input {
                                                 .iter()
                                                 .map(|c| c.width().unwrap_or(1))
                                                 .collect();
-                                            redraw(output, prompt, &chars, &widths, cursor)?;
+                                            redraw(
+                                                output,
+                                                prompt,
+                                                &chars,
+                                                &widths,
+                                                cursor,
+                                                term_cols,
+                                                terminal_line,
+                                                terminal_end_line,
+                                            )?;
                                         }
                                     }
                                     // Home: ESC [ H  (VT220) or ESC [ 1 ~ (xterm)
                                     (Some(b'H'), []) | (Some(b'~'), b"1") => {
                                         if cursor > 0 {
                                             cursor = 0;
-                                            redraw(output, prompt, &chars, &widths, cursor)?;
+                                            redraw(
+                                                output,
+                                                prompt,
+                                                &chars,
+                                                &widths,
+                                                cursor,
+                                                term_cols,
+                                                terminal_line,
+                                                terminal_end_line,
+                                            )?;
                                         }
                                     }
                                     // End: ESC [ F  (VT220) or ESC [ 4 ~ (xterm)
                                     (Some(b'F'), []) | (Some(b'~'), b"4") => {
                                         if cursor < chars.len() {
                                             cursor = chars.len();
-                                            redraw(output, prompt, &chars, &widths, cursor)?;
+                                            redraw(
+                                                output,
+                                                prompt,
+                                                &chars,
+                                                &widths,
+                                                cursor,
+                                                term_cols,
+                                                terminal_line,
+                                                terminal_end_line,
+                                            )?;
                                         }
                                     }
                                     // Delete (forward): ESC [ 3 ~
@@ -1974,7 +2148,16 @@ mod prompt_input {
                                             if cursor == chars.len() && w == 1 {
                                                 write!(output, "\x1b[P")?;
                                             } else {
-                                                redraw(output, prompt, &chars, &widths, cursor)?;
+                                                redraw(
+                                                    output,
+                                                    prompt,
+                                                    &chars,
+                                                    &widths,
+                                                    cursor,
+                                                    term_cols,
+                                                    terminal_line,
+                                                    terminal_end_line,
+                                                )?;
                                             }
                                         }
                                     }
@@ -2006,7 +2189,16 @@ mod prompt_input {
                     if cursor == chars.len() {
                         output.write_all(&[b])?;
                     } else {
-                        redraw(output, prompt, &chars, &widths, cursor)?;
+                        redraw(
+                            output,
+                            prompt,
+                            &chars,
+                            &widths,
+                            cursor,
+                            term_cols,
+                            terminal_line,
+                            terminal_end_line,
+                        )?;
                     }
                 }
                 // Valid UTF-8 multi-byte lead bytes only.
@@ -2051,7 +2243,16 @@ mod prompt_input {
                             if cursor == chars.len() {
                                 output.write_all(s.as_bytes())?;
                             } else {
-                                redraw(output, prompt, &chars, &widths, cursor)?;
+                                redraw(
+                                    output,
+                                    prompt,
+                                    &chars,
+                                    &widths,
+                                    cursor,
+                                    term_cols,
+                                    terminal_line,
+                                    terminal_end_line,
+                                )?;
                             }
                         }
                     }
@@ -2088,10 +2289,19 @@ mod prompt_input {
             input: &[u8],
             history: &[&str],
         ) -> (std::io::Result<Option<String>>, Vec<u8>) {
+            run_with_history_prompt(input, history, "", 80)
+        }
+
+        fn run_with_history_prompt(
+            input: &[u8],
+            history: &[&str],
+            prompt: &str,
+            term_cols: usize,
+        ) -> (std::io::Result<Option<String>>, Vec<u8>) {
             let history_owned: Vec<Arc<str>> = history.iter().map(|s| Arc::from(*s)).collect();
             let mut reader = Cursor::new(input.to_vec());
             let mut output: Vec<u8> = Vec::new();
-            let result = process_input(&mut reader, &mut output, &history_owned, "");
+            let result = process_input(&mut reader, &mut output, &history_owned, prompt, term_cols);
             (result, output)
         }
 
@@ -2641,6 +2851,142 @@ mod prompt_input {
         fn end_at_end_does_nothing() {
             let (res, _) = run(b"abc\x1b[Fz\r");
             assert_eq!(res.unwrap(), Some("abcz".to_string()));
+        }
+
+        // ------------------------------------------------------------------ //
+        // Multi-line redraw (content wider than term_cols)
+        // ------------------------------------------------------------------ //
+
+        #[test]
+        fn multi_line_redraw_uses_erase_display() {
+            // 81 'a' chars wraps past col 80 because the test helper passes
+            // term_cols = 80 into process_input.  A left arrow triggers
+            // redraw with end_visual_line = 1, so output must contain
+            // ESC[J (erase to end of display).
+            let mut input: Vec<u8> = vec![b'a'; 81];
+            input.extend_from_slice(b"\x1b[D\r"); // left arrow + Enter
+            let (res, output) = run(&input);
+            assert_eq!(res.unwrap(), Some("a".repeat(81)));
+            assert!(
+                output.windows(3).any(|w| w == b"\x1b[J"),
+                "expected ESC[J for multi-line erase, got: {:?}",
+                output
+            );
+        }
+
+        #[test]
+        fn multi_line_redraw_cross_line_cursor_reposition() {
+            // 82 'a' chars + Home moves cursor to col 0 (term_cols = 80 passed
+            // by test helper).  end_visual_line = 1, cursor on line 0 → CUU needed.
+            let mut input: Vec<u8> = vec![b'a'; 82];
+            input.extend_from_slice(b"\x1b[H\r"); // Home + Enter
+            let (res, output) = run(&input);
+            assert_eq!(res.unwrap(), Some("a".repeat(82)));
+            // Must contain CUU (ESC [ n A) to move cursor up across visual lines.
+            assert!(
+                output.windows(4).any(|w| w == b"\x1b[1A"),
+                "expected ESC[1A (CUU) for cross-line cursor reposition, got: {:?}",
+                output
+            );
+        }
+
+        #[test]
+        fn multi_line_redraw_cursor_at_exact_wrap_boundary() {
+            // 81 'a' chars (term_cols = 80 passed by test helper), cursor
+            // moves left once: lands at col 80 (pending-wrap boundary).
+            // CHA should emit ESC[80G, not ESC[1G.
+            let mut input: Vec<u8> = vec![b'a'; 81];
+            input.extend_from_slice(b"\x1b[D\r"); // left arrow + Enter
+            let (res, output) = run(&input);
+            assert_eq!(res.unwrap(), Some("a".repeat(81)));
+            // ESC[80G — cursor at last column of line 0, not column 1.
+            assert!(
+                output.windows(5).any(|w| w == b"\x1b[80G"),
+                "expected ESC[80G for wrap-boundary CHA, got: {:?}",
+                output
+            );
+        }
+
+        #[test]
+        fn history_multiline_to_short_clears_lower_lines() {
+            // Reproduce: first history entry is short ("hello"), current buffer
+            // is a long multi-line text (81 'a' chars, wraps to line 1 with
+            // term_cols=80).  Pressing Up should replace the multi-line display
+            // with "hello" and clear the wrapped lines below — verified by the
+            // presence of ESC[J (erase to end of display) in the redraw output.
+            let long_text = "a".repeat(81);
+            // Start with multi-line text already typed; press Up to go to "hello".
+            let mut input: Vec<u8> = long_text.bytes().collect();
+            input.extend_from_slice(b"\x1b[A\r"); // Up arrow + Enter
+            let (res, output) = run_with_history(&input, &["hello"]);
+            assert_eq!(res.unwrap(), Some("hello".to_string()));
+            // The redraw replacing the 81-char text with "hello" must use ED,
+            // not EL, so that the second visual line is erased.
+            assert!(
+                output.windows(3).any(|w| w == b"\x1b[J"),
+                "expected ESC[J when replacing multi-line buffer with short history entry, got: {:?}",
+                output
+            );
+        }
+
+        #[test]
+        fn history_long_then_short_exact_pane_scenario() {
+            // Exact reproduction of the reported bug:
+            // term_cols=104, prompt="> "(2 cols), history[0]="hello",
+            // history[1]="x"*110.  Up Up Enter must return "hello" and
+            // must emit ESC[J twice (once per Up redraw).
+            let long_text = "x".repeat(110); // 2+110=112 > 104, wraps to line 1
+            let input = b"\x1b[A\x1b[A\r";
+            let (res, output) = run_with_history_prompt(input, &["hello", &long_text], "> ", 104);
+            assert_eq!(res.unwrap(), Some("hello".to_string()));
+            let esc_j_count = output.windows(3).filter(|w| *w == b"\x1b[J").count();
+            // The second Up (long→hello) must emit ESC[J to clear the wrapped line.
+            // The first Up (empty→long) also emits ESC[J because end_visual_line>0.
+            assert!(
+                esc_j_count >= 2,
+                "expected >=2 ESC[J, got {esc_j_count}; output: {:?}",
+                output
+            );
+        }
+
+        #[test]
+        fn history_long_home_then_up_clears_lower_lines() {
+            // Regression: type long text (wraps), press Home (cursor→0,
+            // terminal_line=0), then Up (navigate to short history entry).
+            // With cursor at position 0, old_end_line must still trigger ED
+            // to erase the wrapped lines that remain on screen.
+            let long_text = "x".repeat(110); // wraps to line 1 with term_cols=104
+            let mut input: Vec<u8> = long_text.bytes().collect();
+            input.extend_from_slice(b"\x1b[H\x1b[A\r"); // Home + Up + Enter
+            let (res, output) = run_with_history_prompt(&input, &["hello"], "> ", 104);
+            assert_eq!(res.unwrap(), Some("hello".to_string()));
+            assert!(
+                output.windows(3).any(|w| w == b"\x1b[J"),
+                "expected ESC[J after Home+Up to clear wrapped lines, got: {:?}",
+                output
+            );
+        }
+
+        #[test]
+        fn history_long_then_short_clears_lower_lines() {
+            // Scenario: history[0]="hello", history[1]=81-char long text (already
+            // submitted).  Current buffer is empty.  Press Up once (→ long text),
+            // then Up again (→ "hello").  The second Up must erase the wrapped
+            // lines left by the long text, i.e. ESC[J must appear after the
+            // second Up's CUU.
+            let long_text = "a".repeat(81);
+            // Empty buffer: just two Up arrows then Enter.
+            let input = b"\x1b[A\x1b[A\r";
+            let (res, output) = run_with_history(input, &["hello", &long_text]);
+            assert_eq!(res.unwrap(), Some("hello".to_string()));
+            // Find the second ESC[J (first is from loading long_text, second
+            // must appear when replacing long_text with "hello").
+            let esc_j_count = output.windows(3).filter(|w| *w == b"\x1b[J").count();
+            assert!(
+                esc_j_count >= 2,
+                "expected at least 2 ESC[J (one per Up), got {esc_j_count}; output: {:?}",
+                output
+            );
         }
 
         // ------------------------------------------------------------------ //
