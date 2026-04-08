@@ -1772,6 +1772,7 @@ mod prompt_input {
         widths: &[usize],
         cursor: usize,
         term_cols: usize,
+        from_line: usize,
     ) -> std::io::Result<()> {
         let prompt_cols: usize = prompt.chars().map(|c| c.width().unwrap_or(1)).sum();
         let cols_before_cursor: usize = widths[..cursor].iter().sum();
@@ -1795,8 +1796,12 @@ mod prompt_input {
         let end_visual_line = visual_line_of(end_col_abs);
 
         // Move up to the first visual line of this prompt before clearing.
-        if cursor_visual_line > 0 {
-            write!(output, "\x1b[{cursor_visual_line}A")?;
+        // Use `from_line` (the actual terminal cursor line) rather than the
+        // new cursor's visual line: when the user presses Home the new cursor
+        // is on line 0 but the terminal cursor is still on line 1, so we must
+        // move up by `from_line` lines to reach the top of the prompt.
+        if from_line > 0 {
+            write!(output, "\x1b[{from_line}A")?;
         }
 
         // Erase: if content spans multiple visual lines use ED (erase to end of
@@ -1856,12 +1861,14 @@ mod prompt_input {
         prompt: &str,
         term_cols: usize,
     ) -> std::io::Result<Option<String>> {
+        let prompt_cols: usize = prompt.chars().map(|c| c.width().unwrap_or(1)).sum();
+        // See redraw() for why (col-1)/term_cols is used instead of col/term_cols.
+        let visual_line_of = |col: usize| if col == 0 { 0 } else { (col - 1) / term_cols };
         let mut chars: Vec<char> = Vec::new();
         // Display width (columns) of each char, matched by index to `chars`.
         let mut widths: Vec<usize> = Vec::new();
         // Cursor position: index into `chars` (0 = start, chars.len() = end).
         let mut cursor: usize = 0;
-
         // History navigation state.
         // `hist_idx` == history.len() means "current draft" (not navigating history).
         let mut hist_idx: usize = history.len();
@@ -1871,6 +1878,13 @@ mod prompt_input {
         let mut draft_cursor: usize = 0;
 
         loop {
+            // Visual line (0-based) where the terminal cursor currently sits.
+            // Every key handler in this iteration leaves the terminal cursor at
+            // `cursor`'s position, so at the top of each iteration `cursor`
+            // reflects the terminal position from the previous iteration.
+            let terminal_line =
+                visual_line_of(prompt_cols + widths[..cursor].iter().sum::<usize>());
+
             let mut byte = [0u8; 1];
             match input.read_exact(&mut byte) {
                 Ok(()) => {}
@@ -1923,7 +1937,15 @@ mod prompt_input {
                                 write!(output, "\x1b[{w}D\x1b[K")?;
                             } else {
                                 // Mid-line deletion: full redraw to shift remaining chars.
-                                redraw(output, prompt, &chars, &widths, cursor, term_cols)?;
+                                redraw(
+                                    output,
+                                    prompt,
+                                    &chars,
+                                    &widths,
+                                    cursor,
+                                    term_cols,
+                                    terminal_line,
+                                )?;
                             }
                         } else {
                             // Zero-width combining mark: it was rendered on top of the
@@ -1933,7 +1955,15 @@ mod prompt_input {
                             // first character it may have combined visually with the
                             // trailing character of the prompt, so reprinting the prompt
                             // via redraw() is the only way to restore it.
-                            redraw(output, prompt, &chars, &widths, cursor, term_cols)?;
+                            redraw(
+                                output,
+                                prompt,
+                                &chars,
+                                &widths,
+                                cursor,
+                                term_cols,
+                                terminal_line,
+                            )?;
                         }
                     }
                 }
@@ -1972,7 +2002,13 @@ mod prompt_input {
                                         if cursor > 0 {
                                             cursor -= 1;
                                             redraw(
-                                                output, prompt, &chars, &widths, cursor, term_cols,
+                                                output,
+                                                prompt,
+                                                &chars,
+                                                &widths,
+                                                cursor,
+                                                term_cols,
+                                                terminal_line,
                                             )?;
                                         }
                                     }
@@ -1981,7 +2017,13 @@ mod prompt_input {
                                         if cursor < chars.len() {
                                             cursor += 1;
                                             redraw(
-                                                output, prompt, &chars, &widths, cursor, term_cols,
+                                                output,
+                                                prompt,
+                                                &chars,
+                                                &widths,
+                                                cursor,
+                                                term_cols,
+                                                terminal_line,
                                             )?;
                                         }
                                     }
@@ -2002,7 +2044,13 @@ mod prompt_input {
                                                 .collect();
                                             cursor = chars.len();
                                             redraw(
-                                                output, prompt, &chars, &widths, cursor, term_cols,
+                                                output,
+                                                prompt,
+                                                &chars,
+                                                &widths,
+                                                cursor,
+                                                term_cols,
+                                                terminal_line,
                                             )?;
                                         }
                                     }
@@ -2025,7 +2073,13 @@ mod prompt_input {
                                                 .map(|c| c.width().unwrap_or(1))
                                                 .collect();
                                             redraw(
-                                                output, prompt, &chars, &widths, cursor, term_cols,
+                                                output,
+                                                prompt,
+                                                &chars,
+                                                &widths,
+                                                cursor,
+                                                term_cols,
+                                                terminal_line,
                                             )?;
                                         }
                                     }
@@ -2034,7 +2088,13 @@ mod prompt_input {
                                         if cursor > 0 {
                                             cursor = 0;
                                             redraw(
-                                                output, prompt, &chars, &widths, cursor, term_cols,
+                                                output,
+                                                prompt,
+                                                &chars,
+                                                &widths,
+                                                cursor,
+                                                term_cols,
+                                                terminal_line,
                                             )?;
                                         }
                                     }
@@ -2043,7 +2103,13 @@ mod prompt_input {
                                         if cursor < chars.len() {
                                             cursor = chars.len();
                                             redraw(
-                                                output, prompt, &chars, &widths, cursor, term_cols,
+                                                output,
+                                                prompt,
+                                                &chars,
+                                                &widths,
+                                                cursor,
+                                                term_cols,
+                                                terminal_line,
                                             )?;
                                         }
                                     }
@@ -2062,8 +2128,13 @@ mod prompt_input {
                                                 write!(output, "\x1b[P")?;
                                             } else {
                                                 redraw(
-                                                    output, prompt, &chars, &widths, cursor,
+                                                    output,
+                                                    prompt,
+                                                    &chars,
+                                                    &widths,
+                                                    cursor,
                                                     term_cols,
+                                                    terminal_line,
                                                 )?;
                                             }
                                         }
@@ -2096,7 +2167,15 @@ mod prompt_input {
                     if cursor == chars.len() {
                         output.write_all(&[b])?;
                     } else {
-                        redraw(output, prompt, &chars, &widths, cursor, term_cols)?;
+                        redraw(
+                            output,
+                            prompt,
+                            &chars,
+                            &widths,
+                            cursor,
+                            term_cols,
+                            terminal_line,
+                        )?;
                     }
                 }
                 // Valid UTF-8 multi-byte lead bytes only.
@@ -2141,7 +2220,15 @@ mod prompt_input {
                             if cursor == chars.len() {
                                 output.write_all(s.as_bytes())?;
                             } else {
-                                redraw(output, prompt, &chars, &widths, cursor, term_cols)?;
+                                redraw(
+                                    output,
+                                    prompt,
+                                    &chars,
+                                    &widths,
+                                    cursor,
+                                    term_cols,
+                                    terminal_line,
+                                )?;
                             }
                         }
                     }
