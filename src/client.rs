@@ -2268,10 +2268,19 @@ mod prompt_input {
             input: &[u8],
             history: &[&str],
         ) -> (std::io::Result<Option<String>>, Vec<u8>) {
+            run_with_history_prompt(input, history, "", 80)
+        }
+
+        fn run_with_history_prompt(
+            input: &[u8],
+            history: &[&str],
+            prompt: &str,
+            term_cols: usize,
+        ) -> (std::io::Result<Option<String>>, Vec<u8>) {
             let history_owned: Vec<Arc<str>> = history.iter().map(|s| Arc::from(*s)).collect();
             let mut reader = Cursor::new(input.to_vec());
             let mut output: Vec<u8> = Vec::new();
-            let result = process_input(&mut reader, &mut output, &history_owned, "", 80);
+            let result = process_input(&mut reader, &mut output, &history_owned, prompt, term_cols);
             (result, output)
         }
 
@@ -2895,6 +2904,48 @@ mod prompt_input {
             assert!(
                 output.windows(3).any(|w| w == b"\x1b[J"),
                 "expected ESC[J when replacing multi-line buffer with short history entry, got: {:?}",
+                output
+            );
+        }
+
+        #[test]
+        fn history_long_then_short_exact_pane_scenario() {
+            // Exact reproduction of the reported bug:
+            // term_cols=104, prompt="> "(2 cols), history[0]="hello",
+            // history[1]="x"*110.  Up Up Enter must return "hello" and
+            // must emit ESC[J twice (once per Up redraw).
+            let long_text = "x".repeat(110); // 2+110=112 > 104, wraps to line 1
+            let input = b"\x1b[A\x1b[A\r";
+            let (res, output) = run_with_history_prompt(input, &["hello", &long_text], "> ", 104);
+            assert_eq!(res.unwrap(), Some("hello".to_string()));
+            let esc_j_count = output.windows(3).filter(|w| *w == b"\x1b[J").count();
+            // The second Up (long→hello) must emit ESC[J to clear the wrapped line.
+            // The first Up (empty→long) also emits ESC[J because end_visual_line>0.
+            assert!(
+                esc_j_count >= 2,
+                "expected >=2 ESC[J, got {esc_j_count}; output: {:?}",
+                output
+            );
+        }
+
+        #[test]
+        fn history_long_then_short_clears_lower_lines() {
+            // Scenario: history[0]="hello", history[1]=81-char long text (already
+            // submitted).  Current buffer is empty.  Press Up once (→ long text),
+            // then Up again (→ "hello").  The second Up must erase the wrapped
+            // lines left by the long text, i.e. ESC[J must appear after the
+            // second Up's CUU.
+            let long_text = "a".repeat(81);
+            // Empty buffer: just two Up arrows then Enter.
+            let input = b"\x1b[A\x1b[A\r";
+            let (res, output) = run_with_history(input, &["hello", &long_text]);
+            assert_eq!(res.unwrap(), Some("hello".to_string()));
+            // Find the second ESC[J (first is from loading long_text, second
+            // must appear when replacing long_text with "hello").
+            let esc_j_count = output.windows(3).filter(|w| *w == b"\x1b[J").count();
+            assert!(
+                esc_j_count >= 2,
+                "expected at least 2 ESC[J (one per Up), got {esc_j_count}; output: {:?}",
                 output
             );
         }
