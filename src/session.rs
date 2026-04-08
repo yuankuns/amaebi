@@ -252,8 +252,8 @@ pub fn get_or_create(dir: &Path) -> Result<String> {
 
     // Double-check: another process may have created the entry between the
     // shared read and the exclusive lock acquisition.
-    // `load_map` always produces non-empty vecs (legacy single records are
-    // wrapped in vec![..]), so `first_mut` is infallible in practice.
+    // `first_mut` may return `None` for an empty vec (e.g. hand-edited file);
+    // that is treated the same as a missing entry and falls through to create.
     let uuid = if let Some(rec) = map.get_mut(&key).and_then(|v| v.first_mut()) {
         rec.touch();
         let id = rec.uuid.clone();
@@ -319,10 +319,16 @@ pub fn create_fresh(dir: &Path) -> Result<String> {
     let key = canonical_key(dir);
     let mut map = load_map(&path)?;
 
+    /// Maximum number of per-directory session records kept in history.
+    /// Oldest entries beyond this cap are silently dropped on each `create_fresh`.
+    const MAX_HISTORY: usize = 20;
+
     let rec = SessionRecord::new();
     let new_id = rec.uuid.clone();
-    // Prepend so the newest session is always first.
-    map.entry(key).or_default().insert(0, rec);
+    // Prepend so the newest session is always first, then cap the history.
+    let vec = map.entry(key).or_default();
+    vec.insert(0, rec);
+    vec.truncate(MAX_HISTORY);
     save_map(&path, &map)?;
 
     lock_file.unlock().context("releasing sessions lock")?;

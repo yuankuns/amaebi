@@ -148,10 +148,12 @@ pub enum MemoryAction {
 
 #[derive(clap::Subcommand, Debug)]
 pub enum SessionAction {
-    /// Show the session UUID for the current directory.
+    /// Show the session history for the current directory.
     ///
-    /// Prints the UUID if one has been assigned, or "(none)" if the current
-    /// directory has not started a session yet.
+    /// Prints all past session UUIDs (newest first) with their creation and
+    /// last-access timestamps.  Prints "(none)" if no session has been started
+    /// in this directory yet.  Use a listed UUID with `--resume` to continue
+    /// a previous session.
     Show,
     /// Reset the session for the current directory by generating a new UUID.
     ///
