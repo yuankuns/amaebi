@@ -2826,9 +2826,10 @@ mod prompt_input {
 
         #[test]
         fn multi_line_redraw_uses_erase_display() {
-            // 81 'a' chars wraps past col 80 (term_cols fallback = 80).
-            // A left arrow triggers redraw with end_visual_line = 1,
-            // so the output must contain ESC[J (erase to end of display).
+            // 81 'a' chars wraps past col 80 because the test helper passes
+            // term_cols = 80 into process_input.  A left arrow triggers
+            // redraw with end_visual_line = 1, so output must contain
+            // ESC[J (erase to end of display).
             let mut input: Vec<u8> = vec![b'a'; 81];
             input.extend_from_slice(b"\x1b[D\r"); // left arrow + Enter
             let (res, output) = run(&input);
@@ -2842,8 +2843,8 @@ mod prompt_input {
 
         #[test]
         fn multi_line_redraw_cross_line_cursor_reposition() {
-            // 82 'a' chars + Home moves cursor to col 0, line 0.
-            // end_visual_line = 1, cursor_visual_line = 0 → CUU needed.
+            // 82 'a' chars + Home moves cursor to col 0 (term_cols = 80 passed
+            // by test helper).  end_visual_line = 1, cursor on line 0 → CUU needed.
             let mut input: Vec<u8> = vec![b'a'; 82];
             input.extend_from_slice(b"\x1b[H\r"); // Home + Enter
             let (res, output) = run(&input);
@@ -2858,8 +2859,8 @@ mod prompt_input {
 
         #[test]
         fn multi_line_redraw_cursor_at_exact_wrap_boundary() {
-            // 81 'a' chars, cursor moves left once: cursor lands at col 80
-            // (exact multiple of term_cols=80, pending-wrap position).
+            // 81 'a' chars (term_cols = 80 passed by test helper), cursor
+            // moves left once: lands at col 80 (pending-wrap boundary).
             // CHA should emit ESC[80G, not ESC[1G.
             let mut input: Vec<u8> = vec![b'a'; 81];
             input.extend_from_slice(b"\x1b[D\r"); // left arrow + Enter
