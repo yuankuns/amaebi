@@ -287,13 +287,11 @@ async fn spawn_agent(args: serde_json::Value, ctx: &SpawnContext) -> Result<Stri
         )
     })?;
 
-    // Fix 4: inherit the parent's current model when the tool caller does not
-    // specify one explicitly.
     let model = args["model"]
         .as_str()
         .map(|s| s.to_string())
         .unwrap_or_else(|| {
-            std::env::var("AMAEBI_MODEL")
+            std::env::var("AMAEBI_SUBAGENT_MODEL")
                 .unwrap_or_else(|_| crate::provider::DEFAULT_MODEL.to_string())
         });
 
@@ -616,8 +614,7 @@ pub fn tool_schemas(include_spawn_agent: bool) -> Vec<serde_json::Value> {
                         },
                         "model": {
                             "type": "string",
-                            "description": "LLM model to use (optional; defaults to the AMAEBI_MODEL \
-                                            environment variable, or gpt-4o if unset)."
+                            "description": "LLM model to use (optional; defaults to AMAEBI_SUBAGENT_MODEL env var, or claude-sonnet-4.6 if unset). Supports provider/model format (e.g. bedrock/claude-haiku-4.5)."
                         },
                         "extra_mounts": {
                             "type": "array",

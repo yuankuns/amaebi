@@ -773,6 +773,7 @@ async fn spawn_agent_runs_task() {
         &[
             ("AMAEBI_SPAWN_SANDBOX", "noop"),
             ("AMAEBI_MODEL", "copilot/gpt-4o"),
+            ("AMAEBI_SUBAGENT_MODEL", "copilot/gpt-4o"),
         ],
     )
     .await
@@ -838,6 +839,7 @@ async fn spawn_agent_child_cannot_spawn() {
         &[
             ("AMAEBI_SPAWN_SANDBOX", "noop"),
             ("AMAEBI_MODEL", "copilot/gpt-4o"),
+            ("AMAEBI_SUBAGENT_MODEL", "copilot/gpt-4o"),
         ],
     )
     .await
@@ -914,6 +916,7 @@ async fn spawn_agent_uses_specified_model() {
         &[
             ("AMAEBI_SPAWN_SANDBOX", "noop"),
             ("AMAEBI_MODEL", "copilot/gpt-4o"),
+            ("AMAEBI_SUBAGENT_MODEL", "copilot/gpt-4o"),
         ],
     )
     .await
@@ -980,6 +983,7 @@ async fn spawn_agent_missing_workspace_returns_error() {
         &[
             ("AMAEBI_SPAWN_SANDBOX", "noop"),
             ("AMAEBI_MODEL", "copilot/gpt-4o"),
+            ("AMAEBI_SUBAGENT_MODEL", "copilot/gpt-4o"),
         ],
     )
     .await
@@ -1070,6 +1074,7 @@ async fn spawn_agent_workspace_passed_to_sandbox() {
         &[
             ("AMAEBI_SPAWN_SANDBOX", "noop"),
             ("AMAEBI_MODEL", "copilot/gpt-4o"),
+            ("AMAEBI_SUBAGENT_MODEL", "copilot/gpt-4o"),
         ],
     )
     .await
@@ -1167,6 +1172,7 @@ async fn spawn_agent_parallel_calls() {
         &[
             ("AMAEBI_SPAWN_SANDBOX", "noop"),
             ("AMAEBI_MODEL", "copilot/gpt-4o"),
+            ("AMAEBI_SUBAGENT_MODEL", "copilot/gpt-4o"),
         ],
     )
     .await
@@ -1265,6 +1271,7 @@ async fn spawn_agent_parallel_timing() {
         &[
             ("AMAEBI_SPAWN_SANDBOX", "noop"),
             ("AMAEBI_MODEL", "copilot/gpt-4o"),
+            ("AMAEBI_SUBAGENT_MODEL", "copilot/gpt-4o"),
         ],
     )
     .await
@@ -1323,7 +1330,10 @@ async fn cron_job_triggers_llm_call() {
     let (socket, mut child, _socket_dir) = start_daemon_at_home_with_env(
         home_dir.path(),
         &server.url(),
-        &[("AMAEBI_MODEL", "copilot/gpt-4o")],
+        &[
+            ("AMAEBI_MODEL", "copilot/gpt-4o"),
+            ("AMAEBI_SUBAGENT_MODEL", "copilot/gpt-4o"),
+        ],
     )
     .await
     .expect("start daemon");
@@ -1402,7 +1412,10 @@ async fn cron_job_result_not_sent_to_chat() {
     let (socket, mut child, _socket_dir) = start_daemon_at_home_with_env(
         home_dir.path(),
         &server.url(),
-        &[("AMAEBI_MODEL", "copilot/gpt-4o")],
+        &[
+            ("AMAEBI_MODEL", "copilot/gpt-4o"),
+            ("AMAEBI_SUBAGENT_MODEL", "copilot/gpt-4o"),
+        ],
     )
     .await
     .expect("start daemon");
@@ -1487,6 +1500,7 @@ async fn cron_job_with_spawn_agent() {
         &[
             ("AMAEBI_SPAWN_SANDBOX", "noop"),
             ("AMAEBI_MODEL", "copilot/gpt-4o"),
+            ("AMAEBI_SUBAGENT_MODEL", "copilot/gpt-4o"),
         ],
     )
     .await
@@ -1691,6 +1705,7 @@ async fn sandbox_noop_child_does_not_expose_credentials() {
         &[
             ("AMAEBI_SPAWN_SANDBOX", "noop"),
             ("AMAEBI_MODEL", "copilot/gpt-4o"),
+            ("AMAEBI_SUBAGENT_MODEL", "copilot/gpt-4o"),
         ],
     )
     .await
@@ -1793,6 +1808,7 @@ async fn subagent_chain_session_remains_usable_after_recursion_block() {
         &[
             ("AMAEBI_SPAWN_SANDBOX", "noop"),
             ("AMAEBI_MODEL", "copilot/gpt-4o"),
+            ("AMAEBI_SUBAGENT_MODEL", "copilot/gpt-4o"),
         ],
     )
     .await
