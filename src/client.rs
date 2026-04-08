@@ -776,11 +776,11 @@ pub async fn run_chat_loop(
 
     let cwd = std::env::current_dir().context("getting current directory")?;
     let cwd_for_session = cwd.clone();
-    let session_id = tokio::task::spawn_blocking(move || session::get_or_create(&cwd_for_session))
+    let session_id = tokio::task::spawn_blocking(move || session::create_fresh(&cwd_for_session))
         .await
-        .context("session::get_or_create panicked")?
+        .context("session::create_fresh panicked")?
         .unwrap_or_else(|e| {
-            tracing::warn!(error = %e, "failed to resolve session id; using \"global\"");
+            tracing::warn!(error = %e, "failed to create fresh session id; using \"global\"");
             "global".to_string()
         });
 

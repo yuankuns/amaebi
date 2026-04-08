@@ -337,10 +337,19 @@ fn run_inbox(action: cli::InboxAction) -> Result<()> {
 fn run_session(action: cli::SessionAction) -> Result<()> {
     let cwd = std::env::current_dir().context("getting current directory")?;
     match action {
-        cli::SessionAction::Show => match session::current(&cwd)? {
-            Some(id) => println!("{id}"),
-            None => println!("(none)"),
-        },
+        cli::SessionAction::Show => {
+            let history = session::list_for_dir(&cwd)?;
+            if history.is_empty() {
+                println!("(none)");
+            } else {
+                for (i, rec) in history.iter().enumerate() {
+                    let marker = if i == 0 { " (current)" } else { "" };
+                    println!("{}{}", rec.uuid, marker);
+                    println!("  created: {}", rec.created_at);
+                    println!("  last accessed: {}", rec.last_accessed);
+                }
+            }
+        }
         cli::SessionAction::New => {
             let id = session::reset(&cwd)?;
             println!("{id}");
