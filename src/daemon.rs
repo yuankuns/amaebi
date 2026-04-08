@@ -74,6 +74,31 @@ fn response_max_tokens(model: &str) -> usize {
     );
     result
 }
+/// Resolve the model to use for background session compaction.
+///
+/// Defaults to [`crate::provider::DEFAULT_MODEL`] so compaction never
+/// inherits an expensive main-agent model (e.g. opus) unless the caller
+/// explicitly opts in.  The provider prefix of `main_model` is preserved so
+/// compaction stays on the same API backend (e.g. `copilot/` stays Copilot).
+///
+/// Resolution order:
+///   1. `AMAEBI_COMPACT_MODEL` env var (used verbatim)
+///   2. Same provider prefix as `main_model` + `DEFAULT_MODEL` (sonnet)
+fn compact_model(main_model: &str) -> String {
+    if let Ok(override_model) = std::env::var("AMAEBI_COMPACT_MODEL") {
+        return override_model;
+    }
+    // Preserve the provider prefix so compaction uses the same API backend.
+    let prefix = main_model
+        .split_once('/')
+        .map(|(p, _)| p)
+        .filter(|p| matches!(*p, "copilot" | "bedrock"));
+    match prefix {
+        Some(p) => format!("{}/{}", p, crate::provider::DEFAULT_MODEL),
+        None => crate::provider::DEFAULT_MODEL.to_string(),
+    }
+}
+
 /// Compact session history when prompt tokens exceed this fraction of available input.
 const COMPACTION_THRESHOLD: f64 = 0.85;
 /// Minimum recent user/assistant *pairs* to keep in the hot tail after a token-budget trim.
@@ -995,7 +1020,7 @@ async fn handle_chat_request(
                 tokio::spawn(compact_session(
                     Arc::clone(state),
                     old_sid,
-                    model.clone(),
+                    compact_model(&model),
                     0,
                 ));
             }
@@ -1050,7 +1075,7 @@ async fn handle_chat_request(
                     tokio::spawn(compact_session(
                         Arc::clone(state),
                         sid.clone(),
-                        model.clone(),
+                        compact_model(&model),
                         HOT_TAIL_PAIRS * 2,
                     ));
                 }
