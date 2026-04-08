@@ -1765,6 +1765,7 @@ mod prompt_input {
     /// display (multi-line input) or end of line (single-line input), reprints
     /// `prompt` and all `chars`, then repositions the terminal cursor to
     /// `cursor`.  `term_cols` is the terminal width used for line-wrap math.
+    #[allow(clippy::too_many_arguments)]
     fn redraw<W: Write>(
         output: &mut W,
         prompt: &str,
@@ -1773,6 +1774,7 @@ mod prompt_input {
         cursor: usize,
         term_cols: usize,
         from_line: usize,
+        old_end_line: usize,
     ) -> std::io::Result<()> {
         let prompt_cols: usize = prompt.chars().map(|c| c.width().unwrap_or(1)).sum();
         let cols_before_cursor: usize = widths[..cursor].iter().sum();
@@ -1804,12 +1806,15 @@ mod prompt_input {
             write!(output, "\x1b[{from_line}A")?;
         }
 
-        // Erase: use ED (erase to end of display) when either the new content
-        // spans multiple visual lines OR the terminal cursor was on a line below
-        // line 0 before this redraw (from_line > 0 means old content may have
-        // wrapped and those lower lines must be cleared even if the new content
-        // fits on one line).  EL suffices only for purely single-line rewrites.
-        if end_visual_line > 0 || from_line > 0 {
+        // Erase: use ED (erase to end of display) when the old or new content
+        // spans multiple visual lines.  We need the larger of:
+        //   - end_visual_line: how many lines the new content needs
+        //   - old_end_line:    how many lines the old content occupied
+        //                      (independent of where the cursor was; e.g. the
+        //                      user pressed Home before navigating history, so
+        //                      from_line==0 but old wrapped lines still exist)
+        // EL (\r\x1b[K) suffices only when both old and new fit on one line.
+        if end_visual_line > 0 || old_end_line > 0 {
             output.write_all(b"\r\x1b[J")?;
         } else {
             output.write_all(b"\r\x1b[K")?;
@@ -1887,6 +1892,11 @@ mod prompt_input {
             // reflects the terminal position from the previous iteration.
             let terminal_line =
                 visual_line_of(prompt_cols + widths[..cursor].iter().sum::<usize>());
+            // Visual line of the last character in the buffer (the full extent
+            // of the old content on screen).  Needed by redraw() so it can
+            // choose ED over EL even when the cursor is at position 0 (e.g.
+            // after Home) but wrapped lines still occupy lines 1+.
+            let terminal_end_line = visual_line_of(prompt_cols + widths.iter().sum::<usize>());
 
             let mut byte = [0u8; 1];
             match input.read_exact(&mut byte) {
@@ -1948,6 +1958,7 @@ mod prompt_input {
                                     cursor,
                                     term_cols,
                                     terminal_line,
+                                    terminal_end_line,
                                 )?;
                             }
                         } else {
@@ -1966,6 +1977,7 @@ mod prompt_input {
                                 cursor,
                                 term_cols,
                                 terminal_line,
+                                terminal_end_line,
                             )?;
                         }
                     }
@@ -2012,6 +2024,7 @@ mod prompt_input {
                                                 cursor,
                                                 term_cols,
                                                 terminal_line,
+                                                terminal_end_line,
                                             )?;
                                         }
                                     }
@@ -2027,6 +2040,7 @@ mod prompt_input {
                                                 cursor,
                                                 term_cols,
                                                 terminal_line,
+                                                terminal_end_line,
                                             )?;
                                         }
                                     }
@@ -2054,6 +2068,7 @@ mod prompt_input {
                                                 cursor,
                                                 term_cols,
                                                 terminal_line,
+                                                terminal_end_line,
                                             )?;
                                         }
                                     }
@@ -2083,6 +2098,7 @@ mod prompt_input {
                                                 cursor,
                                                 term_cols,
                                                 terminal_line,
+                                                terminal_end_line,
                                             )?;
                                         }
                                     }
@@ -2098,6 +2114,7 @@ mod prompt_input {
                                                 cursor,
                                                 term_cols,
                                                 terminal_line,
+                                                terminal_end_line,
                                             )?;
                                         }
                                     }
@@ -2113,6 +2130,7 @@ mod prompt_input {
                                                 cursor,
                                                 term_cols,
                                                 terminal_line,
+                                                terminal_end_line,
                                             )?;
                                         }
                                     }
@@ -2138,6 +2156,7 @@ mod prompt_input {
                                                     cursor,
                                                     term_cols,
                                                     terminal_line,
+                                                    terminal_end_line,
                                                 )?;
                                             }
                                         }
@@ -2178,6 +2197,7 @@ mod prompt_input {
                             cursor,
                             term_cols,
                             terminal_line,
+                            terminal_end_line,
                         )?;
                     }
                 }
@@ -2231,6 +2251,7 @@ mod prompt_input {
                                     cursor,
                                     term_cols,
                                     terminal_line,
+                                    terminal_end_line,
                                 )?;
                             }
                         }
@@ -2924,6 +2945,24 @@ mod prompt_input {
             assert!(
                 esc_j_count >= 2,
                 "expected >=2 ESC[J, got {esc_j_count}; output: {:?}",
+                output
+            );
+        }
+
+        #[test]
+        fn history_long_home_then_up_clears_lower_lines() {
+            // Regression: type long text (wraps), press Home (cursor→0,
+            // terminal_line=0), then Up (navigate to short history entry).
+            // With cursor at position 0, old_end_line must still trigger ED
+            // to erase the wrapped lines that remain on screen.
+            let long_text = "x".repeat(110); // wraps to line 1 with term_cols=104
+            let mut input: Vec<u8> = long_text.bytes().collect();
+            input.extend_from_slice(b"\x1b[H\x1b[A\r"); // Home + Up + Enter
+            let (res, output) = run_with_history_prompt(&input, &["hello"], "> ", 104);
+            assert_eq!(res.unwrap(), Some("hello".to_string()));
+            assert!(
+                output.windows(3).any(|w| w == b"\x1b[J"),
+                "expected ESC[J after Home+Up to clear wrapped lines, got: {:?}",
                 output
             );
         }
