@@ -188,11 +188,14 @@ async fn shell_command(
 
 /// Capture the visible text of a tmux pane.
 async fn tmux_capture_pane(args: serde_json::Value) -> Result<String> {
-    // Default to the first pane if no target provided.
     let target = args["target"].as_str().unwrap_or("%0");
+    // Limit scrollback to avoid flooding the LLM with thousands of lines.
+    // -S -N means "start N lines before the bottom of the pane history".
+    let lines = args["lines"].as_u64().unwrap_or(200);
+    let start = format!("-{lines}");
 
     let output = Command::new("tmux")
-        .args(["capture-pane", "-t", target, "-p"])
+        .args(["capture-pane", "-t", target, "-p", "-S", &start])
         .output()
         .await
         .context("spawning tmux capture-pane")?;
@@ -517,7 +520,7 @@ pub fn tool_schemas(include_spawn_agent: bool) -> Vec<serde_json::Value> {
             "type": "function",
             "function": {
                 "name": "tmux_capture_pane",
-                "description": "Capture and return the current visible text of a tmux pane.",
+                "description": "Capture and return recent text from a tmux pane.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -525,6 +528,12 @@ pub fn tool_schemas(include_spawn_agent: bool) -> Vec<serde_json::Value> {
                             "type": "string",
                             "description": "tmux target pane (e.g. '%0', '0:1.0'). \
                                             Defaults to %0."
+                        },
+                        "lines": {
+                            "type": "integer",
+                            "description": "Number of lines of scrollback to capture \
+                                            (default: 200). Use a smaller value to reduce \
+                                            token usage when only the tail matters."
                         }
                     },
                     "required": []
