@@ -188,9 +188,10 @@ async fn shell_command(
 
 /// Capture recent lines from a tmux pane's scrollback history.
 ///
-/// Uses `tmux capture-pane -S -N` to start N lines before the bottom of the
-/// pane history, returning at most `lines` lines. This avoids flooding the LLM
-/// with thousands of lines of build output when only the tail matters.
+/// Uses `tmux capture-pane -S -{lines}` where `-S` receives a negative numeric
+/// argument, starting `lines` lines before the bottom of the pane history and
+/// returning at most `lines` lines. This avoids flooding the LLM with thousands
+/// of lines of build output when only the tail matters.
 async fn tmux_capture_pane(args: serde_json::Value) -> Result<String> {
     let target = args["target"].as_str().unwrap_or("%0");
     // Clamp to at least 1: lines=0 would produce "-S -0" which disables the
@@ -535,9 +536,10 @@ pub fn tool_schemas(include_spawn_agent: bool) -> Vec<serde_json::Value> {
                         },
                         "lines": {
                             "type": "integer",
+                            "minimum": 1,
                             "description": "Number of lines of scrollback to capture \
-                                            (default: 200). Use a smaller value to reduce \
-                                            token usage when only the tail matters."
+                                            (minimum: 1, default: 200). Use a smaller value \
+                                            to reduce token usage when only the tail matters."
                         }
                     },
                     "required": []
