@@ -643,11 +643,14 @@ pub fn tool_schemas(include_spawn_agent: bool) -> Vec<serde_json::Value> {
                         },
                         "timeout_secs": {
                             "type": "integer",
-                            "description": "Hard timeout in seconds before giving up. Default: 600."
+                            "description": "Hard timeout in seconds before giving up. Default: 600. Maximum: 86400.",
+                            "minimum": 1,
+                            "maximum": 86400
                         },
                         "poll_interval_secs": {
                             "type": "integer",
-                            "description": "How often to sample the pane, in seconds. Default: 2."
+                            "description": "How often to sample the pane, in seconds. Minimum: 1. Default: 2.",
+                            "minimum": 1
                         }
                     },
                     "required": []
