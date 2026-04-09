@@ -1173,23 +1173,20 @@ fn should_persist_tool_output(tool_name: &str) -> bool {
 /// Write `content` to `scratch_dir/{uuid}.txt` and return a stub message
 /// containing a preview (up to 2 000 Unicode scalar values) and the file path.
 ///
-/// The filename is a fresh UUID v4, guaranteeing uniqueness even when multiple
-/// tool IDs sanitise to the same string.  The file is created with mode 0600
-/// (unix) so that tool outputs, which may include secrets, are not world-readable.
-/// The blocking open+write runs in `spawn_blocking` to avoid stalling the Tokio
-/// runtime.
+/// The filename is a fresh UUID v4, guaranteeing uniqueness across concurrent
+/// tool calls.  The file is created with mode 0600 (unix) so that tool outputs,
+/// which may include secrets, are not world-readable.  The blocking open+write
+/// runs in `spawn_blocking` to avoid stalling the Tokio runtime.
 ///
 /// If the write fails (e.g. /tmp not writable) the stub is returned inline with
 /// an explicit note that persistence failed, so the model knows the full output
 /// is unavailable rather than silently receiving a truncated fragment.
 ///
-/// Note: individual files can be large (up to the LARGE_TOOL_RESULT_CHARS threshold).
-/// The scratch directory is cleaned up when the agentic loop exits via ScratchDirGuard.
-async fn persist_large_result(
-    _tool_use_id: &str,
-    content: String,
-    scratch_dir: &std::path::Path,
-) -> String {
+/// Note: persistence is triggered when an output *exceeds* `LARGE_TOOL_RESULT_CHARS`;
+/// the written file contains the full output and may therefore be larger than that
+/// threshold.  The scratch directory is cleaned up when the loop exits via
+/// `ScratchDirGuard`.
+async fn persist_large_result(content: String, scratch_dir: &std::path::Path) -> String {
     // Use a UUID filename to guarantee uniqueness regardless of tool_use_id content.
     let path = scratch_dir.join(format!("{}.txt", uuid::Uuid::new_v4()));
     let total = content.len(); // byte count — O(1), good enough for display
@@ -1265,8 +1262,8 @@ async fn file_cache_key(path: &std::path::Path) -> Option<(u128, u64)> {
 /// `drop` uses synchronous `remove_dir_all` because `Drop` cannot be async.
 /// This is intentional: /tmp is a local filesystem so the latency is negligible
 /// even for large files, and the call happens only at loop exit (not on the hot
-/// path).  The number of persisted files is bounded by the number of tool calls
-/// in a single session, each at most LARGE_TOOL_RESULT_CHARS bytes.
+/// path).  Each file is the full output of one tool call (no upper bound enforced
+/// beyond system memory); the file count is bounded by the session's tool-call count.
 struct ScratchDirGuard(std::path::PathBuf);
 
 impl Drop for ScratchDirGuard {
@@ -2220,7 +2217,7 @@ where
                                             .nth(LARGE_TOOL_RESULT_CHARS)
                                             .is_some()
                                         {
-                                            persist_large_result(&tc.id, output, &scratch_dir).await
+                                            persist_large_result(output, &scratch_dir).await
                                         } else {
                                             output
                                         }
@@ -2276,6 +2273,17 @@ where
                                         if let Some((cached_key, cached_id)) = read_cache.get(&path)
                                         {
                                             if *cached_key == key {
+                                                // Emit a ToolUse frame so the UI shows
+                                                // the tool was called (with "unchanged"
+                                                // detail to distinguish from a real read).
+                                                write_frame(
+                                                    writer,
+                                                    &Response::ToolUse {
+                                                        name: tc.name.clone(),
+                                                        detail: format!("{path_str} (unchanged)"),
+                                                    },
+                                                )
+                                                .await?;
                                                 messages.push(Message::tool_result(
                                                     &tc.id,
                                                     file_unchanged_stub(cached_id),
@@ -2367,13 +2375,18 @@ where
                                             read_cache.insert(path, (key, tc.id.clone()));
                                         }
                                     }
-                                    output // no size limit for read_file
+                                    // read_file is injected in full: it is the model's
+                                    // only path to complete file content.  Capping it
+                                    // would leave the model with a truncated view and
+                                    // no way to retrieve the rest.  The dedup cache
+                                    // above avoids re-injecting unchanged files.
+                                    output
                                 } else if output
                                     .char_indices()
                                     .nth(LARGE_TOOL_RESULT_CHARS)
                                     .is_some()
                                 {
-                                    persist_large_result(&tc.id, output, &scratch_dir).await
+                                    persist_large_result(output, &scratch_dir).await
                                 } else {
                                     output
                                 }
@@ -3498,7 +3511,7 @@ mod tests {
     async fn large_tool_output_persisted_to_tmp() {
         let dir = tempfile::TempDir::new().unwrap();
         let big_output = "x".repeat(51_000);
-        let result = persist_large_result("tool-use-id-abc", big_output, dir.path()).await;
+        let result = persist_large_result(big_output, dir.path()).await;
         // Stub must contain a path inside the scratch dir and a Preview section.
         assert!(
             result.contains(dir.path().to_str().unwrap()),
@@ -3535,7 +3548,7 @@ mod tests {
         // The exemption itself is enforced by should_persist_tool_output (tested below).
         let dir = tempfile::TempDir::new().unwrap();
         let big_output = "x".repeat(51_000);
-        let stub = persist_large_result("id", big_output, dir.path()).await;
+        let stub = persist_large_result(big_output, dir.path()).await;
         assert!(
             stub.len() < 10_000,
             "persist_large_result must produce a short stub: len={}",
