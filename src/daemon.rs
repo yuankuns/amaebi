@@ -1161,6 +1161,74 @@ fn truncate_chars(s: &str, max: usize) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Tool-result folding
+// ---------------------------------------------------------------------------
+
+/// Number of the most-recent tool-result messages to keep at full fidelity.
+/// All earlier ones are collapsed to a one-line reference.
+const FOLD_KEEP_RECENT: usize = 6;
+
+/// Threshold (as a fraction of the compaction token budget) above which
+/// `fold_old_tool_results` is triggered inside the agentic loop.
+const FOLD_TRIGGER_FRACTION: f64 = 0.5;
+
+/// Collapse older tool-result messages to one-line references, keeping the
+/// most-recent `keep_recent` results at full fidelity.
+///
+/// This mirrors Claude Code's behaviour of replacing previously-read file
+/// contents with a compact reference once the context grows large.  Only
+/// results with content longer than `min_chars` are folded; short results
+/// (e.g. `"ok"`) are left as-is because they add negligible cost.
+///
+/// The tool name is resolved by looking up the matching assistant
+/// `tool_calls` entry whose `id` equals the result's `tool_call_id`.
+fn fold_old_tool_results(messages: &mut [copilot::Message], keep_recent: usize) {
+    use std::collections::HashMap;
+
+    // Build id → tool_name from all assistant messages.
+    let mut call_names: HashMap<String, String> = HashMap::new();
+    for msg in messages.iter() {
+        if msg.role == "assistant" {
+            for tc in &msg.tool_calls {
+                call_names.insert(tc.id.clone(), tc.function.name.clone());
+            }
+        }
+    }
+
+    // Collect indices of all tool-result messages.
+    let indices: Vec<usize> = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.role == "tool")
+        .map(|(i, _)| i)
+        .collect();
+
+    // Only fold the oldest ones; leave the last `keep_recent` intact.
+    let fold_until = indices.len().saturating_sub(keep_recent);
+    for &idx in &indices[..fold_until] {
+        let msg = &mut messages[idx];
+        let char_count = msg
+            .content
+            .as_deref()
+            .map(|c| c.chars().count())
+            .unwrap_or(0);
+        const MIN_FOLD_CHARS: usize = 200;
+        if char_count <= MIN_FOLD_CHARS {
+            continue;
+        }
+        let tool_name = msg
+            .tool_call_id
+            .as_deref()
+            .and_then(|id| call_names.get(id))
+            .map(|s| s.as_str())
+            .unwrap_or("unknown_tool");
+        msg.content = Some(format!(
+            "[{tool_name} result: {char_count} chars — collapsed to save context]"
+        ));
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Memory helpers — canonical DB access for daemon and ACP agent
 // ---------------------------------------------------------------------------
 
@@ -2233,6 +2301,18 @@ where
 
                 // Steers that arrived during tool execution are drained at
                 // the top of the next loop iteration, before the model call.
+
+                // Fold old tool results once we're past half the token budget so
+                // accumulated file reads / shell outputs don't crowd the context.
+                let fold_threshold =
+                    (compaction_threshold_tokens(model) as f64 * FOLD_TRIGGER_FRACTION) as usize;
+                if count_message_tokens(&messages) > fold_threshold {
+                    fold_old_tool_results(&mut messages, FOLD_KEEP_RECENT);
+                    tracing::debug!(
+                        fold_keep_recent = FOLD_KEEP_RECENT,
+                        "folded old tool results to save context"
+                    );
+                }
             }
 
             FinishReason::Other(ref reason) => {
@@ -3296,5 +3376,77 @@ mod tests {
             compact_model("bedrock/us.anthropic.claude-opus-4-6-v1:0"),
             format!("bedrock/{}", crate::provider::DEFAULT_MODEL),
         );
+    }
+
+    // ---- fold_old_tool_results -------------------------------------------
+
+    fn make_tool_turn(call_id: &str, tool_name: &str, result: &str) -> Vec<copilot::Message> {
+        vec![
+            copilot::Message::assistant(
+                None,
+                vec![crate::copilot::ApiToolCall {
+                    id: call_id.into(),
+                    kind: "function".into(),
+                    function: crate::copilot::ApiToolCallFunction {
+                        name: tool_name.into(),
+                        arguments: "{}".into(),
+                    },
+                }],
+            ),
+            copilot::Message::tool_result(call_id, result),
+        ]
+    }
+
+    #[test]
+    fn fold_does_not_touch_recent_results() {
+        let large = "x".repeat(500);
+        let mut msgs = Vec::new();
+        // Only one tool turn → it is "recent", must not be folded.
+        msgs.extend(make_tool_turn("id1", "read_file", &large));
+        fold_old_tool_results(&mut msgs, 2);
+        let content = msgs.last().unwrap().content.as_deref().unwrap();
+        assert_eq!(content, large, "recent result must not be folded");
+    }
+
+    #[test]
+    fn fold_collapses_old_large_results() {
+        let large = "x".repeat(500);
+        let mut msgs = Vec::new();
+        // 3 turns; with keep_recent=2, the first must be folded.
+        msgs.extend(make_tool_turn("id1", "read_file", &large));
+        msgs.extend(make_tool_turn("id2", "shell_command", &large));
+        msgs.extend(make_tool_turn("id3", "tmux_capture_pane", &large));
+        fold_old_tool_results(&mut msgs, 2);
+        // First tool result (index 1) should be collapsed.
+        let first_result = msgs[1].content.as_deref().unwrap();
+        assert!(
+            first_result.contains("collapsed to save context"),
+            "old result should be folded: {first_result}"
+        );
+        assert!(
+            first_result.contains("read_file"),
+            "folded text should include tool name: {first_result}"
+        );
+        // Last two must be intact.
+        assert_eq!(msgs[3].content.as_deref().unwrap(), large);
+        assert_eq!(msgs[5].content.as_deref().unwrap(), large);
+    }
+
+    #[test]
+    fn fold_skips_short_results() {
+        let short = "ok";
+        let mut msgs = Vec::new();
+        msgs.extend(make_tool_turn("id1", "shell_command", short));
+        msgs.extend(make_tool_turn("id2", "shell_command", short));
+        msgs.extend(make_tool_turn("id3", "shell_command", short));
+        fold_old_tool_results(&mut msgs, 1);
+        // Short results should never be collapsed regardless of age.
+        for msg in msgs.iter().filter(|m| m.role == "tool") {
+            assert_eq!(
+                msg.content.as_deref().unwrap(),
+                short,
+                "short result must not be folded"
+            );
+        }
     }
 }
