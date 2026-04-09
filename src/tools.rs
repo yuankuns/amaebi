@@ -251,6 +251,32 @@ async fn read_file(args: serde_json::Value) -> Result<String> {
 /// The child executor is created with `spawn_ctx: None` so it cannot
 /// call `spawn_agent` itself.
 /// TODO: enforce a depth limit for nested agents if needed.
+/// Resolve the default model for a spawned sub-agent.
+///
+/// Mirrors the provider-prefix preservation logic in `compact_model` in
+/// `daemon.rs`: if the parent session uses `copilot/` or `bedrock/` (as
+/// indicated by `AMAEBI_MODEL`), the sub-agent defaults to the same backend
+/// rather than falling back to bare `DEFAULT_MODEL` (Bedrock).
+///
+/// Resolution order:
+///   1. `AMAEBI_SUBAGENT_MODEL` env var (used verbatim)
+///   2. Provider prefix from `AMAEBI_MODEL` + `DEFAULT_MODEL`
+///   3. Bare `DEFAULT_MODEL`
+fn subagent_default_model() -> String {
+    if let Ok(m) = std::env::var("AMAEBI_SUBAGENT_MODEL") {
+        return m;
+    }
+    let parent = std::env::var("AMAEBI_MODEL").unwrap_or_default();
+    let prefix = parent
+        .split_once('/')
+        .map(|(p, _)| p)
+        .filter(|p| matches!(*p, "copilot" | "bedrock"));
+    match prefix {
+        Some(p) => format!("{}/{}", p, crate::provider::DEFAULT_MODEL),
+        None => crate::provider::DEFAULT_MODEL.to_string(),
+    }
+}
+
 async fn spawn_agent(args: serde_json::Value, ctx: &SpawnContext) -> Result<String> {
     let task = args["task"]
         .as_str()
@@ -287,15 +313,10 @@ async fn spawn_agent(args: serde_json::Value, ctx: &SpawnContext) -> Result<Stri
         )
     })?;
 
-    // Fix 4: inherit the parent's current model when the tool caller does not
-    // specify one explicitly.
     let model = args["model"]
         .as_str()
         .map(|s| s.to_string())
-        .unwrap_or_else(|| {
-            std::env::var("AMAEBI_MODEL")
-                .unwrap_or_else(|_| crate::provider::DEFAULT_MODEL.to_string())
-        });
+        .unwrap_or_else(subagent_default_model);
 
     let extra_mounts = args["extra_mounts"].as_array().cloned().unwrap_or_default();
     let mut ro_paths: Vec<PathBuf> = vec![];
@@ -394,7 +415,20 @@ async fn spawn_agent(args: serde_json::Value, ctx: &SpawnContext) -> Result<Stri
     context_lines.push(task.to_string());
     let full_task = context_lines.join("\n");
 
-    tracing::info!(task = %task, workspace = %workspace.display(), model = %model, "spawn_agent: starting child agent");
+    let model_source = if args["model"].as_str().is_some() {
+        "explicit"
+    } else if std::env::var("AMAEBI_SUBAGENT_MODEL").is_ok() {
+        "AMAEBI_SUBAGENT_MODEL"
+    } else {
+        "default"
+    };
+    tracing::info!(
+        task = %task,
+        workspace = %workspace.display(),
+        model = %model,
+        model_source = %model_source,
+        "spawn_agent: starting child agent"
+    );
 
     // Build the child sandbox using the pre-computed `using_noop` flag.
     let child_sandbox: Box<dyn Sandbox> = if using_noop {
@@ -616,8 +650,12 @@ pub fn tool_schemas(include_spawn_agent: bool) -> Vec<serde_json::Value> {
                         },
                         "model": {
                             "type": "string",
-                            "description": "LLM model to use (optional; defaults to the AMAEBI_MODEL \
-                                            environment variable, or gpt-4o if unset)."
+                            "description": (format!(
+                                "LLM model to use (optional; defaults to AMAEBI_SUBAGENT_MODEL \
+                                 env var, or {} if unset). Supports provider/model format \
+                                 (e.g. bedrock/claude-haiku-4.5).",
+                                crate::provider::DEFAULT_MODEL
+                            ))
                         },
                         "extra_mounts": {
                             "type": "array",
@@ -1104,6 +1142,57 @@ mod tests {
             compacting_sessions: Arc::new(Mutex::new(HashSet::new())),
             tokens: Arc::new(crate::auth::TokenCache::new()),
         }
+    }
+
+    // ---- subagent_default_model -----------------------------------------
+
+    #[test]
+    #[serial_test::serial]
+    fn subagent_default_model_uses_subagent_env_verbatim() {
+        std::env::set_var("AMAEBI_MODEL", "copilot/claude-opus-4-6");
+        std::env::set_var("AMAEBI_SUBAGENT_MODEL", "bedrock/claude-haiku-4.5");
+        let result = subagent_default_model();
+        std::env::remove_var("AMAEBI_MODEL");
+        std::env::remove_var("AMAEBI_SUBAGENT_MODEL");
+        // AMAEBI_SUBAGENT_MODEL wins over AMAEBI_MODEL.
+        assert_eq!(result, "bedrock/claude-haiku-4.5");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn subagent_default_model_does_not_inherit_amaebi_model() {
+        std::env::set_var("AMAEBI_MODEL", "copilot/claude-opus-4-6");
+        std::env::remove_var("AMAEBI_SUBAGENT_MODEL");
+        let result = subagent_default_model();
+        std::env::remove_var("AMAEBI_MODEL");
+        // Must NOT be the parent model — just the prefix + DEFAULT_MODEL.
+        assert_ne!(result, "copilot/claude-opus-4-6");
+        assert_eq!(
+            result,
+            format!("copilot/{}", crate::provider::DEFAULT_MODEL)
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn subagent_default_model_preserves_copilot_prefix() {
+        std::env::set_var("AMAEBI_MODEL", "copilot/gpt-4o");
+        std::env::remove_var("AMAEBI_SUBAGENT_MODEL");
+        let result = subagent_default_model();
+        std::env::remove_var("AMAEBI_MODEL");
+        assert_eq!(
+            result,
+            format!("copilot/{}", crate::provider::DEFAULT_MODEL)
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn subagent_default_model_no_prefix_falls_back_to_default() {
+        std::env::remove_var("AMAEBI_MODEL");
+        std::env::remove_var("AMAEBI_SUBAGENT_MODEL");
+        let result = subagent_default_model();
+        assert_eq!(result, crate::provider::DEFAULT_MODEL);
     }
 
     // ---- unknown tool ---------------------------------------------------
