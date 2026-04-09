@@ -1240,6 +1240,19 @@ fn fold_old_tool_results(messages: &mut [copilot::Message], keep_recent: usize) 
     let fold_until = indices.len().saturating_sub(keep_recent);
     for &idx in &indices[..fold_until] {
         let msg = &mut messages[idx];
+
+        // spawn_agent results are already summaries written by the subagent —
+        // folding them would discard useful context rather than save tokens.
+        let tool_name_for_check = msg
+            .tool_call_id
+            .as_deref()
+            .and_then(|id| call_info.get(id))
+            .map(|(n, _)| n.as_str())
+            .unwrap_or("");
+        if tool_name_for_check == "spawn_agent" {
+            continue;
+        }
+
         let char_count = msg
             .content
             .as_deref()
@@ -3517,5 +3530,24 @@ mod tests {
             folded.contains("collapsed"),
             "must be marked collapsed: {folded}"
         );
+    }
+
+    #[test]
+    fn fold_never_collapses_spawn_agent_results() {
+        // spawn_agent results are already summaries; folding them discards context.
+        let summary = "x".repeat(500); // large enough to trigger folding normally
+        let mut msgs = Vec::new();
+        msgs.extend(make_tool_turn("id1", "spawn_agent", &summary));
+        msgs.extend(make_tool_turn("id2", "spawn_agent", &summary));
+        msgs.extend(make_tool_turn("id3", "spawn_agent", &summary));
+        fold_old_tool_results(&mut msgs, 1);
+        // All spawn_agent results must remain untouched regardless of age.
+        for msg in msgs.iter().filter(|m| m.role == "tool") {
+            assert_eq!(
+                msg.content.as_deref().unwrap(),
+                summary,
+                "spawn_agent result must not be folded"
+            );
+        }
     }
 }
