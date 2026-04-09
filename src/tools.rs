@@ -186,12 +186,16 @@ async fn shell_command(
     Ok(result)
 }
 
-/// Capture the visible text of a tmux pane.
+/// Capture recent lines from a tmux pane's scrollback history.
+///
+/// Uses `tmux capture-pane -S -N` to start N lines before the bottom of the
+/// pane history, returning at most `lines` lines. This avoids flooding the LLM
+/// with thousands of lines of build output when only the tail matters.
 async fn tmux_capture_pane(args: serde_json::Value) -> Result<String> {
     let target = args["target"].as_str().unwrap_or("%0");
-    // Limit scrollback to avoid flooding the LLM with thousands of lines.
-    // -S -N means "start N lines before the bottom of the pane history".
-    let lines = args["lines"].as_u64().unwrap_or(200);
+    // Clamp to at least 1: lines=0 would produce "-S -0" which disables the
+    // limit and could capture unbounded history.
+    let lines = args["lines"].as_u64().unwrap_or(200).max(1);
     let start = format!("-{lines}");
 
     let output = Command::new("tmux")
