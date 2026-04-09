@@ -250,11 +250,26 @@ async fn tmux_wait(args: serde_json::Value) -> Result<String> {
     let mut stable_since = tokio::time::Instant::now();
 
     loop {
-        let output = Command::new("tmux")
+        // Check the hard deadline at the top of every iteration so we never
+        // start a new capture call after time has already expired.
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "tmux_wait: timed out after {timeout_secs}s waiting for pane '{target}' to become idle"
+            );
+        }
+
+        // Wrap the capture call with timeout_at so a hung tmux process cannot
+        // block past the deadline.
+        let capture_fut = Command::new("tmux")
             .args(["capture-pane", "-t", target, "-p"])
-            .output()
+            .output();
+        let output = tokio::time::timeout_at(deadline, capture_fut)
             .await
+            .map_err(|_| {
+                anyhow::anyhow!("tmux_wait: capture-pane timed out waiting for pane '{target}'")
+            })?
             .context("tmux_wait: spawning tmux capture-pane")?;
+
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             anyhow::bail!(
@@ -272,12 +287,10 @@ async fn tmux_wait(args: serde_json::Value) -> Result<String> {
             return Ok(last_content);
         }
 
-        if tokio::time::Instant::now() >= deadline {
-            anyhow::bail!(
-                "tmux_wait: timed out after {timeout_secs}s waiting for pane '{target}' to become idle"
-            );
-        }
-        tokio::time::sleep(std::time::Duration::from_secs(poll_secs)).await;
+        // Sleep at most until the deadline to keep the timeout accurate.
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let sleep_dur = std::time::Duration::from_secs(poll_secs).min(remaining);
+        tokio::time::sleep(sleep_dur).await;
     }
 }
 
