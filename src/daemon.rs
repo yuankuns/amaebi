@@ -1170,35 +1170,28 @@ fn should_persist_tool_output(tool_name: &str) -> bool {
     tool_name != "read_file"
 }
 
-/// Write `content` to `scratch_dir/{safe_id}.txt` and return a stub message
+/// Write `content` to `scratch_dir/{uuid}.txt` and return a stub message
 /// containing a preview (up to 2 000 Unicode scalar values) and the file path.
 ///
-/// `tool_use_id` is sanitised: alphanumerics and `-` are kept as-is; all other
-/// characters (including `/`, `..`, spaces) are replaced with `_` to prevent
-/// path traversal.  The file is created with mode 0600 (unix) so that tool
-/// outputs, which may include secrets, are not world-readable.  The blocking
-/// open+write runs in `spawn_blocking` to avoid stalling the Tokio runtime.
+/// The filename is a fresh UUID v4, guaranteeing uniqueness even when multiple
+/// tool IDs sanitise to the same string.  The file is created with mode 0600
+/// (unix) so that tool outputs, which may include secrets, are not world-readable.
+/// The blocking open+write runs in `spawn_blocking` to avoid stalling the Tokio
+/// runtime.
 ///
 /// If the write fails (e.g. /tmp not writable) the stub is returned inline with
 /// an explicit note that persistence failed, so the model knows the full output
 /// is unavailable rather than silently receiving a truncated fragment.
+///
+/// Note: individual files can be large (up to the LARGE_TOOL_RESULT_CHARS threshold).
+/// The scratch directory is cleaned up when the agentic loop exits via ScratchDirGuard.
 async fn persist_large_result(
-    tool_use_id: &str,
+    _tool_use_id: &str,
     content: String,
     scratch_dir: &std::path::Path,
 ) -> String {
-    // Sanitise: keep only alphanumerics and '-'; replace everything else with '_'.
-    let safe_id: String = tool_use_id
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    let path = scratch_dir.join(format!("{safe_id}.txt"));
+    // Use a UUID filename to guarantee uniqueness regardless of tool_use_id content.
+    let path = scratch_dir.join(format!("{}.txt", uuid::Uuid::new_v4()));
     let total = content.len(); // byte count — O(1), good enough for display
     let preview: String = content.chars().take(2_000).collect();
 
@@ -1241,6 +1234,18 @@ async fn write_tool_output_file(path: &std::path::Path, content: String) -> std:
     }
 }
 
+/// Format the "file unchanged" stub returned by the read_file dedup check.
+///
+/// Centralised so that tests can assert on the same format without duplicating
+/// the string literal — changes to the wording only need to be made once.
+fn file_unchanged_stub(cached_tool_use_id: &str) -> String {
+    format!(
+        "[File unchanged since last read \
+         (see tool_result for call {cached_tool_use_id}) \
+         — content still current]"
+    )
+}
+
 /// Return `(mtime_nanos, size_bytes)` for `path`, or `None` if metadata is
 /// unavailable.  Using both fields reduces false cache-hits on filesystems with
 /// coarse mtime granularity (e.g. FAT32 at 2-second resolution) where content
@@ -1256,11 +1261,17 @@ async fn file_cache_key(path: &std::path::Path) -> Option<(u128, u64)> {
 }
 
 /// RAII guard that removes a directory tree on drop (best-effort).
+///
+/// `drop` uses synchronous `remove_dir_all` because `Drop` cannot be async.
+/// This is intentional: /tmp is a local filesystem so the latency is negligible
+/// even for large files, and the call happens only at loop exit (not on the hot
+/// path).  The number of persisted files is bounded by the number of tool calls
+/// in a single session, each at most LARGE_TOOL_RESULT_CHARS bytes.
 struct ScratchDirGuard(std::path::PathBuf);
 
 impl Drop for ScratchDirGuard {
     fn drop(&mut self) {
-        // Best-effort sync removal; /tmp is ephemeral so failure is acceptable.
+        // Best-effort; /tmp is ephemeral so lingering files on failure are fine.
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
@@ -1833,7 +1844,8 @@ where
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
-        let _ = std::fs::set_permissions(&scratch_dir, std::fs::Permissions::from_mode(0o700));
+        let _ =
+            tokio::fs::set_permissions(&scratch_dir, std::fs::Permissions::from_mode(0o700)).await;
     }
     let _scratch_guard = ScratchDirGuard(scratch_dir.clone());
 
@@ -2264,12 +2276,10 @@ where
                                         if let Some((cached_key, cached_id)) = read_cache.get(&path)
                                         {
                                             if *cached_key == key {
-                                                let stub = format!(
-                                                    "[File unchanged since last read \
-                                                     (see tool_result for call {cached_id}) \
-                                                     — content still current]"
-                                                );
-                                                messages.push(Message::tool_result(&tc.id, stub));
+                                                messages.push(Message::tool_result(
+                                                    &tc.id,
+                                                    file_unchanged_stub(cached_id),
+                                                ));
                                                 continue;
                                             }
                                         }
@@ -3489,10 +3499,14 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let big_output = "x".repeat(51_000);
         let result = persist_large_result("tool-use-id-abc", big_output, dir.path()).await;
-        // Must reference the file name and contain a Preview section.
+        // Stub must contain a path inside the scratch dir and a Preview section.
         assert!(
-            result.contains("tool-use-id-abc.txt"),
-            "result must contain the file name: {result}"
+            result.contains(dir.path().to_str().unwrap()),
+            "result must contain the scratch dir path: {result}"
+        );
+        assert!(
+            result.contains(".txt"),
+            "result must reference a .txt file: {result}"
         );
         assert!(
             result.contains("Preview:"),
@@ -3504,9 +3518,13 @@ mod tests {
             "stub must be much shorter than 51K chars, got {} chars",
             result.len()
         );
-        // The file itself must exist and contain the full content.
-        let file_path = dir.path().join("tool-use-id-abc.txt");
-        let written = std::fs::read_to_string(&file_path).unwrap();
+        // The file must exist in the scratch dir and contain the full content.
+        let files: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert_eq!(files.len(), 1, "exactly one file must be written");
+        let written = std::fs::read_to_string(files[0].path()).unwrap();
         assert_eq!(written.len(), 51_000);
     }
 
@@ -3563,24 +3581,15 @@ mod tests {
             .expect("metadata must be available");
         let stub = if let Some((cached_key, cached_id)) = read_cache.get(&file_path) {
             if *cached_key == key2 {
-                format!(
-                    "[File unchanged since last read (see tool_result for call {cached_id}) \
-                     — content still current]"
-                )
+                file_unchanged_stub(cached_id)
             } else {
                 "NOT_STUB".to_string()
             }
         } else {
             "NOT_STUB".to_string()
         };
-        assert!(
-            stub.contains("File unchanged since last read"),
-            "second read must return unchanged stub: {stub}"
-        );
-        assert!(
-            stub.contains("first-call-id"),
-            "stub must reference the first call id: {stub}"
-        );
+        let expected = file_unchanged_stub("first-call-id");
+        assert_eq!(stub, expected, "second read must return unchanged stub");
     }
 
     #[tokio::test]
