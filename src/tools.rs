@@ -309,7 +309,9 @@ async fn wait_for_file(args: serde_json::Value) -> Result<String> {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
     loop {
         match tokio::fs::metadata(path).await {
-            Ok(_) => return Ok("found".to_owned()),
+            Ok(m) if m.is_file() => return Ok("found".to_owned()),
+            // A directory at the sentinel path is not the expected file — keep polling.
+            Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => {
                 return Err(anyhow::anyhow!(
@@ -1405,20 +1407,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wait_for_file_errors_on_permission_denied() {
-        // Create a directory where metadata checks return PermissionDenied
-        // by using a path whose *parent* is a file (so stat errors differently).
-        // On Linux we can also test with /proc/1/mem which is always EACCES.
+    async fn wait_for_file_does_not_match_directory() {
+        // If a directory exists at the sentinel path it should NOT be treated as
+        // "found" — wait_for_file expects a regular file.
+        let tmp = TempDir::new().unwrap();
+        let dir_path = tmp.path().join("subdir");
+        std::fs::create_dir(&dir_path).unwrap();
+        // With a zero timeout the call must time out rather than return "found".
         let result = wait_for_file(serde_json::json!({
-            "path": "/proc/1/mem/sentinel",
-            "timeout_secs": 1,
+            "path": dir_path.to_str().unwrap(),
+            "timeout_secs": 0,
             "poll_interval_ms": 10
         }))
-        .await;
-        // Either an error (permission denied propagated) or timeout is acceptable
-        // depending on how the kernel reports the path. The key assertion is that
-        // we don't silently poll until timeout on an accessible path that exists.
-        // We just check it doesn't panic.
-        let _ = result;
+        .await
+        .unwrap();
+        assert!(
+            result.starts_with("timeout:"),
+            "directory must not match: {result}"
+        );
     }
 }
