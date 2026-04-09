@@ -1160,13 +1160,25 @@ fn truncate_chars(s: &str, max: usize) -> String {
     out
 }
 
+/// Returns `true` if large outputs from `tool_name` should be persisted to /tmp
+/// rather than injected inline into the model context.
+///
+/// `read_file` is always injected fully: it is the model's only path to access
+/// complete file content.  Persisting it would restrict the model to a 2 KB
+/// preview, severing its ability to read files larger than the preview window.
+fn should_persist_tool_output(tool_name: &str) -> bool {
+    tool_name != "read_file"
+}
+
 /// Write `content` to `scratch_dir/{safe_id}.txt` and return a stub message
 /// containing a 2 KB preview and the path.  Falls back to inline truncation if
 /// the write fails (e.g. /tmp not writable).
 ///
 /// `tool_use_id` is sanitised to alphanumerics and `-` before use as a filename
 /// to prevent path traversal.  The file is created with mode 0600 (unix) so
-/// that tool outputs, which may include secrets, are not world-readable.
+/// that tool outputs, which may include secrets, are not world-readable.  The
+/// blocking open+write is moved to `spawn_blocking` to avoid stalling the Tokio
+/// runtime thread on large outputs.
 async fn persist_large_result(
     tool_use_id: &str,
     content: &str,
@@ -1186,26 +1198,8 @@ async fn persist_large_result(
     let path = scratch_dir.join(format!("{safe_id}.txt"));
     let total = content.len(); // byte count — O(1), good enough for display
     let preview: String = content.chars().take(2_000).collect();
-    let write_ok = async {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            // Create with mode 0600; fail if the file already exists.
-            let file = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&path)?;
-            use std::io::Write as _;
-            { file }.write_all(content.as_bytes())?;
-            Ok::<_, std::io::Error>(())
-        }
-        #[cfg(not(unix))]
-        {
-            tokio::fs::write(&path, content).await
-        }
-    }
-    .await;
+
+    let write_ok = write_tool_output_file(&path, content).await;
 
     if write_ok.is_ok() {
         format!(
@@ -1217,16 +1211,45 @@ async fn persist_large_result(
     }
 }
 
-/// Return the modification time of `path` as nanoseconds since Unix epoch,
-/// or 0 if metadata is unavailable or the clock predates the epoch.
-async fn file_mtime_nanos(path: &std::path::Path) -> u128 {
-    tokio::fs::metadata(path)
+/// Write `content` to `path` with mode 0600 (unix) using `spawn_blocking` to
+/// avoid stalling the async runtime.  Falls back to a plain async write on
+/// non-unix platforms.
+async fn write_tool_output_file(path: &std::path::Path, content: &str) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let path = path.to_owned();
+        let content = content.to_owned();
+        tokio::task::spawn_blocking(move || {
+            use std::io::Write as _;
+            use std::os::unix::fs::OpenOptionsExt as _;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&path)?;
+            file.write_all(content.as_bytes())
+        })
         .await
+        .map_err(std::io::Error::other)?
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::fs::write(path, content).await
+    }
+}
+
+/// Return `(mtime_nanos, size_bytes)` for `path`, or `None` if metadata is
+/// unavailable.  Using both fields reduces false cache-hits on filesystems with
+/// coarse mtime granularity (e.g. FAT32 at 2-second resolution) where content
+/// can change without the mtime advancing.
+async fn file_cache_key(path: &std::path::Path) -> Option<(u128, u64)> {
+    let meta = tokio::fs::metadata(path).await.ok()?;
+    let mtime = meta
+        .modified()
         .ok()
-        .and_then(|m| m.modified().ok())
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_nanos())
-        .unwrap_or(0)
+        .map(|d| d.as_nanos())?;
+    Some((mtime, meta.len()))
 }
 
 /// RAII guard that removes a directory tree on drop (best-effort).
@@ -1811,8 +1834,10 @@ where
     }
     let _scratch_guard = ScratchDirGuard(scratch_dir.clone());
 
-    // read_file dedup cache: path → (mtime_nanos, tool_use_id of last read)
-    let mut read_cache: std::collections::HashMap<std::path::PathBuf, (u128, String)> =
+    // read_file dedup cache: path → ((mtime_nanos, size_bytes), tool_use_id of last read).
+    // Both mtime and size are stored to reduce false hits on filesystems with
+    // coarse mtime granularity where content can change without mtime advancing.
+    let mut read_cache: std::collections::HashMap<std::path::PathBuf, ((u128, u64), String)> =
         Default::default();
 
     loop {
@@ -2173,7 +2198,7 @@ where
                                             output_len = output.len(),
                                             "tool succeeded"
                                         );
-                                        if tc.name == "read_file" {
+                                        if !should_persist_tool_output(&tc.name) {
                                             output
                                         } else if output
                                             .char_indices()
@@ -2227,16 +2252,16 @@ where
                         tracing::debug!(tool = %tc.name, "executing tool");
 
                         // read_file dedup: skip re-read if file is unchanged.
+                        // Both mtime and size are compared to reduce false hits on
+                        // filesystems with coarse mtime resolution (e.g. FAT32).
                         if tc.name == "read_file" {
                             if let Ok(args) = tc.parse_args() {
                                 if let Some(path_str) = args["path"].as_str() {
                                     let path = std::path::PathBuf::from(path_str);
-                                    let mtime = file_mtime_nanos(&path).await;
-                                    if mtime != 0 {
-                                        if let Some((cached_mtime, cached_id)) =
-                                            read_cache.get(&path)
+                                    if let Some(key) = file_cache_key(&path).await {
+                                        if let Some((cached_key, cached_id)) = read_cache.get(&path)
                                         {
-                                            if *cached_mtime == mtime {
+                                            if *cached_key == key {
                                                 let stub = format!(
                                                     "[File unchanged since last read \
                                                      (see tool_result for call {cached_id}) \
@@ -2326,9 +2351,8 @@ where
                                 if tc.name == "read_file" {
                                     // Update dedup cache after a fresh read.
                                     if let Some(path) = read_path {
-                                        let mtime = file_mtime_nanos(&path).await;
-                                        if mtime != 0 {
-                                            read_cache.insert(path, (mtime, tc.id.clone()));
+                                        if let Some(key) = file_cache_key(&path).await {
+                                            read_cache.insert(path, (key, tc.id.clone()));
                                         }
                                     }
                                     output // no size limit for read_file
@@ -3484,31 +3508,17 @@ mod tests {
         assert_eq!(written.len(), 51_000);
     }
 
-    #[tokio::test]
-    async fn read_file_not_truncated_by_persist() {
-        // Verify that persist_large_result is NOT called for read_file outputs,
-        // i.e. read_file content passes through at full size.  We confirm this
-        // by calling persist_large_result with a 51K string and ensuring its
-        // output (the stub) is much shorter — proving the loop would need to
-        // *skip* this call to preserve the full content for read_file.
-        let big_output = "x".repeat(51_000);
-        assert!(
-            big_output.chars().count() > LARGE_TOOL_RESULT_CHARS,
-            "test pre-condition: 51k > LARGE_TOOL_RESULT_CHARS"
-        );
-        let dir = tempfile::TempDir::new().unwrap();
-        let stub = persist_large_result("read-file-test-id", &big_output, dir.path()).await;
-        // The stub is much shorter than 51K — confirming that any code path
-        // that calls persist_large_result for read_file would lose content.
-        // The loop guards against this with the `tc.name == "read_file"` check.
-        assert!(
-            stub.len() < 10_000,
-            "persist_large_result must produce a short stub, not the full content"
-        );
-        assert!(
-            stub.contains("Preview:"),
-            "stub must contain a preview section"
-        );
+    #[test]
+    fn read_file_exempt_from_persistence() {
+        // should_persist_tool_output drives the read_file exemption in the loop.
+        // If this fails, the loop would call persist_large_result for read_file
+        // outputs, replacing full content with a 2KB stub and breaking the model's
+        // only path to read complete files.
+        assert!(!should_persist_tool_output("read_file"));
+        assert!(should_persist_tool_output("shell_command"));
+        assert!(should_persist_tool_output("tmux_capture_pane"));
+        assert!(should_persist_tool_output("tmux_wait"));
+        assert!(should_persist_tool_output("spawn_agent"));
     }
 
     #[tokio::test]
@@ -3517,18 +3527,21 @@ mod tests {
         let file_path = dir.path().join("test_file.txt");
         std::fs::write(&file_path, "hello world content").unwrap();
 
-        let mut read_cache: std::collections::HashMap<std::path::PathBuf, (u128, String)> =
+        let mut read_cache: std::collections::HashMap<std::path::PathBuf, ((u128, u64), String)> =
             Default::default();
 
-        // First read: capture mtime via the shared helper and populate cache.
-        let mtime = file_mtime_nanos(&file_path).await;
-        assert!(mtime != 0);
-        read_cache.insert(file_path.clone(), (mtime, "first-call-id".to_string()));
+        // First read: capture cache key and populate cache.
+        let key = file_cache_key(&file_path)
+            .await
+            .expect("metadata must be available");
+        read_cache.insert(file_path.clone(), (key, "first-call-id".to_string()));
 
-        // Second read with same mtime → dedup should produce a stub.
-        let mtime2 = file_mtime_nanos(&file_path).await;
-        let stub = if let Some((cached_mtime, cached_id)) = read_cache.get(&file_path) {
-            if *cached_mtime == mtime2 {
+        // Second read with same key → dedup should produce a stub.
+        let key2 = file_cache_key(&file_path)
+            .await
+            .expect("metadata must be available");
+        let stub = if let Some((cached_key, cached_id)) = read_cache.get(&file_path) {
+            if *cached_key == key2 {
                 format!(
                     "[File unchanged since last read (see tool_result for call {cached_id}) \
                      — content still current]"
@@ -3555,31 +3568,36 @@ mod tests {
         let file_path = dir.path().join("test_file2.txt");
         std::fs::write(&file_path, "original content").unwrap();
 
-        let mtime1 = file_mtime_nanos(&file_path).await;
+        let key1 = file_cache_key(&file_path)
+            .await
+            .expect("metadata must be available");
 
-        let mut read_cache: std::collections::HashMap<std::path::PathBuf, (u128, String)> =
+        let mut read_cache: std::collections::HashMap<std::path::PathBuf, ((u128, u64), String)> =
             Default::default();
-        read_cache.insert(file_path.clone(), (mtime1, "first-call-id".to_string()));
+        read_cache.insert(file_path.clone(), (key1, "first-call-id".to_string()));
 
-        // Modify the file to change its mtime.
+        // Modify the file to change its mtime and/or size.
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        std::fs::write(&file_path, "modified content").unwrap();
+        std::fs::write(&file_path, "modified content — longer now").unwrap();
 
-        let mtime2 = file_mtime_nanos(&file_path).await;
+        let key2 = file_cache_key(&file_path)
+            .await
+            .expect("metadata must be available");
 
-        // If filesystem has coarse mtime resolution, skip rather than fail.
-        if mtime1 == mtime2 {
+        // If both mtime and size are identical (coarse-resolution filesystem),
+        // the cache would not correctly detect the change — skip rather than fail.
+        if key1 == key2 {
             return;
         }
 
-        let is_stub = if let Some((cached_mtime, _cached_id)) = read_cache.get(&file_path) {
-            *cached_mtime == mtime2
+        let is_stub = if let Some((cached_key, _cached_id)) = read_cache.get(&file_path) {
+            *cached_key == key2
         } else {
             false
         };
         assert!(
             !is_stub,
-            "after file change, dedup must NOT produce a stub (mtimes differ)"
+            "after file change, dedup must NOT produce a stub (cache key differs)"
         );
     }
 }
