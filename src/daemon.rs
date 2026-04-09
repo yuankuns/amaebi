@@ -1177,11 +1177,11 @@ const FOLD_TRIGGER_FRACTION: f64 = 0.5;
 ///
 /// This mirrors Claude Code's behaviour of replacing previously-read file
 /// contents with a compact reference once the context grows large.  Only
-/// results with content longer than `min_chars` are folded; short results
+/// results longer than `MIN_FOLD_CHARS` (200) are folded; short results
 /// (e.g. `"ok"`) are left as-is because they add negligible cost.
 ///
-/// The tool name is resolved by looking up the matching assistant
-/// `tool_calls` entry whose `id` equals the result's `tool_call_id`.
+/// The tool name and a human-readable label (e.g. the file path for
+/// `read_file`) are resolved from the matching assistant `tool_calls` entry.
 fn fold_old_tool_results(messages: &mut [copilot::Message], keep_recent: usize) {
     use std::collections::HashMap;
 
@@ -1196,23 +1196,30 @@ fn fold_old_tool_results(messages: &mut [copilot::Message], keep_recent: usize) 
                 let args: serde_json::Value =
                     serde_json::from_str(&tc.function.arguments).unwrap_or_default();
                 let label = match tc.function.name.as_str() {
-                    "read_file" | "edit_file" | "write_file" | "wait_for_file" => args
+                    "read_file" | "edit_file" | "wait_for_file" => args
                         .get("path")
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
                         .to_string(),
                     "shell_command" => {
                         let cmd = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
-                        if cmd.len() > 60 {
-                            format!("{}…", &cmd[..60])
+                        // Use char-aware truncation to avoid splitting multi-byte sequences.
+                        if cmd.chars().count() > 60 {
+                            format!("{}…", cmd.chars().take(60).collect::<String>())
                         } else {
                             cmd.to_string()
                         }
                     }
-                    "tmux_capture_pane" | "tmux_send_keys" | "tmux_wait" => args
+                    "tmux_capture_pane" | "tmux_wait" => args
                         .get("target")
                         .and_then(|v| v.as_str())
                         .unwrap_or("%0")
+                        .to_string(),
+                    // tmux_send_keys: the meaningful argument is the keys sent, not the target.
+                    "tmux_send_keys" => args
+                        .get("keys")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
                         .to_string(),
                     _ => String::new(),
                 };
