@@ -221,12 +221,16 @@ async fn tmux_send_keys(args: serde_json::Value) -> Result<String> {
         .as_str()
         .context("tmux_send_keys: missing string argument 'keys'")?;
     let target = args["target"].as_str().unwrap_or("%0");
+    // Default true: append an Enter keystroke so text is submitted.
+    // Set enter=false to type text without pressing Enter (e.g. partial input).
+    let press_enter = args["enter"].as_bool().unwrap_or(true);
 
-    let output = Command::new("tmux")
-        .args(["send-keys", "-t", target, keys])
-        .output()
-        .await
-        .context("spawning tmux send-keys")?;
+    let mut cmd = Command::new("tmux");
+    cmd.args(["send-keys", "-t", target, keys]);
+    if press_enter {
+        cmd.arg("Enter");
+    }
+    let output = cmd.output().await.context("spawning tmux send-keys")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -687,19 +691,25 @@ pub fn tool_schemas(include_spawn_agent: bool) -> Vec<serde_json::Value> {
             "type": "function",
             "function": {
                 "name": "tmux_send_keys",
-                "description": "Send keystrokes to a tmux pane. Use for interactive \
-                                programs (e.g. pressing Enter, Ctrl-C). For background \
-                                tasks prefer shell_command.",
+                "description": "Send keystrokes to a tmux pane and press Enter to submit \
+                                (default). Use for interactive programs (e.g. answering \
+                                prompts, sending messages to another agent). Set enter=false \
+                                to type text without submitting. For background tasks prefer \
+                                shell_command.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "keys": {
                             "type": "string",
-                            "description": "Keys to send, e.g. 'q', 'Enter', 'C-c'."
+                            "description": "Text or key name to send, e.g. 'hello world', 'C-c', 'q'."
                         },
                         "target": {
                             "type": "string",
                             "description": "tmux target pane. Defaults to %0."
+                        },
+                        "enter": {
+                            "type": "boolean",
+                            "description": "Whether to press Enter after sending keys. Default true."
                         }
                     },
                     "required": ["keys"]
