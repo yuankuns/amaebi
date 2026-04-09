@@ -232,13 +232,18 @@ async fn tmux_send_keys(args: serde_json::Value) -> Result<String> {
 ///
 /// Instead of the LLM calling `tmux_capture_pane` in a loop (burning one LLM
 /// turn per poll), a single `tmux_wait` call blocks until the command running
-/// in the pane appears to have finished.  Returns immediately if the pane is
-/// already idle.
+/// in the pane appears to have finished.
+///
+/// The function observes `idle_secs` of unchanged output before returning, so
+/// it always waits at least `idle_secs` regardless of the initial pane state.
+/// On timeout an error is returned so callers can distinguish it from a real
+/// pane output.
 async fn tmux_wait(args: serde_json::Value) -> Result<String> {
     let target = args["target"].as_str().unwrap_or("%0");
     let idle_secs = args["idle_secs"].as_u64().unwrap_or(3);
-    let timeout_secs = args["timeout_secs"].as_u64().unwrap_or(600);
-    let poll_secs = args["poll_interval_secs"].as_u64().unwrap_or(2);
+    let timeout_secs = args["timeout_secs"].as_u64().unwrap_or(600).min(86_400);
+    // Clamp poll interval to at least 1 s to avoid busy-polling tmux.
+    let poll_secs = args["poll_interval_secs"].as_u64().unwrap_or(2).max(1);
 
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
     let mut last_content = String::new();
@@ -249,7 +254,15 @@ async fn tmux_wait(args: serde_json::Value) -> Result<String> {
             .args(["capture-pane", "-t", target, "-p"])
             .output()
             .await
-            .context("tmux_wait: capture-pane failed")?;
+            .context("tmux_wait: spawning tmux capture-pane")?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!(
+                "tmux_wait: capture-pane failed (exit {}): {}",
+                output.status,
+                stderr.trim()
+            );
+        }
         let content = String::from_utf8_lossy(&output.stdout).into_owned();
 
         if content != last_content {
@@ -260,9 +273,9 @@ async fn tmux_wait(args: serde_json::Value) -> Result<String> {
         }
 
         if tokio::time::Instant::now() >= deadline {
-            return Ok(format!(
-                "timeout after {timeout_secs}s — last pane output:\n{last_content}"
-            ));
+            anyhow::bail!(
+                "tmux_wait: timed out after {timeout_secs}s waiting for pane '{target}' to become idle"
+            );
         }
         tokio::time::sleep(std::time::Duration::from_secs(poll_secs)).await;
     }
