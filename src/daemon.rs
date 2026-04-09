@@ -1834,6 +1834,8 @@ where
     let mut tools_were_used = false;
     let mut conclusion_nudge_sent = false;
     let mut last_prompt_tokens: usize;
+    // Mutable so switch_model tool calls can change the model mid-session.
+    let mut current_model = model.to_string();
 
     // Per-run scratch directory for large tool outputs (unix only).
     // Intentionally not cleaned up on exit — see comment near ScratchDirGuard
@@ -1888,10 +1890,10 @@ where
         // Token management and auth-error retry are handled inside invoke_model.
         let resp = invoke_model(
             state,
-            model,
+            &current_model,
             &messages,
             &schemas,
-            response_max_tokens(model),
+            response_max_tokens(&current_model),
             writer,
         )
         .await?;
@@ -2209,6 +2211,7 @@ where
                     let results =
                         futures_util::future::join_all(tool_calls_snapshot.iter().map(|tc| {
                             let scratch_dir = scratch_dir.clone();
+                            let current_model = current_model.clone();
                             async move {
                                 let args = match tc.parse_args() {
                                     Ok(v) => v,
@@ -2223,14 +2226,14 @@ where
                                 };
                                 tracing::debug!(
                                     tool = %tc.name,
-                                    model = %model,
+                                    model = %current_model,
                                     "executing tool"
                                 );
                                 match state.executor.execute(&tc.name, args).await {
                                     Ok(output) => {
                                         tracing::debug!(
                                             tool = %tc.name,
-                                            model = %model,
+                                            model = %current_model,
                                             output_len = output.len(),
                                             "tool succeeded"
                                         );
@@ -2284,7 +2287,7 @@ where
                             break;
                         }
 
-                        tracing::debug!(tool = %tc.name, model = %model, "executing tool");
+                        tracing::debug!(tool = %tc.name, model = %current_model, "executing tool");
 
                         // Parse args once; reused for dedup, tool_detail, and execution.
                         let args = match tc.parse_args() {
@@ -2308,9 +2311,6 @@ where
                                 if let Some(key) = file_cache_key(&path).await {
                                     if let Some((cached_key, cached_id)) = read_cache.get(&path) {
                                         if *cached_key == key {
-                                            // Emit a ToolUse frame so the UI shows
-                                            // the tool was called (with "unchanged"
-                                            // detail to distinguish from a real read).
                                             write_frame(
                                                 writer,
                                                 &Response::ToolUse {
@@ -2357,6 +2357,11 @@ where
                                 .and_then(|v| v.as_str())
                                 .unwrap_or_default()
                                 .to_string(),
+                            "switch_model" => args
+                                .get("model")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default()
+                                .to_string(),
                             _ => String::new(),
                         };
                         write_frame(
@@ -2367,6 +2372,39 @@ where
                             },
                         )
                         .await?;
+
+                        // switch_model is handled here, not by the executor.
+                        if tc.name == "switch_model" {
+                            let result = match args["model"].as_str() {
+                                None => "error: switch_model: missing 'model' argument".to_string(),
+                                Some(new_model) if new_model.trim().is_empty() => {
+                                    "error: switch_model: 'model' must not be empty".to_string()
+                                }
+                                Some(new_model) => {
+                                    let old = std::mem::replace(
+                                        &mut current_model,
+                                        new_model.to_string(),
+                                    );
+                                    tracing::info!(
+                                        old = %old,
+                                        new = %current_model,
+                                        "model switched by LLM"
+                                    );
+                                    write_frame(
+                                        writer,
+                                        &Response::Text {
+                                            chunk: format!(
+                                                "[model switched: {old} → {current_model}]\n"
+                                            ),
+                                        },
+                                    )
+                                    .await?;
+                                    format!("Model switched to {current_model}")
+                                }
+                            };
+                            messages.push(Message::tool_result(&tc.id, result));
+                            continue;
+                        }
 
                         // Extract the read_file path before args is consumed by execute.
                         let read_path: Option<std::path::PathBuf> = if tc.name == "read_file" {
@@ -2379,7 +2417,7 @@ where
                             Ok(output) => {
                                 tracing::debug!(
                                     tool = %tc.name,
-                                    model = %model,
+                                    model = %current_model,
                                     output_len = output.len(),
                                     "tool succeeded"
                                 );
