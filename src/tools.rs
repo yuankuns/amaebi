@@ -614,7 +614,12 @@ pub fn tool_schemas(include_spawn_agent: bool) -> Vec<serde_json::Value> {
                         },
                         "model": {
                             "type": "string",
-                            "description": "LLM model to use (optional; defaults to AMAEBI_SUBAGENT_MODEL env var, or claude-sonnet-4.6 if unset). Supports provider/model format (e.g. bedrock/claude-haiku-4.5)."
+                            "description": (format!(
+                                "LLM model to use (optional; defaults to AMAEBI_SUBAGENT_MODEL \
+                                 env var, or {} if unset). Supports provider/model format \
+                                 (e.g. bedrock/claude-haiku-4.5).",
+                                crate::provider::DEFAULT_MODEL
+                            ))
                         },
                         "extra_mounts": {
                             "type": "array",
