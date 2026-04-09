@@ -1144,6 +1144,57 @@ mod tests {
         }
     }
 
+    // ---- subagent_default_model -----------------------------------------
+
+    #[test]
+    #[serial_test::serial]
+    fn subagent_default_model_uses_subagent_env_verbatim() {
+        std::env::set_var("AMAEBI_MODEL", "copilot/claude-opus-4-6");
+        std::env::set_var("AMAEBI_SUBAGENT_MODEL", "bedrock/claude-haiku-4.5");
+        let result = subagent_default_model();
+        std::env::remove_var("AMAEBI_MODEL");
+        std::env::remove_var("AMAEBI_SUBAGENT_MODEL");
+        // AMAEBI_SUBAGENT_MODEL wins over AMAEBI_MODEL.
+        assert_eq!(result, "bedrock/claude-haiku-4.5");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn subagent_default_model_does_not_inherit_amaebi_model() {
+        std::env::set_var("AMAEBI_MODEL", "copilot/claude-opus-4-6");
+        std::env::remove_var("AMAEBI_SUBAGENT_MODEL");
+        let result = subagent_default_model();
+        std::env::remove_var("AMAEBI_MODEL");
+        // Must NOT be the parent model — just the prefix + DEFAULT_MODEL.
+        assert_ne!(result, "copilot/claude-opus-4-6");
+        assert_eq!(
+            result,
+            format!("copilot/{}", crate::provider::DEFAULT_MODEL)
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn subagent_default_model_preserves_copilot_prefix() {
+        std::env::set_var("AMAEBI_MODEL", "copilot/gpt-4o");
+        std::env::remove_var("AMAEBI_SUBAGENT_MODEL");
+        let result = subagent_default_model();
+        std::env::remove_var("AMAEBI_MODEL");
+        assert_eq!(
+            result,
+            format!("copilot/{}", crate::provider::DEFAULT_MODEL)
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn subagent_default_model_no_prefix_falls_back_to_default() {
+        std::env::remove_var("AMAEBI_MODEL");
+        std::env::remove_var("AMAEBI_SUBAGENT_MODEL");
+        let result = subagent_default_model();
+        assert_eq!(result, crate::provider::DEFAULT_MODEL);
+    }
+
     // ---- unknown tool ---------------------------------------------------
 
     #[tokio::test]
