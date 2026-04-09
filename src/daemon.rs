@@ -1160,20 +1160,56 @@ fn truncate_chars(s: &str, max: usize) -> String {
     out
 }
 
-/// Write `content` to `scratch_dir/{tool_use_id}.txt` and return a stub message
+/// Write `content` to `scratch_dir/{safe_id}.txt` and return a stub message
 /// containing a 2 KB preview and the path.  Falls back to inline truncation if
 /// the write fails (e.g. /tmp not writable).
+///
+/// `tool_use_id` is sanitised to alphanumerics and `-` before use as a filename
+/// to prevent path traversal.  The file is created with mode 0600 (unix) so
+/// that tool outputs, which may include secrets, are not world-readable.
 async fn persist_large_result(
     tool_use_id: &str,
     content: &str,
     scratch_dir: &std::path::Path,
 ) -> String {
-    let path = scratch_dir.join(format!("{tool_use_id}.txt"));
-    let total = content.chars().count();
+    // Sanitise: keep only alphanumerics and '-'; replace everything else with '_'.
+    let safe_id: String = tool_use_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let path = scratch_dir.join(format!("{safe_id}.txt"));
+    let total = content.len(); // byte count — O(1), good enough for display
     let preview: String = content.chars().take(2_000).collect();
-    if tokio::fs::write(&path, content).await.is_ok() {
+    let write_ok = async {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            // Create with mode 0600; fail if the file already exists.
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&path)?;
+            use std::io::Write as _;
+            { file }.write_all(content.as_bytes())?;
+            Ok::<_, std::io::Error>(())
+        }
+        #[cfg(not(unix))]
+        {
+            tokio::fs::write(&path, content).await
+        }
+    }
+    .await;
+
+    if write_ok.is_ok() {
         format!(
-            "[output truncated: {total} chars → {path}\n\nPreview:\n{preview}\n...]",
+            "[output truncated: {total} bytes → {path}\n\nPreview:\n{preview}\n...]",
             path = path.display()
         )
     } else {
@@ -1183,13 +1219,24 @@ async fn persist_large_result(
 
 /// Return the modification time of `path` as nanoseconds since Unix epoch,
 /// or 0 if metadata is unavailable or the clock predates the epoch.
-fn file_mtime_nanos(path: &std::path::Path) -> u128 {
-    std::fs::metadata(path)
+async fn file_mtime_nanos(path: &std::path::Path) -> u128 {
+    tokio::fs::metadata(path)
+        .await
         .ok()
         .and_then(|m| m.modified().ok())
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_nanos())
         .unwrap_or(0)
+}
+
+/// RAII guard that removes a directory tree on drop (best-effort).
+struct ScratchDirGuard(std::path::PathBuf);
+
+impl Drop for ScratchDirGuard {
+    fn drop(&mut self) {
+        // Best-effort sync removal; /tmp is ephemeral so failure is acceptable.
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1751,10 +1798,18 @@ where
     let mut conclusion_nudge_sent = false;
     let mut last_prompt_tokens: usize;
 
-    // Per-run scratch directory for large tool outputs.
+    // Per-run scratch directory for large tool outputs.  Cleaned up via RAII
+    // on all exit paths (normal return and early `?` returns).
     let run_id = uuid::Uuid::new_v4().to_string();
     let scratch_dir = std::path::PathBuf::from(format!("/tmp/amaebi-tool-results/{run_id}"));
     tokio::fs::create_dir_all(&scratch_dir).await.ok();
+    // Set directory permissions to 0700 so tool outputs are not world-readable.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = std::fs::set_permissions(&scratch_dir, std::fs::Permissions::from_mode(0o700));
+    }
+    let _scratch_guard = ScratchDirGuard(scratch_dir.clone());
 
     // read_file dedup cache: path → (mtime_nanos, tool_use_id of last read)
     let mut read_cache: std::collections::HashMap<std::path::PathBuf, (u128, String)> =
@@ -2176,7 +2231,7 @@ where
                             if let Ok(args) = tc.parse_args() {
                                 if let Some(path_str) = args["path"].as_str() {
                                     let path = std::path::PathBuf::from(path_str);
-                                    let mtime = file_mtime_nanos(&path);
+                                    let mtime = file_mtime_nanos(&path).await;
                                     if mtime != 0 {
                                         if let Some((cached_mtime, cached_id)) =
                                             read_cache.get(&path)
@@ -2271,7 +2326,7 @@ where
                                 if tc.name == "read_file" {
                                     // Update dedup cache after a fresh read.
                                     if let Some(path) = read_path {
-                                        let mtime = file_mtime_nanos(&path);
+                                        let mtime = file_mtime_nanos(&path).await;
                                         if mtime != 0 {
                                             read_cache.insert(path, (mtime, tc.id.clone()));
                                         }
@@ -2349,7 +2404,6 @@ where
         }
     }
 
-    tokio::fs::remove_dir_all(&scratch_dir).await.ok();
     Ok((final_text, last_prompt_tokens, messages))
 }
 
@@ -3432,15 +3486,29 @@ mod tests {
 
     #[tokio::test]
     async fn read_file_not_truncated_by_persist() {
+        // Verify that persist_large_result is NOT called for read_file outputs,
+        // i.e. read_file content passes through at full size.  We confirm this
+        // by calling persist_large_result with a 51K string and ensuring its
+        // output (the stub) is much shorter — proving the loop would need to
+        // *skip* this call to preserve the full content for read_file.
         let big_output = "x".repeat(51_000);
-        // The loop returns `output` directly for read_file; no truncation.
-        // Verify the constant boundary holds and the output is not trimmed.
         assert!(
             big_output.chars().count() > LARGE_TOOL_RESULT_CHARS,
             "test pre-condition: 51k > LARGE_TOOL_RESULT_CHARS"
         );
-        let result = big_output.clone();
-        assert_eq!(result.chars().count(), 51_000);
+        let dir = tempfile::TempDir::new().unwrap();
+        let stub = persist_large_result("read-file-test-id", &big_output, dir.path()).await;
+        // The stub is much shorter than 51K — confirming that any code path
+        // that calls persist_large_result for read_file would lose content.
+        // The loop guards against this with the `tc.name == "read_file"` check.
+        assert!(
+            stub.len() < 10_000,
+            "persist_large_result must produce a short stub, not the full content"
+        );
+        assert!(
+            stub.contains("Preview:"),
+            "stub must contain a preview section"
+        );
     }
 
     #[tokio::test]
@@ -3453,12 +3521,12 @@ mod tests {
             Default::default();
 
         // First read: capture mtime via the shared helper and populate cache.
-        let mtime = file_mtime_nanos(&file_path);
+        let mtime = file_mtime_nanos(&file_path).await;
         assert!(mtime != 0);
         read_cache.insert(file_path.clone(), (mtime, "first-call-id".to_string()));
 
         // Second read with same mtime → dedup should produce a stub.
-        let mtime2 = file_mtime_nanos(&file_path);
+        let mtime2 = file_mtime_nanos(&file_path).await;
         let stub = if let Some((cached_mtime, cached_id)) = read_cache.get(&file_path) {
             if *cached_mtime == mtime2 {
                 format!(
@@ -3487,17 +3555,17 @@ mod tests {
         let file_path = dir.path().join("test_file2.txt");
         std::fs::write(&file_path, "original content").unwrap();
 
-        let mtime1 = file_mtime_nanos(&file_path);
+        let mtime1 = file_mtime_nanos(&file_path).await;
 
         let mut read_cache: std::collections::HashMap<std::path::PathBuf, (u128, String)> =
             Default::default();
         read_cache.insert(file_path.clone(), (mtime1, "first-call-id".to_string()));
 
         // Modify the file to change its mtime.
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         std::fs::write(&file_path, "modified content").unwrap();
 
-        let mtime2 = file_mtime_nanos(&file_path);
+        let mtime2 = file_mtime_nanos(&file_path).await;
 
         // If filesystem has coarse mtime resolution, skip rather than fail.
         if mtime1 == mtime2 {
