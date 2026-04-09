@@ -251,6 +251,32 @@ async fn read_file(args: serde_json::Value) -> Result<String> {
 /// The child executor is created with `spawn_ctx: None` so it cannot
 /// call `spawn_agent` itself.
 /// TODO: enforce a depth limit for nested agents if needed.
+/// Resolve the default model for a spawned sub-agent.
+///
+/// Mirrors the provider-prefix preservation logic in `compact_model` in
+/// `daemon.rs`: if the parent session uses `copilot/` or `bedrock/` (as
+/// indicated by `AMAEBI_MODEL`), the sub-agent defaults to the same backend
+/// rather than falling back to bare `DEFAULT_MODEL` (Bedrock).
+///
+/// Resolution order:
+///   1. `AMAEBI_SUBAGENT_MODEL` env var (used verbatim)
+///   2. Provider prefix from `AMAEBI_MODEL` + `DEFAULT_MODEL`
+///   3. Bare `DEFAULT_MODEL`
+fn subagent_default_model() -> String {
+    if let Ok(m) = std::env::var("AMAEBI_SUBAGENT_MODEL") {
+        return m;
+    }
+    let parent = std::env::var("AMAEBI_MODEL").unwrap_or_default();
+    let prefix = parent
+        .split_once('/')
+        .map(|(p, _)| p)
+        .filter(|p| matches!(*p, "copilot" | "bedrock"));
+    match prefix {
+        Some(p) => format!("{}/{}", p, crate::provider::DEFAULT_MODEL),
+        None => crate::provider::DEFAULT_MODEL.to_string(),
+    }
+}
+
 async fn spawn_agent(args: serde_json::Value, ctx: &SpawnContext) -> Result<String> {
     let task = args["task"]
         .as_str()
@@ -290,10 +316,7 @@ async fn spawn_agent(args: serde_json::Value, ctx: &SpawnContext) -> Result<Stri
     let model = args["model"]
         .as_str()
         .map(|s| s.to_string())
-        .unwrap_or_else(|| {
-            std::env::var("AMAEBI_SUBAGENT_MODEL")
-                .unwrap_or_else(|_| crate::provider::DEFAULT_MODEL.to_string())
-        });
+        .unwrap_or_else(subagent_default_model);
 
     let extra_mounts = args["extra_mounts"].as_array().cloned().unwrap_or_default();
     let mut ro_paths: Vec<PathBuf> = vec![];
@@ -392,7 +415,20 @@ async fn spawn_agent(args: serde_json::Value, ctx: &SpawnContext) -> Result<Stri
     context_lines.push(task.to_string());
     let full_task = context_lines.join("\n");
 
-    tracing::info!(task = %task, workspace = %workspace.display(), model = %model, "spawn_agent: starting child agent");
+    let model_source = if args["model"].as_str().is_some() {
+        "explicit"
+    } else if std::env::var("AMAEBI_SUBAGENT_MODEL").is_ok() {
+        "AMAEBI_SUBAGENT_MODEL"
+    } else {
+        "default"
+    };
+    tracing::info!(
+        task = %task,
+        workspace = %workspace.display(),
+        model = %model,
+        model_source = %model_source,
+        "spawn_agent: starting child agent"
+    );
 
     // Build the child sandbox using the pre-computed `using_noop` flag.
     let child_sandbox: Box<dyn Sandbox> = if using_noop {
