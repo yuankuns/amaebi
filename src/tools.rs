@@ -188,13 +188,21 @@ async fn shell_command(
     Ok(result)
 }
 
-/// Capture the visible text of a tmux pane.
+/// Capture recent lines from a tmux pane's scrollback history.
+///
+/// Uses `tmux capture-pane -S -{lines}` where `-S` receives a negative numeric
+/// argument, starting `lines` lines before the bottom of the pane history and
+/// returning at most `lines` lines. This avoids flooding the LLM with thousands
+/// of lines of build output when only the tail matters.
 async fn tmux_capture_pane(args: serde_json::Value) -> Result<String> {
-    // Default to the first pane if no target provided.
     let target = args["target"].as_str().unwrap_or("%0");
+    // Clamp to at least 1: lines=0 would produce "-S -0" which disables the
+    // limit and could capture unbounded history.
+    let lines = args["lines"].as_u64().unwrap_or(200).max(1);
+    let start = format!("-{lines}");
 
     let output = Command::new("tmux")
-        .args(["capture-pane", "-t", target, "-p"])
+        .args(["capture-pane", "-t", target, "-p", "-S", &start])
         .output()
         .await
         .context("spawning tmux capture-pane")?;
@@ -654,7 +662,7 @@ pub fn tool_schemas(include_spawn_agent: bool) -> Vec<serde_json::Value> {
             "type": "function",
             "function": {
                 "name": "tmux_capture_pane",
-                "description": "Capture and return the current visible text of a tmux pane.",
+                "description": "Capture and return recent text from a tmux pane.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -662,6 +670,13 @@ pub fn tool_schemas(include_spawn_agent: bool) -> Vec<serde_json::Value> {
                             "type": "string",
                             "description": "tmux target pane (e.g. '%0', '0:1.0'). \
                                             Defaults to %0."
+                        },
+                        "lines": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "description": "Number of lines of scrollback to capture \
+                                            (minimum: 1, default: 200). Use a smaller value \
+                                            to reduce token usage when only the tail matters."
                         }
                     },
                     "required": []
