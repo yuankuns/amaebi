@@ -3258,4 +3258,43 @@ mod tests {
     fn gpt_5_mini_requires_responses_api() {
         assert!(requires_responses_api("gpt-5-mini"));
     }
+
+    #[test]
+    #[serial_test::serial]
+    fn compact_model_override_used_verbatim() {
+        std::env::set_var("AMAEBI_COMPACT_MODEL", "custom/provider-model");
+        let result = compact_model("copilot/claude-opus-4-6");
+        std::env::remove_var("AMAEBI_COMPACT_MODEL");
+        assert_eq!(result, "custom/provider-model");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn compact_model_defaults_to_default_model_no_prefix() {
+        std::env::remove_var("AMAEBI_COMPACT_MODEL");
+        assert_eq!(
+            compact_model("claude-opus-4-6"),
+            crate::provider::DEFAULT_MODEL
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn compact_model_preserves_copilot_prefix() {
+        std::env::remove_var("AMAEBI_COMPACT_MODEL");
+        assert_eq!(
+            compact_model("copilot/claude-opus-4-6"),
+            format!("copilot/{}", crate::provider::DEFAULT_MODEL),
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn compact_model_preserves_bedrock_prefix() {
+        std::env::remove_var("AMAEBI_COMPACT_MODEL");
+        assert_eq!(
+            compact_model("bedrock/us.anthropic.claude-opus-4-6-v1:0"),
+            format!("bedrock/{}", crate::provider::DEFAULT_MODEL),
+        );
+    }
 }
