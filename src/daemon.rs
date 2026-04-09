@@ -101,10 +101,6 @@ fn compact_model(main_model: &str) -> String {
 
 /// Compact session history when prompt tokens exceed this fraction of available input.
 const COMPACTION_THRESHOLD: f64 = 0.75;
-/// Maximum chars to send verbatim per history entry when building the compaction prompt.
-/// Entries longer than this are replaced with a reference line so the summarising LLM
-/// does not waste tokens re-reading large file dumps or long inline outputs.
-const COMPACT_INLINE_CHARS: usize = 600;
 /// Minimum recent user/assistant *pairs* to keep in the hot tail after a token-budget trim.
 const HOT_TAIL_PAIRS: usize = 3;
 /// How many past-session summaries to prepend to the system message.
@@ -1164,6 +1160,59 @@ fn truncate_chars(s: &str, max: usize) -> String {
     out
 }
 
+/// Replace fenced markdown code blocks (` ```...``` `) with a one-line reference.
+///
+/// Prose outside code blocks is kept verbatim.  Used in `compact_session` so
+/// the summarising LLM sees the conversational context without re-reading raw
+/// file contents or command outputs that were quoted inline.
+///
+/// Example:
+/// ```text
+/// "Here is the file:\n```rust\nfn main() {}\n```\nLooks good." →
+/// "Here is the file:\n[code block: 15 chars]\nLooks good."
+/// ```
+fn fold_code_blocks(s: &str) -> String {
+    let fence = "```";
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    loop {
+        match rest.find(fence) {
+            None => {
+                out.push_str(rest);
+                break;
+            }
+            Some(open) => {
+                // Text before the opening fence.
+                out.push_str(&rest[..open]);
+                rest = &rest[open + fence.len()..];
+                // Skip the optional language tag on the opening line.
+                let body_start = rest.find('\n').map(|i| i + 1).unwrap_or(0);
+                rest = &rest[body_start..];
+                // Find the closing fence.
+                match rest.find(fence) {
+                    None => {
+                        // Unclosed fence — emit a reference for all remaining text.
+                        let char_count = rest.chars().count();
+                        out.push_str(&format!("[code block: {char_count} chars]"));
+                        break;
+                    }
+                    Some(close) => {
+                        let body = &rest[..close];
+                        let char_count = body.chars().count();
+                        out.push_str(&format!("[code block: {char_count} chars]"));
+                        rest = &rest[close + fence.len()..];
+                        // Skip the newline that follows the closing fence, if any.
+                        if rest.starts_with('\n') {
+                            rest = &rest[1..];
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Memory helpers — canonical DB access for daemon and ACP agent
 // ---------------------------------------------------------------------------
@@ -1333,18 +1382,13 @@ async fn compact_session(
 
     // Only user prompts and assistant text responses are stored in the DB
     // (tool results and system prompts are never persisted).  Still, if an
-    // assistant response quoted a large file inline we don't want to send all
+    // assistant response quoted file content inline we don't want to send all
     // that raw content to the summarising LLM — it adds cost without helping
-    // the summary.  Content longer than COMPACT_INLINE_CHARS is replaced with
-    // a reference line so the summariser knows something was there without
-    // needing to re-read it.
+    // the summary.  Markdown fenced code blocks (```...```) are replaced with
+    // a one-line reference so the summariser knows code was there without
+    // re-reading it.  Prose outside code blocks is kept verbatim.
     for entry in &history {
-        let content = if entry.content.chars().count() > COMPACT_INLINE_CHARS {
-            let char_count = entry.content.chars().count();
-            format!("[{} chars omitted — not relevant for summary]", char_count)
-        } else {
-            entry.content.clone()
-        };
+        let content = fold_code_blocks(&entry.content);
         match entry.role.as_str() {
             "user" => messages.push(Message::user(content)),
             "assistant" => messages.push(Message::assistant(Some(content), vec![])),
@@ -3314,66 +3358,55 @@ mod tests {
         );
     }
 
-    // ---- compact_session inline-content filtering -----------------------
+    // ---- fold_code_blocks -----------------------------------------------
 
-    /// Build the compaction message list from fake history entries, mimicking
-    /// what `compact_session` does, to verify the inline-content threshold.
-    fn build_compact_messages_from(entries: &[(&str, &str)]) -> Vec<copilot::Message> {
-        let mut messages = vec![copilot::Message::system("You are a memory compactor.")];
-        for (role, content) in entries {
-            let out = if content.chars().count() > COMPACT_INLINE_CHARS {
-                let n = content.chars().count();
-                format!("[{n} chars omitted — not relevant for summary]")
-            } else {
-                content.to_string()
-            };
-            match *role {
-                "user" => messages.push(copilot::Message::user(out)),
-                "assistant" => messages.push(copilot::Message::assistant(Some(out), vec![])),
-                _ => {}
-            }
-        }
-        messages
+    #[test]
+    fn fold_code_blocks_no_fence_unchanged() {
+        let s = "Hello, this is plain text with no code.";
+        assert_eq!(fold_code_blocks(s), s);
     }
 
     #[test]
-    fn compact_short_content_kept_verbatim() {
-        let short = "Fix the bug please.";
-        let msgs = build_compact_messages_from(&[("user", short)]);
-        let content = msgs[1].content.as_deref().unwrap();
-        assert_eq!(content, short);
-    }
-
-    #[test]
-    fn compact_large_content_replaced_with_reference() {
-        let large = "x".repeat(COMPACT_INLINE_CHARS + 1);
-        let msgs = build_compact_messages_from(&[("user", &large)]);
-        let content = msgs[1].content.as_deref().unwrap();
+    fn fold_code_blocks_replaces_fenced_block() {
+        let s = "Here is the file:\n```rust\nfn main() {}\n```\nLooks good.";
+        let out = fold_code_blocks(s);
+        assert!(out.contains("[code block:"), "got: {out}");
         assert!(
-            content.contains("chars omitted"),
-            "large content should be replaced: {content}"
+            !out.contains("fn main()"),
+            "code body must be removed: {out}"
         );
         assert!(
-            !content.contains(&large[..50]),
-            "original content must not appear verbatim"
+            out.contains("Here is the file:"),
+            "prose before must be kept"
         );
+        assert!(out.contains("Looks good."), "prose after must be kept");
     }
 
     #[test]
-    fn compact_assistant_large_content_replaced() {
-        let large = "y".repeat(2000);
-        let msgs = build_compact_messages_from(&[("assistant", &large)]);
-        let content = msgs[1].content.as_deref().unwrap();
-        assert!(content.contains("chars omitted"), "got: {content}");
+    fn fold_code_blocks_lang_tag_stripped() {
+        let s = "```python\nprint('hello')\n```";
+        let out = fold_code_blocks(s);
+        assert!(out.contains("[code block:"), "got: {out}");
+        assert!(!out.contains("print"), "code body must be removed");
     }
 
     #[test]
-    fn compact_tool_roles_are_skipped() {
-        // The DB schema enforces role IN ('user', 'assistant'), but verify
-        // the loop silently ignores unknown roles.
-        let msgs = build_compact_messages_from(&[("tool", "tool output"), ("user", "hello")]);
-        // Only system + user messages should appear (tool skipped).
-        assert_eq!(msgs.len(), 2, "tool role must be skipped");
-        assert_eq!(msgs[1].role, "user");
+    fn fold_code_blocks_multiple_blocks() {
+        let s = "A\n```\nblock1\n```\nB\n```\nblock2\n```\nC";
+        let out = fold_code_blocks(s);
+        assert_eq!(out.matches("[code block:").count(), 2);
+        assert!(out.contains("A\n"));
+        assert!(out.contains("B\n"));
+        assert!(out.contains("C"));
+        assert!(!out.contains("block1"));
+        assert!(!out.contains("block2"));
+    }
+
+    #[test]
+    fn fold_code_blocks_unclosed_fence_folded() {
+        let s = "Intro\n```\nunclosed content here";
+        let out = fold_code_blocks(s);
+        assert!(out.contains("[code block:"), "got: {out}");
+        assert!(!out.contains("unclosed content"));
     }
 }
