@@ -1185,12 +1185,38 @@ const FOLD_TRIGGER_FRACTION: f64 = 0.5;
 fn fold_old_tool_results(messages: &mut [copilot::Message], keep_recent: usize) {
     use std::collections::HashMap;
 
-    // Build id → tool_name from all assistant messages.
-    let mut call_names: HashMap<String, String> = HashMap::new();
+    // Build id → (tool_name, label) from all assistant messages.
+    // `label` extracts the most useful argument for each tool so the folded
+    // reference reads e.g. `[read_file: src/daemon.rs — 8432 chars, collapsed]`
+    // instead of the opaque `[read_file result: 8432 chars]`.
+    let mut call_info: HashMap<String, (String, String)> = HashMap::new();
     for msg in messages.iter() {
         if msg.role == "assistant" {
             for tc in &msg.tool_calls {
-                call_names.insert(tc.id.clone(), tc.function.name.clone());
+                let args: serde_json::Value =
+                    serde_json::from_str(&tc.function.arguments).unwrap_or_default();
+                let label = match tc.function.name.as_str() {
+                    "read_file" | "edit_file" | "write_file" | "wait_for_file" => args
+                        .get("path")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    "shell_command" => {
+                        let cmd = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
+                        if cmd.len() > 60 {
+                            format!("{}…", &cmd[..60])
+                        } else {
+                            cmd.to_string()
+                        }
+                    }
+                    "tmux_capture_pane" | "tmux_send_keys" | "tmux_wait" => args
+                        .get("target")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("%0")
+                        .to_string(),
+                    _ => String::new(),
+                };
+                call_info.insert(tc.id.clone(), (tc.function.name.clone(), label));
             }
         }
     }
@@ -1216,15 +1242,17 @@ fn fold_old_tool_results(messages: &mut [copilot::Message], keep_recent: usize) 
         if char_count <= MIN_FOLD_CHARS {
             continue;
         }
-        let tool_name = msg
+        let (tool_name, label) = msg
             .tool_call_id
             .as_deref()
-            .and_then(|id| call_names.get(id))
-            .map(|s| s.as_str())
-            .unwrap_or("unknown_tool");
-        msg.content = Some(format!(
-            "[{tool_name} result: {char_count} chars — collapsed to save context]"
-        ));
+            .and_then(|id| call_info.get(id))
+            .map(|(n, l)| (n.as_str(), l.as_str()))
+            .unwrap_or(("unknown_tool", ""));
+        msg.content = Some(if label.is_empty() {
+            format!("[{tool_name} — {char_count} chars, collapsed]")
+        } else {
+            format!("[{tool_name}: {label} — {char_count} chars, collapsed]")
+        });
     }
 }
 
@@ -3420,7 +3448,7 @@ mod tests {
         // First tool result (index 1) should be collapsed.
         let first_result = msgs[1].content.as_deref().unwrap();
         assert!(
-            first_result.contains("collapsed to save context"),
+            first_result.contains("collapsed"),
             "old result should be folded: {first_result}"
         );
         assert!(
@@ -3448,5 +3476,39 @@ mod tests {
                 "short result must not be folded"
             );
         }
+    }
+
+    #[test]
+    fn fold_includes_path_label_for_read_file() {
+        let large = "x".repeat(500);
+        // Build a turn with a real path argument.
+        let msgs_turn = vec![
+            copilot::Message::assistant(
+                None,
+                vec![crate::copilot::ApiToolCall {
+                    id: "id1".into(),
+                    kind: "function".into(),
+                    function: crate::copilot::ApiToolCallFunction {
+                        name: "read_file".into(),
+                        arguments: r#"{"path":"src/daemon.rs"}"#.into(),
+                    },
+                }],
+            ),
+            copilot::Message::tool_result("id1", &large),
+        ];
+        // Add a second turn so the first is eligible for folding (keep_recent=1).
+        let msgs_turn2 = make_tool_turn("id2", "read_file", &large);
+        let mut msgs = msgs_turn;
+        msgs.extend(msgs_turn2);
+        fold_old_tool_results(&mut msgs, 1);
+        let folded = msgs[1].content.as_deref().unwrap();
+        assert!(
+            folded.contains("src/daemon.rs"),
+            "folded reference must include file path: {folded}"
+        );
+        assert!(
+            folded.contains("collapsed"),
+            "must be marked collapsed: {folded}"
+        );
     }
 }
