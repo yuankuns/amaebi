@@ -1171,17 +1171,20 @@ fn should_persist_tool_output(tool_name: &str) -> bool {
 }
 
 /// Write `content` to `scratch_dir/{safe_id}.txt` and return a stub message
-/// containing a 2 KB preview and the path.  Falls back to inline truncation if
-/// the write fails (e.g. /tmp not writable).
+/// containing a preview (up to 2 000 Unicode scalar values) and the file path.
 ///
-/// `tool_use_id` is sanitised to alphanumerics and `-` before use as a filename
-/// to prevent path traversal.  The file is created with mode 0600 (unix) so
-/// that tool outputs, which may include secrets, are not world-readable.  The
-/// blocking open+write is moved to `spawn_blocking` to avoid stalling the Tokio
-/// runtime thread on large outputs.
+/// `tool_use_id` is sanitised: alphanumerics and `-` are kept as-is; all other
+/// characters (including `/`, `..`, spaces) are replaced with `_` to prevent
+/// path traversal.  The file is created with mode 0600 (unix) so that tool
+/// outputs, which may include secrets, are not world-readable.  The blocking
+/// open+write runs in `spawn_blocking` to avoid stalling the Tokio runtime.
+///
+/// If the write fails (e.g. /tmp not writable) the stub is returned inline with
+/// an explicit note that persistence failed, so the model knows the full output
+/// is unavailable rather than silently receiving a truncated fragment.
 async fn persist_large_result(
     tool_use_id: &str,
-    content: &str,
+    content: String,
     scratch_dir: &std::path::Path,
 ) -> String {
     // Sanitise: keep only alphanumerics and '-'; replace everything else with '_'.
@@ -1199,26 +1202,26 @@ async fn persist_large_result(
     let total = content.len(); // byte count — O(1), good enough for display
     let preview: String = content.chars().take(2_000).collect();
 
-    let write_ok = write_tool_output_file(&path, content).await;
-
-    if write_ok.is_ok() {
-        format!(
+    match write_tool_output_file(&path, content).await {
+        Ok(()) => format!(
             "[output truncated: {total} bytes → {path}\n\nPreview:\n{preview}\n...]",
             path = path.display()
-        )
-    } else {
-        truncate_chars(content, 2_000)
+        ),
+        Err(e) => format!(
+            "[output truncated: {total} bytes — could not persist to /tmp ({e}). \
+             Preview:\n{preview}\n...]"
+        ),
     }
 }
 
 /// Write `content` to `path` with mode 0600 (unix) using `spawn_blocking` to
 /// avoid stalling the async runtime.  Falls back to a plain async write on
-/// non-unix platforms.
-async fn write_tool_output_file(path: &std::path::Path, content: &str) -> std::io::Result<()> {
+/// non-unix platforms.  Takes ownership of `content` so the caller avoids an
+/// extra clone for large outputs.
+async fn write_tool_output_file(path: &std::path::Path, content: String) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         let path = path.to_owned();
-        let content = content.to_owned();
         tokio::task::spawn_blocking(move || {
             use std::io::Write as _;
             use std::os::unix::fs::OpenOptionsExt as _;
@@ -2205,8 +2208,7 @@ where
                                             .nth(LARGE_TOOL_RESULT_CHARS)
                                             .is_some()
                                         {
-                                            persist_large_result(&tc.id, &output, &scratch_dir)
-                                                .await
+                                            persist_large_result(&tc.id, output, &scratch_dir).await
                                         } else {
                                             output
                                         }
@@ -2361,7 +2363,7 @@ where
                                     .nth(LARGE_TOOL_RESULT_CHARS)
                                     .is_some()
                                 {
-                                    persist_large_result(&tc.id, &output, &scratch_dir).await
+                                    persist_large_result(&tc.id, output, &scratch_dir).await
                                 } else {
                                     output
                                 }
@@ -3486,8 +3488,8 @@ mod tests {
     async fn large_tool_output_persisted_to_tmp() {
         let dir = tempfile::TempDir::new().unwrap();
         let big_output = "x".repeat(51_000);
-        let result = persist_large_result("tool-use-id-abc", &big_output, dir.path()).await;
-        // Must reference /tmp path (or our temp dir path) and contain Preview.
+        let result = persist_large_result("tool-use-id-abc", big_output, dir.path()).await;
+        // Must reference the file name and contain a Preview section.
         assert!(
             result.contains("tool-use-id-abc.txt"),
             "result must contain the file name: {result}"
@@ -3496,7 +3498,7 @@ mod tests {
             result.contains("Preview:"),
             "result must contain a preview header: {result}"
         );
-        // Must NOT contain the full 51K content inline.
+        // Stub must be much shorter than the original 51K content.
         assert!(
             result.len() < 10_000,
             "stub must be much shorter than 51K chars, got {} chars",
@@ -3508,12 +3510,31 @@ mod tests {
         assert_eq!(written.len(), 51_000);
     }
 
+    #[tokio::test]
+    async fn read_file_not_truncated_by_persist() {
+        // Validate that persist_large_result produces a short stub — confirming
+        // that the loop MUST skip it for read_file to preserve full content.
+        // The exemption itself is enforced by should_persist_tool_output (tested below).
+        let dir = tempfile::TempDir::new().unwrap();
+        let big_output = "x".repeat(51_000);
+        let stub = persist_large_result("id", big_output, dir.path()).await;
+        assert!(
+            stub.len() < 10_000,
+            "persist_large_result must produce a short stub: len={}",
+            stub.len()
+        );
+        assert!(
+            stub.contains("Preview:"),
+            "stub must contain a preview section"
+        );
+    }
+
     #[test]
     fn read_file_exempt_from_persistence() {
         // should_persist_tool_output drives the read_file exemption in the loop.
-        // If this fails, the loop would call persist_large_result for read_file
-        // outputs, replacing full content with a 2KB stub and breaking the model's
-        // only path to read complete files.
+        // If this returns true for read_file, the loop would call persist_large_result
+        // and replace full file content with a stub, breaking the model's only path
+        // to read complete files.
         assert!(!should_persist_tool_output("read_file"));
         assert!(should_persist_tool_output("shell_command"));
         assert!(should_persist_tool_output("tmux_capture_pane"));
