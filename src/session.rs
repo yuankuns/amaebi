@@ -1,10 +1,16 @@
 //! Centralized directory-to-UUID session mapping.
 //!
 //! Session identifiers are stable UUIDs stored in `~/.amaebi/sessions.json`.
-//! Each entry maps a canonical directory path to a session record containing
-//! the UUID, creation timestamp, and last-access timestamp.  The mapping
-//! persists across daemon restarts; the UUID is the authoritative identity for
-//! a session — used for per-session history locking in the daemon.
+//! Each directory maps to a *list* of session records (newest first), so that
+//! `amaebi chat` can start a fresh UUID on every invocation while preserving
+//! historical UUIDs for `--resume`.
+//!
+//! # Schema migration
+//!
+//! Older versions stored `HashMap<String, SessionRecord>` (one record per
+//! directory).  The new format is `HashMap<String, Vec<SessionRecord>>`.
+//! `load_map` transparently upgrades old entries by wrapping any lone
+//! `SessionRecord` in a single-element `Vec`.
 //!
 //! # Concurrency
 //!
@@ -102,7 +108,17 @@ fn open_lock_file() -> Result<std::fs::File> {
 // Serialization helpers
 // ---------------------------------------------------------------------------
 
-fn load_map(path: &Path) -> Result<HashMap<String, SessionRecord>> {
+/// On-disk entry: either a legacy single record or the new vec format.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum SessionEntryV {
+    Many(Vec<SessionRecord>),
+    One(SessionRecord),
+}
+
+type SessionMap = HashMap<String, Vec<SessionRecord>>;
+
+fn load_map(path: &Path) -> Result<SessionMap> {
     if !path.exists() {
         return Ok(HashMap::new());
     }
@@ -111,8 +127,18 @@ fn load_map(path: &Path) -> Result<HashMap<String, SessionRecord>> {
     if content.trim().is_empty() {
         return Ok(HashMap::new());
     }
-    match serde_json::from_str(&content) {
-        Ok(map) => Ok(map),
+    // Deserialise as a map of the untagged union, then normalise.
+    match serde_json::from_str::<HashMap<String, SessionEntryV>>(&content) {
+        Ok(raw) => Ok(raw
+            .into_iter()
+            .map(|(k, v)| {
+                let records = match v {
+                    SessionEntryV::Many(recs) => recs,
+                    SessionEntryV::One(rec) => vec![rec],
+                };
+                (k, records)
+            })
+            .collect()),
         Err(e) => {
             tracing::warn!(
                 path = %path.display(),
@@ -125,7 +151,7 @@ fn load_map(path: &Path) -> Result<HashMap<String, SessionRecord>> {
 }
 
 /// Write the map atomically: write to a `.tmp` file, then rename.
-fn save_map(path: &Path, map: &HashMap<String, SessionRecord>) -> Result<()> {
+fn save_map(path: &Path, map: &SessionMap) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
@@ -166,7 +192,8 @@ fn canonical_key(dir: &Path) -> String {
 
 /// Look up or create the session UUID for `dir`.
 ///
-/// Uses a two-phase locking strategy:
+/// Returns the UUID of the most-recent (first) record for the directory,
+/// creating a new entry if none exists.  Uses a two-phase locking strategy:
 /// 1. **Fast path** — shared lock + read.  If the entry exists, touch its
 ///    `last_accessed` timestamp under an exclusive lock upgrade and return.
 /// 2. **Slow path** — exclusive lock + read-modify-write.  Only taken when
@@ -186,26 +213,30 @@ pub fn get_or_create(dir: &Path) -> Result<String> {
             .context("acquiring shared sessions lock")?;
 
         if let Ok(map) = load_map(&path) {
-            if let Some(rec) = map.get(&key) {
-                let uuid = rec.uuid.clone();
-                lock_file
-                    .unlock()
-                    .context("releasing shared sessions lock")?;
+            if let Some(recs) = map.get(&key) {
+                if let Some(rec) = recs.first() {
+                    let uuid = rec.uuid.clone();
+                    lock_file
+                        .unlock()
+                        .context("releasing shared sessions lock")?;
 
-                // Touch last_accessed under exclusive lock (best-effort).
-                if let Ok(lf2) = open_lock_file() {
-                    if lf2.lock_exclusive().is_ok() {
-                        if let Ok(mut m) = load_map(&path) {
-                            if let Some(r) = m.get_mut(&key) {
-                                r.touch();
-                                let _ = save_map(&path, &m);
+                    // Touch last_accessed under exclusive lock (best-effort).
+                    if let Ok(lf2) = open_lock_file() {
+                        if lf2.lock_exclusive().is_ok() {
+                            if let Ok(mut m) = load_map(&path) {
+                                if let Some(rs) = m.get_mut(&key) {
+                                    if let Some(r) = rs.first_mut() {
+                                        r.touch();
+                                        let _ = save_map(&path, &m);
+                                    }
+                                }
                             }
+                            let _ = lf2.unlock();
                         }
-                        let _ = lf2.unlock();
                     }
-                }
 
-                return Ok(uuid);
+                    return Ok(uuid);
+                }
             }
         }
         let _ = lock_file.unlock();
@@ -221,18 +252,17 @@ pub fn get_or_create(dir: &Path) -> Result<String> {
 
     // Double-check: another process may have created the entry between the
     // shared read and the exclusive lock acquisition.
-    let uuid = if let Some(rec) = map.get_mut(&key) {
+    // `first_mut` may return `None` for an empty vec (e.g. hand-edited file);
+    // that is treated the same as a missing entry and falls through to create.
+    let uuid = if let Some(rec) = map.get_mut(&key).and_then(|v| v.first_mut()) {
         rec.touch();
-        // Clone UUID before releasing the mutable borrow so we can pass `map`
-        // to save_map.  Persisting here ensures TTL eviction sees the correct
-        // last_accessed even when two processes race on the same entry.
         let id = rec.uuid.clone();
         save_map(&path, &map)?;
         id
     } else {
         let rec = SessionRecord::new();
         let id = rec.uuid.clone();
-        map.insert(key, rec);
+        map.insert(key, vec![rec]);
         save_map(&path, &map)?;
         id
     };
@@ -253,14 +283,14 @@ pub fn get_or_create_with_tier(dir: &Path, tier: &str) -> Result<String> {
 
     let mut map = load_map(&path)?;
 
-    let uuid = if let Some(rec) = map.get_mut(&key) {
+    let uuid = if let Some(rec) = map.get_mut(&key).and_then(|v| v.first_mut()) {
         rec.touch();
         rec.ttl_tier = tier.to_string();
         rec.uuid.clone()
     } else {
         let rec = SessionRecord::new_with_tier(tier);
         let id = rec.uuid.clone();
-        map.insert(key, rec);
+        map.entry(key).or_default().insert(0, rec);
         id
     };
 
@@ -269,9 +299,16 @@ pub fn get_or_create_with_tier(dir: &Path, tier: &str) -> Result<String> {
     Ok(uuid)
 }
 
-/// Replace the session UUID for `dir` with a fresh one, effectively resetting
-/// the session context.
+/// Replace the session UUID for `dir` with a fresh one, preserving old
+/// session records in history.
 pub fn reset(dir: &Path) -> Result<String> {
+    create_fresh(dir)
+}
+
+/// Create a brand-new session for `dir` and register it as the current
+/// session.  Previous sessions for this directory are preserved in the history
+/// (available via `list_for_dir`).
+pub fn create_fresh(dir: &Path) -> Result<String> {
     let path = sessions_path()?;
 
     let lock_file = open_lock_file()?;
@@ -282,16 +319,42 @@ pub fn reset(dir: &Path) -> Result<String> {
     let key = canonical_key(dir);
     let mut map = load_map(&path)?;
 
+    /// Maximum number of per-directory session records kept in history.
+    /// Oldest entries beyond this cap are silently dropped on each `create_fresh`.
+    const MAX_HISTORY: usize = 20;
+
     let rec = SessionRecord::new();
     let new_id = rec.uuid.clone();
-    map.insert(key, rec);
+    // Prepend so the newest session is always first, then cap the history.
+    let vec = map.entry(key).or_default();
+    vec.insert(0, rec);
+    vec.truncate(MAX_HISTORY);
     save_map(&path, &map)?;
 
     lock_file.unlock().context("releasing sessions lock")?;
     Ok(new_id)
 }
 
+/// Return all session records for `dir`, newest first.
+pub fn list_for_dir(dir: &Path) -> Result<Vec<SessionRecord>> {
+    let path = sessions_path()?;
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+
+    let lock_file = open_lock_file()?;
+    lock_file.lock_shared().context("acquiring sessions lock")?;
+
+    let key = canonical_key(dir);
+    let map = load_map(&path)?;
+    let result = map.get(&key).cloned().unwrap_or_default();
+
+    lock_file.unlock().context("releasing sessions lock")?;
+    Ok(result)
+}
+
 /// Return the current session UUID for `dir`, if one exists.
+#[allow(dead_code)]
 pub fn current(dir: &Path) -> Result<Option<String>> {
     let path = sessions_path()?;
     if !path.exists() {
@@ -303,7 +366,10 @@ pub fn current(dir: &Path) -> Result<Option<String>> {
 
     let key = canonical_key(dir);
     let map = load_map(&path)?;
-    let result = map.get(&key).map(|r| r.uuid.clone());
+    let result = map
+        .get(&key)
+        .and_then(|recs| recs.first())
+        .map(|r| r.uuid.clone());
 
     lock_file.unlock().context("releasing sessions lock")?;
     Ok(result)
@@ -322,13 +388,15 @@ pub fn current_record(dir: &Path) -> Result<Option<SessionRecord>> {
 
     let key = canonical_key(dir);
     let map = load_map(&path)?;
-    let result = map.get(&key).cloned();
+    let result = map.get(&key).and_then(|recs| recs.first()).cloned();
 
     lock_file.unlock().context("releasing sessions lock")?;
     Ok(result)
 }
 
-/// Return all session records (directory → SessionRecord).
+/// Return all session records (directory → most-recent SessionRecord).
+///
+/// Returns one record per directory (the most recent / current one).
 pub fn list_all() -> Result<HashMap<String, SessionRecord>> {
     let path = sessions_path()?;
     if !path.exists() {
@@ -339,18 +407,23 @@ pub fn list_all() -> Result<HashMap<String, SessionRecord>> {
     lock_file.lock_shared().context("acquiring sessions lock")?;
 
     let map = load_map(&path)?;
+    let result = map
+        .into_iter()
+        .filter_map(|(k, recs)| recs.into_iter().next().map(|r| (k, r)))
+        .collect();
 
     lock_file.unlock().context("releasing sessions lock")?;
-    Ok(map)
+    Ok(result)
 }
 
 /// Clear expired sessions from `sessions.json`.
 ///
-/// `ttl_secs` maps tier names to their TTL in seconds.  Entries whose
-/// `last_accessed` is older than their tier's TTL are removed.
+/// `ttl_secs` maps tier names to their TTL in seconds.  A directory entry is
+/// removed when the most-recent record's `last_accessed` is older than its
+/// tier's TTL.  The entire history Vec for that directory is discarded.
 ///
-/// If `dry_run` is true, returns the list of expired keys without modifying
-/// the file.
+/// If `dry_run` is true, returns the list of expired (dir, most-recent record)
+/// pairs without modifying the file.
 pub fn clear_expired(
     ttl_secs: &HashMap<String, u64>,
     dry_run: bool,
@@ -372,16 +445,13 @@ pub fn clear_expired(
     let keys: Vec<String> = map.keys().cloned().collect();
 
     for key in keys {
-        let rec = &map[&key];
-        // Resolution order (mirrors Config::ttl_for):
-        //   1. exact directory-path key
-        //   2. longest ancestor-prefix key (path must start with '/')
-        //   3. tier-name key
-        //   4. "default" key
-        //   5. hardcoded 30-minute fallback
+        let recs = &map[&key];
+        // Use the most-recent record to determine the effective TTL / tier.
+        let Some(rec) = recs.first() else { continue };
+
         let exact = ttl_secs.get(&key).copied();
         let ancestor = if exact.is_none() {
-            let mut best: Option<(usize, u64)> = None; // (key_len, secs)
+            let mut best: Option<(usize, u64)> = None;
             for (k, &secs) in ttl_secs.iter() {
                 if !k.starts_with('/') {
                     continue;
@@ -669,8 +739,10 @@ mod tests {
         let path = sessions_path().unwrap();
         let mut map = load_map(&path).unwrap();
         let key = canonical_key(dir.path());
-        if let Some(rec) = map.get_mut(&key) {
-            rec.last_accessed = "2020-01-01T00:00:00Z".to_string();
+        if let Some(recs) = map.get_mut(&key) {
+            for rec in recs.iter_mut() {
+                rec.last_accessed = "2020-01-01T00:00:00Z".to_string();
+            }
         }
         save_map(&path, &map).unwrap();
 
@@ -694,8 +766,10 @@ mod tests {
         let path = sessions_path().unwrap();
         let mut map = load_map(&path).unwrap();
         let key = canonical_key(dir.path());
-        if let Some(rec) = map.get_mut(&key) {
-            rec.last_accessed = "2020-01-01T00:00:00Z".to_string();
+        if let Some(recs) = map.get_mut(&key) {
+            for rec in recs.iter_mut() {
+                rec.last_accessed = "2020-01-01T00:00:00Z".to_string();
+            }
         }
         save_map(&path, &map).unwrap();
 
@@ -724,8 +798,10 @@ mod tests {
         let path = sessions_path().unwrap();
         let mut map = load_map(&path).unwrap();
         let two_hours_ago = (chrono::Utc::now() - chrono::Duration::hours(2)).to_rfc3339();
-        for rec in map.values_mut() {
-            rec.last_accessed = two_hours_ago.clone();
+        for recs in map.values_mut() {
+            for rec in recs.iter_mut() {
+                rec.last_accessed = two_hours_ago.clone();
+            }
         }
         save_map(&path, &map).unwrap();
 
@@ -822,5 +898,87 @@ mod tests {
         for h in handles {
             h.join().unwrap();
         }
+    }
+
+    // ---- New feature tests -------------------------------------------------
+
+    #[test]
+    fn create_fresh_returns_new_uuid_each_time() {
+        let _guard = with_temp_home();
+        let dir = tempdir().unwrap();
+        let id1 = create_fresh(dir.path()).unwrap();
+        let id2 = create_fresh(dir.path()).unwrap();
+        let id3 = create_fresh(dir.path()).unwrap();
+        assert_ne!(id1, id2);
+        assert_ne!(id2, id3);
+        assert_ne!(id1, id3);
+    }
+
+    #[test]
+    fn create_fresh_newest_is_current() {
+        let _guard = with_temp_home();
+        let dir = tempdir().unwrap();
+        let _id1 = create_fresh(dir.path()).unwrap();
+        let id2 = create_fresh(dir.path()).unwrap();
+        assert_eq!(current(dir.path()).unwrap(), Some(id2));
+    }
+
+    #[test]
+    fn list_for_dir_returns_all_sessions_newest_first() {
+        let _guard = with_temp_home();
+        let dir = tempdir().unwrap();
+        let id1 = create_fresh(dir.path()).unwrap();
+        let id2 = create_fresh(dir.path()).unwrap();
+        let id3 = create_fresh(dir.path()).unwrap();
+
+        let history = list_for_dir(dir.path()).unwrap();
+        assert_eq!(history.len(), 3);
+        // Newest first.
+        assert_eq!(history[0].uuid, id3);
+        assert_eq!(history[1].uuid, id2);
+        assert_eq!(history[2].uuid, id1);
+    }
+
+    #[test]
+    fn list_for_dir_empty_for_unknown_dir() {
+        let _guard = with_temp_home();
+        let dir = tempdir().unwrap();
+        let history = list_for_dir(dir.path()).unwrap();
+        assert!(history.is_empty());
+    }
+
+    #[test]
+    fn create_fresh_preserves_history() {
+        let _guard = with_temp_home();
+        let dir = tempdir().unwrap();
+        let old_id = get_or_create(dir.path()).unwrap();
+        let new_id = create_fresh(dir.path()).unwrap();
+        assert_ne!(old_id, new_id);
+
+        let history = list_for_dir(dir.path()).unwrap();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].uuid, new_id);
+        assert_eq!(history[1].uuid, old_id);
+    }
+
+    #[test]
+    fn migration_from_legacy_single_record_format() {
+        let _guard = with_temp_home();
+        let dir = tempdir().unwrap();
+        let key = canonical_key(dir.path());
+
+        // Write old-format sessions.json (single SessionRecord per dir).
+        let path = sessions_path().unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let old_rec = SessionRecord::new();
+        let old_uuid = old_rec.uuid.clone();
+        let legacy: HashMap<String, SessionRecord> = [(key.clone(), old_rec)].into();
+        std::fs::write(&path, serde_json::to_string(&legacy).unwrap()).unwrap();
+
+        // load_map should migrate transparently.
+        let map = load_map(&path).unwrap();
+        let recs = map.get(&key).unwrap();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].uuid, old_uuid);
     }
 }
