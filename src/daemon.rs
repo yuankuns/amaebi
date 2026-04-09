@@ -75,7 +75,7 @@ fn response_max_tokens(model: &str) -> usize {
     result
 }
 /// Compact session history when prompt tokens exceed this fraction of available input.
-const COMPACTION_THRESHOLD: f64 = 0.85;
+const COMPACTION_THRESHOLD: f64 = 0.75;
 /// Minimum recent user/assistant *pairs* to keep in the hot tail after a token-budget trim.
 const HOT_TAIL_PAIRS: usize = 3;
 /// How many past-session summaries to prepend to the system message.
