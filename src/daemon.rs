@@ -101,6 +101,10 @@ fn compact_model(main_model: &str) -> String {
 
 /// Compact session history when prompt tokens exceed this fraction of available input.
 const COMPACTION_THRESHOLD: f64 = 0.75;
+/// Maximum chars to send verbatim per history entry when building the compaction prompt.
+/// Entries longer than this are replaced with a reference line so the summarising LLM
+/// does not waste tokens re-reading large file dumps or long inline outputs.
+const COMPACT_INLINE_CHARS: usize = 600;
 /// Minimum recent user/assistant *pairs* to keep in the hot tail after a token-budget trim.
 const HOT_TAIL_PAIRS: usize = 3;
 /// How many past-session summaries to prepend to the system message.
@@ -1327,8 +1331,20 @@ async fn compact_session(
         messages.push(Message::assistant(Some(prev.clone()), vec![]));
     }
 
+    // Only user prompts and assistant text responses are stored in the DB
+    // (tool results and system prompts are never persisted).  Still, if an
+    // assistant response quoted a large file inline we don't want to send all
+    // that raw content to the summarising LLM — it adds cost without helping
+    // the summary.  Content longer than COMPACT_INLINE_CHARS is replaced with
+    // a reference line so the summariser knows something was there without
+    // needing to re-read it.
     for entry in &history {
-        let content = truncate_chars(&entry.content, 1_500);
+        let content = if entry.content.chars().count() > COMPACT_INLINE_CHARS {
+            let char_count = entry.content.chars().count();
+            format!("[{} chars omitted — not relevant for summary]", char_count)
+        } else {
+            entry.content.clone()
+        };
         match entry.role.as_str() {
             "user" => messages.push(Message::user(content)),
             "assistant" => messages.push(Message::assistant(Some(content), vec![])),
@@ -3296,5 +3312,68 @@ mod tests {
             compact_model("bedrock/us.anthropic.claude-opus-4-6-v1:0"),
             format!("bedrock/{}", crate::provider::DEFAULT_MODEL),
         );
+    }
+
+    // ---- compact_session inline-content filtering -----------------------
+
+    /// Build the compaction message list from fake history entries, mimicking
+    /// what `compact_session` does, to verify the inline-content threshold.
+    fn build_compact_messages_from(entries: &[(&str, &str)]) -> Vec<copilot::Message> {
+        let mut messages = vec![copilot::Message::system("You are a memory compactor.")];
+        for (role, content) in entries {
+            let out = if content.chars().count() > COMPACT_INLINE_CHARS {
+                let n = content.chars().count();
+                format!("[{n} chars omitted — not relevant for summary]")
+            } else {
+                content.to_string()
+            };
+            match *role {
+                "user" => messages.push(copilot::Message::user(out)),
+                "assistant" => messages.push(copilot::Message::assistant(Some(out), vec![])),
+                _ => {}
+            }
+        }
+        messages
+    }
+
+    #[test]
+    fn compact_short_content_kept_verbatim() {
+        let short = "Fix the bug please.";
+        let msgs = build_compact_messages_from(&[("user", short)]);
+        let content = msgs[1].content.as_deref().unwrap();
+        assert_eq!(content, short);
+    }
+
+    #[test]
+    fn compact_large_content_replaced_with_reference() {
+        let large = "x".repeat(COMPACT_INLINE_CHARS + 1);
+        let msgs = build_compact_messages_from(&[("user", &large)]);
+        let content = msgs[1].content.as_deref().unwrap();
+        assert!(
+            content.contains("chars omitted"),
+            "large content should be replaced: {content}"
+        );
+        assert!(
+            !content.contains(&large[..50]),
+            "original content must not appear verbatim"
+        );
+    }
+
+    #[test]
+    fn compact_assistant_large_content_replaced() {
+        let large = "y".repeat(2000);
+        let msgs = build_compact_messages_from(&[("assistant", &large)]);
+        let content = msgs[1].content.as_deref().unwrap();
+        assert!(content.contains("chars omitted"), "got: {content}");
+    }
+
+    #[test]
+    fn compact_tool_roles_are_skipped() {
+        // The DB schema enforces role IN ('user', 'assistant'), but verify
+        // the loop silently ignores unknown roles.
+        let msgs = build_compact_messages_from(&[("tool", "tool output"), ("user", "hello")]);
+        // Only system + user messages should appear (tool skipped).
+        assert_eq!(msgs.len(), 2, "tool role must be skipped");
+        assert_eq!(msgs[1].role, "user");
     }
 }
