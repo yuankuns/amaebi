@@ -108,6 +108,7 @@ impl ToolExecutor for LocalExecutor {
             }
             "tmux_capture_pane" => tmux_capture_pane(args).await,
             "tmux_send_keys" => tmux_send_keys(args).await,
+            "tmux_wait" => tmux_wait(args).await,
             "read_file" => read_file(args).await,
             "edit_file" => edit_file(args).await,
             "spawn_agent" => match &self.spawn_ctx {
@@ -224,6 +225,73 @@ async fn tmux_send_keys(args: serde_json::Value) -> Result<String> {
     }
 
     Ok(format!("sent keys to pane {target}"))
+}
+
+/// Poll a tmux pane until its output has been stable for `idle_secs`, then
+/// return the final pane content.
+///
+/// Instead of the LLM calling `tmux_capture_pane` in a loop (burning one LLM
+/// turn per poll), a single `tmux_wait` call blocks until the command running
+/// in the pane appears to have finished.
+///
+/// The function observes `idle_secs` of unchanged output before returning, so
+/// it always waits at least `idle_secs` regardless of the initial pane state.
+/// On timeout an error is returned so callers can distinguish it from a real
+/// pane output.
+async fn tmux_wait(args: serde_json::Value) -> Result<String> {
+    let target = args["target"].as_str().unwrap_or("%0");
+    let idle_secs = args["idle_secs"].as_u64().unwrap_or(3);
+    let timeout_secs = args["timeout_secs"].as_u64().unwrap_or(600).min(86_400);
+    // Clamp poll interval to at least 1 s to avoid busy-polling tmux.
+    let poll_secs = args["poll_interval_secs"].as_u64().unwrap_or(2).max(1);
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    let mut last_content = String::new();
+    let mut stable_since = tokio::time::Instant::now();
+
+    loop {
+        // Check the hard deadline at the top of every iteration so we never
+        // start a new capture call after time has already expired.
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "tmux_wait: timed out after {timeout_secs}s waiting for pane '{target}' to become idle"
+            );
+        }
+
+        // Wrap the capture call with timeout_at so a hung tmux process cannot
+        // block past the deadline.
+        let capture_fut = Command::new("tmux")
+            .args(["capture-pane", "-t", target, "-p"])
+            .output();
+        let output = tokio::time::timeout_at(deadline, capture_fut)
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!("tmux_wait: capture-pane timed out waiting for pane '{target}'")
+            })?
+            .context("tmux_wait: spawning tmux capture-pane")?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!(
+                "tmux_wait: capture-pane failed (exit {}): {}",
+                output.status,
+                stderr.trim()
+            );
+        }
+        let content = String::from_utf8_lossy(&output.stdout).into_owned();
+
+        if content != last_content {
+            last_content = content;
+            stable_since = tokio::time::Instant::now();
+        } else if stable_since.elapsed().as_secs() >= idle_secs {
+            return Ok(last_content);
+        }
+
+        // Sleep at most until the deadline to keep the timeout accurate.
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let sleep_dur = std::time::Duration::from_secs(poll_secs).min(remaining);
+        tokio::time::sleep(sleep_dur).await;
+    }
 }
 
 /// Read the full contents of a file.
@@ -591,6 +659,41 @@ pub fn tool_schemas(include_spawn_agent: bool) -> Vec<serde_json::Value> {
         serde_json::json!({
             "type": "function",
             "function": {
+                "name": "tmux_wait",
+                "description": "Poll a tmux pane until its output has been stable for idle_secs, \
+                                then return the final pane content. Use this instead of calling \
+                                tmux_capture_pane in a loop while waiting for a long-running command \
+                                (e.g. a build) to finish.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "target": {
+                            "type": "string",
+                            "description": "Tmux pane target (e.g. \"%0\", \"session:window.pane\"). Default: \"%0\"."
+                        },
+                        "idle_secs": {
+                            "type": "integer",
+                            "description": "Seconds of unchanged output before returning. Default: 3."
+                        },
+                        "timeout_secs": {
+                            "type": "integer",
+                            "description": "Hard timeout in seconds before giving up. Default: 600. Maximum: 86400.",
+                            "minimum": 1,
+                            "maximum": 86400
+                        },
+                        "poll_interval_secs": {
+                            "type": "integer",
+                            "description": "How often to sample the pane, in seconds. Minimum: 1. Default: 2.",
+                            "minimum": 1
+                        }
+                    },
+                    "required": []
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
                 "name": "read_file",
                 "description": "Read the full contents of a file on disk.",
                 "parameters": {
@@ -724,6 +827,7 @@ mod tests {
             "shell_command",
             "tmux_capture_pane",
             "tmux_send_keys",
+            "tmux_wait",
             "read_file",
             "edit_file",
             "spawn_agent",
