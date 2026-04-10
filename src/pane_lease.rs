@@ -462,7 +462,7 @@ fn ensure_idle_panes_locked(needed: usize) -> Result<()> {
 
     if total + deficit > MAX_PANES {
         return Err(anyhow::Error::new(CapacityError {
-            requested: needed,
+            requested: deficit,
             max_panes: MAX_PANES,
             current_busy: busy_count,
         }));
@@ -543,15 +543,16 @@ pub fn ensure_and_acquire_idle(
     lock.lock_exclusive()
         .context("acquiring flock for ensure_and_acquire_idle")?;
 
-    // Ensure at least 1 idle pane exists (expand if necessary).
-    ensure_idle_panes_locked(1)?;
-
-    // Acquire the first idle pane.
-    let pane_id = acquire_first_idle_locked(task_id, session_id, worktree)?;
+    let result = (|| {
+        // Ensure at least 1 idle pane exists (expand if necessary).
+        ensure_idle_panes_locked(1)?;
+        // Acquire the first idle pane.
+        acquire_first_idle_locked(task_id, session_id, worktree)
+    })();
 
     lock.unlock()
         .context("releasing flock after ensure_and_acquire_idle")?;
-    Ok(pane_id)
+    result
 }
 
 // ---------------------------------------------------------------------------

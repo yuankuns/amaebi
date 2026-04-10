@@ -221,18 +221,26 @@ struct ClaudeTask {
 /// /claude [--worktree <path>] [--no-enter] "task description" ["task2" ...]
 /// ```
 ///
-/// Returns `None` if the input does not start with `/claude ` (trailing space
-/// required) or has no task descriptions.
-fn parse_claude_command(input: &str) -> Option<Vec<ClaudeTask>> {
+/// Returns:
+/// - `None` — input does not start with `/claude ` (not a `/claude` command)
+/// - `Some(Err(msg))` — input is a `/claude` command but has a parse error
+/// - `Some(Ok(tasks))` — successfully parsed task list
+fn parse_claude_command(input: &str) -> Option<Result<Vec<ClaudeTask>, String>> {
     let rest = input.strip_prefix("/claude ")?.trim();
     if rest.is_empty() {
-        return None;
+        return Some(Err(
+            "usage: /claude [--worktree <path>] [--no-enter] \"task description\" [...]"
+                .to_string(),
+        ));
     }
 
     // Tokenise (shell-style quoting); each entry is (token, was_quoted).
     let tokens = parse_quoted_args(rest);
     if tokens.is_empty() {
-        return None;
+        return Some(Err(
+            "usage: /claude [--worktree <path>] [--no-enter] \"task description\" [...]"
+                .to_string(),
+        ));
     }
 
     let mut worktree: Option<String> = None;
@@ -247,9 +255,15 @@ fn parse_claude_command(input: &str) -> Option<Vec<ClaudeTask>> {
                 i += 1;
                 // Require a non-flag value to follow --worktree.
                 if i >= tokens.len() || tokens[i].0.starts_with("--") {
-                    return None; // missing value
+                    return Some(Err("--worktree requires a path argument".to_string()));
                 }
-                worktree = Some(tokens[i].0.clone());
+                // Canonicalize to an absolute path so worktree uniqueness
+                // checks in the daemon are reliable regardless of how the
+                // path was spelled (relative vs. symlink vs. absolute).
+                let raw = &tokens[i].0;
+                let abs =
+                    std::fs::canonicalize(raw).unwrap_or_else(|_| std::path::PathBuf::from(raw));
+                worktree = Some(abs.to_string_lossy().into_owned());
             }
             "--no-enter" => {
                 auto_enter = false;
@@ -262,7 +276,10 @@ fn parse_claude_command(input: &str) -> Option<Vec<ClaudeTask>> {
     }
 
     if desc_tokens.is_empty() {
-        return None;
+        return Some(Err(
+            "usage: /claude [--worktree <path>] [--no-enter] \"task description\" [...]"
+                .to_string(),
+        ));
     }
 
     // Build task list.  Quoted tokens each become a separate task.  Unquoted
@@ -294,7 +311,7 @@ fn parse_claude_command(input: &str) -> Option<Vec<ClaudeTask>> {
         })
         .collect();
 
-    Some(tasks)
+    Some(Ok(tasks))
 }
 
 /// Derive a short task label from a description + index.
@@ -415,7 +432,17 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
     let session_id_copy = session_id.clone();
 
     // Intercept `/claude` commands: send a ClaudeLaunch request instead of Chat.
-    if let Some(tasks) = parse_claude_command(&prompt) {
+    if let Some(parse_result) = parse_claude_command(&prompt) {
+        let tasks = match parse_result {
+            Ok(t) => t,
+            Err(msg) => {
+                let mut stdout = tokio::io::stdout();
+                stdout.write_all(msg.as_bytes()).await?;
+                stdout.write_all(b"\n").await?;
+                stdout.flush().await?;
+                return Ok(());
+            }
+        };
         let req = Request::ClaudeLaunch {
             tasks: tasks
                 .into_iter()
@@ -830,7 +857,16 @@ pub async fn run_chat_loop(
 
         // Intercept `/claude` commands: send ClaudeLaunch and handle the response
         // before resuming the normal chat loop.
-        if let Some(tasks) = parse_claude_command(&prompt) {
+        if let Some(parse_result) = parse_claude_command(&prompt) {
+            let tasks = match parse_result {
+                Ok(t) => t,
+                Err(msg) => {
+                    stdout.write_all(msg.as_bytes()).await?;
+                    stdout.write_all(b"\n").await?;
+                    stdout.flush().await?;
+                    continue 'session;
+                }
+            };
             let req = Request::ClaudeLaunch {
                 tasks: tasks
                     .into_iter()
@@ -3276,7 +3312,7 @@ mod tests {
     #[test]
     fn parse_claude_two_quoted_tasks() {
         let result = parse_claude_command(r#"/claude "task one" "task two""#);
-        let tasks = result.expect("should parse");
+        let tasks = result.expect("should be Some").expect("should be Ok");
         assert_eq!(tasks.len(), 2);
         assert_eq!(tasks[0].description, "task one");
         assert_eq!(tasks[1].description, "task two");
@@ -3286,7 +3322,7 @@ mod tests {
     #[test]
     fn parse_claude_single_quoted_task() {
         let result = parse_claude_command(r#"/claude "implement something""#);
-        let tasks = result.expect("should parse");
+        let tasks = result.expect("should be Some").expect("should be Ok");
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].description, "implement something");
     }
@@ -3294,7 +3330,7 @@ mod tests {
     #[test]
     fn parse_claude_unquoted_tokens_join_as_single_task() {
         let result = parse_claude_command("/claude implement something");
-        let tasks = result.expect("should parse");
+        let tasks = result.expect("should be Some").expect("should be Ok");
         // Unquoted words are joined into one task (avoids surprising N-task launch).
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].description, "implement something");
@@ -3302,12 +3338,15 @@ mod tests {
 
     #[test]
     fn parse_claude_no_args_returns_none() {
+        // No trailing space — not a /claude command at all.
         assert!(parse_claude_command("/claude").is_none());
     }
 
     #[test]
-    fn parse_claude_only_space_returns_none() {
-        assert!(parse_claude_command("/claude   ").is_none());
+    fn parse_claude_only_space_returns_err() {
+        // Has trailing spaces → recognized as /claude command but missing description.
+        let result = parse_claude_command("/claude   ");
+        assert!(result.expect("should be Some").is_err());
     }
 
     #[test]
@@ -3318,7 +3357,7 @@ mod tests {
     #[test]
     fn parse_claude_no_enter_flag() {
         let result = parse_claude_command(r#"/claude --no-enter "do something""#);
-        let tasks = result.expect("should parse");
+        let tasks = result.expect("should be Some").expect("should be Ok");
         assert_eq!(tasks.len(), 1);
         assert!(!tasks[0].auto_enter);
         assert_eq!(tasks[0].description, "do something");
@@ -3326,8 +3365,9 @@ mod tests {
 
     #[test]
     fn parse_claude_worktree_flag() {
+        // Non-existent path: canonicalize falls back to the raw string.
         let result = parse_claude_command(r#"/claude --worktree /repo/wt/t1 "implement X""#);
-        let tasks = result.expect("should parse");
+        let tasks = result.expect("should be Some").expect("should be Ok");
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].worktree.as_deref(), Some("/repo/wt/t1"));
         assert_eq!(tasks[0].description, "implement X");
@@ -3336,7 +3376,7 @@ mod tests {
     #[test]
     fn parse_claude_escaped_quotes_in_description() {
         let result = parse_claude_command(r#"/claude "task with \"quotes\"""#);
-        let tasks = result.expect("should parse");
+        let tasks = result.expect("should be Some").expect("should be Ok");
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].description, r#"task with "quotes""#);
     }
@@ -3344,7 +3384,7 @@ mod tests {
     #[test]
     fn parse_claude_task_id_derived_from_description() {
         let result = parse_claude_command(r#"/claude "Implement Cron Scheduling""#);
-        let tasks = result.expect("should parse");
+        let tasks = result.expect("should be Some").expect("should be Ok");
         assert_eq!(tasks[0].task_id, "implement-cron-scheduling");
     }
 
@@ -3352,7 +3392,7 @@ mod tests {
     fn parse_claude_task_id_truncated() {
         let long = format!("/claude \"{}\"", "a".repeat(100));
         let result = parse_claude_command(&long);
-        let tasks = result.expect("should parse");
+        let tasks = result.expect("should be Some").expect("should be Ok");
         assert!(tasks[0].task_id.len() <= 32);
     }
 

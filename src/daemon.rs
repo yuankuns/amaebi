@@ -821,20 +821,10 @@ async fn handle_claude_launch(
         let tid_for_lease = task_id.clone();
         let wt_for_lease = worktree.clone();
 
-        // Compute the session UUID the launched `amaebi chat` will use, so
-        // the PaneAssigned response carries the real session ID rather than a
-        // random placeholder.
-        let session_dir = worktree
-            .as_deref()
-            .map(std::path::Path::new)
-            .map(std::path::Path::to_path_buf)
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-        let session_id = tokio::task::spawn_blocking(move || session::get_or_create(&session_dir))
-            .await
-            .context("session::get_or_create panicked")?
-            .context("resolving session ID")?;
-
-        let sid_for_lease = session_id.clone();
+        // Acquire a pane lease *before* creating session state so that a
+        // capacity failure does not leave orphan session entries on disk.
+        let sid_placeholder = uuid::Uuid::new_v4().to_string();
+        let sid_for_lease = sid_placeholder.clone();
         let pane_result = tokio::task::spawn_blocking(move || {
             pane_lease::ensure_and_acquire_idle(
                 &tid_for_lease,
@@ -848,9 +838,9 @@ async fn handle_claude_launch(
         let pane_id = match pane_result {
             Ok(p) => p,
             Err(e) => {
-                // Surface CapacityError as the typed response.
+                // Surface CapacityError as a typed terminal response.
+                let mut w = writer.lock().await;
                 if let Some(cap) = e.downcast_ref::<pane_lease::CapacityError>() {
-                    let mut w = writer.lock().await;
                     write_frame(
                         &mut *w,
                         &Response::CapacityError {
@@ -860,19 +850,31 @@ async fn handle_claude_launch(
                         },
                     )
                     .await?;
-                    continue;
+                } else {
+                    write_frame(
+                        &mut *w,
+                        &Response::Error {
+                            message: format!("[error] {e:#}"),
+                        },
+                    )
+                    .await?;
                 }
-                let mut w = writer.lock().await;
-                write_frame(
-                    &mut *w,
-                    &Response::Error {
-                        message: format!("[error] {e:#}"),
-                    },
-                )
-                .await?;
-                continue;
+                // Both Error and CapacityError are terminal: the client
+                // breaks its read loop on either, so return immediately.
+                return Ok(());
             }
         };
+
+        // Resolve the real session UUID now that the pane is secured.
+        let session_dir = worktree
+            .as_deref()
+            .map(std::path::Path::new)
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+        let session_id = tokio::task::spawn_blocking(move || session::get_or_create(&session_dir))
+            .await
+            .context("session::get_or_create panicked")?
+            .context("resolving session ID")?;
 
         // Rename the pane for visibility.
         let rename_pane = pane_id.clone();
@@ -912,15 +914,36 @@ async fn handle_claude_launch(
         // Send the command to the pane. "Enter" must be a separate argument —
         // passing it as part of the keys string would send the literal text
         // " Enter" rather than pressing the Enter key.
-        tokio::task::spawn_blocking(move || {
+        let send_result = tokio::task::spawn_blocking(move || {
             let mut cmd_args = vec!["send-keys", "-t", &send_pane, &cmd];
             if auto_enter {
                 cmd_args.push("Enter");
             }
-            let _ = std::process::Command::new("tmux").args(&cmd_args).output();
+            std::process::Command::new("tmux").args(&cmd_args).output()
         })
-        .await
-        .ok();
+        .await;
+
+        let send_ok = matches!(send_result, Ok(Ok(ref out)) if out.status.success());
+        if !send_ok {
+            // Injection failed — release the lease so the pane is not stuck Busy.
+            let failed_pane = pane_id.clone();
+            tokio::task::spawn_blocking(move || {
+                let _ = pane_lease::release_lease(&failed_pane);
+            })
+            .await
+            .ok();
+            let mut w = writer.lock().await;
+            write_frame(
+                &mut *w,
+                &Response::Error {
+                    message: format!(
+                        "[error] failed to inject command into pane {pane_id}: tmux send-keys failed"
+                    ),
+                },
+            )
+            .await?;
+            return Ok(());
+        }
 
         let mut w = writer.lock().await;
         write_frame(
