@@ -1237,9 +1237,9 @@ async fn write_tool_output_file(path: &std::path::Path, content: String) -> std:
 /// the string literal — changes to the wording only need to be made once.
 fn file_unchanged_stub(cached_tool_use_id: &str) -> String {
     format!(
-        "[File unchanged since last read \
+        "[File metadata (mtime, size) unchanged since last read \
          (see tool_result for call {cached_tool_use_id}) \
-         — content still current]"
+         — re-reading is skipped]"
     )
 }
 
@@ -1268,11 +1268,18 @@ struct ScratchDirGuard(std::path::PathBuf);
 impl Drop for ScratchDirGuard {
     fn drop(&mut self) {
         let path = self.0.clone();
-        // Spawn a thread so we don't block the Tokio runtime on drop.
+        // Prefer Tokio's bounded blocking pool; fall back to a raw thread only
+        // when no runtime is available (e.g. during shutdown or in tests).
         // Best-effort: /tmp is ephemeral so lingering files on failure are fine.
-        std::thread::spawn(move || {
-            let _ = std::fs::remove_dir_all(&path);
-        });
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn_blocking(move || {
+                let _ = std::fs::remove_dir_all(&path);
+            });
+        } else {
+            std::thread::spawn(move || {
+                let _ = std::fs::remove_dir_all(&path);
+            });
+        }
     }
 }
 
@@ -2374,8 +2381,8 @@ where
                                     output_len = output.len(),
                                     "tool succeeded"
                                 );
-                                if tc.name == "read_file" {
-                                    // Update dedup cache after a fresh read.
+                                if !should_persist_tool_output(&tc.name) {
+                                    // Update dedup cache after a fresh read_file.
                                     if let Some(path) = read_path {
                                         if let Some(key) = file_cache_key(&path).await {
                                             read_cache.insert(path, (key, tc.id.clone()));
