@@ -1160,6 +1160,122 @@ fn truncate_chars(s: &str, max: usize) -> String {
     out
 }
 
+/// Returns `true` if large outputs from `tool_name` should be persisted to /tmp
+/// rather than injected inline into the model context.
+///
+/// `read_file` is always injected fully: it is the model's only path to access
+/// complete file content.  Persisting it would restrict the model to a 2 KB
+/// preview, severing its ability to read files larger than the preview window.
+fn should_persist_tool_output(tool_name: &str) -> bool {
+    tool_name != "read_file"
+}
+
+/// Write `content` to `scratch_dir/{uuid}.txt` and return a stub message
+/// containing a preview (up to 2 000 Unicode scalar values) and the file path.
+///
+/// **Unix only**: the file is created with mode 0600 so that tool outputs,
+/// which may include secrets, are not world-readable.  On non-unix platforms
+/// this function always returns an inline fallback stub (no disk write) because
+/// equivalent permission hardening is not available.
+///
+/// The filename is a fresh UUID v4, guaranteeing uniqueness across concurrent
+/// tool calls.  The blocking open+write runs in `spawn_blocking` to avoid
+/// stalling the Tokio runtime.
+///
+/// If the write fails the stub is returned inline with an explicit note so the
+/// model knows the full output is unavailable.
+///
+/// Note: persistence is triggered when an output *exceeds* `LARGE_TOOL_RESULT_CHARS`;
+/// files contain the full output and may therefore be larger than that threshold.
+/// Files are intentionally **not** deleted when the loop exits: stubs in
+/// `carried_messages` reference these paths across Chat turns, and deleting them
+/// would cause `read_file` calls on those paths to fail with NotFound.  /tmp is
+/// cleaned by the OS on reboot.
+async fn persist_large_result(content: String, scratch_dir: &std::path::Path) -> String {
+    let total = content.len(); // byte count — O(1), good enough for display
+    let preview: String = content.chars().take(2_000).collect();
+
+    // Unix: write with mode 0600 and return a path stub.
+    #[cfg(unix)]
+    let result = {
+        let path = scratch_dir.join(format!("{}.txt", uuid::Uuid::new_v4()));
+        match write_tool_output_file(&path, content).await {
+            Ok(()) => format!(
+                "[output truncated: {total} bytes → {path}\n\nPreview:\n{preview}\n...]",
+                path = path.display()
+            ),
+            Err(e) => format!(
+                "[output truncated: {total} bytes — could not persist to /tmp ({e}). \
+                 Preview:\n{preview}\n...]"
+            ),
+        }
+    };
+
+    // Non-unix: no 0600-equivalent permission guarantee, return inline.
+    #[cfg(not(unix))]
+    let result = {
+        let _ = scratch_dir;
+        format!(
+            "[output truncated: {total} bytes — persistence unavailable on this platform. \
+             Preview:\n{preview}\n...]"
+        )
+    };
+
+    result
+}
+
+/// Write `content` to `path` with mode 0600 using `spawn_blocking`.
+/// Only compiled on unix; callers on other platforms skip the write entirely.
+#[cfg(unix)]
+async fn write_tool_output_file(path: &std::path::Path, content: String) -> std::io::Result<()> {
+    let path = path.to_owned();
+    tokio::task::spawn_blocking(move || {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)?;
+        file.write_all(content.as_bytes())
+    })
+    .await
+    .map_err(std::io::Error::other)?
+}
+
+/// Format the "file unchanged" stub returned by the read_file dedup check.
+///
+/// Centralised so that tests can assert on the same format without duplicating
+/// the string literal — changes to the wording only need to be made once.
+fn file_unchanged_stub(cached_tool_use_id: &str) -> String {
+    format!(
+        "[File metadata (mtime, size) unchanged since last read \
+         (see tool_result for call {cached_tool_use_id}) \
+         — re-reading is skipped]"
+    )
+}
+
+/// Return `(mtime_nanos, size_bytes)` for `path`, or `None` if metadata is
+/// unavailable.  Using both fields reduces false cache-hits on filesystems with
+/// coarse mtime granularity (e.g. FAT32 at 2-second resolution) where content
+/// can change without the mtime advancing.
+async fn file_cache_key(path: &std::path::Path) -> Option<(u128, u64)> {
+    let meta = tokio::fs::metadata(path).await.ok()?;
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos())?;
+    Some((mtime, meta.len()))
+}
+
+// Note: there is intentionally no ScratchDirGuard / cleanup for the per-run
+// scratch directory.  Stubs written into tool_result messages reference paths
+// under this directory, and those messages are carried across Chat turns in
+// carried_messages.  Deleting the directory when run_agentic_loop returns would
+// cause read_file calls on those paths to fail with NotFound on the next turn.
+// The directory is left in /tmp for the OS to clean up on reboot.
+
 // ---------------------------------------------------------------------------
 // Memory helpers — canonical DB access for daemon and ACP agent
 // ---------------------------------------------------------------------------
@@ -1686,10 +1802,9 @@ where
 /// outputs from blowing the model's context window after extended use.
 const MAX_HISTORY_CHARS: usize = 4_000;
 
-/// Maximum number of Unicode scalar values kept from a single tool-call
-/// output within the current agentic loop iteration.  Large file reads and
-/// shell command outputs are truncated before being fed back to the model.
-const MAX_TOOL_OUTPUT_CHARS: usize = 8_000;
+/// Tool outputs larger than this (chars) are written to /tmp and replaced with a stub.
+/// Matches Claude Code's DEFAULT_MAX_RESULT_SIZE_CHARS. read_file is exempt (always full).
+const LARGE_TOOL_RESULT_CHARS: usize = 50_000;
 
 /// Drive the conversation until Copilot responds with `finish_reason: stop`
 /// (or an error).  Executes tool calls and feeds results back in a loop.
@@ -1719,6 +1834,41 @@ where
     let mut tools_were_used = false;
     let mut conclusion_nudge_sent = false;
     let mut last_prompt_tokens: usize;
+
+    // Per-run scratch directory for large tool outputs (unix only).
+    // Intentionally not cleaned up on exit — see comment near ScratchDirGuard
+    // for rationale.  /tmp is cleaned by the OS on reboot.
+    let scratch_dir = {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let run_id = uuid::Uuid::new_v4().to_string();
+            let dir = std::path::PathBuf::from(format!("/tmp/amaebi-tool-results/{run_id}"));
+            if let Err(e) = tokio::fs::create_dir_all(&dir).await {
+                tracing::warn!(
+                    path = %dir.display(),
+                    error = %e,
+                    "failed to create tool-output scratch dir; large outputs will be truncated inline"
+                );
+            } else if let Err(e) =
+                tokio::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).await
+            {
+                tracing::warn!(
+                    path = %dir.display(),
+                    error = %e,
+                    "failed to set scratch dir permissions to 0700"
+                );
+            }
+            dir
+        }
+        #[cfg(not(unix))]
+        std::path::PathBuf::new() // unused placeholder; persist_large_result is no-op on non-unix
+    };
+    // read_file dedup cache: path → ((mtime_nanos, size_bytes), tool_use_id of last read).
+    // Both mtime and size are stored to reduce false hits on filesystems with
+    // coarse mtime granularity where content can change without mtime advancing.
+    let mut read_cache: std::collections::HashMap<std::path::PathBuf, ((u128, u64), String)> =
+        Default::default();
 
     loop {
         // Drain any steering corrections that arrived since the last model
@@ -2056,36 +2206,48 @@ where
                     // Steer interrupts are not checked here — they only apply
                     // to the sequential path where we can abort cleanly before
                     // the next tool runs.
-                    let results = futures_util::future::join_all(tool_calls_snapshot.iter().map(
-                        |tc| async move {
-                            let args = match tc.parse_args() {
-                                Ok(v) => v,
-                                Err(e) => {
-                                    tracing::warn!(
-                                        tool = %tc.name,
-                                        error = %e,
-                                        "bad tool arguments"
-                                    );
-                                    return format!("argument error: {e:#}");
-                                }
-                            };
-                            match state.executor.execute(&tc.name, args).await {
-                                Ok(output) => {
-                                    tracing::debug!(
-                                        tool = %tc.name,
-                                        output_len = output.len(),
-                                        "tool succeeded"
-                                    );
-                                    truncate_chars(&output, MAX_TOOL_OUTPUT_CHARS)
-                                }
-                                Err(e) => {
-                                    tracing::warn!(tool = %tc.name, error = %e, "tool failed");
-                                    format!("error: {e:#}")
+                    let results =
+                        futures_util::future::join_all(tool_calls_snapshot.iter().map(|tc| {
+                            let scratch_dir = scratch_dir.clone();
+                            async move {
+                                let args = match tc.parse_args() {
+                                    Ok(v) => v,
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            tool = %tc.name,
+                                            error = %e,
+                                            "bad tool arguments"
+                                        );
+                                        return format!("argument error: {e:#}");
+                                    }
+                                };
+                                match state.executor.execute(&tc.name, args).await {
+                                    Ok(output) => {
+                                        tracing::debug!(
+                                            tool = %tc.name,
+                                            output_len = output.len(),
+                                            "tool succeeded"
+                                        );
+                                        if !should_persist_tool_output(&tc.name) {
+                                            output
+                                        } else if output
+                                            .char_indices()
+                                            .nth(LARGE_TOOL_RESULT_CHARS)
+                                            .is_some()
+                                        {
+                                            persist_large_result(output, &scratch_dir).await
+                                        } else {
+                                            output
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(tool = %tc.name, error = %e, "tool failed");
+                                        format!("error: {e:#}")
+                                    }
                                 }
                             }
-                        },
-                    ))
-                    .await;
+                        }))
+                        .await;
 
                     for (tc, result) in tool_calls_snapshot.iter().zip(results) {
                         messages.push(Message::tool_result(&tc.id, result));
@@ -2118,53 +2280,7 @@ where
 
                         tracing::debug!(tool = %tc.name, "executing tool");
 
-                        let tool_detail = {
-                            let args: serde_json::Value = serde_json::from_str(&tc.arguments)
-                                .unwrap_or(serde_json::Value::Null);
-                            match tc.name.as_str() {
-                                "shell_command" => args
-                                    .get("command")
-                                    .and_then(|v| v.as_str())
-                                    .map(|s| {
-                                        if s.len() > 80 {
-                                            format!("{}…", &s[..80])
-                                        } else {
-                                            s.to_string()
-                                        }
-                                    })
-                                    .unwrap_or_default(),
-                                "read_file" => args
-                                    .get("path")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or_default()
-                                    .to_string(),
-                                "edit_file" => args
-                                    .get("path")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or_default()
-                                    .to_string(),
-                                "tmux_send_keys" => args
-                                    .get("keys")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or_default()
-                                    .to_string(),
-                                "tmux_capture_pane" => args
-                                    .get("target")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or_default()
-                                    .to_string(),
-                                _ => String::new(),
-                            }
-                        };
-                        write_frame(
-                            writer,
-                            &Response::ToolUse {
-                                name: tc.name.clone(),
-                                detail: tool_detail,
-                            },
-                        )
-                        .await?;
-
+                        // Parse args once; reused for dedup, tool_detail, and execution.
                         let args = match tc.parse_args() {
                             Ok(v) => v,
                             Err(e) => {
@@ -2177,6 +2293,82 @@ where
                             }
                         };
 
+                        // read_file dedup: skip re-read if file is unchanged.
+                        // Both mtime and size are compared to reduce false hits on
+                        // filesystems with coarse mtime resolution (e.g. FAT32).
+                        if tc.name == "read_file" {
+                            if let Some(path_str) = args["path"].as_str() {
+                                let path = std::path::PathBuf::from(path_str);
+                                if let Some(key) = file_cache_key(&path).await {
+                                    if let Some((cached_key, cached_id)) = read_cache.get(&path) {
+                                        if *cached_key == key {
+                                            // Emit a ToolUse frame so the UI shows
+                                            // the tool was called (with "unchanged"
+                                            // detail to distinguish from a real read).
+                                            write_frame(
+                                                writer,
+                                                &Response::ToolUse {
+                                                    name: tc.name.clone(),
+                                                    detail: format!("{path_str} (unchanged)"),
+                                                },
+                                            )
+                                            .await?;
+                                            messages.push(Message::tool_result(
+                                                &tc.id,
+                                                file_unchanged_stub(cached_id),
+                                            ));
+                                            continue;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        let tool_detail = match tc.name.as_str() {
+                            "shell_command" => args
+                                .get("command")
+                                .and_then(|v| v.as_str())
+                                .map(|s| {
+                                    if s.len() > 80 {
+                                        format!("{}…", &s[..80])
+                                    } else {
+                                        s.to_string()
+                                    }
+                                })
+                                .unwrap_or_default(),
+                            "read_file" | "edit_file" => args
+                                .get("path")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default()
+                                .to_string(),
+                            "tmux_send_keys" => args
+                                .get("keys")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default()
+                                .to_string(),
+                            "tmux_capture_pane" => args
+                                .get("target")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default()
+                                .to_string(),
+                            _ => String::new(),
+                        };
+                        write_frame(
+                            writer,
+                            &Response::ToolUse {
+                                name: tc.name.clone(),
+                                detail: tool_detail,
+                            },
+                        )
+                        .await?;
+
+                        // Extract the read_file path before args is consumed by execute.
+                        let read_path: Option<std::path::PathBuf> = if tc.name == "read_file" {
+                            args["path"].as_str().map(std::path::PathBuf::from)
+                        } else {
+                            None
+                        };
+
                         let result = match state.executor.execute(&tc.name, args).await {
                             Ok(output) => {
                                 tracing::debug!(
@@ -2184,7 +2376,28 @@ where
                                     output_len = output.len(),
                                     "tool succeeded"
                                 );
-                                truncate_chars(&output, MAX_TOOL_OUTPUT_CHARS)
+                                if !should_persist_tool_output(&tc.name) {
+                                    // Update dedup cache after a fresh read_file.
+                                    if let Some(path) = read_path {
+                                        if let Some(key) = file_cache_key(&path).await {
+                                            read_cache.insert(path, (key, tc.id.clone()));
+                                        }
+                                    }
+                                    // read_file is injected in full: it is the model's
+                                    // only path to complete file content.  Capping it
+                                    // would leave the model with a truncated view and
+                                    // no way to retrieve the rest.  The dedup cache
+                                    // above avoids re-injecting unchanged files.
+                                    output
+                                } else if output
+                                    .char_indices()
+                                    .nth(LARGE_TOOL_RESULT_CHARS)
+                                    .is_some()
+                                {
+                                    persist_large_result(output, &scratch_dir).await
+                                } else {
+                                    output
+                                }
                             }
                             Err(e) => {
                                 tracing::warn!(tool = %tc.name, error = %e, "tool failed");
@@ -3295,6 +3508,147 @@ mod tests {
         assert_eq!(
             compact_model("bedrock/us.anthropic.claude-opus-4-6-v1:0"),
             format!("bedrock/{}", crate::provider::DEFAULT_MODEL),
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // persist_large_result tests
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn large_tool_output_persisted_to_tmp() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let big_output = "x".repeat(51_000);
+        let result = persist_large_result(big_output, dir.path()).await;
+        // Stub must contain a path inside the scratch dir and a Preview section.
+        assert!(
+            result.contains(dir.path().to_str().unwrap()),
+            "result must contain the scratch dir path: {result}"
+        );
+        assert!(
+            result.contains(".txt"),
+            "result must reference a .txt file: {result}"
+        );
+        assert!(
+            result.contains("Preview:"),
+            "result must contain a preview header: {result}"
+        );
+        // Stub must be much shorter than the original 51K content.
+        assert!(
+            result.len() < 10_000,
+            "stub must be much shorter than 51K chars, got {} chars",
+            result.len()
+        );
+        // The file must exist in the scratch dir and contain the full content.
+        let files: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert_eq!(files.len(), 1, "exactly one file must be written");
+        let written = std::fs::read_to_string(files[0].path()).unwrap();
+        assert_eq!(written.len(), 51_000);
+    }
+
+    #[tokio::test]
+    async fn read_file_not_truncated_by_persist() {
+        // Validate that persist_large_result produces a short stub — confirming
+        // that the loop MUST skip it for read_file to preserve full content.
+        // The exemption itself is enforced by should_persist_tool_output (tested below).
+        let dir = tempfile::TempDir::new().unwrap();
+        let big_output = "x".repeat(51_000);
+        let stub = persist_large_result(big_output, dir.path()).await;
+        assert!(
+            stub.len() < 10_000,
+            "persist_large_result must produce a short stub: len={}",
+            stub.len()
+        );
+        assert!(
+            stub.contains("Preview:"),
+            "stub must contain a preview section"
+        );
+    }
+
+    #[test]
+    fn read_file_exempt_from_persistence() {
+        // should_persist_tool_output drives the read_file exemption in the loop.
+        // If this returns true for read_file, the loop would call persist_large_result
+        // and replace full file content with a stub, breaking the model's only path
+        // to read complete files.
+        assert!(!should_persist_tool_output("read_file"));
+        assert!(should_persist_tool_output("shell_command"));
+        assert!(should_persist_tool_output("tmux_capture_pane"));
+        assert!(should_persist_tool_output("tmux_wait"));
+        assert!(should_persist_tool_output("spawn_agent"));
+    }
+
+    #[tokio::test]
+    async fn read_file_dedup_returns_stub_when_unchanged() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let file_path = dir.path().join("test_file.txt");
+        std::fs::write(&file_path, "hello world content").unwrap();
+
+        let mut read_cache: std::collections::HashMap<std::path::PathBuf, ((u128, u64), String)> =
+            Default::default();
+
+        // First read: capture cache key and populate cache.
+        let key = file_cache_key(&file_path)
+            .await
+            .expect("metadata must be available");
+        read_cache.insert(file_path.clone(), (key, "first-call-id".to_string()));
+
+        // Second read with same key → dedup should produce a stub.
+        let key2 = file_cache_key(&file_path)
+            .await
+            .expect("metadata must be available");
+        let stub = if let Some((cached_key, cached_id)) = read_cache.get(&file_path) {
+            if *cached_key == key2 {
+                file_unchanged_stub(cached_id)
+            } else {
+                "NOT_STUB".to_string()
+            }
+        } else {
+            "NOT_STUB".to_string()
+        };
+        let expected = file_unchanged_stub("first-call-id");
+        assert_eq!(stub, expected, "second read must return unchanged stub");
+    }
+
+    #[tokio::test]
+    async fn read_file_dedup_re_reads_when_changed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let file_path = dir.path().join("test_file2.txt");
+        std::fs::write(&file_path, "original content").unwrap();
+
+        let key1 = file_cache_key(&file_path)
+            .await
+            .expect("metadata must be available");
+
+        let mut read_cache: std::collections::HashMap<std::path::PathBuf, ((u128, u64), String)> =
+            Default::default();
+        read_cache.insert(file_path.clone(), (key1, "first-call-id".to_string()));
+
+        // Modify the file to change its mtime and/or size.
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        std::fs::write(&file_path, "modified content — longer now").unwrap();
+
+        let key2 = file_cache_key(&file_path)
+            .await
+            .expect("metadata must be available");
+
+        // If both mtime and size are identical (coarse-resolution filesystem),
+        // the cache would not correctly detect the change — skip rather than fail.
+        if key1 == key2 {
+            return;
+        }
+
+        let is_stub = if let Some((cached_key, _cached_id)) = read_cache.get(&file_path) {
+            *cached_key == key2
+        } else {
+            false
+        };
+        assert!(
+            !is_stub,
+            "after file change, dedup must NOT produce a stub (cache key differs)"
         );
     }
 }
