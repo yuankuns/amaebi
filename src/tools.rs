@@ -215,6 +215,25 @@ async fn tmux_capture_pane(args: serde_json::Value) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+/// Build the argument list for `tmux send-keys`.
+///
+/// Extracted as a pure function so the argument-construction logic can be
+/// unit-tested without requiring a real tmux session.
+fn tmux_send_keys_argv(target: &str, keys: &str, press_enter: bool) -> Vec<String> {
+    let mut args = vec![
+        "send-keys".to_string(),
+        "-t".to_string(),
+        target.to_string(),
+        keys.to_string(),
+    ];
+    // Avoid a double Enter when the caller explicitly sends the "Enter" key name.
+    // e.g. keys="Enter", enter=true (default) presses Enter once, not twice.
+    if press_enter && keys != "Enter" {
+        args.push("Enter".to_string());
+    }
+    args
+}
+
 /// Send keystrokes to a tmux pane (for interactive programs).
 async fn tmux_send_keys(args: serde_json::Value) -> Result<String> {
     let keys = args["keys"]
@@ -222,17 +241,16 @@ async fn tmux_send_keys(args: serde_json::Value) -> Result<String> {
         .context("tmux_send_keys: missing string argument 'keys'")?;
     let target = args["target"].as_str().unwrap_or("%0");
     // Default true: append an Enter keystroke so text is submitted.
-    // Set enter=false to type text without pressing Enter (e.g. partial input).
+    // Set enter=false for single keypresses (q, Escape, C-c, arrow keys, etc.)
+    // to avoid an unintended trailing Enter.
     let press_enter = args["enter"].as_bool().unwrap_or(true);
 
-    let mut cmd = Command::new("tmux");
-    cmd.args(["send-keys", "-t", target, keys]);
-    // Avoid a double Enter when the caller explicitly sends the "Enter" key name.
-    // e.g. keys="Enter", enter=true (default) should press Enter once, not twice.
-    if press_enter && keys != "Enter" {
-        cmd.arg("Enter");
-    }
-    let output = cmd.output().await.context("spawning tmux send-keys")?;
+    let argv = tmux_send_keys_argv(target, keys, press_enter);
+    let output = Command::new("tmux")
+        .args(&argv)
+        .output()
+        .await
+        .context("spawning tmux send-keys")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -703,10 +721,10 @@ pub fn tool_schemas(include_spawn_agent: bool) -> Vec<serde_json::Value> {
                     "properties": {
                         "keys": {
                             "type": "string",
-                            "description": "Text to type or a single tmux key name \
-                                            (e.g. 'hello world', 'q'). \
-                                            For control keys like 'C-c' or 'Escape' set \
-                                            enter=false to avoid an unwanted trailing Enter."
+                            "description": "Text to type (e.g. 'hello world'). \
+                                            For single keypresses such as 'q', 'Escape', \
+                                            'C-c', or arrow keys, set enter=false to avoid \
+                                            an unintended trailing Enter keystroke."
                         },
                         "target": {
                             "type": "string",
@@ -1458,38 +1476,33 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn tmux_send_keys_appends_enter_by_default() {
-        // Verify that when enter=true (default) and keys != "Enter",
-        // the "Enter" key is appended as a separate tmux argument.
-        // We call the function with a pane that doesn't exist; the test only
-        // checks argument construction so we assert on the error (pane not found)
-        // rather than needing a real tmux session.
-        let result = tmux_send_keys(serde_json::json!({
-            "keys": "hello",
-            "target": "nonexistent_pane_xyz",
-            "enter": true
-        }))
-        .await;
-        // Expect a tmux error (pane not found), not a panic or argument error.
-        assert!(result.is_err(), "should fail on nonexistent pane");
+    #[test]
+    fn tmux_send_keys_argv_appends_enter_by_default() {
+        // Default (press_enter=true) appends "Enter" as a separate arg.
+        let argv = tmux_send_keys_argv("%0", "hello world", true);
+        assert_eq!(argv.last().map(|s| s.as_str()), Some("Enter"));
+        assert!(argv.contains(&"hello world".to_string()));
     }
 
-    #[tokio::test]
-    async fn tmux_send_keys_no_double_enter_when_keys_is_enter() {
-        // If keys="Enter" and enter=true (default), only one Enter should be sent.
-        // Regression: previously this would send "Enter" Enter — two keystrokes.
-        // We verify by checking that the fn doesn't panic on this input combination.
-        let result = tmux_send_keys(serde_json::json!({
-            "keys": "Enter",
-            "target": "nonexistent_pane_xyz"
-        }))
-        .await;
-        // Expect a tmux error (pane not found), not an argument panic.
-        assert!(
-            result.is_err(),
-            "should fail on nonexistent pane, not panic"
-        );
+    #[test]
+    fn tmux_send_keys_argv_no_enter_when_disabled() {
+        let argv = tmux_send_keys_argv("%0", "hello", false);
+        assert!(!argv.contains(&"Enter".to_string()));
+    }
+
+    #[test]
+    fn tmux_send_keys_argv_no_double_enter_when_keys_is_enter() {
+        // keys="Enter" + press_enter=true should produce only one "Enter" in argv.
+        let argv = tmux_send_keys_argv("%0", "Enter", true);
+        let enter_count = argv.iter().filter(|a| a.as_str() == "Enter").count();
+        assert_eq!(enter_count, 1, "must send exactly one Enter: {argv:?}");
+    }
+
+    #[test]
+    fn tmux_send_keys_argv_control_key_no_trailing_enter() {
+        // C-c with enter=false must not append Enter (would confuse the program).
+        let argv = tmux_send_keys_argv("%0", "C-c", false);
+        assert!(!argv.contains(&"Enter".to_string()));
     }
 
     #[tokio::test]
