@@ -1257,19 +1257,22 @@ async fn file_cache_key(path: &std::path::Path) -> Option<(u128, u64)> {
     Some((mtime, meta.len()))
 }
 
-/// RAII guard that removes a directory tree on drop (best-effort).
+/// RAII guard that removes a directory tree when dropped (best-effort).
 ///
-/// `drop` uses synchronous `remove_dir_all` because `Drop` cannot be async.
-/// This is intentional: /tmp is a local filesystem so the latency is negligible
-/// even for large files, and the call happens only at loop exit (not on the hot
-/// path).  Each file is the full output of one tool call (no upper bound enforced
-/// beyond system memory); the file count is bounded by the session's tool-call count.
+/// Deletion is performed on a background thread so the Tokio worker is never
+/// blocked, even when many large files were persisted.  Each file holds one full
+/// tool-call output (no enforced upper bound beyond system memory); the file
+/// count is bounded by the session's tool-call count.
 struct ScratchDirGuard(std::path::PathBuf);
 
 impl Drop for ScratchDirGuard {
     fn drop(&mut self) {
-        // Best-effort; /tmp is ephemeral so lingering files on failure are fine.
-        let _ = std::fs::remove_dir_all(&self.0);
+        let path = self.0.clone();
+        // Spawn a thread so we don't block the Tokio runtime on drop.
+        // Best-effort: /tmp is ephemeral so lingering files on failure are fine.
+        std::thread::spawn(move || {
+            let _ = std::fs::remove_dir_all(&path);
+        });
     }
 }
 
@@ -1836,13 +1839,26 @@ where
     // on all exit paths (normal return and early `?` returns).
     let run_id = uuid::Uuid::new_v4().to_string();
     let scratch_dir = std::path::PathBuf::from(format!("/tmp/amaebi-tool-results/{run_id}"));
-    tokio::fs::create_dir_all(&scratch_dir).await.ok();
-    // Set directory permissions to 0700 so tool outputs are not world-readable.
+    if let Err(e) = tokio::fs::create_dir_all(&scratch_dir).await {
+        tracing::warn!(
+            path = %scratch_dir.display(),
+            error = %e,
+            "failed to create tool-output scratch dir; large outputs will be truncated inline"
+        );
+    }
+    // Restrict to 0700 so persisted tool outputs are not world-readable.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
-        let _ =
-            tokio::fs::set_permissions(&scratch_dir, std::fs::Permissions::from_mode(0o700)).await;
+        if let Err(e) =
+            tokio::fs::set_permissions(&scratch_dir, std::fs::Permissions::from_mode(0o700)).await
+        {
+            tracing::warn!(
+                path = %scratch_dir.display(),
+                error = %e,
+                "failed to set scratch dir permissions to 0700"
+            );
+        }
     }
     let _scratch_guard = ScratchDirGuard(scratch_dir.clone());
 
@@ -2262,87 +2278,7 @@ where
 
                         tracing::debug!(tool = %tc.name, "executing tool");
 
-                        // read_file dedup: skip re-read if file is unchanged.
-                        // Both mtime and size are compared to reduce false hits on
-                        // filesystems with coarse mtime resolution (e.g. FAT32).
-                        if tc.name == "read_file" {
-                            if let Ok(args) = tc.parse_args() {
-                                if let Some(path_str) = args["path"].as_str() {
-                                    let path = std::path::PathBuf::from(path_str);
-                                    if let Some(key) = file_cache_key(&path).await {
-                                        if let Some((cached_key, cached_id)) = read_cache.get(&path)
-                                        {
-                                            if *cached_key == key {
-                                                // Emit a ToolUse frame so the UI shows
-                                                // the tool was called (with "unchanged"
-                                                // detail to distinguish from a real read).
-                                                write_frame(
-                                                    writer,
-                                                    &Response::ToolUse {
-                                                        name: tc.name.clone(),
-                                                        detail: format!("{path_str} (unchanged)"),
-                                                    },
-                                                )
-                                                .await?;
-                                                messages.push(Message::tool_result(
-                                                    &tc.id,
-                                                    file_unchanged_stub(cached_id),
-                                                ));
-                                                continue;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        let tool_detail = {
-                            let args: serde_json::Value = serde_json::from_str(&tc.arguments)
-                                .unwrap_or(serde_json::Value::Null);
-                            match tc.name.as_str() {
-                                "shell_command" => args
-                                    .get("command")
-                                    .and_then(|v| v.as_str())
-                                    .map(|s| {
-                                        if s.len() > 80 {
-                                            format!("{}…", &s[..80])
-                                        } else {
-                                            s.to_string()
-                                        }
-                                    })
-                                    .unwrap_or_default(),
-                                "read_file" => args
-                                    .get("path")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or_default()
-                                    .to_string(),
-                                "edit_file" => args
-                                    .get("path")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or_default()
-                                    .to_string(),
-                                "tmux_send_keys" => args
-                                    .get("keys")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or_default()
-                                    .to_string(),
-                                "tmux_capture_pane" => args
-                                    .get("target")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or_default()
-                                    .to_string(),
-                                _ => String::new(),
-                            }
-                        };
-                        write_frame(
-                            writer,
-                            &Response::ToolUse {
-                                name: tc.name.clone(),
-                                detail: tool_detail,
-                            },
-                        )
-                        .await?;
-
+                        // Parse args once; reused for dedup, tool_detail, and execution.
                         let args = match tc.parse_args() {
                             Ok(v) => v,
                             Err(e) => {
@@ -2354,6 +2290,76 @@ where
                                 continue;
                             }
                         };
+
+                        // read_file dedup: skip re-read if file is unchanged.
+                        // Both mtime and size are compared to reduce false hits on
+                        // filesystems with coarse mtime resolution (e.g. FAT32).
+                        if tc.name == "read_file" {
+                            if let Some(path_str) = args["path"].as_str() {
+                                let path = std::path::PathBuf::from(path_str);
+                                if let Some(key) = file_cache_key(&path).await {
+                                    if let Some((cached_key, cached_id)) = read_cache.get(&path) {
+                                        if *cached_key == key {
+                                            // Emit a ToolUse frame so the UI shows
+                                            // the tool was called (with "unchanged"
+                                            // detail to distinguish from a real read).
+                                            write_frame(
+                                                writer,
+                                                &Response::ToolUse {
+                                                    name: tc.name.clone(),
+                                                    detail: format!("{path_str} (unchanged)"),
+                                                },
+                                            )
+                                            .await?;
+                                            messages.push(Message::tool_result(
+                                                &tc.id,
+                                                file_unchanged_stub(cached_id),
+                                            ));
+                                            continue;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        let tool_detail = match tc.name.as_str() {
+                            "shell_command" => args
+                                .get("command")
+                                .and_then(|v| v.as_str())
+                                .map(|s| {
+                                    if s.len() > 80 {
+                                        format!("{}…", &s[..80])
+                                    } else {
+                                        s.to_string()
+                                    }
+                                })
+                                .unwrap_or_default(),
+                            "read_file" | "edit_file" => args
+                                .get("path")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default()
+                                .to_string(),
+                            "tmux_send_keys" => args
+                                .get("keys")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default()
+                                .to_string(),
+                            "tmux_capture_pane" => args
+                                .get("target")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default()
+                                .to_string(),
+                            _ => String::new(),
+                        };
+                        write_frame(
+                            writer,
+                            &Response::ToolUse {
+                                name: tc.name.clone(),
+                                detail: tool_detail,
+                            },
+                        )
+                        .await?;
+
                         // Extract the read_file path before args is consumed by execute.
                         let read_path: Option<std::path::PathBuf> = if tc.name == "read_file" {
                             args["path"].as_str().map(std::path::PathBuf::from)
