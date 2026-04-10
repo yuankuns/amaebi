@@ -614,7 +614,7 @@ async fn spawn_agent(args: serde_json::Value, ctx: &SpawnContext) -> Result<Stri
 
     // Fix 5: child agents do not get spawn_agent in their tool schema to
     // prevent unbounded recursion at the schema level.
-    let (final_text, _, _) = crate::daemon::run_agentic_loop(
+    let (final_text, _, _, _) = crate::daemon::run_agentic_loop(
         &child_state,
         &model,
         messages,
@@ -898,6 +898,37 @@ pub fn tool_schemas(include_spawn_agent: bool) -> Vec<serde_json::Value> {
             }
         }));
     }
+
+    // switch_model is always available (not gated on include_spawn_agent).
+    // The tool has no executor implementation — it is intercepted and handled
+    // directly inside run_agentic_loop before the executor is called.
+    schemas.push(serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": "switch_model",
+            "description": "Switch the AI model used for the remainder of this session. \
+                            Use a more capable model (e.g. claude-opus-4.6) for tasks \
+                            requiring deep reasoning or planning; switch back to a faster \
+                            model (e.g. claude-sonnet-4.6) for routine work like reading \
+                            files or running commands.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "model": {
+                        "type": "string",
+                        "description": (format!(
+                            "Model to switch to. Supports provider/model format \
+                             (e.g. bedrock/claude-opus-4.6, copilot/gpt-4o). \
+                             Project default: {}.",
+                            crate::provider::DEFAULT_MODEL
+                        ))
+                    }
+                },
+                "required": ["model"]
+            }
+        }
+    }));
+
     schemas
 }
 
@@ -929,6 +960,7 @@ mod tests {
             "read_file",
             "edit_file",
             "spawn_agent",
+            "switch_model",
         ] {
             assert!(names.contains(&name), "missing tool: {name}");
         }
@@ -1508,6 +1540,41 @@ mod tests {
         assert!(
             result.starts_with("timeout:"),
             "directory must not match: {result}"
+        );
+    }
+
+    // ---- switch_model schema -----------------------------------------------
+
+    #[test]
+    fn switch_model_schema_present_in_all_modes() {
+        // switch_model must always be available, regardless of include_spawn_agent.
+        for include in [true, false] {
+            let schemas = tool_schemas(include);
+            let names: Vec<&str> = schemas
+                .iter()
+                .map(|s| s["function"]["name"].as_str().unwrap())
+                .collect();
+            assert!(
+                names.contains(&"switch_model"),
+                "switch_model must be present when include_spawn_agent={include}"
+            );
+        }
+    }
+
+    #[test]
+    fn switch_model_schema_has_required_model_param() {
+        let schemas = tool_schemas(true);
+        let schema = schemas
+            .iter()
+            .find(|s| s["function"]["name"] == "switch_model")
+            .expect("switch_model schema must exist");
+        let required = schema["function"]["parameters"]["required"]
+            .as_array()
+            .expect("required must be an array");
+        let required_names: Vec<&str> = required.iter().filter_map(|v| v.as_str()).collect();
+        assert!(
+            required_names.contains(&"model"),
+            "switch_model must require 'model': {required_names:?}"
         );
     }
 }
