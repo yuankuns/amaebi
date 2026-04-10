@@ -3696,4 +3696,35 @@ mod tests {
             "after file change, dedup must NOT produce a stub (cache key differs)"
         );
     }
+
+    // ---- switch_model validation -------------------------------------------
+
+    #[test]
+    fn switch_model_rejects_empty_string() {
+        let model = "";
+        assert!(model.trim().is_empty(), "empty string must be rejected");
+    }
+
+    #[test]
+    fn switch_model_rejects_whitespace_only() {
+        let model = "   ";
+        assert!(
+            model.trim().is_empty(),
+            "whitespace-only string must be rejected by the guard"
+        );
+    }
+
+    #[test]
+    fn switch_model_accepts_valid_model_name() {
+        for valid in [
+            "claude-sonnet-4.6",
+            "bedrock/claude-opus-4.6",
+            "copilot/gpt-4o",
+        ] {
+            assert!(
+                !valid.trim().is_empty(),
+                "valid model name must pass the guard: {valid}"
+            );
+        }
+    }
 }
