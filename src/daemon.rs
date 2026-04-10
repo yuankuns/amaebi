@@ -2221,10 +2221,16 @@ where
                                         return format!("argument error: {e:#}");
                                     }
                                 };
+                                tracing::debug!(
+                                    tool = %tc.name,
+                                    model = %model,
+                                    "executing tool"
+                                );
                                 match state.executor.execute(&tc.name, args).await {
                                     Ok(output) => {
                                         tracing::debug!(
                                             tool = %tc.name,
+                                            model = %model,
                                             output_len = output.len(),
                                             "tool succeeded"
                                         );
@@ -2278,7 +2284,7 @@ where
                             break;
                         }
 
-                        tracing::debug!(tool = %tc.name, "executing tool");
+                        tracing::debug!(tool = %tc.name, model = %model, "executing tool");
 
                         // Parse args once; reused for dedup, tool_detail, and execution.
                         let args = match tc.parse_args() {
@@ -2373,6 +2379,7 @@ where
                             Ok(output) => {
                                 tracing::debug!(
                                     tool = %tc.name,
+                                    model = %model,
                                     output_len = output.len(),
                                     "tool succeeded"
                                 );
