@@ -1173,62 +1173,74 @@ fn should_persist_tool_output(tool_name: &str) -> bool {
 /// Write `content` to `scratch_dir/{uuid}.txt` and return a stub message
 /// containing a preview (up to 2 000 Unicode scalar values) and the file path.
 ///
-/// The filename is a fresh UUID v4, guaranteeing uniqueness across concurrent
-/// tool calls.  The file is created with mode 0600 (unix) so that tool outputs,
-/// which may include secrets, are not world-readable.  The blocking open+write
-/// runs in `spawn_blocking` to avoid stalling the Tokio runtime.
+/// **Unix only**: the file is created with mode 0600 so that tool outputs,
+/// which may include secrets, are not world-readable.  On non-unix platforms
+/// this function always returns an inline fallback stub (no disk write) because
+/// equivalent permission hardening is not available.
 ///
-/// If the write fails (e.g. /tmp not writable) the stub is returned inline with
-/// an explicit note that persistence failed, so the model knows the full output
-/// is unavailable rather than silently receiving a truncated fragment.
+/// The filename is a fresh UUID v4, guaranteeing uniqueness across concurrent
+/// tool calls.  The blocking open+write runs in `spawn_blocking` to avoid
+/// stalling the Tokio runtime.
+///
+/// If the write fails the stub is returned inline with an explicit note so the
+/// model knows the full output is unavailable.
 ///
 /// Note: persistence is triggered when an output *exceeds* `LARGE_TOOL_RESULT_CHARS`;
-/// the written file contains the full output and may therefore be larger than that
-/// threshold.  The scratch directory is cleaned up when the loop exits via
-/// `ScratchDirGuard`.
+/// files contain the full output and may therefore be larger than that threshold.
+/// Files are intentionally **not** deleted when the loop exits: stubs in
+/// `carried_messages` reference these paths across Chat turns, and deleting them
+/// would cause `read_file` calls on those paths to fail with NotFound.  /tmp is
+/// cleaned by the OS on reboot.
 async fn persist_large_result(content: String, scratch_dir: &std::path::Path) -> String {
-    // Use a UUID filename to guarantee uniqueness regardless of tool_use_id content.
-    let path = scratch_dir.join(format!("{}.txt", uuid::Uuid::new_v4()));
     let total = content.len(); // byte count — O(1), good enough for display
     let preview: String = content.chars().take(2_000).collect();
 
-    match write_tool_output_file(&path, content).await {
-        Ok(()) => format!(
-            "[output truncated: {total} bytes → {path}\n\nPreview:\n{preview}\n...]",
-            path = path.display()
-        ),
-        Err(e) => format!(
-            "[output truncated: {total} bytes — could not persist to /tmp ({e}). \
+    // Unix: write with mode 0600 and return a path stub.
+    #[cfg(unix)]
+    let result = {
+        let path = scratch_dir.join(format!("{}.txt", uuid::Uuid::new_v4()));
+        match write_tool_output_file(&path, content).await {
+            Ok(()) => format!(
+                "[output truncated: {total} bytes → {path}\n\nPreview:\n{preview}\n...]",
+                path = path.display()
+            ),
+            Err(e) => format!(
+                "[output truncated: {total} bytes — could not persist to /tmp ({e}). \
+                 Preview:\n{preview}\n...]"
+            ),
+        }
+    };
+
+    // Non-unix: no 0600-equivalent permission guarantee, return inline.
+    #[cfg(not(unix))]
+    let result = {
+        let _ = scratch_dir;
+        format!(
+            "[output truncated: {total} bytes — persistence unavailable on this platform. \
              Preview:\n{preview}\n...]"
-        ),
-    }
+        )
+    };
+
+    result
 }
 
-/// Write `content` to `path` with mode 0600 (unix) using `spawn_blocking` to
-/// avoid stalling the async runtime.  Falls back to a plain async write on
-/// non-unix platforms.  Takes ownership of `content` so the caller avoids an
-/// extra clone for large outputs.
+/// Write `content` to `path` with mode 0600 using `spawn_blocking`.
+/// Only compiled on unix; callers on other platforms skip the write entirely.
+#[cfg(unix)]
 async fn write_tool_output_file(path: &std::path::Path, content: String) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        let path = path.to_owned();
-        tokio::task::spawn_blocking(move || {
-            use std::io::Write as _;
-            use std::os::unix::fs::OpenOptionsExt as _;
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&path)?;
-            file.write_all(content.as_bytes())
-        })
-        .await
-        .map_err(std::io::Error::other)?
-    }
-    #[cfg(not(unix))]
-    {
-        tokio::fs::write(path, content).await
-    }
+    let path = path.to_owned();
+    tokio::task::spawn_blocking(move || {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)?;
+        file.write_all(content.as_bytes())
+    })
+    .await
+    .map_err(std::io::Error::other)?
 }
 
 /// Format the "file unchanged" stub returned by the read_file dedup check.
@@ -1257,31 +1269,12 @@ async fn file_cache_key(path: &std::path::Path) -> Option<(u128, u64)> {
     Some((mtime, meta.len()))
 }
 
-/// RAII guard that removes a directory tree when dropped (best-effort).
-///
-/// Deletion is performed on a background thread so the Tokio worker is never
-/// blocked, even when many large files were persisted.  Each file holds one full
-/// tool-call output (no enforced upper bound beyond system memory); the file
-/// count is bounded by the session's tool-call count.
-struct ScratchDirGuard(std::path::PathBuf);
-
-impl Drop for ScratchDirGuard {
-    fn drop(&mut self) {
-        let path = self.0.clone();
-        // Prefer Tokio's bounded blocking pool; fall back to a raw thread only
-        // when no runtime is available (e.g. during shutdown or in tests).
-        // Best-effort: /tmp is ephemeral so lingering files on failure are fine.
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn_blocking(move || {
-                let _ = std::fs::remove_dir_all(&path);
-            });
-        } else {
-            std::thread::spawn(move || {
-                let _ = std::fs::remove_dir_all(&path);
-            });
-        }
-    }
-}
+// Note: there is intentionally no ScratchDirGuard / cleanup for the per-run
+// scratch directory.  Stubs written into tool_result messages reference paths
+// under this directory, and those messages are carried across Chat turns in
+// carried_messages.  Deleting the directory when run_agentic_loop returns would
+// cause read_file calls on those paths to fail with NotFound on the next turn.
+// The directory is left in /tmp for the OS to clean up on reboot.
 
 // ---------------------------------------------------------------------------
 // Memory helpers — canonical DB access for daemon and ACP agent
@@ -1842,33 +1835,35 @@ where
     let mut conclusion_nudge_sent = false;
     let mut last_prompt_tokens: usize;
 
-    // Per-run scratch directory for large tool outputs.  Cleaned up via RAII
-    // on all exit paths (normal return and early `?` returns).
-    let run_id = uuid::Uuid::new_v4().to_string();
-    let scratch_dir = std::path::PathBuf::from(format!("/tmp/amaebi-tool-results/{run_id}"));
-    if let Err(e) = tokio::fs::create_dir_all(&scratch_dir).await {
-        tracing::warn!(
-            path = %scratch_dir.display(),
-            error = %e,
-            "failed to create tool-output scratch dir; large outputs will be truncated inline"
-        );
-    }
-    // Restrict to 0700 so persisted tool outputs are not world-readable.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        if let Err(e) =
-            tokio::fs::set_permissions(&scratch_dir, std::fs::Permissions::from_mode(0o700)).await
+    // Per-run scratch directory for large tool outputs (unix only).
+    // Intentionally not cleaned up on exit — see comment near ScratchDirGuard
+    // for rationale.  /tmp is cleaned by the OS on reboot.
+    let scratch_dir = {
+        #[cfg(unix)]
         {
-            tracing::warn!(
-                path = %scratch_dir.display(),
-                error = %e,
-                "failed to set scratch dir permissions to 0700"
-            );
+            use std::os::unix::fs::PermissionsExt as _;
+            let run_id = uuid::Uuid::new_v4().to_string();
+            let dir = std::path::PathBuf::from(format!("/tmp/amaebi-tool-results/{run_id}"));
+            if let Err(e) = tokio::fs::create_dir_all(&dir).await {
+                tracing::warn!(
+                    path = %dir.display(),
+                    error = %e,
+                    "failed to create tool-output scratch dir; large outputs will be truncated inline"
+                );
+            } else if let Err(e) =
+                tokio::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).await
+            {
+                tracing::warn!(
+                    path = %dir.display(),
+                    error = %e,
+                    "failed to set scratch dir permissions to 0700"
+                );
+            }
+            dir
         }
-    }
-    let _scratch_guard = ScratchDirGuard(scratch_dir.clone());
-
+        #[cfg(not(unix))]
+        std::path::PathBuf::new() // unused placeholder; persist_large_result is no-op on non-unix
+    };
     // read_file dedup cache: path → ((mtime_nanos, size_bytes), tool_use_id of last read).
     // Both mtime and size are stored to reduce false hits on filesystems with
     // coarse mtime granularity where content can change without mtime advancing.
