@@ -590,7 +590,7 @@ async fn spawn_agent(args: serde_json::Value, ctx: &SpawnContext) -> Result<Stri
 
     // Fix 5: child agents do not get spawn_agent in their tool schema to
     // prevent unbounded recursion at the schema level.
-    let (final_text, _, _) = crate::daemon::run_agentic_loop(
+    let (final_text, _, _, _) = crate::daemon::run_agentic_loop(
         &child_state,
         &model,
         messages,
@@ -885,7 +885,7 @@ pub fn tool_schemas(include_spawn_agent: bool) -> Vec<serde_json::Value> {
                         "description": (format!(
                             "Model to switch to. Supports provider/model format \
                              (e.g. bedrock/claude-opus-4.6, copilot/gpt-4o). \
-                             Current default: {}.",
+                             Project default: {}.",
                             crate::provider::DEFAULT_MODEL
                         ))
                     }

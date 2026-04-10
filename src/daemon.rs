@@ -487,6 +487,10 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
     // Tracks the session_id so context is reset when the client switches sessions.
     let mut carried_messages: Option<Vec<Message>> = None;
     let mut carried_session_id: Option<String> = None;
+    // Carries the effective model across Chat turns: updated when switch_model
+    // is called inside run_agentic_loop so the new model persists for the
+    // remainder of the session, not just the current agentic loop invocation.
+    let mut carried_model: Option<String> = None;
     // Count of unsolicited frames received while an agentic loop was running.
     // Flushed as error responses after the loop releases the writer lock.
     let mut pending_unsolicited: u32 = 0;
@@ -600,7 +604,7 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                     match run_agentic_loop(&state, &model, messages, &mut sink, &mut steer_rx, true)
                         .await
                     {
-                        Ok((final_text, _, _)) => {
+                        Ok((final_text, _, _, _)) => {
                             store_conversation(
                                 &state,
                                 &sid,
@@ -665,6 +669,7 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                     &mut conn_state,
                     &mut carried_messages,
                     &mut carried_session_id,
+                    &mut carried_model,
                     &mut chat_session_guard,
                     prompt,
                     tmux_pane,
@@ -723,7 +728,7 @@ async fn drive_agentic_loop(
     expected_sid: &str,
     messages: Vec<Message>,
     model: &str,
-) -> Option<anyhow::Result<(String, usize, Vec<Message>)>> {
+) -> Option<anyhow::Result<(String, usize, Vec<Message>, String)>> {
     let (steer_tx, mut steer_rx) = tokio::sync::mpsc::channel::<Option<String>>(16);
     let writer_loop = Arc::clone(writer);
     let state_loop = Arc::clone(state);
@@ -898,7 +903,7 @@ async fn handle_resume_request(
     };
     flush_pending_unsolicited(writer, conn_state.pending_unsolicited).await;
     match result {
-        Ok((response_text, _, _)) => {
+        Ok((response_text, _, _, _)) => {
             store_conversation(
                 state,
                 &session_id,
@@ -937,6 +942,7 @@ async fn handle_chat_request(
     conn_state: &mut ConnState<'_>,
     carried_messages: &mut Option<Vec<Message>>,
     carried_session_id: &mut Option<String>,
+    carried_model: &mut Option<String>,
     chat_session_guard: &mut Option<ActiveSessionGuard>,
     prompt: String,
     tmux_pane: Option<String>,
@@ -1038,16 +1044,18 @@ async fn handle_chat_request(
     };
 
     let pre_send_tokens = count_message_tokens(&messages);
-    let threshold = compaction_threshold_tokens(&model);
+    // If a switch_model call updated the model in a previous turn, use it.
+    let effective_model = carried_model.take().unwrap_or(model);
+    let threshold = compaction_threshold_tokens(&effective_model);
     let Some(loop_result) =
-        drive_agentic_loop(state, writer, conn_state, &sid, messages, &model).await
+        drive_agentic_loop(state, writer, conn_state, &sid, messages, &effective_model).await
     else {
         return Ok(ConnAction::Break);
     };
     flush_pending_unsolicited(writer, conn_state.pending_unsolicited).await;
 
     match loop_result {
-        Ok((response_text, prompt_tokens, final_messages)) => {
+        Ok((response_text, prompt_tokens, final_messages, final_model)) => {
             store_conversation(
                 state,
                 &sid,
@@ -1075,7 +1083,7 @@ async fn handle_chat_request(
                     tokio::spawn(compact_session(
                         Arc::clone(state),
                         sid.clone(),
-                        compact_model(&model),
+                        compact_model(&effective_model),
                         HOT_TAIL_PAIRS * 2,
                     ));
                 }
@@ -1084,6 +1092,8 @@ async fn handle_chat_request(
             drop(w);
             *carried_messages = Some(final_messages);
             *carried_session_id = Some(sid.clone());
+            // Persist the final model so the next turn starts with it.
+            *carried_model = Some(final_model);
         }
         Err(e) => {
             tracing::error!(error = %e, "agentic loop error");
@@ -1097,6 +1107,7 @@ async fn handle_chat_request(
             .await;
             *carried_messages = None;
             *carried_session_id = None;
+            *carried_model = None;
         }
     }
     Ok(ConnAction::Continue)
@@ -1168,6 +1179,25 @@ fn truncate_chars(s: &str, max: usize) -> String {
 /// preview, severing its ability to read files larger than the preview window.
 fn should_persist_tool_output(tool_name: &str) -> bool {
     tool_name != "read_file"
+}
+
+/// Validate and normalise the `model` argument from a `switch_model` tool call.
+///
+/// Returns `Ok(trimmed_model)` on success, or `Err(error_message)` if the
+/// argument is missing or blank.  Trimming ensures leading/trailing whitespace
+/// does not silently change provider routing behaviour.
+fn parse_switch_model_arg(raw: Option<&str>) -> Result<String, String> {
+    match raw {
+        None => Err("error: switch_model: missing 'model' argument".to_string()),
+        Some(s) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                Err("error: switch_model: 'model' must not be empty".to_string())
+            } else {
+                Ok(trimmed.to_string())
+            }
+        }
+    }
 }
 
 /// Write `content` to `scratch_dir/{uuid}.txt` and return a stub message
@@ -1825,7 +1855,7 @@ pub(crate) async fn run_agentic_loop<W>(
     writer: &mut W,
     steer_rx: &mut tokio::sync::mpsc::Receiver<Option<String>>,
     include_spawn_agent: bool,
-) -> Result<(String, usize, Vec<Message>)>
+) -> Result<(String, usize, Vec<Message>, String)>
 where
     W: AsyncWriteExt + Unpin,
 {
@@ -2375,16 +2405,11 @@ where
 
                         // switch_model is handled here, not by the executor.
                         if tc.name == "switch_model" {
-                            let result = match args["model"].as_str() {
-                                None => "error: switch_model: missing 'model' argument".to_string(),
-                                Some(new_model) if new_model.trim().is_empty() => {
-                                    "error: switch_model: 'model' must not be empty".to_string()
-                                }
-                                Some(new_model) => {
-                                    let old = std::mem::replace(
-                                        &mut current_model,
-                                        new_model.to_string(),
-                                    );
+                            let result = match parse_switch_model_arg(args["model"].as_str()) {
+                                Err(e) => e,
+                                Ok(new_model) => {
+                                    let old =
+                                        std::mem::replace(&mut current_model, new_model.clone());
                                     tracing::info!(
                                         old = %old,
                                         new = %current_model,
@@ -2506,7 +2531,7 @@ where
         }
     }
 
-    Ok((final_text, last_prompt_tokens, messages))
+    Ok((final_text, last_prompt_tokens, messages, current_model))
 }
 
 // ---------------------------------------------------------------------------
@@ -2784,7 +2809,7 @@ async fn run_cron_job(state: Arc<DaemonState>, job: &cron::CronJob) {
     let result = run_agentic_loop(&state, &model, messages, &mut sink, &mut steer_rx, true).await;
 
     let (output, run_ok) = match result {
-        Ok((final_text, _, _)) => {
+        Ok((final_text, _, _, _)) => {
             store_conversation(&state, &session_id, &job.description, &final_text).await;
             (final_text, true)
         }
@@ -3697,34 +3722,39 @@ mod tests {
         );
     }
 
-    // ---- switch_model validation -------------------------------------------
+    // ---- switch_model validation (via parse_switch_model_arg helper) -------
+
+    #[test]
+    fn switch_model_rejects_missing_arg() {
+        assert!(parse_switch_model_arg(None).is_err());
+    }
 
     #[test]
     fn switch_model_rejects_empty_string() {
-        let model = "";
-        assert!(model.trim().is_empty(), "empty string must be rejected");
+        assert!(parse_switch_model_arg(Some("")).is_err());
     }
 
     #[test]
     fn switch_model_rejects_whitespace_only() {
-        let model = "   ";
-        assert!(
-            model.trim().is_empty(),
-            "whitespace-only string must be rejected by the guard"
-        );
+        assert!(parse_switch_model_arg(Some("   ")).is_err());
     }
 
     #[test]
     fn switch_model_accepts_valid_model_name() {
-        for valid in [
+        for raw in [
             "claude-sonnet-4.6",
             "bedrock/claude-opus-4.6",
             "copilot/gpt-4o",
         ] {
-            assert!(
-                !valid.trim().is_empty(),
-                "valid model name must pass the guard: {valid}"
-            );
+            let result = parse_switch_model_arg(Some(raw));
+            assert!(result.is_ok(), "valid model must be accepted: {raw}");
+            assert_eq!(result.unwrap(), raw);
         }
+    }
+
+    #[test]
+    fn switch_model_trims_whitespace() {
+        let result = parse_switch_model_arg(Some("  claude-opus-4.6  "));
+        assert_eq!(result.unwrap(), "claude-opus-4.6");
     }
 }

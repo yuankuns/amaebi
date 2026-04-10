@@ -277,7 +277,7 @@ impl acp::Agent for AmaebiAgent {
                 true,
             )
             .await
-            .map(|(text, tokens, _messages)| (text, tokens)) // discard messages Vec
+            .map(|(text, tokens, _messages, _model)| (text, tokens)) // discard messages Vec
             .map_err(|e| format!("{e:#}"));
             let _ = result_tx.send(outcome);
             // Dropping write_half closes the pipe, signalling EOF to the reader.
