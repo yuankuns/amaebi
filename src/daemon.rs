@@ -941,15 +941,25 @@ async fn handle_claude_launch(
         //
         // Each element is (keys, press_enter).
         let key_sequence: Vec<(String, bool)> = if had_claude {
-            vec![(description.clone(), auto_enter)]
+            // Reusing an existing claude session in the same worktree: compact
+            // the prior conversation first so stale context does not pollute
+            // the new task, then inject the description.
+            vec![
+                ("/compact".to_string(), true),
+                (description.clone(), auto_enter),
+            ]
         } else {
+            // Fresh pane: launch claude with --dangerously-skip-permissions so
+            // the autonomous session never blocks on an interactive approval
+            // prompt, then inject the description as the opening message.
             let launch_cmd = if let Some(ref wt) = worktree {
-                format!("cd {} && claude", shell_escape(wt))
+                format!(
+                    "cd {} && claude --dangerously-skip-permissions",
+                    shell_escape(wt)
+                )
             } else {
-                "claude".to_string()
+                "claude --dangerously-skip-permissions".to_string()
             };
-            // Launch `claude` with Enter, then queue the description without
-            // Enter so the user can review it before submitting.
             vec![(launch_cmd, true), (description.clone(), auto_enter)]
         };
 
