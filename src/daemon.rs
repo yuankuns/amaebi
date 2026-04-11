@@ -1124,8 +1124,19 @@ fn create_task_worktree(
         .and_then(|n| n.to_str())
         .unwrap_or("repo");
 
-    // Place worktrees under ~/.amaebi/worktrees/<repo>/<task_id> so they are
-    // centralised alongside other amaebi state and never pollute the repo tree.
+    // Place worktrees under ~/.amaebi/worktrees/<repo>/<task_id>-<uuid8>.
+    // A short UUID suffix guarantees uniqueness across runs so repeated
+    // invocations with the same task description never collide on the branch
+    // name or directory path — the same approach Claude Code uses for its own
+    // agent worktrees (agent-{uuid8}).
+    let short_id = uuid::Uuid::new_v4()
+        .to_string()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(8)
+        .collect::<String>();
+    let unique_name = format!("{task_id}-{short_id}");
+
     let home = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
         .context("HOME environment variable not set")?;
@@ -1133,7 +1144,7 @@ fn create_task_worktree(
         .join(".amaebi")
         .join("worktrees")
         .join(repo_name)
-        .join(task_id);
+        .join(&unique_name);
 
     // Ensure the parent directory exists before calling git.
     let wt_parent = wt_path
@@ -1142,7 +1153,7 @@ fn create_task_worktree(
     std::fs::create_dir_all(wt_parent)
         .with_context(|| format!("creating worktree parent directory {}", wt_parent.display()))?;
 
-    // Create the worktree on a new branch with the same name as the task.
+    // Create the worktree on a new branch named <task_id>-<uuid8>.
     let mut git_cmd = std::process::Command::new("git");
     if let Some(cwd) = client_cwd {
         git_cmd.args(["-C", cwd]);
@@ -1155,7 +1166,7 @@ fn create_task_worktree(
                 .to_str()
                 .context("worktree path is not valid UTF-8")?,
             "-b",
-            task_id,
+            &unique_name,
         ])
         .output()
         .context("spawning git worktree add")?;
