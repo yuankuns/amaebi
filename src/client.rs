@@ -310,6 +310,14 @@ fn parse_claude_command(input: &str) -> Option<Result<Vec<ClaudeTask>, String>> 
             .join(" ")]
     };
 
+    // --worktree is a single path — it cannot be shared across multiple tasks
+    // because the daemon enforces worktree uniqueness per pane.
+    if worktree.is_some() && descriptions.len() > 1 {
+        return Some(Err("--worktree cannot be used with multiple tasks; \
+             each task gets its own auto-created worktree"
+            .to_string()));
+    }
+
     let tasks: Vec<ClaudeTask> = descriptions
         .into_iter()
         .enumerate()
@@ -351,15 +359,26 @@ fn make_task_id(description: &str, idx: usize) -> String {
     }
     let trimmed = result.trim_matches('-');
 
-    let base = if trimmed.is_empty() {
-        format!("task-{idx}")
-    } else if trimmed.len() > 32 {
+    // For non-ASCII-only descriptions that produce an empty slug, use
+    // "task-{idx}" which already encodes the index — no suffix needed.
+    if trimmed.is_empty() {
+        return format!("task-{idx}");
+    }
+
+    let base = if trimmed.len() > 32 {
         trimmed[..32].trim_end_matches('-').to_string()
     } else {
         trimmed.to_string()
     };
 
-    base
+    // Append the index for tasks beyond the first so that duplicate
+    // descriptions within a single /claude invocation get distinct task_ids
+    // (and therefore distinct auto-worktree paths / branch names).
+    if idx > 0 {
+        format!("{base}-{idx}")
+    } else {
+        base
+    }
 }
 
 /// Parse shell-style arguments, supporting both quoted and unquoted tokens.
@@ -463,6 +482,9 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
                     task_id: t.task_id,
                     description: t.description,
                     worktree: t.worktree,
+                    client_cwd: std::env::current_dir()
+                        .ok()
+                        .map(|p| p.to_string_lossy().into_owned()),
                     auto_enter: t.auto_enter,
                 })
                 .collect(),
@@ -887,6 +909,9 @@ pub async fn run_chat_loop(
                         task_id: t.task_id,
                         description: t.description,
                         worktree: t.worktree,
+                        client_cwd: std::env::current_dir()
+                            .ok()
+                            .map(|p| p.to_string_lossy().into_owned()),
                         auto_enter: t.auto_enter,
                     })
                     .collect(),

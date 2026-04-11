@@ -830,9 +830,12 @@ async fn handle_claude_launch(
             Some(wt) => Some(wt),
             None => {
                 let tid = task_id.clone();
-                match tokio::task::spawn_blocking(move || create_task_worktree(&tid))
-                    .await
-                    .context("create_task_worktree panicked")?
+                let cwd = task.client_cwd.clone();
+                match tokio::task::spawn_blocking(move || {
+                    create_task_worktree(&tid, cwd.as_deref())
+                })
+                .await
+                .context("create_task_worktree panicked")?
                 {
                     Ok(path) => Some(path.to_string_lossy().into_owned()),
                     Err(e) => {
@@ -1059,16 +1062,47 @@ async fn handle_claude_launch(
 /// A per-repo subdirectory (the basename of the git root) prevents task-id
 /// collisions across different repositories.
 ///
+/// `client_cwd` is the working directory of the invoking client.  Git is run
+/// with `-C <client_cwd>` so the correct repository is targeted even when the
+/// daemon was started from a different directory.
+///
 /// Returns the absolute path of the newly created worktree, or an error if:
-/// - the current directory is not inside a git repository, or
+/// - `task_id` contains unsafe characters (path separators, `..`), or
+/// - the client's directory is not inside a git repository, or
 /// - `git worktree add` fails (e.g. branch name already exists).
 ///
 /// All git commands are synchronous; call this from `spawn_blocking`.
-fn create_task_worktree(task_id: &str) -> anyhow::Result<std::path::PathBuf> {
+fn create_task_worktree(
+    task_id: &str,
+    client_cwd: Option<&str>,
+) -> anyhow::Result<std::path::PathBuf> {
     use std::path::PathBuf;
 
-    // Locate the repository root.
-    let out = std::process::Command::new("git")
+    // Sanitize task_id: allow only characters that are safe as both a
+    // filesystem path component and a git branch name.
+    if task_id.is_empty()
+        || task_id == ".."
+        || task_id.contains('/')
+        || task_id.contains('\\')
+        || task_id.contains("..")
+        || !task_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    {
+        anyhow::bail!(
+            "task_id {:?} contains unsafe characters; \
+             only ASCII alphanumerics, '-', '_', and '.' are allowed",
+            task_id
+        );
+    }
+
+    // Locate the repository root using the client's cwd so the daemon (which
+    // may have been started from a different directory) targets the right repo.
+    let mut git_cmd = std::process::Command::new("git");
+    if let Some(cwd) = client_cwd {
+        git_cmd.args(["-C", cwd]);
+    }
+    let out = git_cmd
         .args(["rev-parse", "--show-toplevel"])
         .output()
         .context("spawning git rev-parse")?;
@@ -1097,8 +1131,19 @@ fn create_task_worktree(task_id: &str) -> anyhow::Result<std::path::PathBuf> {
         .join(repo_name)
         .join(task_id);
 
+    // Ensure the parent directory exists before calling git.
+    let wt_parent = wt_path
+        .parent()
+        .context("worktree path has no parent directory")?;
+    std::fs::create_dir_all(wt_parent)
+        .with_context(|| format!("creating worktree parent directory {}", wt_parent.display()))?;
+
     // Create the worktree on a new branch with the same name as the task.
-    let out = std::process::Command::new("git")
+    let mut git_cmd = std::process::Command::new("git");
+    if let Some(cwd) = client_cwd {
+        git_cmd.args(["-C", cwd]);
+    }
+    let out = git_cmd
         .args([
             "worktree",
             "add",

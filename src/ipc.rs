@@ -8,6 +8,11 @@ pub struct TaskSpec {
     /// Optional absolute path to a git worktree for this task.
     /// Enforced as unique across all currently Busy panes.
     pub worktree: Option<String>,
+    /// Absolute path to the client's working directory at the time `/claude`
+    /// was invoked.  Used by the daemon to locate the correct git repository
+    /// for auto-worktree creation, since the daemon may have been started from
+    /// a different directory.
+    pub client_cwd: Option<String>,
     /// If `false`, the command is injected into the pane without a trailing
     /// Enter key (useful for commands the user wants to review first).
     pub auto_enter: bool,
@@ -187,7 +192,11 @@ pub enum Response {
     /// The [`Request::ClaudeLaunch`] was rejected because adding the requested
     /// panes would exceed the configured maximum.
     CapacityError {
-        /// Number of panes that were requested.
+        /// Number of tasks still unassigned when capacity was reached.
+        ///
+        /// This is the remaining portion of the launch request at the point of
+        /// failure, not necessarily the original total number of tasks
+        /// submitted by the client.
         requested: usize,
         /// Configured maximum total pane count.
         max_panes: usize,
@@ -518,6 +527,7 @@ mod tests {
             task_id: "pr-123".into(),
             description: "implement feature X".into(),
             worktree: Some("/home/user/repo-wt/feat-x".into()),
+            client_cwd: Some("/home/user/repo".into()),
             auto_enter: true,
         };
         let json = serde_json::to_string(&spec).unwrap();
@@ -536,12 +546,14 @@ mod tests {
                     task_id: "t1".into(),
                     description: "do A".into(),
                     worktree: None,
+                    client_cwd: Some("/home/user/repo".into()),
                     auto_enter: true,
                 },
                 TaskSpec {
                     task_id: "t2".into(),
                     description: "do B".into(),
                     worktree: Some("/wt/b".into()),
+                    client_cwd: None,
                     auto_enter: false,
                 },
             ],
