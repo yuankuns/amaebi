@@ -904,10 +904,14 @@ async fn handle_claude_launch(
 
         // Resolve the real session UUID now that the pane is secured, then
         // correct the placeholder stored in the lease.
+        // Prefer the worktree path for session identity; fall back to the
+        // client's cwd (not the daemon's cwd, which may be unrelated to the
+        // repo the client was invoked from).
         let session_dir = worktree
             .as_deref()
             .map(std::path::Path::new)
             .map(std::path::Path::to_path_buf)
+            .or_else(|| task.client_cwd.as_deref().map(std::path::PathBuf::from))
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
         let session_id = tokio::task::spawn_blocking(move || session::get_or_create(&session_dir))
             .await
