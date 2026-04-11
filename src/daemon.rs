@@ -797,7 +797,7 @@ async fn drive_agentic_loop(
 /// Steps for each task:
 /// 1. `ensure_and_acquire_idle` — atomically expand the pane pool if needed
 ///    and acquire an idle pane.
-/// 2. Rename the pane title to `"claude | <task_id>"`.
+/// 2. Rename the pane title to `"cc-{N}"` (tmux pane numeric index).
 /// 3. If the pane already has `claude` running, inject `description` as a new
 ///    prompt.  Otherwise launch `claude` (with optional `cd <worktree>`) via
 ///    `tmux send-keys`, then inject `description` as a second keystroke.
@@ -817,7 +817,8 @@ async fn handle_claude_launch(
     // tmux send-keys.
     // `ensure_and_acquire_idle` holds a single LOCK_EX for both expansion and
     // acquisition, eliminating the TOCTOU race.
-    for task in tasks {
+    let total_tasks = tasks.len();
+    for (task_idx, task) in tasks.into_iter().enumerate() {
         let task_id = task.task_id.clone();
         let worktree = task.worktree.clone();
         let description = task.description.clone();
@@ -827,6 +828,8 @@ async fn handle_claude_launch(
 
         // Acquire a pane lease *before* creating session state so that a
         // capacity failure does not leave orphan session entries on disk.
+        // A placeholder session_id is stored now; it is corrected to the real
+        // UUID via `update_session_id` after `session::get_or_create` returns.
         let sid_placeholder = uuid::Uuid::new_v4().to_string();
         let sid_for_lease = sid_placeholder.clone();
         let pane_result = tokio::task::spawn_blocking(move || {
@@ -843,12 +846,15 @@ async fn handle_claude_launch(
             Ok(p) => p,
             Err(e) => {
                 // Surface CapacityError as a typed terminal response.
+                // Report tasks still unassigned (including this one) so the
+                // caller sees the real demand that exceeded capacity.
+                let remaining = total_tasks - task_idx;
                 let mut w = writer.lock().await;
                 if let Some(cap) = e.downcast_ref::<pane_lease::CapacityError>() {
                     write_frame(
                         &mut *w,
                         &Response::CapacityError {
-                            requested: cap.requested,
+                            requested: remaining,
                             max_panes: cap.max_panes,
                             current_busy: cap.current_busy,
                         },
@@ -869,7 +875,8 @@ async fn handle_claude_launch(
             }
         };
 
-        // Resolve the real session UUID now that the pane is secured.
+        // Resolve the real session UUID now that the pane is secured, then
+        // correct the placeholder stored in the lease.
         let session_dir = worktree
             .as_deref()
             .map(std::path::Path::new)
@@ -879,6 +886,13 @@ async fn handle_claude_launch(
             .await
             .context("session::get_or_create panicked")?
             .context("resolving session ID")?;
+        let update_pane = pane_id.clone();
+        let update_sid = session_id.clone();
+        tokio::task::spawn_blocking(move || {
+            let _ = pane_lease::update_session_id(&update_pane, &update_sid);
+        })
+        .await
+        .ok();
 
         // Rename the pane for visibility.  Use the tmux pane numeric index
         // (strip the leading '%' from e.g. "%5") to keep the title short.

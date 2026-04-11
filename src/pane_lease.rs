@@ -39,7 +39,12 @@ pub const MAX_PANES: usize = 16;
 
 /// Seconds after which a Busy pane whose heartbeat has not been refreshed is
 /// treated as Idle (allows dead processes to release their pane automatically).
-pub const LEASE_TTL_SECS: u64 = 120;
+///
+/// Set to 24 hours so long-running `claude` sessions are not mistakenly
+/// reclaimed.  Proper heartbeat support (periodic refresh while a lease is
+/// active) is a future enhancement; until then TTL serves only as a
+/// crash-recovery safety net.
+pub const LEASE_TTL_SECS: u64 = 86_400;
 
 // ---------------------------------------------------------------------------
 // Data types
@@ -183,8 +188,9 @@ fn read_state_unlocked() -> Result<PaneState> {
         return Ok(PaneState::new());
     }
     // Tolerate corrupt JSON: reset to empty state rather than hard-erroring.
-    // A corrupt file is treated the same as a missing one — the panes will
-    // be re-discovered on the next `ensure_idle_panes` call.
+    // A corrupt file is treated the same as a missing one; persisted lease
+    // state is discarded and rebuilt through normal pane creation / lease
+    // updates going forward.
     Ok(serde_json::from_str(&contents).unwrap_or_default())
 }
 
@@ -197,10 +203,16 @@ fn write_state_unlocked(state: &PaneState) -> Result<()> {
     let contents = serde_json::to_string_pretty(state)?;
 
     // Atomic write: write to a temp file then rename so readers never see a
-    // partially-written file.
+    // partially-written file.  Restrict permissions to 0o600 so session IDs
+    // and worktree paths are not world-readable.
     let tmp_path = path.with_extension("tmp");
     std::fs::write(&tmp_path, &contents)
         .with_context(|| format!("writing tmp {}", tmp_path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600));
+    }
     std::fs::rename(&tmp_path, &path)
         .with_context(|| format!("renaming {} → {}", tmp_path.display(), path.display()))
 }
@@ -577,6 +589,30 @@ pub fn ensure_and_acquire_idle(
 
     lock.unlock()
         .context("releasing flock after ensure_and_acquire_idle")?;
+    result
+}
+
+/// Correct the session ID stored in the pane lease after the real
+/// `session::get_or_create` UUID is known.
+///
+/// `ensure_and_acquire_idle` is called with a placeholder UUID so the pane is
+/// secured before the (potentially fallible) session creation step.  This
+/// function patches the stored value to the real ID.
+pub fn update_session_id(pane_id: &str, session_id: &str) -> Result<()> {
+    let lock = open_lock_file()?;
+    lock.lock_exclusive()
+        .context("acquiring flock for update_session_id")?;
+
+    let result = (|| {
+        let mut state = read_state_unlocked()?;
+        if let Some(lease) = state.get_mut(pane_id) {
+            lease.session_id = Some(session_id.to_string());
+        }
+        write_state_unlocked(&state)
+    })();
+
+    lock.unlock()
+        .context("releasing flock after update_session_id")?;
     result
 }
 

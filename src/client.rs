@@ -260,15 +260,28 @@ fn parse_claude_command(input: &str) -> Option<Result<Vec<ClaudeTask>, String>> 
                 // Canonicalize to an absolute path so worktree uniqueness
                 // checks in the daemon are reliable regardless of how the
                 // path was spelled (relative vs. symlink vs. absolute).
+                // If canonicalize fails (path doesn't exist yet), fall back to
+                // an explicit absolute path rather than leaving it relative.
                 let raw = &tokens[i].0;
-                let abs =
-                    std::fs::canonicalize(raw).unwrap_or_else(|_| std::path::PathBuf::from(raw));
+                let raw_path = std::path::PathBuf::from(raw);
+                let abs = std::fs::canonicalize(&raw_path).unwrap_or_else(|_| {
+                    if raw_path.is_absolute() {
+                        raw_path.clone()
+                    } else {
+                        std::env::current_dir()
+                            .map(|cwd| cwd.join(&raw_path))
+                            .unwrap_or(raw_path)
+                    }
+                });
                 worktree = Some(abs.to_string_lossy().into_owned());
             }
             "--no-enter" => {
                 auto_enter = false;
             }
             tok => {
+                if tok.starts_with("--") {
+                    return Some(Err(format!("unknown flag: {tok}")));
+                }
                 desc_tokens.push((tok.to_string(), tokens[i].1));
             }
         }
