@@ -67,7 +67,7 @@ pub struct PaneLease {
     pub worktree: Option<String>,
     /// Unix timestamp of the last heartbeat (or acquisition time).
     pub heartbeat_at: u64,
-    /// Whether `amaebi chat` has been started in this pane.  Idle panes with
+    /// Whether `claude` has been started in this pane.  Idle panes with
     /// `has_claude = true` are preferred over blank panes when assigning tasks:
     /// the scheduler injects just the prompt rather than launching a new session.
     #[serde(default)]
@@ -245,9 +245,9 @@ pub fn acquire_first_idle(
 }
 
 /// Returns `(pane_id, had_claude)` where `had_claude` indicates whether
-/// `amaebi chat` was already running in the pane.  Callers use this to decide
+/// `claude` was already running in the pane.  Callers use this to decide
 /// whether to inject only the prompt (`had_claude = true`) or to launch a
-/// fresh `amaebi chat <description>` (`had_claude = false`).
+/// fresh `claude` session (`had_claude = false`).
 ///
 /// Priority: idle panes with `has_claude = true` are preferred so that
 /// existing Claude sessions absorb new tasks before blank panes are used.
@@ -552,9 +552,9 @@ fn ensure_idle_panes_locked(needed: usize) -> Result<()> {
 /// the given task — all within a single `LOCK_EX`.
 ///
 /// Returns `(pane_id, had_claude)`.  `had_claude = true` means the pane
-/// already had `amaebi chat` running; the caller should inject just the
+/// already had `claude` running; the caller should inject just the
 /// prompt.  `had_claude = false` means the pane is blank; the caller should
-/// launch `amaebi chat <description>`.
+/// launch `claude`.
 ///
 /// This eliminates the TOCTOU race between `ensure_idle_panes` and
 /// `acquire_first_idle` when multiple `ClaudeLaunch` requests arrive
@@ -580,9 +580,9 @@ pub fn ensure_and_acquire_idle(
     result
 }
 
-/// Mark a pane as having an active `amaebi chat` session.
+/// Mark a pane as having an active `claude` session.
 ///
-/// Called after successfully injecting `amaebi chat` into a blank pane so
+/// Called after successfully launching `claude` into a blank pane so
 /// that future task assignments can inject prompts directly instead of
 /// launching a new session.
 pub fn mark_claude_started(pane_id: &str) -> Result<()> {

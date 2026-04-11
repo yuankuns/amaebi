@@ -791,15 +791,16 @@ async fn drive_agentic_loop(
 // Sub-handlers — one per Request variant
 // ---------------------------------------------------------------------------
 
-/// Handle `Request::ClaudeLaunch`: assign tmux panes and launch `amaebi chat`
-/// sessions for each task.
+/// Handle `Request::ClaudeLaunch`: assign tmux panes and launch `claude`
+/// (Claude Code CLI) sessions for each task.
 ///
 /// Steps for each task:
 /// 1. `ensure_and_acquire_idle` — atomically expand the pane pool if needed
 ///    and acquire an idle pane.
-/// 2. Rename the pane title to `"amaebi | <task_id>"`.
-/// 3. Inject `amaebi chat <description>` (with optional `cd <worktree>`)
-///    via `tmux send-keys`.
+/// 2. Rename the pane title to `"claude | <task_id>"`.
+/// 3. If the pane already has `claude` running, inject `description` as a new
+///    prompt.  Otherwise launch `claude` (with optional `cd <worktree>`) via
+///    `tmux send-keys`, then inject `description` as a second keystroke.
 /// 4. Stream `Response::PaneAssigned` for each task, then `Response::Done`.
 async fn handle_claude_launch(
     writer: &Arc<tokio::sync::Mutex<tokio::net::unix::OwnedWriteHalf>>,
@@ -812,7 +813,8 @@ async fn handle_claude_launch(
     }
 
     // For each task: acquire a pane (auto-expanding the pool if needed), then
-    // inject `amaebi chat <description>` via tmux send-keys.
+    // launch `claude` (or inject a prompt into an already-running session) via
+    // tmux send-keys.
     // `ensure_and_acquire_idle` holds a single LOCK_EX for both expansion and
     // acquisition, eliminating the TOCTOU race.
     for task in tasks {
@@ -880,7 +882,7 @@ async fn handle_claude_launch(
 
         // Rename the pane for visibility.
         let rename_pane = pane_id.clone();
-        let rename_title = format!("amaebi | {}", task_id);
+        let rename_title = format!("claude | {}", task_id);
         tokio::task::spawn_blocking(move || {
             // Best-effort — ignore errors (non-tmux environments).
             let _ = pane_lease::rename_pane(&rename_pane, &rename_title);
@@ -888,51 +890,52 @@ async fn handle_claude_launch(
         .await
         .ok();
 
-        // Build the keys to inject into the pane.
+        // Build the key sequences to inject into the pane.
         //
         // Priority:
-        //  - `had_claude = true`: pane already has `amaebi chat` running at
-        //    its prompt → send just the description as a new user message.
+        //  - `had_claude = true`: pane already has `claude` running at its
+        //    prompt → send just the description as a new user message.
         //  - `had_claude = false`: pane is blank (freshly created or at a
-        //    shell prompt) → launch `amaebi chat <description>`.
-        let cmd = if had_claude {
-            description.clone()
+        //    shell prompt) → launch `claude` first, then send the description
+        //    as a second keystroke so it lands at the Claude Code prompt.
+        //
+        // Each element is (keys, press_enter).
+        let key_sequence: Vec<(String, bool)> = if had_claude {
+            vec![(description.clone(), auto_enter)]
         } else {
-            let amaebi_cmd = std::env::current_exe()
-                .ok()
-                .and_then(|p| p.to_str().map(str::to_string))
-                .unwrap_or_else(|| "amaebi".to_string());
-            if let Some(ref wt) = worktree {
-                format!(
-                    "cd {} && {} chat {}",
-                    shell_escape(wt),
-                    shell_escape(&amaebi_cmd),
-                    shell_escape(&description)
-                )
+            let launch_cmd = if let Some(ref wt) = worktree {
+                format!("cd {} && claude", shell_escape(wt))
             } else {
-                format!(
-                    "{} chat {}",
-                    shell_escape(&amaebi_cmd),
-                    shell_escape(&description)
-                )
-            }
+                "claude".to_string()
+            };
+            // Launch `claude` with Enter, then queue the description without
+            // Enter so the user can review it before submitting.
+            vec![(launch_cmd, true), (description.clone(), auto_enter)]
         };
 
         let send_pane = pane_id.clone();
 
-        // Send the command to the pane. "Enter" must be a separate argument —
-        // passing it as part of the keys string would send the literal text
-        // " Enter" rather than pressing the Enter key.
+        // Send all key sequences to the pane.  "Enter" must be a separate
+        // argument — passing it as part of the keys string would send the
+        // literal text " Enter" rather than pressing the Enter key.
         let send_result = tokio::task::spawn_blocking(move || {
-            let mut cmd_args = vec!["send-keys", "-t", &send_pane, &cmd];
-            if auto_enter {
-                cmd_args.push("Enter");
+            for (keys, press_enter) in &key_sequence {
+                let mut cmd_args = vec!["send-keys", "-t", &send_pane, keys.as_str()];
+                if *press_enter {
+                    cmd_args.push("Enter");
+                }
+                let out = std::process::Command::new("tmux")
+                    .args(&cmd_args)
+                    .output()?;
+                if !out.status.success() {
+                    return Ok::<bool, std::io::Error>(false);
+                }
             }
-            std::process::Command::new("tmux").args(&cmd_args).output()
+            Ok(true)
         })
         .await;
 
-        let send_ok = matches!(send_result, Ok(Ok(ref out)) if out.status.success());
+        let send_ok = matches!(send_result, Ok(Ok(true)));
         if !send_ok {
             // Injection failed — release the lease so the pane is not stuck Busy.
             let failed_pane = pane_id.clone();
@@ -954,7 +957,7 @@ async fn handle_claude_launch(
             return Ok(());
         }
 
-        // If we just launched `amaebi chat` in a blank pane, record that so
+        // If we just launched `claude` in a blank pane, record that so
         // future task assignments can inject prompts directly.
         if !had_claude {
             let started_pane = pane_id.clone();
