@@ -739,9 +739,6 @@ fn tmux_split_window_sync(window_id: &str) -> Result<String> {
 mod tests {
     use super::*;
 
-    // Mutex to serialize tests that mutate the HOME env var.
-    static HOME_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     fn make_idle(pane_id: &str, window_id: &str) -> PaneLease {
         PaneLease::new_idle(pane_id.to_string(), window_id.to_string())
     }
@@ -833,28 +830,11 @@ mod tests {
     // ── file-based state ops (use tempdir via HOME override) ───────────────
 
     // Helper: redirect HOME to a tempdir, run f(), restore HOME.
-    fn with_temp_home<F, R>(f: F) -> R
-    where
-        F: FnOnce() -> R,
-    {
-        // Recover from a poisoned mutex (a previous test panicked while holding
-        // it) so remaining tests can still run.
-        let _guard = HOME_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
-        let dir = tempfile::tempdir().expect("tempdir");
-        let orig = std::env::var("HOME").ok();
-        // Safety: we hold the HOME_MUTEX so no other test can mutate HOME.
-        unsafe { std::env::set_var("HOME", dir.path()) };
-        let result = f();
-        match orig {
-            Some(h) => unsafe { std::env::set_var("HOME", &h) },
-            None => unsafe { std::env::remove_var("HOME") },
-        }
-        result
-    }
 
     #[test]
     fn acquire_lease_on_idle_pane_succeeds() {
-        with_temp_home(|| {
+        {
+            let _guard = crate::test_utils::with_temp_home();
             // Seed one idle pane directly.
             let mut state: PaneState = HashMap::new();
             state.insert("%0".to_string(), make_idle("%0", "@0"));
@@ -865,24 +845,26 @@ mod tests {
             let s = read_state_unlocked().expect("read back");
             assert_eq!(s["%0"].effective_status(), PaneStatus::Busy);
             assert_eq!(s["%0"].task_id.as_deref(), Some("task-x"));
-        });
+        }
     }
 
     #[test]
     fn acquire_lease_on_busy_pane_returns_err() {
-        with_temp_home(|| {
+        {
+            let _guard = crate::test_utils::with_temp_home();
             let mut state: PaneState = HashMap::new();
             state.insert("%0".to_string(), make_busy("%0", "@0", None));
             write_state_unlocked(&state).expect("seed state");
 
             let err = acquire_lease("%0", "task-y", "sess-y", None);
             assert!(err.is_err(), "expected Err for busy pane");
-        });
+        }
     }
 
     #[test]
     fn acquire_lease_on_expired_busy_pane_succeeds() {
-        with_temp_home(|| {
+        {
+            let _guard = crate::test_utils::with_temp_home();
             let mut expired = make_busy("%0", "@0", None);
             expired.heartbeat_at = now_secs().saturating_sub(LEASE_TTL_SECS + 1);
             let mut state: PaneState = HashMap::new();
@@ -893,12 +875,13 @@ mod tests {
 
             let s = read_state_unlocked().expect("read back");
             assert_eq!(s["%0"].task_id.as_deref(), Some("task-new"));
-        });
+        }
     }
 
     #[test]
     fn acquire_first_idle_finds_idle_pane() {
-        with_temp_home(|| {
+        {
+            let _guard = crate::test_utils::with_temp_home();
             let mut state: PaneState = HashMap::new();
             state.insert("%0".to_string(), make_busy("%0", "@0", None));
             state.insert("%1".to_string(), make_idle("%1", "@0"));
@@ -907,12 +890,13 @@ mod tests {
             let (pane, _had_claude) =
                 acquire_first_idle("t", "s", None).expect("acquire first idle");
             assert_eq!(pane, "%1");
-        });
+        }
     }
 
     #[test]
     fn acquire_first_idle_rejects_duplicate_worktree() {
-        with_temp_home(|| {
+        {
+            let _guard = crate::test_utils::with_temp_home();
             let mut state: PaneState = HashMap::new();
             state.insert(
                 "%0".to_string(),
@@ -923,12 +907,13 @@ mod tests {
 
             let err = acquire_first_idle("t2", "s2", Some("/repo/wt/task1"));
             assert!(err.is_err(), "expected Err for duplicate worktree");
-        });
+        }
     }
 
     #[test]
     fn acquire_first_idle_prefers_has_claude_pane_with_matching_worktree() {
-        with_temp_home(|| {
+        {
+            let _guard = crate::test_utils::with_temp_home();
             let mut state: PaneState = HashMap::new();
             // Pane with claude already running in the target worktree — should be preferred.
             let mut has_claude_matching = make_idle("%0", "@0");
@@ -944,12 +929,13 @@ mod tests {
                 acquire_first_idle("t", "s", Some("/repo/wt/task1")).expect("acquire");
             assert_eq!(pane, "%0", "should prefer matching has_claude pane");
             assert!(had_claude, "had_claude should be true for reused pane");
-        });
+        }
     }
 
     #[test]
     fn acquire_first_idle_skips_has_claude_pane_with_different_worktree() {
-        with_temp_home(|| {
+        {
+            let _guard = crate::test_utils::with_temp_home();
             let mut state: PaneState = HashMap::new();
             // Pane with claude in a *different* worktree — must not be preferred.
             let mut has_claude_other = make_idle("%0", "@0");
@@ -971,7 +957,7 @@ mod tests {
                 "must skip has_claude pane with different worktree"
             );
             assert!(!had_claude, "had_claude must be false for blank pane");
-        });
+        }
     }
 
     #[test]
@@ -979,7 +965,8 @@ mod tests {
         // All idle panes have claude running in a different worktree — none
         // are usable for a fresh task.  ensure_and_acquire_idle must attempt
         // expansion rather than returning "no idle panes available" immediately.
-        with_temp_home(|| {
+        {
+            let _guard = crate::test_utils::with_temp_home();
             let mut state: PaneState = HashMap::new();
             let mut pane = make_idle("%0", "@0");
             pane.has_claude = true;
@@ -1005,12 +992,13 @@ mod tests {
                     );
                 }
             }
-        });
+        }
     }
 
     #[test]
     fn release_lease_marks_pane_idle() {
-        with_temp_home(|| {
+        {
+            let _guard = crate::test_utils::with_temp_home();
             let mut state: PaneState = HashMap::new();
             state.insert("%0".to_string(), make_busy("%0", "@0", None));
             write_state_unlocked(&state).expect("seed state");
@@ -1020,14 +1008,15 @@ mod tests {
             let s = read_state_unlocked().expect("read back");
             assert_eq!(s["%0"].effective_status(), PaneStatus::Idle);
             assert!(s["%0"].task_id.is_none());
-        });
+        }
     }
 
     #[test]
     fn release_lease_preserves_worktree_and_has_claude() {
         // worktree and has_claude must survive release so the scheduler can
         // reuse the pane for a future task in the same worktree (tier-1 reuse).
-        with_temp_home(|| {
+        {
+            let _guard = crate::test_utils::with_temp_home();
             let mut lease = make_busy("%0", "@0", Some("/repo/wt/task1"));
             lease.has_claude = true;
             let mut state: PaneState = HashMap::new();
@@ -1044,12 +1033,13 @@ mod tests {
                 "worktree must be preserved so tier-1 reuse can match it"
             );
             assert!(s["%0"].has_claude, "has_claude must be preserved");
-        });
+        }
     }
 
     #[test]
     fn heartbeat_updates_timestamp() {
-        with_temp_home(|| {
+        {
+            let _guard = crate::test_utils::with_temp_home();
             let mut lease = make_busy("%0", "@0", None);
             // Set an old heartbeat.
             lease.heartbeat_at = 1000;
@@ -1064,12 +1054,13 @@ mod tests {
                 s["%0"].heartbeat_at > 1000,
                 "heartbeat should have been updated"
             );
-        });
+        }
     }
 
     #[test]
     fn ensure_idle_panes_capacity_exceeded_returns_err() {
-        with_temp_home(|| {
+        {
+            let _guard = crate::test_utils::with_temp_home();
             // Fill all MAX_PANES slots with Busy leases.
             let mut state: PaneState = HashMap::new();
             for i in 0..MAX_PANES {
@@ -1089,12 +1080,13 @@ mod tests {
             let cap = err.downcast_ref::<CapacityError>().expect("CapacityError");
             assert_eq!(cap.max_panes, MAX_PANES);
             assert_eq!(cap.requested, 1);
-        });
+        }
     }
 
     #[test]
     fn ensure_idle_panes_noop_when_enough_idle() {
-        with_temp_home(|| {
+        {
+            let _guard = crate::test_utils::with_temp_home();
             let mut state: PaneState = HashMap::new();
             state.insert("%0".to_string(), make_idle("%0", "@0"));
             state.insert("%1".to_string(), make_idle("%1", "@0"));
@@ -1107,6 +1099,6 @@ mod tests {
             lock.unlock().expect("unlock");
 
             result.expect("should succeed without calling tmux");
-        });
+        }
     }
 }

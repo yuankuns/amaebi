@@ -942,11 +942,15 @@ async fn handle_claude_launch(
         };
         let update_pane = pane_id.clone();
         let update_sid = session_id.clone();
-        tokio::task::spawn_blocking(move || {
-            let _ = pane_lease::update_session_id(&update_pane, &update_sid);
+        if let Err(e) = tokio::task::spawn_blocking(move || {
+            pane_lease::update_session_id(&update_pane, &update_sid)
         })
         .await
-        .ok();
+        .map_err(|e| anyhow::anyhow!("update_session_id panicked: {e}"))
+        .and_then(|r| r)
+        {
+            tracing::warn!(pane_id = %pane_id, error = %e, "failed to persist session ID in pane lease; tmux-state.json may be inconsistent");
+        }
 
         // Rename the pane for visibility.  Use the tmux pane numeric index
         // (strip the leading '%' from e.g. "%5") to keep the title short.
@@ -1005,6 +1009,7 @@ async fn handle_claude_launch(
         //
         // The Enter key itself is sent in a separate invocation without `-l`
         // so it remains a real key press (not the literal text "Enter").
+        // Returns Ok(None) on success, Ok(Some(stderr)) on tmux failure.
         let send_result = tokio::task::spawn_blocking(move || {
             for (keys, press_enter) in &key_sequence {
                 // Send text literally.
@@ -1012,7 +1017,9 @@ async fn handle_claude_launch(
                     .args(["send-keys", "-t", &send_pane, "-l", "--", keys.as_str()])
                     .output()?;
                 if !out.status.success() {
-                    return Ok::<bool, std::io::Error>(false);
+                    return Ok::<Option<String>, std::io::Error>(Some(
+                        String::from_utf8_lossy(&out.stderr).trim().to_string(),
+                    ));
                 }
                 // Press Enter as a real key in a separate call.
                 if *press_enter {
@@ -1020,16 +1027,23 @@ async fn handle_claude_launch(
                         .args(["send-keys", "-t", &send_pane, "Enter"])
                         .output()?;
                     if !out.status.success() {
-                        return Ok::<bool, std::io::Error>(false);
+                        return Ok(Some(
+                            String::from_utf8_lossy(&out.stderr).trim().to_string(),
+                        ));
                     }
                 }
             }
-            Ok(true)
+            Ok(None)
         })
         .await;
 
-        let send_ok = matches!(send_result, Ok(Ok(true)));
-        if !send_ok {
+        let tmux_err = match send_result {
+            Ok(Ok(None)) => None,
+            Ok(Ok(Some(stderr))) => Some(stderr),
+            Ok(Err(e)) => Some(e.to_string()),
+            Err(e) => Some(format!("send-keys task panicked: {e}")),
+        };
+        if let Some(err_msg) = tmux_err {
             // Injection failed — release the lease so the pane is not stuck Busy.
             let failed_pane = pane_id.clone();
             tokio::task::spawn_blocking(move || {
@@ -1042,7 +1056,7 @@ async fn handle_claude_launch(
                 &mut *w,
                 &Response::Error {
                     message: format!(
-                        "[error] failed to inject command into pane {pane_id}: tmux send-keys failed"
+                        "[error] failed to inject command into pane {pane_id}: {err_msg}"
                     ),
                 },
             )
@@ -1078,16 +1092,17 @@ async fn handle_claude_launch(
     Ok(())
 }
 
-/// Create a git worktree at `~/.amaebi/worktrees/<repo-name>/<task_id>` on a
-/// new branch named `<task_id>`.
+/// Create a git worktree at `~/.amaebi/worktrees/<repo-name>/<task_id>-<uuid8>`
+/// on a new branch named `<task_id>-<uuid8>`.
 ///
 /// Every parallel `/claude` task needs its own worktree so that concurrent
 /// Claude sessions editing the same repository do not trample each other's
 /// in-progress changes.  Worktrees are stored under `~/.amaebi/worktrees/`
 /// (alongside other amaebi state) rather than inside the repository directory,
 /// which avoids polluting the project tree and requires no `.gitignore` entry.
-/// A per-repo subdirectory (the basename of the git root) prevents task-id
-/// collisions across different repositories.
+/// A per-repo subdirectory (the basename of the git root) prevents collisions
+/// across different repositories; the `-<uuid8>` suffix makes each
+/// worktree/branch unique for a given `task_id` across runs.
 ///
 /// `client_cwd` is the working directory of the invoking client.  Git is run
 /// with `-C <client_cwd>` so the correct repository is targeted even when the
