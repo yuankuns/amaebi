@@ -826,6 +826,9 @@ async fn handle_claude_launch(
         // Each parallel Claude session must work in its own git worktree so
         // concurrent tasks cannot trample each other's in-progress file edits.
         // Auto-create a worktree when the caller did not supply one explicitly.
+        // Track whether the worktree was auto-created so we can clean it up
+        // if pane acquisition subsequently fails (avoiding orphaned branches).
+        let was_explicit_worktree = task.worktree.is_some();
         let worktree: Option<String> = match task.worktree {
             Some(wt) => Some(wt),
             None => {
@@ -872,6 +875,20 @@ async fn handle_claude_launch(
         let (pane_id, had_claude) = match pane_result {
             Ok(p) => p,
             Err(e) => {
+                // If the worktree was auto-created, clean it up to avoid
+                // orphaned git branches sitting around after a capacity error.
+                if !was_explicit_worktree {
+                    if let Some(ref wt) = worktree {
+                        let wt_path = wt.clone();
+                        tokio::task::spawn_blocking(move || {
+                            let _ = std::process::Command::new("git")
+                                .args(["worktree", "remove", "--force", &wt_path])
+                                .output();
+                        })
+                        .await
+                        .ok();
+                    }
+                }
                 // Surface CapacityError as a typed terminal response.
                 // Report tasks still unassigned (including this one) so the
                 // caller sees the real demand that exceeded capacity.
@@ -1044,10 +1061,19 @@ async fn handle_claude_launch(
             Err(e) => Some(format!("send-keys task panicked: {e}")),
         };
         if let Some(err_msg) = tmux_err {
-            // Injection failed — release the lease so the pane is not stuck Busy.
+            // Injection failed.  If tmux reports the pane no longer exists,
+            // remove it from the lease map entirely so the scheduler stops
+            // selecting it.  Otherwise just release it back to Idle.
             let failed_pane = pane_id.clone();
+            let is_stale = err_msg.contains("unknown pane")
+                || err_msg.contains("can't find pane")
+                || err_msg.contains("no server running");
             tokio::task::spawn_blocking(move || {
-                let _ = pane_lease::release_lease(&failed_pane);
+                if is_stale {
+                    let _ = pane_lease::remove_pane(&failed_pane);
+                } else {
+                    let _ = pane_lease::release_lease(&failed_pane);
+                }
             })
             .await
             .ok();
@@ -1156,13 +1182,26 @@ fn create_task_worktree(
     }
     let git_root = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
 
-    // Derive a short repo name from the git root basename for namespacing.
-    let repo_name = git_root
+    // Build a repo namespace that combines the basename with a short hash of
+    // the full path.  The basename alone is not unique: `~/src/api` and
+    // `~/work/api` share the same name but are different repos.
+    let repo_basename = git_root
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("repo");
+    let path_hash = {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut h = DefaultHasher::new();
+        git_root.hash(&mut h);
+        format!("{:016x}", h.finish())
+            .chars()
+            .take(8)
+            .collect::<String>()
+    };
+    let repo_namespace = format!("{repo_basename}-{path_hash}");
 
-    // Place worktrees under ~/.amaebi/worktrees/<repo>/<task_id>-<uuid8>.
+    // Place worktrees under ~/.amaebi/worktrees/<repo-hash>/<task_id>-<uuid8>.
     // A short UUID suffix guarantees uniqueness across runs so repeated
     // invocations with the same task description never collide on the branch
     // name or directory path — the same approach Claude Code uses for its own
@@ -1177,7 +1216,7 @@ fn create_task_worktree(
 
     let wt_path = amaebi_home()?
         .join("worktrees")
-        .join(repo_name)
+        .join(&repo_namespace)
         .join(&unique_name);
 
     // Ensure the parent directory exists before calling git.

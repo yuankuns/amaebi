@@ -291,11 +291,16 @@ fn acquire_first_idle_locked(
     //    those panes alone and let auto-expansion create a new blank one.
     // Use state.iter() so the HashMap key is carried through the selection,
     // avoiding a second get_mut lookup (and the unwrap it would require).
+    // Tier-1 reuse requires a known, non-None worktree to match against.
+    // When worktree is None (auto-creation failed), None==None would match any
+    // pane with worktree=None, injecting a prompt into an arbitrary claude
+    // session with unknown directory context.  Guard with worktree.is_some().
     let pane_id = state
         .iter()
         .find(|(_, l)| {
             l.effective_status() == PaneStatus::Idle
                 && l.has_claude
+                && worktree.is_some()
                 && l.worktree.as_deref() == worktree
         })
         .or_else(|| {
@@ -309,11 +314,10 @@ fn acquire_first_idle_locked(
     let lease = state
         .get_mut(&pane_id)
         .ok_or_else(|| anyhow::anyhow!("pane {pane_id} disappeared after selection"))?;
-    // `had_claude` is only true when the pane's stored worktree matches the
-    // requested one — only then can we safely inject a prompt directly into
-    // the running claude session.  A pane with claude in a *different* worktree
-    // must be treated as blank (triggers a fresh `cd <wt> && claude` launch).
-    let had_claude = lease.has_claude && lease.worktree.as_deref() == worktree;
+    // `had_claude` is only true when the pane has a known matching worktree.
+    // worktree.is_some() prevents None==None from triggering tier-1 reuse.
+    let had_claude =
+        lease.has_claude && worktree.is_some() && lease.worktree.as_deref() == worktree;
     lease.status = PaneStatus::Busy;
     lease.task_id = Some(task_id.to_string());
     lease.session_id = Some(session_id.to_string());
@@ -410,6 +414,26 @@ pub fn release_lease(pane_id: &str) -> Result<()> {
 
     lock.unlock()
         .context("releasing flock after release_lease")?;
+    result
+}
+
+/// Remove a pane entry entirely from the lease map.
+///
+/// Used when a tmux pane no longer exists (e.g. "unknown pane" error from
+/// `tmux send-keys`).  Unlike [`release_lease`], this removes the entry so
+/// the scheduler does not keep selecting the same stale pane.
+pub fn remove_pane(pane_id: &str) -> Result<()> {
+    let lock = open_lock_file()?;
+    lock.lock_exclusive()
+        .context("acquiring flock for remove_pane")?;
+
+    let result = (|| {
+        let mut state = read_state_unlocked()?;
+        state.remove(pane_id);
+        write_state_unlocked(&state)
+    })();
+
+    lock.unlock().context("releasing flock after remove_pane")?;
     result
 }
 

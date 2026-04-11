@@ -278,8 +278,20 @@ fn parse_claude_command(input: &str) -> Option<Result<Vec<ClaudeTask>, String>> 
             "--no-enter" => {
                 auto_enter = false;
             }
+            // `--` marks end of flags; everything after is a description token.
+            "--" => {
+                i += 1;
+                while i < tokens.len() {
+                    desc_tokens.push((tokens[i].0.clone(), tokens[i].1));
+                    i += 1;
+                }
+                break;
+            }
             tok => {
-                if tok.starts_with("--") {
+                // Only treat unquoted tokens starting with `--` as unknown
+                // flags.  A quoted token like `"--investigate"` is a valid
+                // task description and must not be rejected.
+                if !tokens[i].1 && tok.starts_with("--") {
                     return Some(Err(format!("unknown flag: {tok}")));
                 }
                 desc_tokens.push((tok.to_string(), tokens[i].1));
