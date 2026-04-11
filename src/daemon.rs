@@ -880,9 +880,11 @@ async fn handle_claude_launch(
             .context("session::get_or_create panicked")?
             .context("resolving session ID")?;
 
-        // Rename the pane for visibility.
+        // Rename the pane for visibility.  Use the tmux pane numeric index
+        // (strip the leading '%' from e.g. "%5") to keep the title short.
         let rename_pane = pane_id.clone();
-        let rename_title = format!("claude | {}", task_id);
+        let pane_num = pane_id.trim_start_matches('%');
+        let rename_title = format!("cc-{}", pane_num);
         tokio::task::spawn_blocking(move || {
             // Best-effort — ignore errors (non-tmux environments).
             let _ = pane_lease::rename_pane(&rename_pane, &rename_title);
