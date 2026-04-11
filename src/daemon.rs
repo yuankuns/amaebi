@@ -820,9 +820,33 @@ async fn handle_claude_launch(
     let total_tasks = tasks.len();
     for (task_idx, task) in tasks.into_iter().enumerate() {
         let task_id = task.task_id.clone();
-        let worktree = task.worktree.clone();
         let description = task.description.clone();
         let auto_enter = task.auto_enter;
+
+        // Each parallel Claude session must work in its own git worktree so
+        // concurrent tasks cannot trample each other's in-progress file edits.
+        // Auto-create a worktree when the caller did not supply one explicitly.
+        let worktree: Option<String> = match task.worktree {
+            Some(wt) => Some(wt),
+            None => {
+                let tid = task_id.clone();
+                match tokio::task::spawn_blocking(move || create_task_worktree(&tid))
+                    .await
+                    .context("create_task_worktree panicked")?
+                {
+                    Ok(path) => Some(path.to_string_lossy().into_owned()),
+                    Err(e) => {
+                        tracing::warn!(
+                            task_id = %task_id,
+                            error = %e,
+                            "auto-worktree creation failed; launching claude without worktree isolation"
+                        );
+                        None
+                    }
+                }
+            }
+        };
+
         let tid_for_lease = task_id.clone();
         let wt_for_lease = worktree.clone();
 
@@ -999,6 +1023,57 @@ async fn handle_claude_launch(
     let mut w = writer.lock().await;
     write_frame(&mut *w, &Response::Done).await?;
     Ok(())
+}
+
+/// Create a git worktree at `<git-root>/amaebi-wt/<task_id>` on a new branch
+/// named `<task_id>`.
+///
+/// Every parallel `/claude` task needs its own worktree so that concurrent
+/// Claude sessions editing the same repository do not trample each other's
+/// in-progress changes.
+///
+/// Returns the absolute path of the newly created worktree, or an error if:
+/// - the current directory is not inside a git repository, or
+/// - `git worktree add` fails (e.g. branch name already exists).
+///
+/// All git commands are synchronous; call this from `spawn_blocking`.
+fn create_task_worktree(task_id: &str) -> anyhow::Result<std::path::PathBuf> {
+    use std::path::PathBuf;
+
+    // Locate the repository root.
+    let out = std::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .context("spawning git rev-parse")?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "not in a git repository (git rev-parse failed: {})",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    let git_root = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+    let wt_path = git_root.join("amaebi-wt").join(task_id);
+
+    // Create the worktree on a new branch with the same name as the task.
+    let out = std::process::Command::new("git")
+        .args([
+            "worktree",
+            "add",
+            wt_path
+                .to_str()
+                .context("worktree path is not valid UTF-8")?,
+            "-b",
+            task_id,
+        ])
+        .output()
+        .context("spawning git worktree add")?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "git worktree add failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(wt_path)
 }
 
 /// Escape a string for safe use as a single shell argument (single-quote wrapping).

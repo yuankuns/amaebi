@@ -284,10 +284,17 @@ fn acquire_first_idle_locked(
         }
     }
 
-    // Prefer idle panes that already have `amaebi chat` running.
+    // Prefer idle panes that already have `claude` running *in the same
+    // worktree* — those can absorb a new task via direct prompt injection.
+    // A pane running `claude` in a different (or no) worktree cannot be
+    // reused this way; fall back to any idle pane and launch a fresh session.
     let pane_id = state
         .values()
-        .find(|l| l.effective_status() == PaneStatus::Idle && l.has_claude)
+        .find(|l| {
+            l.effective_status() == PaneStatus::Idle
+                && l.has_claude
+                && l.worktree.as_deref() == worktree
+        })
         .or_else(|| {
             state
                 .values()
@@ -297,7 +304,11 @@ fn acquire_first_idle_locked(
         .ok_or_else(|| anyhow::anyhow!("no idle panes available"))?;
 
     let lease = state.get_mut(&pane_id).unwrap();
-    let had_claude = lease.has_claude;
+    // `had_claude` is only true when the pane's stored worktree matches the
+    // requested one — only then can we safely inject a prompt directly into
+    // the running claude session.  A pane with claude in a *different* worktree
+    // must be treated as blank (triggers a fresh `cd <wt> && claude` launch).
+    let had_claude = lease.has_claude && lease.worktree.as_deref() == worktree;
     lease.status = PaneStatus::Busy;
     lease.task_id = Some(task_id.to_string());
     lease.session_id = Some(session_id.to_string());
@@ -878,6 +889,53 @@ mod tests {
 
             let err = acquire_first_idle("t2", "s2", Some("/repo/wt/task1"));
             assert!(err.is_err(), "expected Err for duplicate worktree");
+        });
+    }
+
+    #[test]
+    fn acquire_first_idle_prefers_has_claude_pane_with_matching_worktree() {
+        with_temp_home(|| {
+            let mut state: PaneState = HashMap::new();
+            // Pane with claude already running in the target worktree — should be preferred.
+            let mut has_claude_matching = make_idle("%0", "@0");
+            has_claude_matching.has_claude = true;
+            has_claude_matching.worktree = Some("/repo/wt/task1".to_string());
+            // Plain idle pane (no claude).
+            let blank = make_idle("%1", "@0");
+            state.insert("%0".to_string(), has_claude_matching);
+            state.insert("%1".to_string(), blank);
+            write_state_unlocked(&state).expect("seed state");
+
+            let (pane, had_claude) =
+                acquire_first_idle("t", "s", Some("/repo/wt/task1")).expect("acquire");
+            assert_eq!(pane, "%0", "should prefer matching has_claude pane");
+            assert!(had_claude, "had_claude should be true for reused pane");
+        });
+    }
+
+    #[test]
+    fn acquire_first_idle_skips_has_claude_pane_with_different_worktree() {
+        with_temp_home(|| {
+            let mut state: PaneState = HashMap::new();
+            // Pane with claude in a *different* worktree — must not be preferred.
+            let mut has_claude_other = make_idle("%0", "@0");
+            has_claude_other.has_claude = true;
+            has_claude_other.worktree = Some("/repo/wt/other".to_string());
+            // Plain idle pane (no claude, no worktree).
+            let blank = make_idle("%1", "@0");
+            state.insert("%0".to_string(), has_claude_other);
+            state.insert("%1".to_string(), blank);
+            write_state_unlocked(&state).expect("seed state");
+
+            let (pane, had_claude) =
+                acquire_first_idle("t", "s", Some("/repo/wt/task1")).expect("acquire");
+            // Any idle pane is acceptable; the important thing is `had_claude` is false
+            // (i.e. we did not reuse the mismatched pane as a direct-inject target).
+            let _ = pane;
+            assert!(
+                !had_claude,
+                "had_claude must be false when worktree does not match"
+            );
         });
     }
 
