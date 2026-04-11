@@ -1025,12 +1025,16 @@ async fn handle_claude_launch(
     Ok(())
 }
 
-/// Create a git worktree at `<git-root>/amaebi-wt/<task_id>` on a new branch
-/// named `<task_id>`.
+/// Create a git worktree at `~/.amaebi/worktrees/<repo-name>/<task_id>` on a
+/// new branch named `<task_id>`.
 ///
 /// Every parallel `/claude` task needs its own worktree so that concurrent
 /// Claude sessions editing the same repository do not trample each other's
-/// in-progress changes.
+/// in-progress changes.  Worktrees are stored under `~/.amaebi/worktrees/`
+/// (alongside other amaebi state) rather than inside the repository directory,
+/// which avoids polluting the project tree and requires no `.gitignore` entry.
+/// A per-repo subdirectory (the basename of the git root) prevents task-id
+/// collisions across different repositories.
 ///
 /// Returns the absolute path of the newly created worktree, or an error if:
 /// - the current directory is not inside a git repository, or
@@ -1052,7 +1056,23 @@ fn create_task_worktree(task_id: &str) -> anyhow::Result<std::path::PathBuf> {
         );
     }
     let git_root = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
-    let wt_path = git_root.join("amaebi-wt").join(task_id);
+
+    // Derive a short repo name from the git root basename for namespacing.
+    let repo_name = git_root
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("repo");
+
+    // Place worktrees under ~/.amaebi/worktrees/<repo>/<task_id> so they are
+    // centralised alongside other amaebi state and never pollute the repo tree.
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .context("HOME environment variable not set")?;
+    let wt_path = PathBuf::from(home)
+        .join(".amaebi")
+        .join("worktrees")
+        .join(repo_name)
+        .join(task_id);
 
     // Create the worktree on a new branch with the same name as the task.
     let out = std::process::Command::new("git")
