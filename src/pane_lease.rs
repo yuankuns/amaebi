@@ -293,22 +293,26 @@ fn acquire_first_idle_locked(
     //    Sending shell commands to a pane where claude is already intercepting
     //    input would deliver them as chat messages, not shell commands.  Leave
     //    those panes alone and let auto-expansion create a new blank one.
+    // Use state.iter() so the HashMap key is carried through the selection,
+    // avoiding a second get_mut lookup (and the unwrap it would require).
     let pane_id = state
-        .values()
-        .find(|l| {
+        .iter()
+        .find(|(_, l)| {
             l.effective_status() == PaneStatus::Idle
                 && l.has_claude
                 && l.worktree.as_deref() == worktree
         })
         .or_else(|| {
             state
-                .values()
-                .find(|l| l.effective_status() == PaneStatus::Idle && !l.has_claude)
+                .iter()
+                .find(|(_, l)| l.effective_status() == PaneStatus::Idle && !l.has_claude)
         })
-        .map(|l| l.pane_id.clone())
+        .map(|(k, _)| k.clone())
         .ok_or_else(|| anyhow::anyhow!("no idle panes available"))?;
 
-    let lease = state.get_mut(&pane_id).unwrap();
+    let lease = state
+        .get_mut(&pane_id)
+        .ok_or_else(|| anyhow::anyhow!("pane {pane_id} disappeared after selection"))?;
     // `had_claude` is only true when the pane's stored worktree matches the
     // requested one — only then can we safely inject a prompt directly into
     // the running claude session.  A pane with claude in a *different* worktree
