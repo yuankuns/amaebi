@@ -284,10 +284,15 @@ fn acquire_first_idle_locked(
         }
     }
 
-    // Prefer idle panes that already have `claude` running *in the same
-    // worktree* — those can absorb a new task via direct prompt injection.
-    // A pane running `claude` in a different (or no) worktree cannot be
-    // reused this way; fall back to any idle pane and launch a fresh session.
+    // Priority order for pane selection:
+    //
+    // 1. Idle pane with `claude` running in the *same* worktree → safe to
+    //    inject a prompt directly (after /compact).
+    // 2. Idle pane with no `claude` running (blank shell) → fresh launch.
+    // 3. Idle pane with `claude` running in a *different* worktree → skip.
+    //    Sending shell commands to a pane where claude is already intercepting
+    //    input would deliver them as chat messages, not shell commands.  Leave
+    //    those panes alone and let auto-expansion create a new blank one.
     let pane_id = state
         .values()
         .find(|l| {
@@ -298,7 +303,7 @@ fn acquire_first_idle_locked(
         .or_else(|| {
             state
                 .values()
-                .find(|l| l.effective_status() == PaneStatus::Idle)
+                .find(|l| l.effective_status() == PaneStatus::Idle && !l.has_claude)
         })
         .map(|l| l.pane_id.clone())
         .ok_or_else(|| anyhow::anyhow!("no idle panes available"))?;
@@ -929,13 +934,14 @@ mod tests {
 
             let (pane, had_claude) =
                 acquire_first_idle("t", "s", Some("/repo/wt/task1")).expect("acquire");
-            // Any idle pane is acceptable; the important thing is `had_claude` is false
-            // (i.e. we did not reuse the mismatched pane as a direct-inject target).
-            let _ = pane;
-            assert!(
-                !had_claude,
-                "had_claude must be false when worktree does not match"
+            // Must select the blank pane (%1), not the mismatched claude pane (%0).
+            // Sending shell commands to a pane where claude is running in a different
+            // worktree would deliver them as chat messages, not shell commands.
+            assert_eq!(
+                pane, "%1",
+                "must skip has_claude pane with different worktree"
             );
+            assert!(!had_claude, "had_claude must be false for blank pane");
         });
     }
 
