@@ -965,20 +965,33 @@ async fn handle_claude_launch(
 
         let send_pane = pane_id.clone();
 
-        // Send all key sequences to the pane.  "Enter" must be a separate
-        // argument — passing it as part of the keys string would send the
-        // literal text " Enter" rather than pressing the Enter key.
+        // Send all key sequences to the pane.
+        //
+        // Text (user-provided descriptions and shell commands) is sent with
+        // `send-keys -l --` so tmux treats the argument as a literal string
+        // rather than a key name.  Without `-l`, strings like "Enter" or
+        // "C-c" would be interpreted as key presses, and strings starting
+        // with "-" would be parsed as send-keys options.
+        //
+        // The Enter key itself is sent in a separate invocation without `-l`
+        // so it remains a real key press (not the literal text "Enter").
         let send_result = tokio::task::spawn_blocking(move || {
             for (keys, press_enter) in &key_sequence {
-                let mut cmd_args = vec!["send-keys", "-t", &send_pane, keys.as_str()];
-                if *press_enter {
-                    cmd_args.push("Enter");
-                }
+                // Send text literally.
                 let out = std::process::Command::new("tmux")
-                    .args(&cmd_args)
+                    .args(["send-keys", "-t", &send_pane, "-l", "--", keys.as_str()])
                     .output()?;
                 if !out.status.success() {
                     return Ok::<bool, std::io::Error>(false);
+                }
+                // Press Enter as a real key in a separate call.
+                if *press_enter {
+                    let out = std::process::Command::new("tmux")
+                        .args(["send-keys", "-t", &send_pane, "Enter"])
+                        .output()?;
+                    if !out.status.success() {
+                        return Ok::<bool, std::io::Error>(false);
+                    }
                 }
             }
             Ok(true)

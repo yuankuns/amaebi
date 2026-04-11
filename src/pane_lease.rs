@@ -400,7 +400,12 @@ pub fn release_lease(pane_id: &str) -> Result<()> {
             lease.status = PaneStatus::Idle;
             lease.task_id = None;
             lease.session_id = None;
-            lease.worktree = None;
+            // Intentionally keep `worktree` and `has_claude`: the pane still
+            // has `claude` running in the same directory.  Preserving these
+            // fields allows the scheduler to reuse the pane for a future task
+            // in the same worktree (tier-1: /compact + inject) without a
+            // full relaunch.  They are only cleared when the pane is destroyed
+            // or explicitly reset to a blank shell.
             lease.heartbeat_at = now_secs();
         }
         write_state_unlocked(&state)?;
@@ -1019,6 +1024,30 @@ mod tests {
             let s = read_state_unlocked().expect("read back");
             assert_eq!(s["%0"].effective_status(), PaneStatus::Idle);
             assert!(s["%0"].task_id.is_none());
+        });
+    }
+
+    #[test]
+    fn release_lease_preserves_worktree_and_has_claude() {
+        // worktree and has_claude must survive release so the scheduler can
+        // reuse the pane for a future task in the same worktree (tier-1 reuse).
+        with_temp_home(|| {
+            let mut lease = make_busy("%0", "@0", Some("/repo/wt/task1"));
+            lease.has_claude = true;
+            let mut state: PaneState = HashMap::new();
+            state.insert("%0".to_string(), lease);
+            write_state_unlocked(&state).expect("seed state");
+
+            release_lease("%0").expect("release");
+
+            let s = read_state_unlocked().expect("read back");
+            assert_eq!(s["%0"].effective_status(), PaneStatus::Idle);
+            assert_eq!(
+                s["%0"].worktree.as_deref(),
+                Some("/repo/wt/task1"),
+                "worktree must be preserved so tier-1 reuse can match it"
+            );
+            assert!(s["%0"].has_claude, "has_claude must be preserved");
         });
     }
 
