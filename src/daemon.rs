@@ -875,15 +875,37 @@ async fn handle_claude_launch(
         let (pane_id, had_claude) = match pane_result {
             Ok(p) => p,
             Err(e) => {
-                // If the worktree was auto-created, clean it up to avoid
-                // orphaned git branches sitting around after a capacity error.
+                // If the worktree was auto-created, remove it and its branch
+                // to avoid orphaned state after a capacity error.
+                // Use client_cwd with -C so git targets the right repo
+                // regardless of where the daemon was started.
+                // The branch name equals the worktree directory's basename
+                // (both set to unique_name = "<task_id>-<uuid8>").
                 if !was_explicit_worktree {
                     if let Some(ref wt) = worktree {
                         let wt_path = wt.clone();
+                        let cleanup_cwd = task.client_cwd.clone();
                         tokio::task::spawn_blocking(move || {
-                            let _ = std::process::Command::new("git")
+                            let branch = std::path::Path::new(&wt_path)
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .map(str::to_string);
+                            let mut rm_cmd = std::process::Command::new("git");
+                            if let Some(ref cwd) = cleanup_cwd {
+                                rm_cmd.args(["-C", cwd.as_str()]);
+                            }
+                            let removed = rm_cmd
                                 .args(["worktree", "remove", "--force", &wt_path])
-                                .output();
+                                .output()
+                                .map(|o| o.status.success())
+                                .unwrap_or(false);
+                            if removed {
+                                if let (Some(ref cwd), Some(ref br)) = (&cleanup_cwd, &branch) {
+                                    let _ = std::process::Command::new("git")
+                                        .args(["-C", cwd.as_str(), "branch", "-D", br.as_str()])
+                                        .output();
+                                }
+                            }
                         })
                         .await
                         .ok();

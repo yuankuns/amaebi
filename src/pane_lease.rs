@@ -628,16 +628,20 @@ pub fn ensure_and_acquire_idle(
     let result = (|| {
         // Count panes that can actually serve this request:
         //   - blank panes (has_claude = false): always usable
-        //   - same-worktree claude panes: reusable via /compact + inject
-        // Panes with claude running in a *different* worktree are skipped by
-        // acquire_first_idle_locked, so they must not count as available here.
+        //   - same-worktree claude panes: reusable via /compact + inject,
+        //     but only when worktree.is_some() — when worktree is None,
+        //     None==None would match any no-worktree claude pane, but
+        //     acquire_first_idle_locked guards tier-1 reuse with
+        //     worktree.is_some(), so those panes won't actually be selected.
+        //     Counting them as available suppresses expansion and leads to
+        //     "no idle panes available" instead.
         // If none are available, expand the pool with a new blank pane.
         let state = read_state_unlocked()?;
         let available = state
             .values()
             .filter(|l| {
                 l.effective_status() == PaneStatus::Idle
-                    && (!l.has_claude || l.worktree.as_deref() == worktree)
+                    && (!l.has_claude || (worktree.is_some() && l.worktree.as_deref() == worktree))
             })
             .count();
         if available == 0 {
@@ -981,6 +985,39 @@ mod tests {
                 "must skip has_claude pane with different worktree"
             );
             assert!(!had_claude, "had_claude must be false for blank pane");
+        }
+    }
+
+    #[test]
+    fn ensure_and_acquire_expands_when_worktree_none_and_only_claude_panes_exist() {
+        // When worktree=None and the only idle pane has has_claude=true with
+        // worktree=None, None==None must NOT suppress expansion.
+        // acquire_first_idle_locked requires worktree.is_some() for tier-1
+        // reuse, so that pane is not selectable — expansion must be attempted.
+        {
+            let _guard = crate::test_utils::with_temp_home();
+            let mut state: PaneState = HashMap::new();
+            let mut pane = make_idle("%0", "@0");
+            pane.has_claude = true;
+            pane.worktree = None; // matches None==None but must NOT count as available
+            state.insert("%0".to_string(), pane);
+            write_state_unlocked(&state).expect("seed state");
+
+            match ensure_and_acquire_idle("t", "s", None) {
+                Ok((_, had_claude)) => {
+                    assert!(
+                        !had_claude,
+                        "None-worktree pane must not trigger tier-1 reuse"
+                    );
+                }
+                Err(e) => {
+                    let msg = format!("{e:#}");
+                    assert!(
+                        !msg.contains("no idle panes available"),
+                        "should attempt expansion, not short-circuit: {msg}"
+                    );
+                }
+            }
         }
     }
 
