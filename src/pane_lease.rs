@@ -597,9 +597,33 @@ pub fn ensure_and_acquire_idle(
         .context("acquiring flock for ensure_and_acquire_idle")?;
 
     let result = (|| {
-        // Ensure at least 1 idle pane exists (expand if necessary).
-        ensure_idle_panes_locked(1)?;
-        // Acquire the first idle pane, preferring ones with Claude already running.
+        // Count panes that can actually serve this request:
+        //   - blank panes (has_claude = false): always usable
+        //   - same-worktree claude panes: reusable via /compact + inject
+        // Panes with claude running in a *different* worktree are skipped by
+        // acquire_first_idle_locked, so they must not count as available here.
+        // If none are available, expand the pool with a new blank pane.
+        let state = read_state_unlocked()?;
+        let available = state
+            .values()
+            .filter(|l| {
+                l.effective_status() == PaneStatus::Idle
+                    && (!l.has_claude || l.worktree.as_deref() == worktree)
+            })
+            .count();
+        if available == 0 {
+            // No usable idle pane exists (all idle panes have claude running in
+            // a different worktree and cannot receive shell commands).  Force
+            // ensure_idle_panes_locked to create a new blank pane by requesting
+            // one more than the current total idle count — it would otherwise
+            // see the existing (unusable) idle panes and skip expansion.
+            let total_idle = state
+                .values()
+                .filter(|l| l.effective_status() == PaneStatus::Idle)
+                .count();
+            ensure_idle_panes_locked(total_idle + 1)?;
+        }
+        // Acquire the first usable idle pane.
         acquire_first_idle_locked(task_id, session_id, worktree)
     })();
 
@@ -942,6 +966,40 @@ mod tests {
                 "must skip has_claude pane with different worktree"
             );
             assert!(!had_claude, "had_claude must be false for blank pane");
+        });
+    }
+
+    #[test]
+    fn ensure_and_acquire_expands_when_only_mismatched_claude_panes_exist() {
+        // All idle panes have claude running in a different worktree — none
+        // are usable for a fresh task.  ensure_and_acquire_idle must attempt
+        // expansion rather than returning "no idle panes available" immediately.
+        with_temp_home(|| {
+            let mut state: PaneState = HashMap::new();
+            let mut pane = make_idle("%0", "@0");
+            pane.has_claude = true;
+            pane.worktree = Some("/repo/wt/other".to_string());
+            state.insert("%0".to_string(), pane);
+            write_state_unlocked(&state).expect("seed state");
+
+            match ensure_and_acquire_idle("t", "s", Some("/repo/wt/task1")) {
+                Ok((pane_id, had_claude)) => {
+                    // tmux is available: expansion succeeded, must have
+                    // acquired a new blank pane (not the mismatched %0).
+                    assert_ne!(pane_id, "%0", "must not acquire mismatched claude pane");
+                    assert!(!had_claude, "new pane must not have had_claude");
+                }
+                Err(e) => {
+                    // No tmux session: expansion was attempted but failed.
+                    // The error must be a tmux failure, NOT "no idle panes
+                    // available" (which would mean we gave up before trying).
+                    let msg = format!("{e:#}");
+                    assert!(
+                        !msg.contains("no idle panes available"),
+                        "should attempt expansion, not short-circuit: {msg}"
+                    );
+                }
+            }
         });
     }
 
