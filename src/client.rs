@@ -448,22 +448,11 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
         .or_else(|| std::env::var("AMAEBI_MODEL").ok())
         .unwrap_or_else(|| crate::provider::DEFAULT_MODEL.to_string());
 
-    // Resolve the session UUID for the current working directory.
-    // Wrapped in spawn_blocking because session::get_or_create does file I/O.
     let cwd = std::env::current_dir().context("getting current directory")?;
-    let cwd_for_session = cwd.clone();
-    let session_id = tokio::task::spawn_blocking(move || session::get_or_create(&cwd_for_session))
-        .await
-        .context("session::get_or_create panicked")?
-        .unwrap_or_else(|e| {
-            tracing::warn!(error = %e, "failed to resolve session id; using \"global\"");
-            "global".to_string()
-        });
-
-    // Keep a copy for the steering requests and the exit footer.
-    let session_id_copy = session_id.clone();
 
     // Intercept `/claude` commands: send a ClaudeLaunch request instead of Chat.
+    // Checked before session::get_or_create to avoid unnecessary disk I/O for
+    // commands that don't use the chat session.
     if let Some(parse_result) = parse_claude_command(&prompt) {
         let tasks = match parse_result {
             Ok(t) => t,
@@ -536,6 +525,19 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
         stdout.flush().await?;
         return Ok(());
     }
+
+    // Resolve the session UUID now that we know this is a chat request
+    // (not a /claude command).  Done after the /claude check to avoid
+    // unnecessary disk I/O for commands that don't use the chat session.
+    let cwd_for_session = cwd.clone();
+    let session_id = tokio::task::spawn_blocking(move || session::get_or_create(&cwd_for_session))
+        .await
+        .context("session::get_or_create panicked")?
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "failed to resolve session id; using \"global\"");
+            "global".to_string()
+        });
+    let session_id_copy = session_id.clone();
 
     // Build and send the request as a single JSON line.
     let req = Request::Chat {

@@ -34,6 +34,8 @@ use anyhow::{Context, Result};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
+use crate::auth::amaebi_home;
+
 /// Maximum total number of panes (Idle + Busy) that the daemon will manage.
 pub const MAX_PANES: usize = 16;
 
@@ -145,23 +147,16 @@ fn now_secs() -> u64 {
         .as_secs()
 }
 
-fn amaebi_dir() -> Result<PathBuf> {
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .context("HOME environment variable not set")?;
-    Ok(PathBuf::from(home).join(".amaebi"))
-}
-
 fn state_path() -> Result<PathBuf> {
-    Ok(amaebi_dir()?.join("tmux-state.json"))
+    Ok(amaebi_home()?.join("tmux-state.json"))
 }
 
 fn lock_path() -> Result<PathBuf> {
-    Ok(amaebi_dir()?.join("tmux-state.lock"))
+    Ok(amaebi_home()?.join("tmux-state.lock"))
 }
 
 fn open_lock_file() -> Result<File> {
-    let dir = amaebi_dir()?;
+    let dir = amaebi_home()?;
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("creating directory {}", dir.display()))?;
     let path = lock_path()?;
@@ -211,7 +206,8 @@ fn write_state_unlocked(state: &PaneState) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600));
+        std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("setting 0o600 permissions on {}", tmp_path.display()))?;
     }
     std::fs::rename(&tmp_path, &path)
         .with_context(|| format!("renaming {} → {}", tmp_path.display(), path.display()))

@@ -913,10 +913,33 @@ async fn handle_claude_launch(
             .map(std::path::Path::to_path_buf)
             .or_else(|| task.client_cwd.as_deref().map(std::path::PathBuf::from))
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-        let session_id = tokio::task::spawn_blocking(move || session::get_or_create(&session_dir))
-            .await
-            .context("session::get_or_create panicked")?
-            .context("resolving session ID")?;
+        // If session resolution fails, release the pane so it doesn't get
+        // stuck Busy until TTL expiry.
+        let session_id_result =
+            tokio::task::spawn_blocking(move || session::get_or_create(&session_dir))
+                .await
+                .map_err(|e| anyhow::anyhow!("session::get_or_create panicked: {e}"))
+                .and_then(|r| r.context("resolving session ID"));
+        let session_id = match session_id_result {
+            Ok(id) => id,
+            Err(e) => {
+                let failed_pane = pane_id.clone();
+                tokio::task::spawn_blocking(move || {
+                    let _ = pane_lease::release_lease(&failed_pane);
+                })
+                .await
+                .ok();
+                let mut w = writer.lock().await;
+                write_frame(
+                    &mut *w,
+                    &Response::Error {
+                        message: format!("[error] {e:#}"),
+                    },
+                )
+                .await?;
+                return Ok(());
+            }
+        };
         let update_pane = pane_id.clone();
         let update_sid = session_id.clone();
         tokio::task::spawn_blocking(move || {
@@ -1137,11 +1160,7 @@ fn create_task_worktree(
         .collect::<String>();
     let unique_name = format!("{task_id}-{short_id}");
 
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .context("HOME environment variable not set")?;
-    let wt_path = PathBuf::from(home)
-        .join(".amaebi")
+    let wt_path = amaebi_home()?
         .join("worktrees")
         .join(repo_name)
         .join(&unique_name);
