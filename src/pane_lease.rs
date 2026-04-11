@@ -67,6 +67,11 @@ pub struct PaneLease {
     pub worktree: Option<String>,
     /// Unix timestamp of the last heartbeat (or acquisition time).
     pub heartbeat_at: u64,
+    /// Whether `amaebi chat` has been started in this pane.  Idle panes with
+    /// `has_claude = true` are preferred over blank panes when assigning tasks:
+    /// the scheduler injects just the prompt rather than launching a new session.
+    #[serde(default)]
+    pub has_claude: bool,
 }
 
 impl PaneLease {
@@ -79,6 +84,7 @@ impl PaneLease {
             session_id: None,
             worktree: None,
             heartbeat_at: now_secs(),
+            has_claude: false,
         }
     }
 
@@ -218,14 +224,15 @@ pub fn read_state() -> Result<PaneState> {
 
 /// Acquire a lease on the **first available idle pane** for the given task.
 ///
-/// Returns the `pane_id` of the acquired pane.  If `worktree` is provided it
-/// is checked against all currently Busy panes for uniqueness.
+/// Returns `(pane_id, had_claude)`.  If `worktree` is provided it is checked
+/// against all currently Busy panes for uniqueness.  Prefer
+/// [`ensure_and_acquire_idle`] for production use to avoid TOCTOU races.
 #[allow(dead_code)]
 pub fn acquire_first_idle(
     task_id: &str,
     session_id: &str,
     worktree: Option<&str>,
-) -> Result<String> {
+) -> Result<(String, bool)> {
     let lock = open_lock_file()?;
     lock.lock_exclusive()
         .context("acquiring flock for acquire_first_idle")?;
@@ -237,11 +244,18 @@ pub fn acquire_first_idle(
     result
 }
 
+/// Returns `(pane_id, had_claude)` where `had_claude` indicates whether
+/// `amaebi chat` was already running in the pane.  Callers use this to decide
+/// whether to inject only the prompt (`had_claude = true`) or to launch a
+/// fresh `amaebi chat <description>` (`had_claude = false`).
+///
+/// Priority: idle panes with `has_claude = true` are preferred so that
+/// existing Claude sessions absorb new tasks before blank panes are used.
 fn acquire_first_idle_locked(
     task_id: &str,
     session_id: &str,
     worktree: Option<&str>,
-) -> Result<String> {
+) -> Result<(String, bool)> {
     let mut state = read_state_unlocked()?;
 
     // Worktree uniqueness check.
@@ -258,14 +272,20 @@ fn acquire_first_idle_locked(
         }
     }
 
-    // Find first idle pane.
+    // Prefer idle panes that already have `amaebi chat` running.
     let pane_id = state
         .values()
-        .find(|l| l.effective_status() == PaneStatus::Idle)
+        .find(|l| l.effective_status() == PaneStatus::Idle && l.has_claude)
+        .or_else(|| {
+            state
+                .values()
+                .find(|l| l.effective_status() == PaneStatus::Idle)
+        })
         .map(|l| l.pane_id.clone())
         .ok_or_else(|| anyhow::anyhow!("no idle panes available"))?;
 
     let lease = state.get_mut(&pane_id).unwrap();
+    let had_claude = lease.has_claude;
     lease.status = PaneStatus::Busy;
     lease.task_id = Some(task_id.to_string());
     lease.session_id = Some(session_id.to_string());
@@ -273,7 +293,7 @@ fn acquire_first_idle_locked(
     lease.heartbeat_at = now_secs();
 
     write_state_unlocked(&state)?;
-    Ok(pane_id)
+    Ok((pane_id, had_claude))
 }
 
 /// Acquire a lease on a **specific pane** by ID.
@@ -528,8 +548,13 @@ fn ensure_idle_panes_locked(needed: usize) -> Result<()> {
     Ok(())
 }
 
-/// Atomically ensure at least `needed` Idle panes exist **and** acquire the
-/// first idle pane for the given task — all within a single `LOCK_EX`.
+/// Atomically ensure at least one idle pane exists **and** acquire it for
+/// the given task — all within a single `LOCK_EX`.
+///
+/// Returns `(pane_id, had_claude)`.  `had_claude = true` means the pane
+/// already had `amaebi chat` running; the caller should inject just the
+/// prompt.  `had_claude = false` means the pane is blank; the caller should
+/// launch `amaebi chat <description>`.
 ///
 /// This eliminates the TOCTOU race between `ensure_idle_panes` and
 /// `acquire_first_idle` when multiple `ClaudeLaunch` requests arrive
@@ -538,7 +563,7 @@ pub fn ensure_and_acquire_idle(
     task_id: &str,
     session_id: &str,
     worktree: Option<&str>,
-) -> Result<String> {
+) -> Result<(String, bool)> {
     let lock = open_lock_file()?;
     lock.lock_exclusive()
         .context("acquiring flock for ensure_and_acquire_idle")?;
@@ -546,12 +571,35 @@ pub fn ensure_and_acquire_idle(
     let result = (|| {
         // Ensure at least 1 idle pane exists (expand if necessary).
         ensure_idle_panes_locked(1)?;
-        // Acquire the first idle pane.
+        // Acquire the first idle pane, preferring ones with Claude already running.
         acquire_first_idle_locked(task_id, session_id, worktree)
     })();
 
     lock.unlock()
         .context("releasing flock after ensure_and_acquire_idle")?;
+    result
+}
+
+/// Mark a pane as having an active `amaebi chat` session.
+///
+/// Called after successfully injecting `amaebi chat` into a blank pane so
+/// that future task assignments can inject prompts directly instead of
+/// launching a new session.
+pub fn mark_claude_started(pane_id: &str) -> Result<()> {
+    let lock = open_lock_file()?;
+    lock.lock_exclusive()
+        .context("acquiring flock for mark_claude_started")?;
+
+    let result = (|| {
+        let mut state = read_state_unlocked()?;
+        if let Some(lease) = state.get_mut(pane_id) {
+            lease.has_claude = true;
+        }
+        write_state_unlocked(&state)
+    })();
+
+    lock.unlock()
+        .context("releasing flock after mark_claude_started")?;
     result
 }
 
@@ -626,6 +674,7 @@ mod tests {
             session_id: Some("sess-1".to_string()),
             worktree: worktree.map(str::to_string),
             heartbeat_at: now_secs(),
+            has_claude: false,
         }
     }
 
@@ -774,7 +823,8 @@ mod tests {
             state.insert("%1".to_string(), make_idle("%1", "@0"));
             write_state_unlocked(&state).expect("seed state");
 
-            let pane = acquire_first_idle("t", "s", None).expect("acquire first idle");
+            let (pane, _had_claude) =
+                acquire_first_idle("t", "s", None).expect("acquire first idle");
             assert_eq!(pane, "%1");
         });
     }

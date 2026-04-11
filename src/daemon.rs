@@ -791,15 +791,16 @@ async fn drive_agentic_loop(
 // Sub-handlers — one per Request variant
 // ---------------------------------------------------------------------------
 
-/// Handle `Request::ClaudeLaunch`: assign tmux panes and launch amaebi chat
+/// Handle `Request::ClaudeLaunch`: assign tmux panes and launch `amaebi chat`
 /// sessions for each task.
 ///
 /// Steps for each task:
-/// 1. `ensure_idle_panes(n)` — auto-expand pane pool if needed.
-/// 2. For each task: `acquire_first_idle` → get a pane.
-/// 3. Rename the pane title to `"amaebi | <task_id>"`.
-/// 4. Send `tmux send-keys` to start `amaebi chat` (in the worktree if set).
-/// 5. Stream `Response::PaneAssigned` for each task, then `Response::Done`.
+/// 1. `ensure_and_acquire_idle` — atomically expand the pane pool if needed
+///    and acquire an idle pane.
+/// 2. Rename the pane title to `"amaebi | <task_id>"`.
+/// 3. Inject `amaebi chat <description>` (with optional `cd <worktree>`)
+///    via `tmux send-keys`.
+/// 4. Stream `Response::PaneAssigned` for each task, then `Response::Done`.
 async fn handle_claude_launch(
     writer: &Arc<tokio::sync::Mutex<tokio::net::unix::OwnedWriteHalf>>,
     tasks: Vec<crate::ipc::TaskSpec>,
@@ -810,9 +811,10 @@ async fn handle_claude_launch(
         return Ok(());
     }
 
-    // Acquire a lease and launch a chat session for each task.
-    // `ensure_and_acquire_idle` holds a single LOCK_EX for both the
-    // ensure-idle-panes expansion and the acquire, eliminating the TOCTOU race.
+    // For each task: acquire a pane (auto-expanding the pool if needed), then
+    // inject `amaebi chat <description>` via tmux send-keys.
+    // `ensure_and_acquire_idle` holds a single LOCK_EX for both expansion and
+    // acquisition, eliminating the TOCTOU race.
     for task in tasks {
         let task_id = task.task_id.clone();
         let worktree = task.worktree.clone();
@@ -835,7 +837,7 @@ async fn handle_claude_launch(
         .await
         .context("ensure_and_acquire_idle task panicked")?;
 
-        let pane_id = match pane_result {
+        let (pane_id, had_claude) = match pane_result {
             Ok(p) => p,
             Err(e) => {
                 // Surface CapacityError as a typed terminal response.
@@ -886,27 +888,34 @@ async fn handle_claude_launch(
         .await
         .ok();
 
-        // Build the command to inject into the pane.
-        let amaebi_cmd = std::env::current_exe()
-            .ok()
-            .and_then(|p| p.to_str().map(str::to_string))
-            .unwrap_or_else(|| "amaebi".to_string());
-
-        // Build the shell command string and assemble tmux send-keys args.
-        // The description is passed as the opening prompt to `amaebi chat`.
-        let cmd = if let Some(ref wt) = worktree {
-            format!(
-                "cd {} && {} chat {}",
-                shell_escape(wt),
-                shell_escape(&amaebi_cmd),
-                shell_escape(&description)
-            )
+        // Build the keys to inject into the pane.
+        //
+        // Priority:
+        //  - `had_claude = true`: pane already has `amaebi chat` running at
+        //    its prompt → send just the description as a new user message.
+        //  - `had_claude = false`: pane is blank (freshly created or at a
+        //    shell prompt) → launch `amaebi chat <description>`.
+        let cmd = if had_claude {
+            description.clone()
         } else {
-            format!(
-                "{} chat {}",
-                shell_escape(&amaebi_cmd),
-                shell_escape(&description)
-            )
+            let amaebi_cmd = std::env::current_exe()
+                .ok()
+                .and_then(|p| p.to_str().map(str::to_string))
+                .unwrap_or_else(|| "amaebi".to_string());
+            if let Some(ref wt) = worktree {
+                format!(
+                    "cd {} && {} chat {}",
+                    shell_escape(wt),
+                    shell_escape(&amaebi_cmd),
+                    shell_escape(&description)
+                )
+            } else {
+                format!(
+                    "{} chat {}",
+                    shell_escape(&amaebi_cmd),
+                    shell_escape(&description)
+                )
+            }
         };
 
         let send_pane = pane_id.clone();
@@ -943,6 +952,17 @@ async fn handle_claude_launch(
             )
             .await?;
             return Ok(());
+        }
+
+        // If we just launched `amaebi chat` in a blank pane, record that so
+        // future task assignments can inject prompts directly.
+        if !had_claude {
+            let started_pane = pane_id.clone();
+            tokio::task::spawn_blocking(move || {
+                let _ = pane_lease::mark_claude_started(&started_pane);
+            })
+            .await
+            .ok();
         }
 
         let mut w = writer.lock().await;
