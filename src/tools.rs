@@ -110,6 +110,7 @@ impl ToolExecutor for LocalExecutor {
             "tmux_send_keys" => tmux_send_keys(args).await,
             "tmux_wait" => tmux_wait(args).await,
             "wait_for_file" => wait_for_file(args).await,
+            "tmux_rename_pane" => tmux_rename_pane(args).await,
             "read_file" => read_file(args).await,
             "edit_file" => edit_file(args).await,
             "spawn_agent" => match &self.spawn_ctx {
@@ -258,16 +259,10 @@ async fn tmux_send_keys(args: serde_json::Value) -> Result<String> {
 /// Instead of the LLM calling `tmux_capture_pane` in a loop (burning one LLM
 /// turn per poll), a single `tmux_wait` call blocks until the command running
 /// in the pane appears to have finished.
-///
-/// The function observes `idle_secs` of unchanged output before returning, so
-/// it always waits at least `idle_secs` regardless of the initial pane state.
-/// On timeout an error is returned so callers can distinguish it from a real
-/// pane output.
 async fn tmux_wait(args: serde_json::Value) -> Result<String> {
     let target = args["target"].as_str().unwrap_or("%0");
     let idle_secs = args["idle_secs"].as_u64().unwrap_or(3);
     let timeout_secs = args["timeout_secs"].as_u64().unwrap_or(600).min(86_400);
-    // Clamp poll interval to at least 1 s to avoid busy-polling tmux.
     let poll_secs = args["poll_interval_secs"].as_u64().unwrap_or(2).max(1);
 
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
@@ -275,16 +270,12 @@ async fn tmux_wait(args: serde_json::Value) -> Result<String> {
     let mut stable_since = tokio::time::Instant::now();
 
     loop {
-        // Check the hard deadline at the top of every iteration so we never
-        // start a new capture call after time has already expired.
         if tokio::time::Instant::now() >= deadline {
             anyhow::bail!(
                 "tmux_wait: timed out after {timeout_secs}s waiting for pane '{target}' to become idle"
             );
         }
 
-        // Wrap the capture call with timeout_at so a hung tmux process cannot
-        // block past the deadline.
         let capture_fut = Command::new("tmux")
             .args(["capture-pane", "-t", target, "-p"])
             .output();
@@ -312,7 +303,6 @@ async fn tmux_wait(args: serde_json::Value) -> Result<String> {
             return Ok(last_content);
         }
 
-        // Sleep at most until the deadline to keep the timeout accurate.
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         let sleep_dur = std::time::Duration::from_secs(poll_secs).min(remaining);
         tokio::time::sleep(sleep_dur).await;
@@ -320,21 +310,16 @@ async fn tmux_wait(args: serde_json::Value) -> Result<String> {
 }
 
 /// Block until `path` exists on the filesystem, then return `"found"`.
-///
-/// Useful for scripts that drop a sentinel file on completion, avoiding the
-/// need for the LLM to call `tmux_capture_pane` in a polling loop.
 async fn wait_for_file(args: serde_json::Value) -> Result<String> {
     let path = args["path"]
         .as_str()
         .context("wait_for_file: missing string argument 'path'")?;
-    // Cap timeout at 24 h to avoid Instant overflow with very large values.
     let timeout_secs = args["timeout_secs"].as_u64().unwrap_or(300).min(86_400);
     let poll_ms = args["poll_interval_ms"].as_u64().unwrap_or(500);
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
     loop {
         match tokio::fs::metadata(path).await {
             Ok(m) if m.is_file() => return Ok("found".to_owned()),
-            // A directory at the sentinel path is not the expected file — keep polling.
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => {
@@ -351,6 +336,29 @@ async fn wait_for_file(args: serde_json::Value) -> Result<String> {
         }
         tokio::time::sleep(std::time::Duration::from_millis(poll_ms).min(remaining)).await;
     }
+}
+
+/// Rename a tmux pane by setting its title.
+async fn tmux_rename_pane(args: serde_json::Value) -> Result<String> {
+    let target = args["target"]
+        .as_str()
+        .context("tmux_rename_pane: missing string argument 'target'")?;
+    let title = args["title"]
+        .as_str()
+        .context("tmux_rename_pane: missing string argument 'title'")?;
+
+    let output = Command::new("tmux")
+        .args(["select-pane", "-t", target, "-T", title])
+        .output()
+        .await
+        .context("spawning tmux select-pane")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("tmux select-pane -T failed: {stderr}");
+    }
+
+    Ok(format!("renamed pane {target} to \"{title}\""))
 }
 
 /// Read the full contents of a file.
@@ -785,6 +793,28 @@ pub fn tool_schemas(include_spawn_agent: bool) -> Vec<serde_json::Value> {
                         }
                     },
                     "required": ["path"]
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "tmux_rename_pane",
+                "description": "Set the title of a tmux pane using 'tmux select-pane -T'. \
+                                Useful for labelling panes with the current task.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "target": {
+                            "type": "string",
+                            "description": "tmux target pane (e.g. '%3'). Required."
+                        },
+                        "title": {
+                            "type": "string",
+                            "description": "New pane title to display."
+                        }
+                    },
+                    "required": ["target", "title"]
                 }
             }
         }),

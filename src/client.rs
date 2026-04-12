@@ -1,13 +1,13 @@
 use anyhow::{Context, Result};
 use std::collections::VecDeque;
 use std::io::IsTerminal as _;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::signal::unix::{signal, SignalKind};
 
-use crate::ipc::{Request, Response};
+use crate::ipc::{Request, Response, TaskSpec};
 use crate::session;
 
 /// How long the user has to press Ctrl-C a second time to exit.
@@ -198,67 +198,217 @@ fn render_markdown(text: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// /dev command parsing and prompt synthesis
+// /claude command parsing
 // ---------------------------------------------------------------------------
 
-/// A single development task parsed from the `/dev` command.
+/// A task parsed from the `/claude` command.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct DevTask {
-    /// Sanitized branch-safe name, e.g. "cron-scheduling".
-    name: String,
-    /// Original task description.
+struct ClaudeTask {
+    /// Short task label derived from the description.
+    task_id: String,
+    /// Task description / opening prompt.
     description: String,
+    /// Optional absolute worktree path.
+    worktree: Option<String>,
+    /// Whether to auto-send Enter after injecting the command into the pane.
+    auto_enter: bool,
 }
 
-/// Parse a `/dev` command into a list of [`DevTask`]s.
+/// Parse a `/claude` command into a list of [`ClaudeTask`]s.
 ///
-/// Returns `None` if the input does not start with `/dev ` (with a trailing
-/// space).  Supports two forms:
-/// - Quoted tasks: `/dev "implement cron" "fix context limit"` -> 2 tasks
-/// - Single unquoted task: `/dev implement cron scheduling` -> 1 task
-fn parse_dev_command(input: &str) -> Option<Vec<DevTask>> {
-    let rest = input.strip_prefix("/dev ")?;
-    let rest = rest.trim();
+/// Syntax:
+/// ```text
+/// /claude [--worktree <path>] [--no-enter] "task description" ["task2" ...]
+/// ```
+///
+/// Returns:
+/// - `None` — input does not start with `/claude ` (not a `/claude` command)
+/// - `Some(Err(msg))` — input is a `/claude` command but has a parse error
+/// - `Some(Ok(tasks))` — successfully parsed task list
+fn parse_claude_command(input: &str) -> Option<Result<Vec<ClaudeTask>, String>> {
+    let rest = input.strip_prefix("/claude ")?.trim();
     if rest.is_empty() {
-        return None;
+        return Some(Err(
+            "usage: /claude [--worktree <path>] [--no-enter] \"task description\" [...]"
+                .to_string(),
+        ));
     }
 
-    let descriptions = if rest.contains('"') {
-        parse_quoted_args(rest)
+    // Tokenise (shell-style quoting); each entry is (token, was_quoted).
+    let tokens = parse_quoted_args(rest);
+    if tokens.is_empty() {
+        return Some(Err(
+            "usage: /claude [--worktree <path>] [--no-enter] \"task description\" [...]"
+                .to_string(),
+        ));
+    }
+
+    let mut worktree: Option<String> = None;
+    let mut auto_enter = true;
+    // (description, was_quoted) pairs for non-flag tokens.
+    let mut desc_tokens: Vec<(String, bool)> = Vec::new();
+
+    let mut i = 0;
+    while i < tokens.len() {
+        match tokens[i].0.as_str() {
+            "--worktree" => {
+                i += 1;
+                // Require a non-flag value to follow --worktree.
+                if i >= tokens.len() || tokens[i].0.starts_with("--") {
+                    return Some(Err("--worktree requires a path argument".to_string()));
+                }
+                // Canonicalize to an absolute path so worktree uniqueness
+                // checks in the daemon are reliable regardless of how the
+                // path was spelled (relative vs. symlink vs. absolute).
+                // If canonicalize fails (path doesn't exist yet), fall back to
+                // an explicit absolute path rather than leaving it relative.
+                let raw = &tokens[i].0;
+                let raw_path = std::path::PathBuf::from(raw);
+                let abs = std::fs::canonicalize(&raw_path).unwrap_or_else(|_| {
+                    if raw_path.is_absolute() {
+                        raw_path.clone()
+                    } else {
+                        std::env::current_dir()
+                            .map(|cwd| cwd.join(&raw_path))
+                            .unwrap_or(raw_path)
+                    }
+                });
+                worktree = Some(abs.to_string_lossy().into_owned());
+            }
+            "--no-enter" => {
+                auto_enter = false;
+            }
+            // `--` marks end of flags; everything after is a description token.
+            "--" => {
+                i += 1;
+                while i < tokens.len() {
+                    desc_tokens.push((tokens[i].0.clone(), tokens[i].1));
+                    i += 1;
+                }
+                break;
+            }
+            tok => {
+                // Only treat unquoted tokens starting with `--` as unknown
+                // flags.  A quoted token like `"--investigate"` is a valid
+                // task description and must not be rejected.
+                if !tokens[i].1 && tok.starts_with("--") {
+                    return Some(Err(format!("unknown flag: {tok}")));
+                }
+                desc_tokens.push((tok.to_string(), tokens[i].1));
+            }
+        }
+        i += 1;
+    }
+
+    if desc_tokens.is_empty() {
+        return Some(Err(
+            "usage: /claude [--worktree <path>] [--no-enter] \"task description\" [...]"
+                .to_string(),
+        ));
+    }
+
+    // Build task list.  Quoted tokens each become a separate task.  Unquoted
+    // tokens are joined as a single task (e.g. `/claude write some code` →
+    // one task "write some code", not three separate tasks).
+    let all_quoted = desc_tokens.iter().all(|(_, q)| *q);
+    let descriptions: Vec<String> = if all_quoted || desc_tokens.len() == 1 {
+        desc_tokens.into_iter().map(|(s, _)| s).collect()
     } else {
-        vec![rest.to_string()]
+        // Mix of quoted and unquoted, or all unquoted: join as one description.
+        vec![desc_tokens
+            .into_iter()
+            .map(|(s, _)| s)
+            .collect::<Vec<_>>()
+            .join(" ")]
     };
 
-    if descriptions.is_empty() {
-        return None;
+    // --worktree is a single path — it cannot be shared across multiple tasks
+    // because the daemon enforces worktree uniqueness per pane.
+    if worktree.is_some() && descriptions.len() > 1 {
+        return Some(Err("--worktree cannot be used with multiple tasks; \
+             each task gets its own auto-created worktree"
+            .to_string()));
     }
 
-    let tasks: Vec<DevTask> = descriptions
+    let tasks: Vec<ClaudeTask> = descriptions
         .into_iter()
-        .map(|desc| {
-            let name = sanitize_task_name(&desc);
-            DevTask {
-                name,
+        .enumerate()
+        .map(|(idx, desc)| {
+            let task_id = make_task_id(&desc, idx);
+            ClaudeTask {
+                task_id,
                 description: desc,
+                worktree: worktree.clone(),
+                auto_enter,
             }
         })
         .collect();
 
-    Some(tasks)
+    Some(Ok(tasks))
+}
+
+/// Derive a short task label from a description + index.
+fn make_task_id(description: &str, idx: usize) -> String {
+    let lower = description.to_lowercase();
+    let slug: String = lower
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+
+    // Collapse runs of dashes.
+    let mut result = String::new();
+    let mut prev_dash = false;
+    for c in slug.chars() {
+        if c == '-' {
+            if !prev_dash {
+                result.push('-');
+            }
+            prev_dash = true;
+        } else {
+            result.push(c);
+            prev_dash = false;
+        }
+    }
+    let trimmed = result.trim_matches('-');
+
+    // For non-ASCII-only descriptions that produce an empty slug, use
+    // "task-{idx}" which already encodes the index — no suffix needed.
+    if trimmed.is_empty() {
+        return format!("task-{idx}");
+    }
+
+    let base = if trimmed.len() > 32 {
+        trimmed[..32].trim_end_matches('-').to_string()
+    } else {
+        trimmed.to_string()
+    };
+
+    // Append the index for tasks beyond the first so that duplicate
+    // descriptions within a single /claude invocation get distinct task_ids
+    // (and therefore distinct auto-worktree paths / branch names).
+    if idx > 0 {
+        format!("{base}-{idx}")
+    } else {
+        base
+    }
 }
 
 /// Parse shell-style arguments, supporting both quoted and unquoted tokens.
 ///
-/// - `"implement cron" "fix context limit"` → `["implement cron", "fix context limit"]`
-/// - `foo "bar"` → `["foo", "bar"]`  (mixed quoted/unquoted)
-/// - Escaped quotes inside quoted strings are supported: `"say \"hi\""` → `[r#"say "hi""#]`
-fn parse_quoted_args(input: &str) -> Vec<String> {
+/// Returns `(token, was_quoted)` pairs so callers can distinguish
+/// `"foo" "bar"` (two separately-quoted tasks) from `foo bar` (one task whose
+/// words were split by whitespace).
+///
+/// - `"implement cron" "fix context limit"` → two quoted tokens
+/// - `foo "bar"` → one unquoted + one quoted token
+/// - Escaped quotes inside quoted strings: `"say \"hi\""` → `[r#"say "hi""#]`
+fn parse_quoted_args(input: &str) -> Vec<(String, bool)> {
     let mut results = Vec::new();
     let mut chars = input.chars().peekable();
 
     while let Some(&ch) = chars.peek() {
         if ch == '"' {
-            chars.next(); // consume opening quote
+            chars.next();
             let mut arg = String::new();
             loop {
                 match chars.next() {
@@ -274,12 +424,11 @@ fn parse_quoted_args(input: &str) -> Vec<String> {
             }
             let trimmed = arg.trim().to_string();
             if !trimmed.is_empty() {
-                results.push(trimmed);
+                results.push((trimmed, true));
             }
         } else if ch.is_whitespace() {
-            chars.next(); // skip whitespace between tokens
+            chars.next();
         } else {
-            // Unquoted token: collect until whitespace or quote.
             let mut arg = String::new();
             while let Some(&c) = chars.peek() {
                 if c.is_whitespace() || c == '"' {
@@ -289,166 +438,12 @@ fn parse_quoted_args(input: &str) -> Vec<String> {
                 chars.next();
             }
             if !arg.is_empty() {
-                results.push(arg);
+                results.push((arg, false));
             }
         }
     }
 
     results
-}
-
-/// Sanitize a task description into a branch-safe name.
-///
-/// - Lowercase
-/// - Replace spaces and non-ASCII with `-`
-/// - Truncate to 40 chars max
-/// - Remove leading/trailing `-`
-/// - For pure non-ASCII (no ASCII alpha left), use `task-<first-8-hex-of-hash>`
-fn sanitize_task_name(description: &str) -> String {
-    let lower = description.to_lowercase();
-    let sanitized: String = lower
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .collect();
-
-    let collapsed = collapse_dashes(&sanitized);
-    let trimmed = collapsed.trim_matches('-');
-
-    if trimmed.is_empty() {
-        return hash_based_name(description);
-    }
-
-    // Truncate to 40 chars, re-trimming trailing dash if truncation split a word.
-    let truncated = if trimmed.len() > 40 {
-        trimmed[..40].trim_end_matches('-')
-    } else {
-        trimmed
-    };
-
-    truncated.to_string()
-}
-
-/// Collapse runs of consecutive dashes into a single dash.
-fn collapse_dashes(s: &str) -> String {
-    let mut result = String::with_capacity(s.len());
-    let mut prev_dash = false;
-    for c in s.chars() {
-        if c == '-' {
-            if !prev_dash {
-                result.push('-');
-            }
-            prev_dash = true;
-        } else {
-            result.push(c);
-            prev_dash = false;
-        }
-    }
-    result
-}
-
-/// Generate a `task-<hex>` name from a deterministic hash of the description.
-///
-/// Uses `std::hash::DefaultHasher` (SipHash) — not cryptographic, but
-/// deterministic within a process and sufficient for branch-name uniqueness.
-fn hash_based_name(description: &str) -> String {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    description.hash(&mut hasher);
-    let hash = hasher.finish();
-    // Use the upper 32 bits formatted as 8 hex digits: "task-" (5) + 8 = 13 chars.
-    format!("task-{:08x}", (hash >> 32) as u32)
-}
-
-/// Build the orchestration prompt that instructs the parent agent to create
-/// worktrees and launch Claude Code CLI processes for parallel development.
-fn build_dev_prompt(tasks: &[DevTask], cwd: &Path) -> String {
-    let cwd_display = cwd.display();
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .unwrap_or_else(|_| "/tmp".to_string());
-    let worktree_base = format!("{home}/amaebi-wt");
-    let claude = std::env::var("CLAUDE").unwrap_or_else(|_| "claude".to_string());
-
-    let mut task_list = String::new();
-    for (i, task) in tasks.iter().enumerate() {
-        task_list.push_str(&format!(
-            "{}. **{}**: {}\n",
-            i + 1,
-            task.name,
-            task.description
-        ));
-    }
-
-    let mut worktree_commands = String::new();
-    for task in tasks {
-        worktree_commands.push_str(&format!(
-            "   git worktree add \"{worktree_base}/{name}\" -b feat/{name} origin/master\n",
-            worktree_base = worktree_base,
-            name = task.name,
-        ));
-    }
-
-    // Build the background launch command: run all Claude processes in parallel.
-    let mut launch_parts = Vec::new();
-    for task in tasks {
-        let escaped_desc = task
-            .description
-            .replace('\\', "\\\\")
-            .replace('\'', "'\\''");
-        launch_parts.push(format!(
-            "cd \"{worktree_base}/{name}\" && \
-             {claude} --print \
-             --permission-mode bypassPermissions \
-             -p '{escaped_desc}. \
-             Follow the project CLAUDE.md rules. \
-             After implementation, run: cargo fmt && cargo clippy -- -D warnings && cargo test. \
-             Fix any issues until all checks pass. \
-             Then commit with a conventional commit message (feat:, fix:, etc.). \
-             Report what you did and the branch name.' \
-             > \"{worktree_base}/{name}/claude.log\" 2>&1",
-            worktree_base = worktree_base,
-            name = task.name,
-            claude = claude,
-        ));
-    }
-
-    let parallel_cmd = if launch_parts.len() == 1 {
-        launch_parts[0].clone()
-    } else {
-        // Launch all in background, wait for all to finish.
-        let bg_cmds: Vec<String> = launch_parts
-            .iter()
-            .map(|cmd| format!("({cmd}) &"))
-            .collect();
-        format!("{}\nwait", bg_cmds.join("\n"))
-    };
-
-    format!(
-        "You are orchestrating a parallel development session for a Rust project.\n\
-         \n\
-         ## Tasks\n\
-         {task_list}\n\
-         ## Instructions\n\
-         \n\
-         Execute these steps IN ORDER using shell_command:\n\
-         \n\
-         1. Fetch latest upstream:\n\
-         \x20  cd \"{cwd_display}\" && git fetch origin\n\
-         \n\
-         2. Create worktree base and worktrees:\n\
-         \x20  mkdir -p \"{worktree_base}\"\n\
-         \x20  cd \"{cwd_display}\"\n\
-         {worktree_commands}\n\
-         3. Launch Claude Code in each worktree (this runs on the host, not in a sandbox):\n\
-         \x20  Use a SINGLE shell_command to run all tasks in parallel:\n\
-         ```\n\
-         {parallel_cmd}\n\
-         ```\n\
-         \n\
-         4. After the command completes, read each log file and report:\n\
-         \x20  - For each task: branch name (feat/<name>), worktree path, what Claude accomplished\n\
-         \x20  - Any failures (check the log files at {worktree_base}/<name>/claude.log)\n",
-    )
 }
 
 pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Result<()> {
@@ -465,9 +460,87 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
         .or_else(|| std::env::var("AMAEBI_MODEL").ok())
         .unwrap_or_else(|| crate::provider::DEFAULT_MODEL.to_string());
 
-    // Resolve the session UUID for the current working directory.
-    // Wrapped in spawn_blocking because session::get_or_create does file I/O.
     let cwd = std::env::current_dir().context("getting current directory")?;
+
+    // Intercept `/claude` commands: send a ClaudeLaunch request instead of Chat.
+    // Checked before session::get_or_create to avoid unnecessary disk I/O for
+    // commands that don't use the chat session.
+    if let Some(parse_result) = parse_claude_command(&prompt) {
+        let tasks = match parse_result {
+            Ok(t) => t,
+            Err(msg) => {
+                let mut stdout = tokio::io::stdout();
+                stdout.write_all(msg.as_bytes()).await?;
+                stdout.write_all(b"\n").await?;
+                stdout.flush().await?;
+                return Ok(());
+            }
+        };
+        let req = Request::ClaudeLaunch {
+            tasks: tasks
+                .into_iter()
+                .map(|t| TaskSpec {
+                    task_id: t.task_id,
+                    description: t.description,
+                    worktree: t.worktree,
+                    client_cwd: std::env::current_dir()
+                        .ok()
+                        .map(|p| p.to_string_lossy().into_owned()),
+                    auto_enter: t.auto_enter,
+                })
+                .collect(),
+        };
+        let mut req_line = serde_json::to_string(&req).context("serializing ClaudeLaunch")?;
+        req_line.push('\n');
+        writer
+            .write_all(req_line.as_bytes())
+            .await
+            .context("sending ClaudeLaunch to daemon")?;
+
+        let mut lines = BufReader::new(reader).lines();
+        let mut stdout = tokio::io::stdout();
+        loop {
+            let line = lines.next_line().await.context("reading daemon response")?;
+            let Some(line) = line else { break };
+            let frame: Response = serde_json::from_str(&line).context("parsing daemon response")?;
+            match frame {
+                Response::Done => break,
+                Response::Error { message } => {
+                    stdout.write_all(message.as_bytes()).await?;
+                    stdout.write_all(b"\n").await?;
+                    break;
+                }
+                Response::PaneAssigned {
+                    task_id,
+                    pane_id,
+                    session_id: sid,
+                } => {
+                    let msg = format!("[pane {pane_id}] {task_id} → session {sid}\n");
+                    stdout.write_all(msg.as_bytes()).await?;
+                }
+                Response::CapacityError {
+                    requested,
+                    max_panes,
+                    current_busy,
+                } => {
+                    let msg = format!(
+                        "[error] capacity limit reached: max_panes={max_panes}, \
+                         busy={current_busy}, requested={requested}; \
+                         free existing panes to continue\n"
+                    );
+                    stdout.write_all(msg.as_bytes()).await?;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        stdout.flush().await?;
+        return Ok(());
+    }
+
+    // Resolve the session UUID now that we know this is a chat request
+    // (not a /claude command).  Done after the /claude check to avoid
+    // unnecessary disk I/O for commands that don't use the chat session.
     let cwd_for_session = cwd.clone();
     let session_id = tokio::task::spawn_blocking(move || session::get_or_create(&cwd_for_session))
         .await
@@ -476,15 +549,7 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
             tracing::warn!(error = %e, "failed to resolve session id; using \"global\"");
             "global".to_string()
         });
-
-    // Keep a copy for the steering requests and the exit footer.
     let session_id_copy = session_id.clone();
-
-    // Intercept `/dev` commands and rewrite to an orchestration prompt.
-    let prompt = match parse_dev_command(&prompt) {
-        Some(tasks) => build_dev_prompt(&tasks, &cwd),
-        None => prompt,
-    };
 
     // Build and send the request as a single JSON line.
     let req = Request::Chat {
@@ -692,6 +757,10 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
                             let _ = tokio::io::stderr().flush().await;
                         }
                     }
+                    Response::PaneAssigned { .. } | Response::CapacityError { .. } => {
+                        // Not expected in a normal Chat response stream.
+                        tracing::debug!("unexpected pane scheduler response in chat loop");
+                    }
                 }
             }
 
@@ -835,11 +904,77 @@ pub async fn run_chat_loop(
             }
         };
 
-        // Intercept `/dev` commands and rewrite to an orchestration prompt.
-        let prompt = match parse_dev_command(&prompt) {
-            Some(tasks) => build_dev_prompt(&tasks, &cwd),
-            None => prompt,
-        };
+        // Intercept `/claude` commands: send ClaudeLaunch and handle the response
+        // before resuming the normal chat loop.
+        if let Some(parse_result) = parse_claude_command(&prompt) {
+            let tasks = match parse_result {
+                Ok(t) => t,
+                Err(msg) => {
+                    stdout.write_all(msg.as_bytes()).await?;
+                    stdout.write_all(b"\n").await?;
+                    stdout.flush().await?;
+                    continue 'session;
+                }
+            };
+            let req = Request::ClaudeLaunch {
+                tasks: tasks
+                    .into_iter()
+                    .map(|t| TaskSpec {
+                        task_id: t.task_id,
+                        description: t.description,
+                        worktree: t.worktree,
+                        client_cwd: std::env::current_dir()
+                            .ok()
+                            .map(|p| p.to_string_lossy().into_owned()),
+                        auto_enter: t.auto_enter,
+                    })
+                    .collect(),
+            };
+            let mut req_line = serde_json::to_string(&req)?;
+            req_line.push('\n');
+            write_half.write_all(req_line.as_bytes()).await?;
+
+            // Read ClaudeLaunch responses until Done/Error.
+            loop {
+                let line = lines.next_line().await.context("reading daemon response")?;
+                let Some(line) = line else { break 'session };
+                let frame: Response =
+                    serde_json::from_str(&line).context("parsing daemon response")?;
+                match frame {
+                    Response::Done => break,
+                    Response::Error { message } => {
+                        stdout.write_all(message.as_bytes()).await?;
+                        stdout.write_all(b"\n").await?;
+                        break;
+                    }
+                    Response::PaneAssigned {
+                        task_id,
+                        pane_id,
+                        session_id: sid,
+                    } => {
+                        let msg = format!("[pane {pane_id}] {task_id} → session {sid}\n");
+                        stdout.write_all(msg.as_bytes()).await?;
+                    }
+                    Response::CapacityError {
+                        requested,
+                        max_panes,
+                        current_busy,
+                    } => {
+                        let msg = format!(
+                            "[error] capacity limit reached: max_panes={max_panes}, \
+                             busy={current_busy}, requested={requested}; \
+                             free existing panes to continue\n"
+                        );
+                        stdout.write_all(msg.as_bytes()).await?;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            stdout.flush().await?;
+            // Continue the chat loop for the next user input.
+            continue 'session;
+        }
 
         let req = Request::Chat {
             prompt: prompt.clone(),
@@ -1294,6 +1429,9 @@ pub async fn run_resume(
                             eprint!(">");
                             let _ = tokio::io::stderr().flush().await;
                         }
+                    }
+                    Response::PaneAssigned { .. } | Response::CapacityError { .. } => {
+                        tracing::debug!("unexpected pane scheduler response in resume loop");
                     }
                 }
             }
@@ -3220,197 +3358,113 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // /dev command parsing
+    // /claude command parsing
     // -----------------------------------------------------------------------
 
     #[test]
-    fn parse_dev_two_quoted_tasks() {
-        let result = parse_dev_command(r#"/dev "task one" "task two""#);
-        let tasks = result.expect("should parse");
+    fn parse_claude_two_quoted_tasks() {
+        let result = parse_claude_command(r#"/claude "task one" "task two""#);
+        let tasks = result.expect("should be Some").expect("should be Ok");
         assert_eq!(tasks.len(), 2);
         assert_eq!(tasks[0].description, "task one");
         assert_eq!(tasks[1].description, "task two");
+        assert!(tasks[0].auto_enter);
     }
 
     #[test]
-    fn parse_dev_single_unquoted_task() {
-        let result = parse_dev_command("/dev implement something");
-        let tasks = result.expect("should parse");
+    fn parse_claude_single_quoted_task() {
+        let result = parse_claude_command(r#"/claude "implement something""#);
+        let tasks = result.expect("should be Some").expect("should be Ok");
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].description, "implement something");
-        assert_eq!(tasks[0].name, "implement-something");
     }
 
     #[test]
-    fn parse_dev_no_args_returns_none() {
-        assert!(parse_dev_command("/dev").is_none());
+    fn parse_claude_unquoted_tokens_join_as_single_task() {
+        let result = parse_claude_command("/claude implement something");
+        let tasks = result.expect("should be Some").expect("should be Ok");
+        // Unquoted words are joined into one task (avoids surprising N-task launch).
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].description, "implement something");
     }
 
     #[test]
-    fn parse_dev_only_space_returns_none() {
-        assert!(parse_dev_command("/dev   ").is_none());
+    fn parse_claude_no_args_returns_none() {
+        // No trailing space — not a /claude command at all.
+        assert!(parse_claude_command("/claude").is_none());
     }
 
     #[test]
-    fn parse_not_dev_command_returns_none() {
-        assert!(parse_dev_command("not a dev command").is_none());
+    fn parse_claude_only_space_returns_err() {
+        // Has trailing spaces → recognized as /claude command but missing description.
+        let result = parse_claude_command("/claude   ");
+        assert!(result.expect("should be Some").is_err());
     }
 
     #[test]
-    fn parse_develop_is_not_dev() {
-        // Must be exactly `/dev `, not `/develop`.
-        assert!(parse_dev_command("/develop something").is_none());
+    fn parse_not_claude_command_returns_none() {
+        assert!(parse_claude_command("not a claude command").is_none());
     }
 
     #[test]
-    fn parse_dev_escaped_quotes() {
-        let result = parse_dev_command(r#"/dev "task with \"quotes\"" "other""#);
-        let tasks = result.expect("should parse");
-        assert_eq!(tasks.len(), 2);
+    fn parse_claude_no_enter_flag() {
+        let result = parse_claude_command(r#"/claude --no-enter "do something""#);
+        let tasks = result.expect("should be Some").expect("should be Ok");
+        assert_eq!(tasks.len(), 1);
+        assert!(!tasks[0].auto_enter);
+        assert_eq!(tasks[0].description, "do something");
+    }
+
+    #[test]
+    fn parse_claude_worktree_flag() {
+        // Non-existent path: canonicalize falls back to the raw string.
+        let result = parse_claude_command(r#"/claude --worktree /repo/wt/t1 "implement X""#);
+        let tasks = result.expect("should be Some").expect("should be Ok");
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].worktree.as_deref(), Some("/repo/wt/t1"));
+        assert_eq!(tasks[0].description, "implement X");
+    }
+
+    #[test]
+    fn parse_claude_escaped_quotes_in_description() {
+        let result = parse_claude_command(r#"/claude "task with \"quotes\"""#);
+        let tasks = result.expect("should be Some").expect("should be Ok");
+        assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].description, r#"task with "quotes""#);
-        assert_eq!(tasks[1].description, "other");
     }
 
     #[test]
-    fn parse_dev_mixed_quoted_unquoted() {
-        let result = parse_dev_command(r#"/dev foo "bar baz""#);
-        let tasks = result.expect("should parse");
-        assert_eq!(tasks.len(), 2);
-        assert_eq!(tasks[0].description, "foo");
-        assert_eq!(tasks[1].description, "bar baz");
+    fn parse_claude_task_id_derived_from_description() {
+        let result = parse_claude_command(r#"/claude "Implement Cron Scheduling""#);
+        let tasks = result.expect("should be Some").expect("should be Ok");
+        assert_eq!(tasks[0].task_id, "implement-cron-scheduling");
     }
 
-    // -----------------------------------------------------------------------
-    // Task name sanitization
-    // -----------------------------------------------------------------------
+    #[test]
+    fn parse_claude_task_id_truncated() {
+        let long = format!("/claude \"{}\"", "a".repeat(100));
+        let result = parse_claude_command(&long);
+        let tasks = result.expect("should be Some").expect("should be Ok");
+        assert!(tasks[0].task_id.len() <= 32);
+    }
 
     #[test]
-    fn sanitize_simple_english() {
+    fn make_task_id_simple() {
         assert_eq!(
-            sanitize_task_name("implement cron scheduling"),
-            "implement-cron-scheduling"
+            make_task_id("implement something", 0),
+            "implement-something"
         );
     }
 
     #[test]
-    fn sanitize_preserves_lowercase() {
-        assert_eq!(sanitize_task_name("Fix Context Limit"), "fix-context-limit");
+    fn make_task_id_collapses_dashes() {
+        assert_eq!(make_task_id("hello   world", 0), "hello-world");
     }
 
     #[test]
-    fn sanitize_truncates_to_40_chars() {
-        let long_desc = "a very long task description that exceeds the maximum allowed length";
-        let name = sanitize_task_name(long_desc);
-        assert!(
-            name.len() <= 40,
-            "name too long: {} (len={})",
-            name,
-            name.len()
-        );
-        assert!(!name.ends_with('-'));
-    }
-
-    #[test]
-    fn sanitize_removes_leading_trailing_dashes() {
-        assert_eq!(sanitize_task_name("  hello world  "), "hello-world");
-    }
-
-    #[test]
-    fn sanitize_collapses_consecutive_dashes() {
-        assert_eq!(sanitize_task_name("hello   world"), "hello-world");
-    }
-
-    #[test]
-    fn sanitize_pure_cjk_uses_hash() {
-        let name = sanitize_task_name("実装クロン");
-        assert!(
-            name.starts_with("task-"),
-            "expected hash-based name, got: {}",
-            name
-        );
-        assert!(name.len() <= 13);
-    }
-
-    #[test]
-    fn sanitize_mixed_ascii_and_non_ascii() {
-        let name = sanitize_task_name("fix 日本語 bug");
-        // Should contain the ASCII parts with dashes for non-ASCII.
-        assert!(name.contains("fix"));
-        assert!(name.contains("bug"));
-    }
-
-    #[test]
-    fn sanitize_hash_is_deterministic() {
-        let a = sanitize_task_name("こんにちは");
-        let b = sanitize_task_name("こんにちは");
-        assert_eq!(a, b);
-    }
-
-    #[test]
-    fn sanitize_different_cjk_different_hash() {
-        let a = sanitize_task_name("こんにちは");
-        let b = sanitize_task_name("さようなら");
-        assert_ne!(a, b);
-    }
-
-    // -----------------------------------------------------------------------
-    // build_dev_prompt
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn build_dev_prompt_contains_tasks() {
-        let tasks = vec![
-            DevTask {
-                name: "cron-scheduling".into(),
-                description: "implement cron".into(),
-            },
-            DevTask {
-                name: "fix-context".into(),
-                description: "fix context limit".into(),
-            },
-        ];
-        let prompt = build_dev_prompt(&tasks, Path::new("/home/user/project"));
-        assert!(prompt.contains("cron-scheduling"));
-        assert!(prompt.contains("fix-context"));
-        assert!(prompt.contains("implement cron"));
-        assert!(prompt.contains("fix context limit"));
-        assert!(prompt.contains("git worktree add"));
-        assert!(prompt.contains("amaebi-wt"));
-        assert!(prompt.contains("/home/user/project"));
-        // Should use claude CLI, not spawn_agent
-        assert!(prompt.contains("claude"));
-        assert!(prompt.contains("--print"));
-        assert!(!prompt.contains("spawn_agent"));
-    }
-
-    #[test]
-    fn build_dev_prompt_contains_worktree_paths() {
-        let tasks = vec![DevTask {
-            name: "my-task".into(),
-            description: "do something".into(),
-        }];
-        let prompt = build_dev_prompt(&tasks, Path::new("/tmp"));
-        assert!(prompt.contains("amaebi-wt/my-task"));
-        assert!(prompt.contains("feat/my-task"));
-        assert!(prompt.contains("claude.log"));
-    }
-
-    #[test]
-    fn build_dev_prompt_parallel_uses_background() {
-        let tasks = vec![
-            DevTask {
-                name: "task-a".into(),
-                description: "do A".into(),
-            },
-            DevTask {
-                name: "task-b".into(),
-                description: "do B".into(),
-            },
-        ];
-        let prompt = build_dev_prompt(&tasks, Path::new("/tmp"));
-        // Multiple tasks should use background processes + wait
-        assert!(prompt.contains(") &"));
-        assert!(prompt.contains("wait"));
+    fn make_task_id_fallback_for_pure_non_ascii() {
+        let id = make_task_id("こんにちは", 3);
+        assert_eq!(id, "task-3");
     }
 
     // -----------------------------------------------------------------------

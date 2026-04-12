@@ -330,6 +330,10 @@ impl acp::Agent for AmaebiAgent {
                     // ACP mode never submits detach requests.
                     tracing::debug!("unexpected DetachAccepted in ACP mode");
                 }
+                Response::PaneAssigned { .. } | Response::CapacityError { .. } => {
+                    // ACP mode never sends ClaudeLaunch requests.
+                    tracing::debug!("unexpected pane scheduler response in ACP mode");
+                }
             }
         }
 

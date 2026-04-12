@@ -11,6 +11,8 @@ use crate::cron;
 use crate::inbox::InboxStore;
 use crate::ipc::{write_frame, Request, Response};
 use crate::memory_db;
+use crate::pane_lease;
+use crate::session;
 use crate::tools::{self, ToolExecutor};
 
 /// Resolve the raw model string to the API-level model ID for token lookups.
@@ -682,6 +684,10 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                     ConnAction::Break => break 'connection,
                 }
             }
+
+            Request::ClaudeLaunch { tasks } => {
+                handle_claude_launch(&writer, tasks).await?;
+            }
         }
     }
 
@@ -789,6 +795,494 @@ async fn drive_agentic_loop(
 // ---------------------------------------------------------------------------
 // Sub-handlers — one per Request variant
 // ---------------------------------------------------------------------------
+
+/// Handle `Request::ClaudeLaunch`: assign tmux panes and launch `claude`
+/// (Claude Code CLI) sessions for each task.
+///
+/// Steps for each task:
+/// 1. `ensure_and_acquire_idle` — atomically expand the pane pool if needed
+///    and acquire an idle pane.
+/// 2. Rename the pane title to `"cc-{N}"` (tmux pane numeric index).
+/// 3. If the pane already has `claude` running, inject `description` as a new
+///    prompt.  Otherwise launch `claude` (with optional `cd <worktree>`) via
+///    `tmux send-keys`, then inject `description` as a second keystroke.
+/// 4. Stream `Response::PaneAssigned` for each task, then `Response::Done`.
+async fn handle_claude_launch(
+    writer: &Arc<tokio::sync::Mutex<tokio::net::unix::OwnedWriteHalf>>,
+    tasks: Vec<crate::ipc::TaskSpec>,
+) -> Result<()> {
+    if tasks.is_empty() {
+        let mut w = writer.lock().await;
+        write_frame(&mut *w, &Response::Done).await?;
+        return Ok(());
+    }
+
+    // For each task: acquire a pane (auto-expanding the pool if needed), then
+    // launch `claude` (or inject a prompt into an already-running session) via
+    // tmux send-keys.
+    // `ensure_and_acquire_idle` holds a single LOCK_EX for both expansion and
+    // acquisition, eliminating the TOCTOU race.
+    let total_tasks = tasks.len();
+    for (task_idx, task) in tasks.into_iter().enumerate() {
+        let task_id = task.task_id.clone();
+        let description = task.description.clone();
+        let auto_enter = task.auto_enter;
+
+        // Each parallel Claude session must work in its own git worktree so
+        // concurrent tasks cannot trample each other's in-progress file edits.
+        // Auto-create a worktree when the caller did not supply one explicitly.
+        // Track whether the worktree was auto-created so we can clean it up
+        // if pane acquisition subsequently fails (avoiding orphaned branches).
+        let was_explicit_worktree = task.worktree.is_some();
+        let worktree: Option<String> = match task.worktree {
+            Some(wt) => Some(wt),
+            None => {
+                let tid = task_id.clone();
+                let cwd = task.client_cwd.clone();
+                match tokio::task::spawn_blocking(move || {
+                    create_task_worktree(&tid, cwd.as_deref())
+                })
+                .await
+                .context("create_task_worktree panicked")?
+                {
+                    Ok(path) => Some(path.to_string_lossy().into_owned()),
+                    Err(e) => {
+                        tracing::warn!(
+                            task_id = %task_id,
+                            error = %e,
+                            "auto-worktree creation failed; launching claude without worktree isolation"
+                        );
+                        None
+                    }
+                }
+            }
+        };
+
+        let tid_for_lease = task_id.clone();
+        let wt_for_lease = worktree.clone();
+
+        // Acquire a pane lease *before* creating session state so that a
+        // capacity failure does not leave orphan session entries on disk.
+        // A placeholder session_id is stored now; it is corrected to the real
+        // UUID via `update_session_id` after `session::get_or_create` returns.
+        let sid_placeholder = uuid::Uuid::new_v4().to_string();
+        let sid_for_lease = sid_placeholder.clone();
+        let pane_result = tokio::task::spawn_blocking(move || {
+            pane_lease::ensure_and_acquire_idle(
+                &tid_for_lease,
+                &sid_for_lease,
+                wt_for_lease.as_deref(),
+            )
+        })
+        .await
+        .context("ensure_and_acquire_idle task panicked")?;
+
+        let (pane_id, had_claude) = match pane_result {
+            Ok(p) => p,
+            Err(e) => {
+                // If the worktree was auto-created, remove it and its branch
+                // to avoid orphaned state after a capacity error.
+                // Use client_cwd with -C so git targets the right repo
+                // regardless of where the daemon was started.
+                // The branch name equals the worktree directory's basename
+                // (both set to unique_name = "<task_id>-<uuid8>").
+                if !was_explicit_worktree {
+                    if let Some(ref wt) = worktree {
+                        let wt_path = wt.clone();
+                        let cleanup_cwd = task.client_cwd.clone();
+                        tokio::task::spawn_blocking(move || {
+                            let branch = std::path::Path::new(&wt_path)
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .map(str::to_string);
+                            let mut rm_cmd = std::process::Command::new("git");
+                            if let Some(ref cwd) = cleanup_cwd {
+                                rm_cmd.args(["-C", cwd.as_str()]);
+                            }
+                            let removed = rm_cmd
+                                .args(["worktree", "remove", "--force", &wt_path])
+                                .output()
+                                .map(|o| o.status.success())
+                                .unwrap_or(false);
+                            if removed {
+                                if let (Some(ref cwd), Some(ref br)) = (&cleanup_cwd, &branch) {
+                                    let _ = std::process::Command::new("git")
+                                        .args(["-C", cwd.as_str(), "branch", "-D", br.as_str()])
+                                        .output();
+                                }
+                            }
+                        })
+                        .await
+                        .ok();
+                    }
+                }
+                // Surface CapacityError as a typed terminal response.
+                // Report tasks still unassigned (including this one) so the
+                // caller sees the real demand that exceeded capacity.
+                let remaining = total_tasks - task_idx;
+                let mut w = writer.lock().await;
+                if let Some(cap) = e.downcast_ref::<pane_lease::CapacityError>() {
+                    write_frame(
+                        &mut *w,
+                        &Response::CapacityError {
+                            requested: remaining,
+                            max_panes: cap.max_panes,
+                            current_busy: cap.current_busy,
+                        },
+                    )
+                    .await?;
+                } else {
+                    write_frame(
+                        &mut *w,
+                        &Response::Error {
+                            message: format!("[error] {e:#}"),
+                        },
+                    )
+                    .await?;
+                }
+                // Both Error and CapacityError are terminal: the client
+                // breaks its read loop on either, so return immediately.
+                return Ok(());
+            }
+        };
+
+        // Resolve the real session UUID now that the pane is secured, then
+        // correct the placeholder stored in the lease.
+        // Prefer the worktree path for session identity; fall back to the
+        // client's cwd (not the daemon's cwd, which may be unrelated to the
+        // repo the client was invoked from).
+        let session_dir = worktree
+            .as_deref()
+            .map(std::path::Path::new)
+            .map(std::path::Path::to_path_buf)
+            .or_else(|| task.client_cwd.as_deref().map(std::path::PathBuf::from))
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+        // If session resolution fails, release the pane so it doesn't get
+        // stuck Busy until TTL expiry.
+        let session_id_result =
+            tokio::task::spawn_blocking(move || session::get_or_create(&session_dir))
+                .await
+                .map_err(|e| anyhow::anyhow!("session::get_or_create panicked: {e}"))
+                .and_then(|r| r.context("resolving session ID"));
+        let session_id = match session_id_result {
+            Ok(id) => id,
+            Err(e) => {
+                let failed_pane = pane_id.clone();
+                tokio::task::spawn_blocking(move || {
+                    let _ = pane_lease::release_lease(&failed_pane);
+                })
+                .await
+                .ok();
+                let mut w = writer.lock().await;
+                write_frame(
+                    &mut *w,
+                    &Response::Error {
+                        message: format!("[error] {e:#}"),
+                    },
+                )
+                .await?;
+                return Ok(());
+            }
+        };
+        let update_pane = pane_id.clone();
+        let update_sid = session_id.clone();
+        if let Err(e) = tokio::task::spawn_blocking(move || {
+            pane_lease::update_session_id(&update_pane, &update_sid)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("update_session_id panicked: {e}"))
+        .and_then(|r| r)
+        {
+            tracing::warn!(pane_id = %pane_id, error = %e, "failed to persist session ID in pane lease; tmux-state.json may be inconsistent");
+        }
+
+        // Rename the pane for visibility.  Use the tmux pane numeric index
+        // (strip the leading '%' from e.g. "%5") to keep the title short.
+        let rename_pane = pane_id.clone();
+        let pane_num = pane_id.trim_start_matches('%');
+        let rename_title = format!("cc-{}", pane_num);
+        tokio::task::spawn_blocking(move || {
+            // Best-effort — ignore errors (non-tmux environments).
+            let _ = pane_lease::rename_pane(&rename_pane, &rename_title);
+        })
+        .await
+        .ok();
+
+        // Build the key sequences to inject into the pane.
+        //
+        // Priority:
+        //  - `had_claude = true`: pane already has `claude` running at its
+        //    prompt → send just the description as a new user message.
+        //  - `had_claude = false`: pane is blank (freshly created or at a
+        //    shell prompt) → launch `claude` first, then send the description
+        //    as a second keystroke so it lands at the Claude Code prompt.
+        //
+        // Each element is (keys, press_enter).
+        let key_sequence: Vec<(String, bool)> = if had_claude {
+            // Reusing an existing claude session in the same worktree: compact
+            // the prior conversation first so stale context does not pollute
+            // the new task, then inject the description.
+            vec![
+                ("/compact".to_string(), true),
+                (description.clone(), auto_enter),
+            ]
+        } else {
+            // Fresh pane: launch claude with --dangerously-skip-permissions so
+            // the autonomous session never blocks on an interactive approval
+            // prompt, then inject the description as the opening message.
+            let launch_cmd = if let Some(ref wt) = worktree {
+                format!(
+                    "cd {} && claude --dangerously-skip-permissions",
+                    shell_escape(wt)
+                )
+            } else {
+                "claude --dangerously-skip-permissions".to_string()
+            };
+            vec![(launch_cmd, true), (description.clone(), auto_enter)]
+        };
+
+        let send_pane = pane_id.clone();
+
+        // Send all key sequences to the pane.
+        //
+        // Text (user-provided descriptions and shell commands) is sent with
+        // `send-keys -l --` so tmux treats the argument as a literal string
+        // rather than a key name.  Without `-l`, strings like "Enter" or
+        // "C-c" would be interpreted as key presses, and strings starting
+        // with "-" would be parsed as send-keys options.
+        //
+        // The Enter key itself is sent in a separate invocation without `-l`
+        // so it remains a real key press (not the literal text "Enter").
+        // Returns Ok(None) on success, Ok(Some(stderr)) on tmux failure.
+        let send_result = tokio::task::spawn_blocking(move || {
+            for (keys, press_enter) in &key_sequence {
+                // Send text literally.
+                let out = std::process::Command::new("tmux")
+                    .args(["send-keys", "-t", &send_pane, "-l", "--", keys.as_str()])
+                    .output()?;
+                if !out.status.success() {
+                    return Ok::<Option<String>, std::io::Error>(Some(
+                        String::from_utf8_lossy(&out.stderr).trim().to_string(),
+                    ));
+                }
+                // Press Enter as a real key in a separate call.
+                if *press_enter {
+                    let out = std::process::Command::new("tmux")
+                        .args(["send-keys", "-t", &send_pane, "Enter"])
+                        .output()?;
+                    if !out.status.success() {
+                        return Ok(Some(
+                            String::from_utf8_lossy(&out.stderr).trim().to_string(),
+                        ));
+                    }
+                }
+            }
+            Ok(None)
+        })
+        .await;
+
+        let tmux_err = match send_result {
+            Ok(Ok(None)) => None,
+            Ok(Ok(Some(stderr))) => Some(stderr),
+            Ok(Err(e)) => Some(e.to_string()),
+            Err(e) => Some(format!("send-keys task panicked: {e}")),
+        };
+        if let Some(err_msg) = tmux_err {
+            // Injection failed.  If tmux reports the pane no longer exists,
+            // remove it from the lease map entirely so the scheduler stops
+            // selecting it.  Otherwise just release it back to Idle.
+            let failed_pane = pane_id.clone();
+            let is_stale = err_msg.contains("unknown pane")
+                || err_msg.contains("can't find pane")
+                || err_msg.contains("no server running");
+            tokio::task::spawn_blocking(move || {
+                if is_stale {
+                    let _ = pane_lease::remove_pane(&failed_pane);
+                } else {
+                    let _ = pane_lease::release_lease(&failed_pane);
+                }
+            })
+            .await
+            .ok();
+            let mut w = writer.lock().await;
+            write_frame(
+                &mut *w,
+                &Response::Error {
+                    message: format!(
+                        "[error] failed to inject command into pane {pane_id}: {err_msg}"
+                    ),
+                },
+            )
+            .await?;
+            return Ok(());
+        }
+
+        // If we just launched `claude` in a blank pane, record that so
+        // future task assignments can inject prompts directly.
+        if !had_claude {
+            let started_pane = pane_id.clone();
+            tokio::task::spawn_blocking(move || {
+                let _ = pane_lease::mark_claude_started(&started_pane);
+            })
+            .await
+            .ok();
+        }
+
+        let mut w = writer.lock().await;
+        write_frame(
+            &mut *w,
+            &Response::PaneAssigned {
+                task_id: task.task_id,
+                pane_id,
+                session_id,
+            },
+        )
+        .await?;
+    }
+
+    let mut w = writer.lock().await;
+    write_frame(&mut *w, &Response::Done).await?;
+    Ok(())
+}
+
+/// Create a git worktree at `~/.amaebi/worktrees/<repo-name>/<task_id>-<uuid8>`
+/// on a new branch named `<task_id>-<uuid8>`.
+///
+/// Every parallel `/claude` task needs its own worktree so that concurrent
+/// Claude sessions editing the same repository do not trample each other's
+/// in-progress changes.  Worktrees are stored under `~/.amaebi/worktrees/`
+/// (alongside other amaebi state) rather than inside the repository directory,
+/// which avoids polluting the project tree and requires no `.gitignore` entry.
+/// A per-repo subdirectory (the basename of the git root) prevents collisions
+/// across different repositories; the `-<uuid8>` suffix makes each
+/// worktree/branch unique for a given `task_id` across runs.
+///
+/// `client_cwd` is the working directory of the invoking client.  Git is run
+/// with `-C <client_cwd>` so the correct repository is targeted even when the
+/// daemon was started from a different directory.
+///
+/// Returns the absolute path of the newly created worktree, or an error if:
+/// - `task_id` contains unsafe characters (path separators, `..`), or
+/// - the client's directory is not inside a git repository, or
+/// - `git worktree add` fails (e.g. branch name already exists).
+///
+/// All git commands are synchronous; call this from `spawn_blocking`.
+fn create_task_worktree(
+    task_id: &str,
+    client_cwd: Option<&str>,
+) -> anyhow::Result<std::path::PathBuf> {
+    use std::path::PathBuf;
+
+    // Sanitize task_id: allow only characters that are safe as both a
+    // filesystem path component and a git branch name.
+    if task_id.is_empty()
+        || task_id == ".."
+        || task_id.contains('/')
+        || task_id.contains('\\')
+        || task_id.contains("..")
+        || !task_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    {
+        anyhow::bail!(
+            "task_id {:?} contains unsafe characters; \
+             only ASCII alphanumerics, '-', '_', and '.' are allowed",
+            task_id
+        );
+    }
+
+    // Locate the repository root using the client's cwd so the daemon (which
+    // may have been started from a different directory) targets the right repo.
+    let mut git_cmd = std::process::Command::new("git");
+    if let Some(cwd) = client_cwd {
+        git_cmd.args(["-C", cwd]);
+    }
+    let out = git_cmd
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .context("spawning git rev-parse")?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "not in a git repository (git rev-parse failed: {})",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    let git_root = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+
+    // Build a repo namespace that combines the basename with a short hash of
+    // the full path.  The basename alone is not unique: `~/src/api` and
+    // `~/work/api` share the same name but are different repos.
+    let repo_basename = git_root
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("repo");
+    let path_hash = {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut h = DefaultHasher::new();
+        git_root.hash(&mut h);
+        format!("{:016x}", h.finish())
+            .chars()
+            .take(8)
+            .collect::<String>()
+    };
+    let repo_namespace = format!("{repo_basename}-{path_hash}");
+
+    // Place worktrees under ~/.amaebi/worktrees/<repo-hash>/<task_id>-<uuid8>.
+    // A short UUID suffix guarantees uniqueness across runs so repeated
+    // invocations with the same task description never collide on the branch
+    // name or directory path — the same approach Claude Code uses for its own
+    // agent worktrees (agent-{uuid8}).
+    let short_id = uuid::Uuid::new_v4()
+        .to_string()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(8)
+        .collect::<String>();
+    let unique_name = format!("{task_id}-{short_id}");
+
+    let wt_path = amaebi_home()?
+        .join("worktrees")
+        .join(&repo_namespace)
+        .join(&unique_name);
+
+    // Ensure the parent directory exists before calling git.
+    let wt_parent = wt_path
+        .parent()
+        .context("worktree path has no parent directory")?;
+    std::fs::create_dir_all(wt_parent)
+        .with_context(|| format!("creating worktree parent directory {}", wt_parent.display()))?;
+
+    // Create the worktree on a new branch named <task_id>-<uuid8>.
+    let mut git_cmd = std::process::Command::new("git");
+    if let Some(cwd) = client_cwd {
+        git_cmd.args(["-C", cwd]);
+    }
+    let out = git_cmd
+        .args([
+            "worktree",
+            "add",
+            wt_path
+                .to_str()
+                .context("worktree path is not valid UTF-8")?,
+            "-b",
+            &unique_name,
+        ])
+        .output()
+        .context("spawning git worktree add")?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "git worktree add failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(wt_path)
+}
+
+/// Escape a string for safe use as a single shell argument (single-quote wrapping).
+fn shell_escape(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
 
 /// Handle `Request::ClearMemory`: clear the memory DB and send `Done`.
 async fn handle_clear_memory(

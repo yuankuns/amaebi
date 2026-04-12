@@ -15,6 +15,7 @@ mod inbox;
 mod ipc;
 mod memory_db;
 mod models;
+mod pane_lease;
 mod provider;
 mod responses;
 mod retry;
