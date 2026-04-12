@@ -994,6 +994,13 @@ mod tests {
         // worktree=None, None==None must NOT suppress expansion.
         // acquire_first_idle_locked requires worktree.is_some() for tier-1
         // reuse, so that pane is not selectable — expansion must be attempted.
+        //
+        // Skip inside a live tmux session: ensure_and_acquire_idle calls
+        // tmux split-window when expanding, which would create real panes.
+        if std::env::var("TMUX").is_ok() {
+            eprintln!("skipping: live tmux session detected (run via scripts/test.sh --docker)");
+            return;
+        }
         {
             let _guard = crate::test_utils::with_temp_home();
             let mut state: PaneState = HashMap::new();
@@ -1026,6 +1033,13 @@ mod tests {
         // All idle panes have claude running in a different worktree — none
         // are usable for a fresh task.  ensure_and_acquire_idle must attempt
         // expansion rather than returning "no idle panes available" immediately.
+        //
+        // Skip inside a live tmux session: ensure_and_acquire_idle calls
+        // tmux split-window when expanding, which would create real panes.
+        if std::env::var("TMUX").is_ok() {
+            eprintln!("skipping: live tmux session detected (run via scripts/test.sh --docker)");
+            return;
+        }
         {
             let _guard = crate::test_utils::with_temp_home();
             let mut state: PaneState = HashMap::new();
@@ -1037,15 +1051,10 @@ mod tests {
 
             match ensure_and_acquire_idle("t", "s", Some("/repo/wt/task1")) {
                 Ok((pane_id, had_claude)) => {
-                    // tmux is available: expansion succeeded, must have
-                    // acquired a new blank pane (not the mismatched %0).
                     assert_ne!(pane_id, "%0", "must not acquire mismatched claude pane");
                     assert!(!had_claude, "new pane must not have had_claude");
                 }
                 Err(e) => {
-                    // No tmux session: expansion was attempted but failed.
-                    // The error must be a tmux failure, NOT "no idle panes
-                    // available" (which would mean we gave up before trying).
                     let msg = format!("{e:#}");
                     assert!(
                         !msg.contains("no idle panes available"),
