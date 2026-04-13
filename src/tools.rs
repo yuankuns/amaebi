@@ -885,6 +885,8 @@ pub fn tool_schemas(include_spawn_agent: bool) -> Vec<serde_json::Value> {
                         "description": (format!(
                             "Model to switch to. Supports provider/model format \
                              (e.g. bedrock/claude-opus-4.6, copilot/gpt-4o). \
+                             Append [1m] to request 1M-context Bedrock inference \
+                             (e.g. claude-sonnet-4.6[1m], claude-opus-4.6[1m]). \
                              Project default: {}.",
                             crate::provider::DEFAULT_MODEL
                         ))
