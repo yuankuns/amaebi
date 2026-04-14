@@ -564,13 +564,13 @@ fn ensure_idle_panes_locked(needed: usize) -> Result<()> {
         if deficit == 0 || state.len() >= MAX_PANES {
             break;
         }
-        match tmux_split_window_sync(win) {
+        match tmux_new_window_sync(win) {
             Ok(new_pane) => {
                 state.insert(new_pane.clone(), PaneLease::new_idle(new_pane, win.clone()));
                 deficit -= 1;
             }
             Err(e) => {
-                tracing::warn!(window = %win, error = %e, "failed to split tmux window");
+                tracing::warn!(window = %win, error = %e, "failed to create new tmux window");
             }
         }
     }
@@ -581,13 +581,13 @@ fn ensure_idle_panes_locked(needed: usize) -> Result<()> {
             if deficit == 0 || state.len() >= MAX_PANES {
                 break;
             }
-            match tmux_split_window_sync(win) {
+            match tmux_new_window_sync(win) {
                 Ok(new_pane) => {
                     state.insert(new_pane.clone(), PaneLease::new_idle(new_pane, win.clone()));
                     deficit -= 1;
                 }
                 Err(e) => {
-                    tracing::warn!(window = %win, error = %e, "failed to split tmux window");
+                    tracing::warn!(window = %win, error = %e, "failed to create new tmux window");
                 }
             }
         }
@@ -598,7 +598,7 @@ fn ensure_idle_panes_locked(needed: usize) -> Result<()> {
     if deficit > 0 {
         anyhow::bail!(
             "no tmux window available to split; \
-             create a new window with 'tmux new-window'"
+             ensure a tmux session is active"
         );
     }
 
@@ -733,28 +733,42 @@ fn tmux_list_windows_sync() -> Result<Vec<String>> {
         .collect())
 }
 
-/// Run `tmux split-window -t <window_id> -d -P -F "#{pane_id}"` and return
-/// the new pane's ID.
-fn tmux_split_window_sync(window_id: &str) -> Result<String> {
+/// Create a new tmux window in the session that owns `window_id`, then return
+/// the new window's pane ID.
+///
+/// Uses `tmux new-window` rather than `split-window` so each Claude session
+/// gets its own full-size window instead of a split pane — easier to navigate
+/// and gives Claude the full terminal width.
+fn tmux_new_window_sync(window_id: &str) -> Result<String> {
+    // Resolve the session that owns this window so we can target it.
+    let sess_out = std::process::Command::new("tmux")
+        .args(["display-message", "-t", window_id, "-p", "#{session_id}"])
+        .output()
+        .context("spawning tmux display-message")?;
+    let session_id = String::from_utf8_lossy(&sess_out.stdout).trim().to_string();
+    if session_id.is_empty() {
+        anyhow::bail!("could not resolve session for window {window_id}");
+    }
+
     let output = std::process::Command::new("tmux")
         .args([
-            "split-window",
+            "new-window",
             "-t",
-            window_id,
-            "-d",
+            &session_id,
+            "-d", // don't switch focus to the new window
             "-P",
             "-F",
             "#{pane_id}",
         ])
         .output()
-        .context("spawning tmux split-window")?;
+        .context("spawning tmux new-window")?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("tmux split-window failed: {stderr}");
+        anyhow::bail!("tmux new-window failed: {stderr}");
     }
     let pane_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if pane_id.is_empty() {
-        anyhow::bail!("tmux split-window produced no pane ID");
+        anyhow::bail!("tmux new-window produced no pane ID");
     }
     Ok(pane_id)
 }
