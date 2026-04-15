@@ -1056,6 +1056,16 @@ async fn handle_claude_launch(
                 let wait = if idx == 0 { 1 } else { 5 };
                 std::thread::sleep(std::time::Duration::from_secs(wait));
 
+                // For the description injection (idx > 0 on a fresh pane),
+                // dismiss any Claude Code splash/welcome overlay first.
+                // Escape is a safe no-op if no overlay is active.
+                if idx > 0 && !had_claude {
+                    let _ = std::process::Command::new("tmux")
+                        .args(["send-keys", "-t", &send_pane, "Escape"])
+                        .output();
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                }
+
                 // Send text literally.
                 let out = std::process::Command::new("tmux")
                     .args(["send-keys", "-t", &send_pane, "-l", "--", keys.as_str()])
