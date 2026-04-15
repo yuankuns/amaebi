@@ -5479,4 +5479,68 @@ mod tests {
         };
         assert_eq!(effective, "claude-opus-4.6[1m]");
     }
+
+    // -----------------------------------------------------------------------
+    // extract_pr_number
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn extract_pr_number_pr99() {
+        assert_eq!(extract_pr_number("fix PR99 copilot review"), Some(99));
+    }
+
+    #[test]
+    fn extract_pr_number_pr_hash_99() {
+        assert_eq!(extract_pr_number("fix PR #99"), Some(99));
+    }
+
+    #[test]
+    fn extract_pr_number_hash_only() {
+        assert_eq!(extract_pr_number("fix #123 issue"), Some(123));
+    }
+
+    #[test]
+    fn extract_pr_number_case_insensitive() {
+        assert_eq!(extract_pr_number("fix pr42"), Some(42));
+    }
+
+    #[test]
+    fn extract_pr_number_chinese_context() {
+        assert_eq!(
+            extract_pr_number("修复sglang的PR99里的copilot review"),
+            Some(99)
+        );
+    }
+
+    #[test]
+    fn extract_pr_number_none_when_absent() {
+        assert_eq!(extract_pr_number("fix the build"), None);
+    }
+
+    #[test]
+    fn extract_pr_number_ignores_non_numeric() {
+        assert_eq!(extract_pr_number("improve PRoductivity"), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // json_str_field
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn json_str_field_extracts_value() {
+        let json = r#"{"headRefName":"feat/paged","title":"Add FMHA"}"#;
+        assert_eq!(json_str_field(json, "headRefName"), "feat/paged");
+        assert_eq!(json_str_field(json, "title"), "Add FMHA");
+    }
+
+    #[test]
+    fn json_str_field_missing_key() {
+        let json = r#"{"headRefName":"feat/paged"}"#;
+        assert_eq!(json_str_field(json, "baseRefName"), "");
+    }
+
+    #[test]
+    fn json_str_field_empty_json() {
+        assert_eq!(json_str_field("", "key"), "");
+    }
 }
