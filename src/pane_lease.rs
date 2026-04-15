@@ -596,10 +596,18 @@ fn ensure_idle_panes_locked(needed: usize) -> Result<()> {
     write_state_unlocked(&state)?;
 
     if deficit > 0 {
-        anyhow::bail!(
-            "unable to create a new tmux window; \
-             ensure a tmux session is active"
-        );
+        if state.len() >= MAX_PANES {
+            anyhow::bail!(
+                "pane capacity reached: {}/{MAX_PANES} panes in use, \
+                 need {deficit} more; free existing panes to continue",
+                state.len()
+            );
+        } else {
+            anyhow::bail!(
+                "unable to create a new tmux window (need {deficit} more pane(s)); \
+                 ensure a tmux session is active"
+            );
+        }
     }
 
     Ok(())

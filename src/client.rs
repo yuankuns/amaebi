@@ -1087,8 +1087,12 @@ pub async fn run_chat_loop(
                             }
 
                             _ = tokio::time::sleep_until(timeout_at) => {
-                                // Timed out: either post-interrupt 5s or supervision max.
-                                break 'supervision;
+                                // Timed out: either post-interrupt 5 s drain or the
+                                // supervision hard ceiling.  The daemon may still be
+                                // running its supervision loop, so reusing this socket
+                                // for further Chat requests would desync the protocol.
+                                // Terminate the session cleanly instead.
+                                break 'session;
                             }
 
                             line = lines.next_line() => {
