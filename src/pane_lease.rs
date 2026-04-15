@@ -745,6 +745,10 @@ fn tmux_new_window_sync(window_id: &str) -> Result<(String, String)> {
         .args(["display-message", "-t", window_id, "-p", "#{session_id}"])
         .output()
         .context("spawning tmux display-message")?;
+    if !sess_out.status.success() {
+        let stderr = String::from_utf8_lossy(&sess_out.stderr);
+        anyhow::bail!("tmux display-message failed for {window_id}: {stderr}");
+    }
     let session_id = String::from_utf8_lossy(&sess_out.stdout).trim().to_string();
     if session_id.is_empty() {
         anyhow::bail!("could not resolve session for window {window_id}");

@@ -1060,16 +1060,34 @@ pub async fn run_chat_loop(
                     write_half.write_all(req_line.as_bytes()).await?;
 
                     // Stream supervision output exactly like a Chat response.
+                    // After sending Interrupt we keep draining frames until
+                    // Done/Error (with a 5 s timeout) so the daemon can
+                    // acknowledge cleanly.
+                    let mut interrupt_sent = false;
+                    let drain_deadline =
+                        tokio::time::Instant::now() + Duration::from_secs(300);
                     'supervision: loop {
+                        let timeout_at = if interrupt_sent {
+                            // After interrupt, give daemon 5 s to respond with Done.
+                            tokio::time::Instant::now() + Duration::from_secs(5)
+                        } else {
+                            drain_deadline
+                        };
                         tokio::select! {
                             biased;
 
-                            _ = sigint.recv() => {
+                            _ = sigint.recv(), if !interrupt_sent => {
                                 let interrupt_req = Request::Interrupt { session_id: session_id.clone() };
                                 if let Ok(mut frame) = serde_json::to_string(&interrupt_req) {
                                     frame.push('\n');
                                     let _ = write_half.write_all(frame.as_bytes()).await;
                                 }
+                                interrupt_sent = true;
+                                // Continue looping to drain remaining frames.
+                            }
+
+                            _ = tokio::time::sleep_until(timeout_at), if interrupt_sent => {
+                                // Timed out waiting for Done after interrupt.
                                 break 'supervision;
                             }
 

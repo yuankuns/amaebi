@@ -1361,6 +1361,31 @@ async fn handle_supervision(
             Message::user(user_content),
         ];
 
+        // --- Drain any pending interrupts before invoking the model ---
+        // The model call is short (240 tokens max) so mid-call interrupts
+        // are not critical; they will be handled at the next sleep interval.
+        while let Ok(line) = frame_rx.try_recv() {
+            if let Ok(Request::Interrupt { session_id: isid }) =
+                serde_json::from_str::<Request>(&line)
+            {
+                if session_id
+                    .as_deref()
+                    .is_none_or(|expected| isid == expected)
+                {
+                    let mut w = writer.lock().await;
+                    write_frame(
+                        &mut *w,
+                        &Response::Text {
+                            chunk: "[supervision] interrupted\n".into(),
+                        },
+                    )
+                    .await?;
+                    write_frame(&mut *w, &Response::Done).await?;
+                    return Ok(());
+                }
+            }
+        }
+
         // --- Invoke model (no tools) ---
         // Use sink() so the raw LLM tokens are NOT streamed to the client.
         // We write our own formatted one-line status after parsing the response.
@@ -1410,13 +1435,16 @@ async fn handle_supervision(
             if let Some((pane_id_raw, message)) = rest.trim().split_once(':') {
                 let pane_id = pane_id_raw.trim().to_owned();
                 let message = message.trim().to_owned();
-                if !pane_id.is_empty() && !message.is_empty() {
+                let is_valid_pane = panes.iter().any(|t| t.pane_id == pane_id);
+                if !pane_id.is_empty() && !message.is_empty() && is_valid_pane {
                     let pid = pane_id.clone();
                     let msg = message.clone();
                     tokio::task::spawn_blocking(move || send_pane_keys(&pid, &msg))
                         .await
                         .ok();
                     format!("  → STEER {pane_id}: {message}\n")
+                } else if !pane_id.is_empty() && !message.is_empty() && !is_valid_pane {
+                    format!("  → STEER {pane_id} (unknown pane, ignored)\n")
                 } else {
                     "  → STEER (malformed response)\n".to_string()
                 }
@@ -1678,6 +1706,17 @@ fn extract_pr_number(description: &str) -> Option<u32> {
     None
 }
 
+/// Strip userinfo (credentials/tokens) from a remote URL to avoid leaking secrets
+/// into LLM context.  E.g. `https://token@github.com/...` → `https://***@github.com/...`.
+fn sanitize_remote_url(url: &str) -> String {
+    if let Some(at_pos) = url.find('@') {
+        if let Some(scheme_end) = url.find("://") {
+            return format!("{}://***@{}", &url[..scheme_end], &url[at_pos + 1..]);
+        }
+    }
+    url.to_string()
+}
+
 /// Gather git context from `client_cwd` and return a preamble to prepend to
 /// the task description plus an optional base branch for the worktree.
 ///
@@ -1694,7 +1733,7 @@ fn gather_task_context(client_cwd: Option<&str>, description: &str) -> TaskConte
         lines.push(format!("Current branch : {branch}"));
     }
     if !remote.is_empty() {
-        lines.push(format!("Remote origin  : {remote}"));
+        lines.push(format!("Remote origin  : {}", sanitize_remote_url(&remote)));
     }
     if !log.is_empty() {
         lines.push("Recent commits :".into());
