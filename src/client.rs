@@ -839,7 +839,7 @@ pub async fn run_chat_loop(
 ) -> Result<()> {
     let mut sigint = signal(SignalKind::interrupt()).context("setting up SIGINT handler")?;
 
-    let model = model
+    let mut model = model
         .or_else(|| std::env::var("AMAEBI_MODEL").ok())
         .unwrap_or_else(|| crate::provider::DEFAULT_MODEL.to_string());
 
@@ -973,6 +973,23 @@ pub async fn run_chat_loop(
             }
             stdout.flush().await?;
             // Continue the chat loop for the next user input.
+            continue 'session;
+        }
+
+        // Intercept `/model <name>`: switch the model for this session without
+        // an LLM round-trip.  This is more reliable than relying on the model
+        // to call the switch_model tool, and correctly handles names like
+        // `claude-sonnet-4.6[1m]` that may confuse the model.
+        if let Some(new_model) = prompt.strip_prefix("/model ").map(str::trim) {
+            if new_model.is_empty() {
+                let msg = format!("usage: /model <model-name>  (current: {model})\n");
+                stdout.write_all(msg.as_bytes()).await?;
+            } else {
+                model = new_model.to_string();
+                let msg = format!("[model] switched to {model}\n");
+                stdout.write_all(msg.as_bytes()).await?;
+            }
+            stdout.flush().await?;
             continue 'session;
         }
 
