@@ -1092,6 +1092,13 @@ pub async fn run_chat_loop(
                                 // running its supervision loop, so reusing this socket
                                 // for further Chat requests would desync the protocol.
                                 // Terminate the session cleanly instead.
+                                let reason = if interrupt_sent {
+                                    "[supervision] daemon did not stop within 5 s after interrupt; ending session.\n"
+                                } else {
+                                    "[supervision] hard timeout reached; ending session.\n"
+                                };
+                                stdout.write_all(reason.as_bytes()).await?;
+                                stdout.flush().await?;
                                 break 'session;
                             }
 
