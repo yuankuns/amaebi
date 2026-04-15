@@ -1060,18 +1060,18 @@ pub async fn run_chat_loop(
                     write_half.write_all(req_line.as_bytes()).await?;
 
                     // Stream supervision output exactly like a Chat response.
-                    // After sending Interrupt we keep draining frames until
-                    // Done/Error (with a 5 s timeout) so the daemon can
-                    // acknowledge cleanly.
+                    // We always arm a timeout so the client never hangs if the
+                    // daemon silently drops. Default: 12 h (supervision max);
+                    // shortened to 5 s once an interrupt has been sent.
                     let mut interrupt_sent = false;
-                    let drain_deadline =
-                        tokio::time::Instant::now() + Duration::from_secs(300);
+                    let supervision_deadline =
+                        tokio::time::Instant::now() + Duration::from_secs(12 * 60 * 60);
                     'supervision: loop {
                         let timeout_at = if interrupt_sent {
                             // After interrupt, give daemon 5 s to respond with Done.
                             tokio::time::Instant::now() + Duration::from_secs(5)
                         } else {
-                            drain_deadline
+                            supervision_deadline
                         };
                         tokio::select! {
                             biased;
@@ -1086,8 +1086,8 @@ pub async fn run_chat_loop(
                                 // Continue looping to drain remaining frames.
                             }
 
-                            _ = tokio::time::sleep_until(timeout_at), if interrupt_sent => {
-                                // Timed out waiting for Done after interrupt.
+                            _ = tokio::time::sleep_until(timeout_at) => {
+                                // Timed out: either post-interrupt 5s or supervision max.
                                 break 'supervision;
                             }
 
@@ -1114,8 +1114,13 @@ pub async fn run_chat_loop(
                                         break 'supervision;
                                     }
                                     Response::Error { message } => {
+                                        if let Some(remaining) = md_buf.flush_all() {
+                                            let out = render_markdown(&remaining);
+                                            stdout.write_all(out.as_bytes()).await?;
+                                        }
                                         stdout.write_all(message.as_bytes()).await?;
                                         stdout.write_all(b"\n").await?;
+                                        stdout.flush().await?;
                                         break 'supervision;
                                     }
                                     _ => {}
@@ -1123,6 +1128,13 @@ pub async fn run_chat_loop(
                             }
                         }
                     }
+                    // Flush any remaining markdown (e.g. timeout break path).
+                    if let Some(remaining) = md_buf.flush_all() {
+                        let out = render_markdown(&remaining);
+                        stdout.write_all(out.as_bytes()).await?;
+                    }
+                    stdout.write_all(b"\n").await?;
+                    stdout.flush().await?;
                 }
                 continue 'session;
             }

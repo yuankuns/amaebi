@@ -1148,23 +1148,57 @@ async fn handle_claude_launch(
 }
 
 /// Capture the last 60 lines of a tmux pane as plain text.
+/// Returns an empty string on failure so supervision can continue.
 fn capture_pane_text(pane_id: &str) -> String {
-    std::process::Command::new("tmux")
+    match std::process::Command::new("tmux")
         .args(["capture-pane", "-t", pane_id, "-p", "-S", "-60"])
         .output()
-        .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-        .unwrap_or_default()
+    {
+        Ok(output) => {
+            if !output.status.success() {
+                tracing::warn!(
+                    pane_id,
+                    status = %output.status,
+                    stderr = %String::from_utf8_lossy(&output.stderr),
+                    "tmux capture-pane failed"
+                );
+                return String::new();
+            }
+            String::from_utf8_lossy(&output.stdout).into_owned()
+        }
+        Err(e) => {
+            tracing::warn!(pane_id, error = %e, "failed to spawn tmux capture-pane");
+            String::new()
+        }
+    }
 }
 
-/// Send literal text + Enter to a tmux pane.
+/// Send literal text + Enter to a tmux pane (best-effort).
 fn send_pane_keys(pane_id: &str, text: &str) {
-    let _ = std::process::Command::new("tmux")
+    match std::process::Command::new("tmux")
         .args(["send-keys", "-t", pane_id, "-l", "--", text])
-        .status();
-    let _ = std::process::Command::new("tmux")
+        .status()
+    {
+        Ok(s) if !s.success() => {
+            tracing::warn!(pane_id, status = %s, "tmux send-keys (text) failed");
+        }
+        Err(e) => {
+            tracing::warn!(pane_id, error = %e, "failed to spawn tmux send-keys (text)");
+        }
+        _ => {}
+    }
+    match std::process::Command::new("tmux")
         .args(["send-keys", "-t", pane_id, "Enter"])
-        .status();
+        .status()
+    {
+        Ok(s) if !s.success() => {
+            tracing::warn!(pane_id, status = %s, "tmux send-keys (Enter) failed");
+        }
+        Err(e) => {
+            tracing::warn!(pane_id, error = %e, "failed to spawn tmux send-keys (Enter)");
+        }
+        _ => {}
+    }
 }
 
 /// Handle `Request::SupervisePanes`: run a Rust polling loop that captures pane
@@ -1345,6 +1379,11 @@ async fn handle_supervision(
             write_frame(&mut *w, &Response::Text { chunk: header }).await?;
         }
 
+        // Security note: `snap.full_content` is the output of `capture_pane_text`,
+        // which captures only the last 60 visible lines of the pane.  This bounds
+        // the amount of data sent to the LLM, but those lines could still contain
+        // secrets (e.g. env vars printed by a build script).  A future improvement
+        // could add redaction of common secret patterns.
         let mut pane_snapshots = String::new();
         for snap in &snapshots {
             pane_snapshots.push_str(&format!(
@@ -1708,11 +1747,37 @@ fn extract_pr_number(description: &str) -> Option<u32> {
 }
 
 /// Strip userinfo (credentials/tokens) from a remote URL to avoid leaking secrets
-/// into LLM context.  E.g. `https://token@github.com/...` → `https://***@github.com/...`.
+/// into LLM context.
+///
+/// Handles both standard URLs (`https://token@github.com/...` → `https://***@github.com/...`)
+/// and SCP-style URLs (`token@github.com:org/repo.git` → `***@github.com:org/repo.git`).
 fn sanitize_remote_url(url: &str) -> String {
+    // https://token@github.com/... → https://***@github.com/...
+    if let Some(scheme_end) = url.find("://") {
+        let authority_start = scheme_end + 3;
+        let authority_end = url[authority_start..]
+            .find(['/', '?', '#'])
+            .map(|i| authority_start + i)
+            .unwrap_or(url.len());
+        if let Some(at_rel) = url[authority_start..authority_end].find('@') {
+            let at_pos = authority_start + at_rel;
+            return format!("{}***@{}", &url[..authority_start], &url[at_pos + 1..]);
+        }
+        return url.to_string();
+    }
+    // SCP-style: token@github.com:org/repo.git → ***@github.com:org/repo.git
     if let Some(at_pos) = url.find('@') {
-        if let Some(scheme_end) = url.find("://") {
-            return format!("{}://***@{}", &url[..scheme_end], &url[at_pos + 1..]);
+        if let Some(colon_rel) = url[at_pos + 1..].find(':') {
+            let colon_pos = at_pos + 1 + colon_rel;
+            let userinfo = &url[..at_pos];
+            let host = &url[at_pos + 1..colon_pos];
+            if !userinfo.is_empty()
+                && !host.is_empty()
+                && !userinfo.contains('/')
+                && !host.contains('/')
+            {
+                return format!("***@{}", &url[at_pos + 1..]);
+            }
         }
     }
     url.to_string()
@@ -5594,5 +5659,57 @@ mod tests {
     #[test]
     fn json_str_field_empty_json() {
         assert_eq!(json_str_field("", "key"), "");
+    }
+
+    // -----------------------------------------------------------------------
+    // sanitize_remote_url
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn sanitize_remote_url_https_with_token() {
+        assert_eq!(
+            sanitize_remote_url("https://ghp_abc123@github.com/org/repo.git"),
+            "https://***@github.com/org/repo.git"
+        );
+    }
+
+    #[test]
+    fn sanitize_remote_url_https_no_creds() {
+        assert_eq!(
+            sanitize_remote_url("https://github.com/org/repo.git"),
+            "https://github.com/org/repo.git"
+        );
+    }
+
+    #[test]
+    fn sanitize_remote_url_scp_style_with_token() {
+        assert_eq!(
+            sanitize_remote_url("ghp_abc123@github.com:org/repo.git"),
+            "***@github.com:org/repo.git"
+        );
+    }
+
+    #[test]
+    fn sanitize_remote_url_scp_style_git_user() {
+        assert_eq!(
+            sanitize_remote_url("git@github.com:org/repo.git"),
+            "***@github.com:org/repo.git"
+        );
+    }
+
+    #[test]
+    fn sanitize_remote_url_plain_url() {
+        assert_eq!(
+            sanitize_remote_url("https://github.com/org/repo"),
+            "https://github.com/org/repo"
+        );
+    }
+
+    #[test]
+    fn sanitize_remote_url_ssh_scheme() {
+        assert_eq!(
+            sanitize_remote_url("ssh://user@host/path"),
+            "ssh://***@host/path"
+        );
     }
 }
