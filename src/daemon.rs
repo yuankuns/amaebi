@@ -1241,11 +1241,16 @@ async fn handle_supervision(
             .unwrap_or(10 * 3600u64), // 10 hours default — enough for a night shift
     );
 
-    const MAX_SUPERVISION_TOKENS: usize = 240;
+    const MAX_SUPERVISION_TOKENS: usize = 1024;
 
     let supervision_start = std::time::Instant::now();
     let deadline = supervision_start + max_duration;
     let mut turn: u64 = 0;
+
+    // Load skill files (SOUL.md, AGENTS.md, GPU_KERNEL.md) once and reuse
+    // across all supervision turns so the LLM has project context for
+    // higher-quality STEER decisions.
+    let skill_msgs = load_skill_messages().await;
 
     let system_prompt =
         "You are supervising a Claude Code session executing a task in a tmux pane.\n\
@@ -1396,10 +1401,11 @@ async fn handle_supervision(
             "Current pane snapshots (check #{turn}, elapsed {elapsed_mins}m):\n\n{pane_snapshots}"
         );
 
-        let messages = vec![
-            Message::system(system_prompt.clone()),
-            Message::user(user_content),
-        ];
+        let mut messages = vec![Message::system(system_prompt.clone())];
+        // Inject SOUL.md / AGENTS.md etc. right after the system message
+        // so the supervision LLM has full project context.
+        splice_skill_messages(&mut messages, skill_msgs.clone());
+        messages.push(Message::user(user_content));
 
         // --- Drain any pending interrupts before invoking the model ---
         // The model call is short (240 tokens max) so mid-call interrupts
