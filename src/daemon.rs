@@ -811,13 +811,13 @@ async fn handle_claude_launch(
         // the task description mentions a PR number.  The context is prepended
         // to the description so Claude knows where to start, what branch it is
         // on, and how to push when done.
-        let (description, ctx_base_branch) = {
+        let (description, ctx_start_branch) = {
             let raw_desc = task.description.clone();
             let cwd = task.client_cwd.clone();
             tokio::task::spawn_blocking(move || {
                 let ctx = gather_task_context(cwd.as_deref(), &raw_desc);
                 let enriched = format!("{}\n{}", ctx.preamble, raw_desc);
-                (enriched, ctx.base_branch)
+                (enriched, ctx.start_branch)
             })
             .await
             .unwrap_or_else(|_| (task.description.clone(), None))
@@ -834,7 +834,7 @@ async fn handle_claude_launch(
             None => {
                 let tid = task_id.clone();
                 let cwd = task.client_cwd.clone();
-                let base = ctx_base_branch.clone();
+                let base = ctx_start_branch.clone();
                 match tokio::task::spawn_blocking(move || {
                     create_task_worktree(&tid, cwd.as_deref(), base.as_deref())
                 })
@@ -1536,7 +1536,7 @@ async fn handle_supervision(
 fn create_task_worktree(
     task_id: &str,
     client_cwd: Option<&str>,
-    base_branch: Option<&str>,
+    start_branch: Option<&str>,
 ) -> anyhow::Result<std::path::PathBuf> {
     use std::path::PathBuf;
 
@@ -1621,7 +1621,7 @@ fn create_task_worktree(
         .with_context(|| format!("creating worktree parent directory {}", wt_parent.display()))?;
 
     // Create the worktree on a new branch named <task_id>-<uuid8>.
-    // If a base_branch is provided (e.g. the head branch of a PR), the new
+    // If a start_branch is provided (e.g. the head branch of a PR), the new
     // branch is forked from that branch rather than from HEAD.  This ensures
     // Claude starts with the right commits already in place.
     let mut git_cmd = std::process::Command::new("git");
@@ -1635,7 +1635,7 @@ fn create_task_worktree(
     // exists locally.  Use `origin/<base>` as the start-point so we don't
     // require a local tracking branch.  If the fetch fails (e.g. the ref
     // doesn't exist on the remote), fall back to HEAD (omit the start-point).
-    let fetched_base: Option<String> = base_branch.and_then(|base| {
+    let fetched_base: Option<String> = start_branch.and_then(|base| {
         let mut fetch_cmd = std::process::Command::new("git");
         if let Some(cwd) = client_cwd {
             fetch_cmd.args(["-C", cwd]);
@@ -1690,7 +1690,7 @@ struct TaskContext {
     /// If a PR number was detected in the task description and `gh` resolved
     /// the PR's head branch, this is the branch name to use as the base for
     /// the new worktree (instead of HEAD).
-    base_branch: Option<String>,
+    start_branch: Option<String>,
 }
 
 /// Run a single git command with an optional `-C <cwd>` prefix.
@@ -1809,7 +1809,7 @@ fn gather_task_context(client_cwd: Option<&str>, description: &str) -> TaskConte
     }
 
     // --- PR-specific context ---
-    let mut base_branch: Option<String> = None;
+    let mut start_branch: Option<String> = None;
     if let Some(pr_num) = extract_pr_number(description) {
         // Try gh pr view to get the head branch and title.
         let gh_json = std::process::Command::new("gh")
@@ -1839,7 +1839,7 @@ fn gather_task_context(client_cwd: Option<&str>, description: &str) -> TaskConte
             }
             if !head.is_empty() {
                 lines.push(format!("  Head branch: {head}"));
-                base_branch = Some(head.clone());
+                start_branch = Some(head.clone());
             }
             if !base.is_empty() {
                 lines.push(format!("  Base branch: {base}"));
@@ -1847,7 +1847,7 @@ fn gather_task_context(client_cwd: Option<&str>, description: &str) -> TaskConte
         }
     }
 
-    if !branch.is_empty() || base_branch.is_some() {
+    if !branch.is_empty() || start_branch.is_some() {
         lines.push("When your changes are ready, push with: git push -u origin HEAD".to_string());
     }
 
@@ -1856,7 +1856,7 @@ fn gather_task_context(client_cwd: Option<&str>, description: &str) -> TaskConte
 
     TaskContext {
         preamble: lines.join("\n"),
-        base_branch,
+        start_branch,
     }
 }
 
