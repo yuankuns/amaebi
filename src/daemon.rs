@@ -660,9 +660,10 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
             Request::SupervisePanes {
                 panes,
                 model,
-                session_id: _,
+                session_id,
             } => {
-                handle_supervision(&writer, &mut frame_rx, panes, model, &state).await?;
+                handle_supervision(&writer, &mut frame_rx, panes, model, &state, session_id)
+                    .await?;
             }
         }
     }
@@ -1047,7 +1048,7 @@ async fn handle_claude_launch(
         // prompt character variations (❯, >, $, etc.) and avoids the
         // fragility of trying to detect TUI readiness.
         let send_result = tokio::task::spawn_blocking(move || {
-            for (idx, (keys, _press_enter)) in key_sequence.iter().enumerate() {
+            for (idx, (keys, press_enter)) in key_sequence.iter().enumerate() {
                 // Before the very first send: let the new pane's shell
                 // initialise (.bashrc, prompt rendering, etc.).
                 // Before subsequent sends (e.g. description after claude
@@ -1064,16 +1065,18 @@ async fn handle_claude_launch(
                         String::from_utf8_lossy(&out.stderr).trim().to_string(),
                     ));
                 }
-                // Wait for the TUI to render and accept the pasted text,
-                // then press Enter unconditionally.
-                std::thread::sleep(std::time::Duration::from_secs(1));
-                let out = std::process::Command::new("tmux")
-                    .args(["send-keys", "-t", &send_pane, "Enter"])
-                    .output()?;
-                if !out.status.success() {
-                    return Ok(Some(
-                        String::from_utf8_lossy(&out.stderr).trim().to_string(),
-                    ));
+                if *press_enter {
+                    // Wait for the TUI to render and accept the pasted text,
+                    // then press Enter.
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    let out = std::process::Command::new("tmux")
+                        .args(["send-keys", "-t", &send_pane, "Enter"])
+                        .output()?;
+                    if !out.status.success() {
+                        return Ok(Some(
+                            String::from_utf8_lossy(&out.stderr).trim().to_string(),
+                        ));
+                    }
                 }
             }
             Ok(None)
@@ -1167,7 +1170,8 @@ fn send_pane_keys(pane_id: &str, text: &str) {
 /// Handle `Request::SupervisePanes`: run a Rust polling loop that captures pane
 /// content, calls the LLM for analysis (no tools), and acts on the response.
 ///
-/// The loop iterates with a 15-second sleep between turns. Each turn the LLM
+/// The loop iterates with a 60-second sleep between turns (override with
+/// `AMAEBI_SUPERVISION_INTERVAL_SECS`). Each turn the LLM
 /// returns exactly one of:
 /// - `WAIT` — still working, check again
 /// - `STEER: <pane_id>: <message>` — send a correction to the pane
@@ -1182,6 +1186,7 @@ async fn handle_supervision(
     panes: Vec<crate::ipc::SupervisionTarget>,
     model: String,
     state: &Arc<DaemonState>,
+    session_id: Option<String>,
 ) -> Result<()> {
     // How long to wait between checks. Default 60 s; override with
     // AMAEBI_SUPERVISION_INTERVAL_SECS.
@@ -1256,8 +1261,13 @@ async fn handle_supervision(
                                 return Ok(());
                             }
                             Some(line) => {
-                                if let Ok(req) = serde_json::from_str::<Request>(&line) {
-                                    if matches!(req, Request::Interrupt { .. }) {
+                                if let Ok(Request::Interrupt { session_id: sid }) =
+                                    serde_json::from_str::<Request>(&line)
+                                {
+                                    if session_id
+                                        .as_deref()
+                                        .is_none_or(|expected| sid == expected)
+                                    {
                                         break true;
                                     }
                                 }
@@ -1347,14 +1357,7 @@ async fn handle_supervision(
         );
 
         let messages = vec![
-            Message::user(system_prompt.clone()),
-            Message::assistant(
-                Some(
-                    "Understood. I will analyse each pane and respond with WAIT, STEER, or DONE."
-                        .to_owned(),
-                ),
-                vec![],
-            ),
+            Message::system(system_prompt.clone()),
             Message::user(user_content),
         ];
 
@@ -1560,9 +1563,33 @@ fn create_task_worktree(
     let wt_str = wt_path
         .to_str()
         .context("worktree path is not valid UTF-8")?;
+    // If a base branch is provided, fetch it from origin first so the ref
+    // exists locally.  Use `origin/<base>` as the start-point so we don't
+    // require a local tracking branch.  If the fetch fails (e.g. the ref
+    // doesn't exist on the remote), fall back to HEAD (omit the start-point).
+    let fetched_base: Option<String> = base_branch.and_then(|base| {
+        let mut fetch_cmd = std::process::Command::new("git");
+        if let Some(cwd) = client_cwd {
+            fetch_cmd.args(["-C", cwd]);
+        }
+        let fetch_ok = fetch_cmd
+            .args(["fetch", "origin", base])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if fetch_ok {
+            Some(format!("origin/{base}"))
+        } else {
+            tracing::warn!(
+                branch = base,
+                "git fetch origin failed; falling back to HEAD as worktree start-point"
+            );
+            None
+        }
+    });
     let mut args = vec!["worktree", "add", wt_str, "-b", &unique_name];
-    if let Some(base) = base_branch {
-        args.push(base);
+    if let Some(ref start_point) = fetched_base {
+        args.push(start_point);
     }
     let out = git_cmd
         .args(&args)
@@ -1716,12 +1743,7 @@ fn gather_task_context(client_cwd: Option<&str>, description: &str) -> TaskConte
     }
 
     if !branch.is_empty() || base_branch.is_some() {
-        let push_branch = base_branch.as_deref().unwrap_or(&branch);
-        if !push_branch.is_empty() {
-            lines.push(format!(
-                "When your changes are ready, push with: git push origin {push_branch}"
-            ));
-        }
+        lines.push("When your changes are ready, push with: git push -u origin HEAD".to_string());
     }
 
     lines.push("=== End of injected context ===".into());
@@ -1737,20 +1759,10 @@ fn gather_task_context(client_cwd: Option<&str>, description: &str) -> TaskConte
 /// Only handles the case where the value is a JSON string (double-quoted).
 /// Returns an empty string on failure.
 fn json_str_field(json: &str, field: &str) -> String {
-    (|| -> Option<String> {
-        let needle = format!("\"{field}\"");
-        let start = json.find(&needle)?;
-        let after_key = &json[start + needle.len()..];
-        let colon = after_key.find(':')? + 1;
-        let value_start = after_key[colon..].trim_start();
-        if !value_start.starts_with('"') {
-            return None;
-        }
-        let inner = &value_start[1..];
-        let end = inner.find('"')?;
-        Some(inner[..end].to_string())
-    })()
-    .unwrap_or_default()
+    serde_json::from_str::<serde_json::Value>(json)
+        .ok()
+        .and_then(|v| v.get(field)?.as_str().map(str::to_owned))
+        .unwrap_or_default()
 }
 
 /// Handle `Request::ClearMemory`: clear the memory DB and send `Done`.
@@ -3166,8 +3178,8 @@ where
     // the first (tool-execution turns) unless the LLM explicitly switched
     // the model via the switch_model tool.
     let tool_model: Option<String> = std::env::var("AMAEBI_TOOL_MODEL").ok();
-    let mut is_first_turn = true;
     let mut model_explicitly_switched = false;
+    let mut last_turn_used_tools = false;
 
     // Per-run scratch directory for large tool outputs (unix only).
     // Intentionally not cleaned up on exit — see comment near ScratchDirGuard
@@ -3265,7 +3277,7 @@ where
         // switched the model via switch_model, use the tool model for every
         // turn after the first to reduce cost on mechanical tool-execution turns.
         let invoke_with: &str =
-            if !is_first_turn && !model_explicitly_switched && tool_model.is_some() {
+            if last_turn_used_tools && !model_explicitly_switched && tool_model.is_some() {
                 tool_model.as_deref().unwrap()
             } else {
                 &current_model
@@ -3286,7 +3298,7 @@ where
             writer,
         )
         .await?;
-        is_first_turn = false;
+        last_turn_used_tools = matches!(resp.finish_reason, FinishReason::ToolCalls);
 
         last_prompt_tokens = resp.prompt_tokens;
 
