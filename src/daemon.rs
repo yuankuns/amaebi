@@ -1040,13 +1040,13 @@ async fn handle_claude_launch(
         let send_pane = pane_id.clone();
 
         // Send key sequences to the pane.  Each step: send text literally
-        // with `send-keys -l --`, wait 1 second for the TUI to settle, then
-        // send Enter as a separate real key press.
+        // with `send-keys -l --`, then send Enter as a separate key press.
         //
-        // No prompt-polling: we simply give the target process 1 s after
-        // each text injection before pressing Enter.  This is robust against
-        // prompt character variations (❯, >, $, etc.) and avoids the
-        // fragility of trying to detect TUI readiness.
+        // Timing: 1 s pause before the first send (bash init), 5 s before
+        // subsequent sends (e.g. claude startup), then 1 s after each text
+        // injection before pressing Enter.  No prompt-polling — simple
+        // fixed delays are robust against prompt character variations
+        // (❯, >, $, etc.).
         let send_result = tokio::task::spawn_blocking(move || {
             for (idx, (keys, press_enter)) in key_sequence.iter().enumerate() {
                 // Before the very first send: let the new pane's shell
@@ -1153,7 +1153,7 @@ fn capture_pane_text(pane_id: &str) -> String {
         .args(["capture-pane", "-t", pane_id, "-p", "-S", "-60"])
         .output()
         .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
         .unwrap_or_default()
 }
 
@@ -1194,7 +1194,8 @@ async fn handle_supervision(
         std::env::var("AMAEBI_SUPERVISION_INTERVAL_SECS")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(60u64),
+            .unwrap_or(60u64)
+            .max(1), // clamp to >= 1 s to prevent a tight loop
     );
 
     // Hard wall-clock limit before supervision gives up. Default 10 hours;
@@ -3213,9 +3214,9 @@ where
     // turn does not permanently disable compaction for the rest of the
     // session.
     let mut consecutive_compact_failures: u32 = 0;
-    // AMAEBI_TOOL_MODEL: if set, use this cheaper model for every turn after
-    // the first (tool-execution turns) unless the LLM explicitly switched
-    // the model via the switch_model tool.
+    // AMAEBI_TOOL_MODEL: if set, use this cheaper model on turns where the
+    // previous turn finished with tool calls (FinishReason::ToolCalls),
+    // unless the LLM explicitly switched the model via switch_model.
     let tool_model: Option<String> = std::env::var("AMAEBI_TOOL_MODEL").ok();
     let mut model_explicitly_switched = false;
     let mut last_turn_used_tools = false;

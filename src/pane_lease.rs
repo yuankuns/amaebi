@@ -771,7 +771,7 @@ fn tmux_new_window_sync(window_id: &str) -> Result<(String, String)> {
         anyhow::bail!("tmux new-window failed: {stderr}");
     }
     let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let mut parts = raw.splitn(2, ' ');
+    let mut parts = raw.split_whitespace();
     let pane_id = parts
         .next()
         .filter(|s| !s.is_empty())
