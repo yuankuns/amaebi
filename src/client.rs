@@ -1061,7 +1061,8 @@ pub async fn run_chat_loop(
 
                     // Stream supervision output exactly like a Chat response.
                     // We always arm a timeout so the client never hangs if the
-                    // daemon silently drops. Default: 12 h (supervision max);
+                    // daemon silently drops. Default: 12 h (slightly above the
+                    // daemon's 10 h default; both are configurable via env vars);
                     // shortened to 5 s once an interrupt has been sent.
                     let mut interrupt_sent = false;
                     let supervision_deadline =

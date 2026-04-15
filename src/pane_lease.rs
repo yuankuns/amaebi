@@ -16,7 +16,7 @@
 //!
 //! Every mutating operation acquires `LOCK_EX` for the duration of the
 //! read-modify-write cycle.  [`ensure_idle_panes`] holds the lock for the
-//! entire expansion loop (including any `tmux split-window` calls) so two
+//! entire expansion loop (including any `tmux new-window` calls) so two
 //! concurrent `ClaudeLaunch` requests never create duplicate panes.
 //!
 //! All public functions are **synchronous** and must be called from inside
@@ -483,14 +483,14 @@ pub fn rename_pane(pane_id: &str, title: &str) -> Result<()> {
 /// Prefer [`ensure_and_acquire_idle`] for single-request use to avoid a
 /// TOCTOU race.  This function is retained for bulk pre-warming use cases.
 ///
-/// If the current number of Idle panes is insufficient, this function splits
-/// existing tmux windows to create new panes (up to [`MAX_PANES`] total).
+/// If the current number of Idle panes is insufficient, this function creates
+/// new tmux windows to host new panes (up to [`MAX_PANES`] total).
 /// The entire operation runs inside a single `LOCK_EX`, so concurrent calls
 /// never create duplicate panes.
 ///
-/// **Priority order for splitting:**
-/// 1. Windows that contain *no* Busy panes (least disruptive).
-/// 2. Any remaining window (contains at least one Busy pane).
+/// **Priority order for window creation:**
+/// 1. Sessions owning windows with *no* Busy panes (least disruptive).
+/// 2. Any remaining window's session (contains at least one Busy pane).
 /// 3. If total + deficit would exceed `MAX_PANES` → `Err(CapacityError)`.
 ///
 /// # Errors
@@ -499,8 +499,7 @@ pub fn rename_pane(pane_id: &str, title: &str) -> Result<()> {
 ///   exceeded.
 /// - `anyhow::Error` with `"not in a tmux session"` when `tmux list-windows`
 ///   fails (no `$TMUX` set).
-/// - `anyhow::Error` with `"no tmux window available to split"` when all
-///   split attempts fail (extremely rare).
+/// - `anyhow::Error` when all `tmux new-window` attempts fail.
 #[allow(dead_code)]
 pub fn ensure_idle_panes(needed: usize) -> Result<()> {
     if needed == 0 {
@@ -742,7 +741,7 @@ fn tmux_list_windows_sync() -> Result<Vec<String>> {
 }
 
 /// Create a new tmux window in the session that owns `window_id`, then return
-/// the new window's pane ID.
+/// the new window's pane ID and window ID as `(pane_id, window_id)`.
 ///
 /// Uses `tmux new-window` rather than `split-window` so each Claude session
 /// gets its own full-size window instead of a split pane — easier to navigate
