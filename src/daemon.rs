@@ -1538,8 +1538,21 @@ async fn handle_chat_request(
     };
 
     let pre_send_tokens = count_message_tokens(&messages);
-    // If a switch_model call updated the model in a previous turn, use it.
-    let effective_model = carried_model.take().unwrap_or(model);
+    // If the client explicitly changed the model (e.g. via /model), it wins
+    // over carried_model from a previous switch_model call.  This ensures
+    // suffixes like [1m] are not lost.
+    let effective_model = match carried_model.take() {
+        Some(carried) if carried == model => carried,
+        Some(_carried) => {
+            // Client sent a different model than what was carried — client wins.
+            tracing::debug!(
+                client_model = %model,
+                "client model overrides carried_model"
+            );
+            model
+        }
+        None => model,
+    };
     let threshold = compaction_threshold_tokens(&effective_model);
     let Some(loop_result) =
         drive_agentic_loop(state, writer, conn_state, &sid, messages, &effective_model).await
