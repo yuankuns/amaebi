@@ -198,6 +198,27 @@ fn render_markdown(text: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// /model command parsing
+// ---------------------------------------------------------------------------
+
+/// Parse a `/model` command from user input.
+///
+/// Returns:
+/// - `None` — input is not a `/model` command
+/// - `Some(Some(name))` — switch to `name`
+/// - `Some(None)` — bare `/model` with no argument (show usage)
+fn parse_model_command(input: &str) -> Option<Option<String>> {
+    // Match "/model" with optional trailing whitespace/argument.
+    let rest = input.strip_prefix("/model")?;
+    let name = rest.trim();
+    if name.is_empty() {
+        Some(None)
+    } else {
+        Some(Some(name.to_string()))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // /claude command parsing
 // ---------------------------------------------------------------------------
 
@@ -976,18 +997,21 @@ pub async fn run_chat_loop(
             continue 'session;
         }
 
-        // Intercept `/model <name>`: switch the model for this session without
+        // Intercept `/model [<name>]`: switch the model for this session without
         // an LLM round-trip.  This is more reliable than relying on the model
         // to call the switch_model tool, and correctly handles names like
         // `claude-sonnet-4.6[1m]` that may confuse the model.
-        if let Some(new_model) = prompt.strip_prefix("/model ").map(str::trim) {
-            if new_model.is_empty() {
-                let msg = format!("usage: /model <model-name>  (current: {model})\n");
-                stdout.write_all(msg.as_bytes()).await?;
-            } else {
-                model = new_model.to_string();
-                let msg = format!("[model] switched to {model}\n");
-                stdout.write_all(msg.as_bytes()).await?;
+        if let Some(new_model) = parse_model_command(&prompt) {
+            match new_model {
+                Some(name) => {
+                    model = name;
+                    let msg = format!("[model] switched to {model}\n");
+                    stdout.write_all(msg.as_bytes()).await?;
+                }
+                None => {
+                    let msg = format!("usage: /model <model-name>  (current: {model})\n");
+                    stdout.write_all(msg.as_bytes()).await?;
+                }
             }
             stdout.flush().await?;
             continue 'session;
@@ -3463,6 +3487,50 @@ mod tests {
         let result = parse_claude_command(&long);
         let tasks = result.expect("should be Some").expect("should be Ok");
         assert!(tasks[0].task_id.len() <= 32);
+    }
+
+    // -----------------------------------------------------------------------
+    // /model command parsing
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_model_bare_returns_none_arg() {
+        assert_eq!(parse_model_command("/model"), Some(None));
+    }
+
+    #[test]
+    fn parse_model_with_spaces_only_returns_none_arg() {
+        assert_eq!(parse_model_command("/model   "), Some(None));
+    }
+
+    #[test]
+    fn parse_model_with_name_returns_name() {
+        assert_eq!(
+            parse_model_command("/model claude-sonnet-4.6"),
+            Some(Some("claude-sonnet-4.6".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_model_with_1m_suffix() {
+        assert_eq!(
+            parse_model_command("/model claude-sonnet-4.6[1m]"),
+            Some(Some("claude-sonnet-4.6[1m]".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_model_with_provider_prefix() {
+        assert_eq!(
+            parse_model_command("/model bedrock/claude-opus-4.6[1m]"),
+            Some(Some("bedrock/claude-opus-4.6[1m]".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_model_not_a_model_command() {
+        assert!(parse_model_command("not a model command").is_none());
+        assert!(parse_model_command("/claude something").is_none());
     }
 
     #[test]
