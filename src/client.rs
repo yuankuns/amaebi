@@ -198,6 +198,31 @@ fn render_markdown(text: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// /model command parsing
+// ---------------------------------------------------------------------------
+
+/// Parse a `/model` command from user input.
+///
+/// Returns:
+/// - `None` — input is not a `/model` command
+/// - `Some(Some(name))` — switch to `name`
+/// - `Some(None)` — bare `/model` with no argument (show usage)
+fn parse_model_command(input: &str) -> Option<Option<String>> {
+    // Require "/model" followed by end-of-string or whitespace to avoid
+    // false positives like "/modelx" or "/model--help".
+    let rest = input.strip_prefix("/model")?;
+    if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let name = rest.trim();
+    if name.is_empty() {
+        Some(None)
+    } else {
+        Some(Some(name.to_string()))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // /claude command parsing
 // ---------------------------------------------------------------------------
 
@@ -839,7 +864,7 @@ pub async fn run_chat_loop(
 ) -> Result<()> {
     let mut sigint = signal(SignalKind::interrupt()).context("setting up SIGINT handler")?;
 
-    let model = model
+    let mut model = model
         .or_else(|| std::env::var("AMAEBI_MODEL").ok())
         .unwrap_or_else(|| crate::provider::DEFAULT_MODEL.to_string());
 
@@ -973,6 +998,26 @@ pub async fn run_chat_loop(
             }
             stdout.flush().await?;
             // Continue the chat loop for the next user input.
+            continue 'session;
+        }
+
+        // Intercept `/model [<name>]`: switch the model for this session without
+        // an LLM round-trip.  This is more reliable than relying on the model
+        // to call the switch_model tool, and correctly handles names like
+        // `claude-sonnet-4.6[1m]` that may confuse the model.
+        if let Some(new_model) = parse_model_command(&prompt) {
+            match new_model {
+                Some(name) => {
+                    model = name;
+                    let msg = format!("[model] switched to {model}\n");
+                    stdout.write_all(msg.as_bytes()).await?;
+                }
+                None => {
+                    let msg = format!("usage: /model <model-name>  (current: {model})\n");
+                    stdout.write_all(msg.as_bytes()).await?;
+                }
+            }
+            stdout.flush().await?;
             continue 'session;
         }
 
@@ -3446,6 +3491,58 @@ mod tests {
         let result = parse_claude_command(&long);
         let tasks = result.expect("should be Some").expect("should be Ok");
         assert!(tasks[0].task_id.len() <= 32);
+    }
+
+    // -----------------------------------------------------------------------
+    // /model command parsing
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_model_bare_returns_none_arg() {
+        assert_eq!(parse_model_command("/model"), Some(None));
+    }
+
+    #[test]
+    fn parse_model_with_spaces_only_returns_none_arg() {
+        assert_eq!(parse_model_command("/model   "), Some(None));
+    }
+
+    #[test]
+    fn parse_model_with_name_returns_name() {
+        assert_eq!(
+            parse_model_command("/model claude-sonnet-4.6"),
+            Some(Some("claude-sonnet-4.6".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_model_with_1m_suffix() {
+        assert_eq!(
+            parse_model_command("/model claude-sonnet-4.6[1m]"),
+            Some(Some("claude-sonnet-4.6[1m]".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_model_with_provider_prefix() {
+        assert_eq!(
+            parse_model_command("/model bedrock/claude-opus-4.6[1m]"),
+            Some(Some("bedrock/claude-opus-4.6[1m]".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_model_not_a_model_command() {
+        assert!(parse_model_command("not a model command").is_none());
+        assert!(parse_model_command("/claude something").is_none());
+    }
+
+    #[test]
+    fn parse_model_false_positive_prefix_rejected() {
+        // "/modelx" and "/model--help" must NOT be treated as /model commands.
+        assert!(parse_model_command("/modelx").is_none());
+        assert!(parse_model_command("/model--help").is_none());
+        assert!(parse_model_command("/modelclaude").is_none());
     }
 
     #[test]
