@@ -1122,6 +1122,18 @@ pub async fn run_chat_loop(
                                     let _ = stdout.write_all(msg.as_bytes()).await;
                                 }
                                 let _ = stdout.flush().await;
+                                // The daemon is waiting for a Steer after the
+                                // Interrupt we sent.  Send "continue" so the
+                                // agentic loop resumes with the new model taking
+                                // effect on the next turn.
+                                let steer_req = Request::Steer {
+                                    session_id: session_id.clone(),
+                                    message: "continue".to_owned(),
+                                };
+                                if let Ok(mut frame) = serde_json::to_string(&steer_req) {
+                                    frame.push('\n');
+                                    let _ = write_half.write_all(frame.as_bytes()).await;
+                                }
                             } else {
                                 let steer_req = Request::Steer {
                                     session_id: session_id.clone(),
