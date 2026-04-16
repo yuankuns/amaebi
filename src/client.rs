@@ -2039,48 +2039,28 @@ mod prompt_input {
                     ));
                 }
                 // Backspace (DEL = 0x7f on most terminals; BS = 0x08 on some)
-                0x7f | 0x08 => {
-                    if cursor > 0 {
-                        let w = widths[cursor - 1];
-                        chars.remove(cursor - 1);
-                        widths.remove(cursor - 1);
-                        cursor -= 1;
-                        if w > 0 {
-                            // Normal (non-zero-width) char: reposition and erase.
-                            //
-                            // ESC[wD (CUB) is used instead of w×\x08 (BS) because some
-                            // terminals snap the cursor to the left boundary of a wide
-                            // glyph on the first \x08, causing two \x08 to overshoot by
-                            // one column at odd column positions and leave the right-half
-                            // cell visible.  CUB always moves exactly w columns.
-                            //
-                            // Known limitation: CUB does not wrap to the previous visual
-                            // line on soft-wrapped input.  This editor targets single-line
-                            // prompts; multi-line soft-wrap support is out of scope.
-                            if cursor == chars.len() {
-                                // Cursor is at end — simple inline erase.
-                                write!(output, "\x1b[{w}D\x1b[K")?;
-                            } else {
-                                // Mid-line deletion: full redraw to shift remaining chars.
-                                redraw(
-                                    output,
-                                    prompt,
-                                    &chars,
-                                    &widths,
-                                    cursor,
-                                    term_cols,
-                                    terminal_line,
-                                    terminal_end_line,
-                                )?;
-                            }
+                0x7f | 0x08 if cursor > 0 => {
+                    let w = widths[cursor - 1];
+                    chars.remove(cursor - 1);
+                    widths.remove(cursor - 1);
+                    cursor -= 1;
+                    if w > 0 {
+                        // Normal (non-zero-width) char: reposition and erase.
+                        //
+                        // ESC[wD (CUB) is used instead of w×\x08 (BS) because some
+                        // terminals snap the cursor to the left boundary of a wide
+                        // glyph on the first \x08, causing two \x08 to overshoot by
+                        // one column at odd column positions and leave the right-half
+                        // cell visible.  CUB always moves exactly w columns.
+                        //
+                        // Known limitation: CUB does not wrap to the previous visual
+                        // line on soft-wrapped input.  This editor targets single-line
+                        // prompts; multi-line soft-wrap support is out of scope.
+                        if cursor == chars.len() {
+                            // Cursor is at end — simple inline erase.
+                            write!(output, "\x1b[{w}D\x1b[K")?;
                         } else {
-                            // Zero-width combining mark: it was rendered on top of the
-                            // preceding base character without advancing the cursor.
-                            // Always do a full redraw: if there was a preceding base char
-                            // we need to repaint it cleanly; if the mark was the very
-                            // first character it may have combined visually with the
-                            // trailing character of the prompt, so reprinting the prompt
-                            // via redraw() is the only way to restore it.
+                            // Mid-line deletion: full redraw to shift remaining chars.
                             redraw(
                                 output,
                                 prompt,
@@ -2092,6 +2072,24 @@ mod prompt_input {
                                 terminal_end_line,
                             )?;
                         }
+                    } else {
+                        // Zero-width combining mark: it was rendered on top of the
+                        // preceding base character without advancing the cursor.
+                        // Always do a full redraw: if there was a preceding base char
+                        // we need to repaint it cleanly; if the mark was the very
+                        // first character it may have combined visually with the
+                        // trailing character of the prompt, so reprinting the prompt
+                        // via redraw() is the only way to restore it.
+                        redraw(
+                            output,
+                            prompt,
+                            &chars,
+                            &widths,
+                            cursor,
+                            term_cols,
+                            terminal_line,
+                            terminal_end_line,
+                        )?;
                     }
                 }
                 // Escape sequences (arrows, function keys).
@@ -2125,36 +2123,32 @@ mod prompt_input {
                                 };
                                 match (final_byte, params.as_slice()) {
                                     // Left arrow (ESC [ D)
-                                    (Some(b'D'), []) => {
-                                        if cursor > 0 {
-                                            cursor -= 1;
-                                            redraw(
-                                                output,
-                                                prompt,
-                                                &chars,
-                                                &widths,
-                                                cursor,
-                                                term_cols,
-                                                terminal_line,
-                                                terminal_end_line,
-                                            )?;
-                                        }
+                                    (Some(b'D'), []) if cursor > 0 => {
+                                        cursor -= 1;
+                                        redraw(
+                                            output,
+                                            prompt,
+                                            &chars,
+                                            &widths,
+                                            cursor,
+                                            term_cols,
+                                            terminal_line,
+                                            terminal_end_line,
+                                        )?;
                                     }
                                     // Right arrow (ESC [ C)
-                                    (Some(b'C'), []) => {
-                                        if cursor < chars.len() {
-                                            cursor += 1;
-                                            redraw(
-                                                output,
-                                                prompt,
-                                                &chars,
-                                                &widths,
-                                                cursor,
-                                                term_cols,
-                                                terminal_line,
-                                                terminal_end_line,
-                                            )?;
-                                        }
+                                    (Some(b'C'), []) if cursor < chars.len() => {
+                                        cursor += 1;
+                                        redraw(
+                                            output,
+                                            prompt,
+                                            &chars,
+                                            &widths,
+                                            cursor,
+                                            term_cols,
+                                            terminal_line,
+                                            terminal_end_line,
+                                        )?;
                                     }
                                     // Up arrow (ESC [ A) — navigate backwards in history
                                     (Some(b'A'), []) => {
@@ -2185,55 +2179,74 @@ mod prompt_input {
                                         }
                                     }
                                     // Down arrow (ESC [ B) — navigate forwards in history
-                                    (Some(b'B'), []) => {
-                                        if hist_idx < history.len() {
-                                            hist_idx += 1;
-                                            if hist_idx == history.len() {
-                                                // Restore the saved draft, including the
-                                                // cursor position the user had when they
-                                                // pressed Up.
-                                                chars = draft_chars.clone();
-                                                cursor = draft_cursor;
-                                            } else {
-                                                chars = history[hist_idx].chars().collect();
-                                                cursor = chars.len();
-                                            }
-                                            widths = chars
-                                                .iter()
-                                                .map(|c| c.width().unwrap_or(1))
-                                                .collect();
-                                            redraw(
-                                                output,
-                                                prompt,
-                                                &chars,
-                                                &widths,
-                                                cursor,
-                                                term_cols,
-                                                terminal_line,
-                                                terminal_end_line,
-                                            )?;
+                                    (Some(b'B'), []) if hist_idx < history.len() => {
+                                        hist_idx += 1;
+                                        if hist_idx == history.len() {
+                                            // Restore the saved draft, including the
+                                            // cursor position the user had when they
+                                            // pressed Up.
+                                            chars = draft_chars.clone();
+                                            cursor = draft_cursor;
+                                        } else {
+                                            chars = history[hist_idx].chars().collect();
+                                            cursor = chars.len();
                                         }
+                                        widths =
+                                            chars.iter().map(|c| c.width().unwrap_or(1)).collect();
+                                        redraw(
+                                            output,
+                                            prompt,
+                                            &chars,
+                                            &widths,
+                                            cursor,
+                                            term_cols,
+                                            terminal_line,
+                                            terminal_end_line,
+                                        )?;
                                     }
                                     // Home: ESC [ H  (VT220) or ESC [ 1 ~ (xterm)
-                                    (Some(b'H'), []) | (Some(b'~'), b"1") => {
-                                        if cursor > 0 {
-                                            cursor = 0;
-                                            redraw(
-                                                output,
-                                                prompt,
-                                                &chars,
-                                                &widths,
-                                                cursor,
-                                                term_cols,
-                                                terminal_line,
-                                                terminal_end_line,
-                                            )?;
-                                        }
+                                    (Some(b'H'), []) | (Some(b'~'), b"1") if cursor > 0 => {
+                                        cursor = 0;
+                                        redraw(
+                                            output,
+                                            prompt,
+                                            &chars,
+                                            &widths,
+                                            cursor,
+                                            term_cols,
+                                            terminal_line,
+                                            terminal_end_line,
+                                        )?;
                                     }
                                     // End: ESC [ F  (VT220) or ESC [ 4 ~ (xterm)
-                                    (Some(b'F'), []) | (Some(b'~'), b"4") => {
-                                        if cursor < chars.len() {
-                                            cursor = chars.len();
+                                    (Some(b'F'), []) | (Some(b'~'), b"4")
+                                        if cursor < chars.len() =>
+                                    {
+                                        cursor = chars.len();
+                                        redraw(
+                                            output,
+                                            prompt,
+                                            &chars,
+                                            &widths,
+                                            cursor,
+                                            term_cols,
+                                            terminal_line,
+                                            terminal_end_line,
+                                        )?;
+                                    }
+                                    // Delete (forward): ESC [ 3 ~
+                                    (Some(b'~'), b"3") if cursor < chars.len() => {
+                                        let w = widths[cursor];
+                                        chars.remove(cursor);
+                                        widths.remove(cursor);
+                                        // Use DCH (ESC[P) only for a simple 1-wide char at
+                                        // end-of-line.  Zero-width combining marks (w == 0)
+                                        // and wide CJK chars (w > 1) need a full redraw to
+                                        // avoid deleting the wrong terminal cell or leaving
+                                        // visual artifacts.  Mid-line deletions always redraw.
+                                        if cursor == chars.len() && w == 1 {
+                                            write!(output, "\x1b[P")?;
+                                        } else {
                                             redraw(
                                                 output,
                                                 prompt,
@@ -2244,33 +2257,6 @@ mod prompt_input {
                                                 terminal_line,
                                                 terminal_end_line,
                                             )?;
-                                        }
-                                    }
-                                    // Delete (forward): ESC [ 3 ~
-                                    (Some(b'~'), b"3") => {
-                                        if cursor < chars.len() {
-                                            let w = widths[cursor];
-                                            chars.remove(cursor);
-                                            widths.remove(cursor);
-                                            // Use DCH (ESC[P) only for a simple 1-wide char at
-                                            // end-of-line.  Zero-width combining marks (w == 0)
-                                            // and wide CJK chars (w > 1) need a full redraw to
-                                            // avoid deleting the wrong terminal cell or leaving
-                                            // visual artifacts.  Mid-line deletions always redraw.
-                                            if cursor == chars.len() && w == 1 {
-                                                write!(output, "\x1b[P")?;
-                                            } else {
-                                                redraw(
-                                                    output,
-                                                    prompt,
-                                                    &chars,
-                                                    &widths,
-                                                    cursor,
-                                                    term_cols,
-                                                    terminal_line,
-                                                    terminal_end_line,
-                                                )?;
-                                            }
                                         }
                                     }
                                     // All other CSI sequences: discard.
