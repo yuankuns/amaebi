@@ -198,18 +198,46 @@ fn render_markdown(text: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// /model command parsing
+// Slash command parsing
 // ---------------------------------------------------------------------------
 
-/// Parse a `/model` command from user input.
+/// A task for the `/claude` command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ClaudeTask {
+    /// Short task label derived from the description.
+    task_id: String,
+    /// Task description / opening prompt.
+    description: String,
+}
+
+/// A parsed slash command from user input.
+#[derive(Debug, PartialEq)]
+enum SlashCommand {
+    /// `/model [<name>]` — switch model or show current.
+    Model(Option<String>),
+    /// `/claude "task" ...` — launch parallel Claude sessions.
+    Claude(Result<Vec<ClaudeTask>, String>),
+}
+
+/// Parse a slash command from user input.
 ///
-/// Returns:
-/// - `None` — input is not a `/model` command
-/// - `Some(Some(name))` — switch to `name`
-/// - `Some(None)` — bare `/model` with no argument (show usage)
-fn parse_model_command(input: &str) -> Option<Option<String>> {
-    // Require "/model" followed by end-of-string or whitespace to avoid
-    // false positives like "/modelx" or "/model--help".
+/// Returns `None` if the input is not a recognised slash command.
+fn parse_slash_command(input: &str) -> Option<SlashCommand> {
+    if let Some(cmd) = parse_model(input) {
+        return Some(SlashCommand::Model(cmd));
+    }
+    if let Some(result) = parse_claude(input) {
+        return Some(SlashCommand::Claude(result));
+    }
+    None
+}
+
+/// Parse `/model [<name>]`.
+///
+/// - `None` → not a `/model` command
+/// - `Some(None)` → bare `/model` (show usage)
+/// - `Some(Some(name))` → switch to `name`
+fn parse_model(input: &str) -> Option<Option<String>> {
     let rest = input.strip_prefix("/model")?;
     if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
         return None;
@@ -222,140 +250,42 @@ fn parse_model_command(input: &str) -> Option<Option<String>> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// /claude command parsing
-// ---------------------------------------------------------------------------
-
-/// A task parsed from the `/claude` command.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ClaudeTask {
-    /// Short task label derived from the description.
-    task_id: String,
-    /// Task description / opening prompt.
-    description: String,
-    /// Optional absolute worktree path.
-    worktree: Option<String>,
-    /// Whether to auto-send Enter after injecting the command into the pane.
-    auto_enter: bool,
-}
-
-/// Parse a `/claude` command into a list of [`ClaudeTask`]s.
+/// Parse `/claude "task" ["task2" ...]`.
 ///
-/// Syntax:
-/// ```text
-/// /claude [--worktree <path>] [--no-enter] "task description" ["task2" ...]
-/// ```
+/// Quoted strings each become a separate task; unquoted words are joined
+/// into a single task (e.g. `/claude fix the bug` → one task).
 ///
-/// Returns:
-/// - `None` — input does not start with `/claude ` (not a `/claude` command)
-/// - `Some(Err(msg))` — input is a `/claude` command but has a parse error
-/// - `Some(Ok(tasks))` — successfully parsed task list
-fn parse_claude_command(input: &str) -> Option<Result<Vec<ClaudeTask>, String>> {
-    let rest = input.strip_prefix("/claude ")?.trim();
+/// - `None` → not a `/claude` command
+/// - `Some(Err(msg))` → parse error
+/// - `Some(Ok(tasks))` → one or more tasks
+fn parse_claude(input: &str) -> Option<Result<Vec<ClaudeTask>, String>> {
+    let rest = input.strip_prefix("/claude")?.trim_start();
     if rest.is_empty() {
         return Some(Err(
-            "usage: /claude [--worktree <path>] [--no-enter] \"task description\" [...]"
-                .to_string(),
+            "usage: /claude \"task description\" [\"task2\" ...]".to_string()
         ));
     }
 
-    // Tokenise (shell-style quoting); each entry is (token, was_quoted).
     let tokens = parse_quoted_args(rest);
     if tokens.is_empty() {
         return Some(Err(
-            "usage: /claude [--worktree <path>] [--no-enter] \"task description\" [...]"
-                .to_string(),
+            "usage: /claude \"task description\" [\"task2\" ...]".to_string()
         ));
     }
 
-    let mut worktree: Option<String> = None;
-    let mut auto_enter = true;
-    // (description, was_quoted) pairs for non-flag tokens.
-    let mut desc_tokens: Vec<(String, bool)> = Vec::new();
-
-    let mut i = 0;
-    while i < tokens.len() {
-        match tokens[i].0.as_str() {
-            "--worktree" => {
-                i += 1;
-                // Require a non-flag value to follow --worktree.
-                if i >= tokens.len() || tokens[i].0.starts_with("--") {
-                    return Some(Err("--worktree requires a path argument".to_string()));
-                }
-                // Canonicalize to an absolute path so worktree uniqueness
-                // checks in the daemon are reliable regardless of how the
-                // path was spelled (relative vs. symlink vs. absolute).
-                // If canonicalize fails (path doesn't exist yet), fall back to
-                // an explicit absolute path rather than leaving it relative.
-                let raw = &tokens[i].0;
-                let raw_path = std::path::PathBuf::from(raw);
-                let abs = std::fs::canonicalize(&raw_path).unwrap_or_else(|_| {
-                    if raw_path.is_absolute() {
-                        raw_path.clone()
-                    } else {
-                        std::env::current_dir()
-                            .map(|cwd| cwd.join(&raw_path))
-                            .unwrap_or(raw_path)
-                    }
-                });
-                worktree = Some(abs.to_string_lossy().into_owned());
-            }
-            "--no-enter" => {
-                auto_enter = false;
-            }
-            // `--` marks end of flags; everything after is a description token.
-            "--" => {
-                i += 1;
-                while i < tokens.len() {
-                    desc_tokens.push((tokens[i].0.clone(), tokens[i].1));
-                    i += 1;
-                }
-                break;
-            }
-            tok => {
-                // Only treat unquoted tokens starting with `--` as unknown
-                // flags.  A quoted token like `"--investigate"` is a valid
-                // task description and must not be rejected.
-                if !tokens[i].1 && tok.starts_with("--") {
-                    return Some(Err(format!("unknown flag: {tok}")));
-                }
-                desc_tokens.push((tok.to_string(), tokens[i].1));
-            }
-        }
-        i += 1;
-    }
-
-    if desc_tokens.is_empty() {
-        return Some(Err(
-            "usage: /claude [--worktree <path>] [--no-enter] \"task description\" [...]"
-                .to_string(),
-        ));
-    }
-
-    // Build task list.  Quoted tokens each become a separate task.  Unquoted
-    // tokens are joined as a single task (e.g. `/claude write some code` →
-    // one task "write some code", not three separate tasks).
-    let all_quoted = desc_tokens.iter().all(|(_, q)| *q);
-    let descriptions: Vec<String> = if all_quoted || desc_tokens.len() == 1 {
-        desc_tokens.into_iter().map(|(s, _)| s).collect()
+    // Quoted tokens each become a separate task; unquoted tokens are joined.
+    let all_quoted = tokens.iter().all(|(_, q)| *q);
+    let descriptions: Vec<String> = if all_quoted || tokens.len() == 1 {
+        tokens.into_iter().map(|(s, _)| s).collect()
     } else {
-        // Mix of quoted and unquoted, or all unquoted: join as one description.
-        vec![desc_tokens
+        vec![tokens
             .into_iter()
             .map(|(s, _)| s)
             .collect::<Vec<_>>()
             .join(" ")]
     };
 
-    // --worktree is a single path — it cannot be shared across multiple tasks
-    // because the daemon enforces worktree uniqueness per pane.
-    if worktree.is_some() && descriptions.len() > 1 {
-        return Some(Err("--worktree cannot be used with multiple tasks; \
-             each task gets its own auto-created worktree"
-            .to_string()));
-    }
-
-    let tasks: Vec<ClaudeTask> = descriptions
+    let tasks = descriptions
         .into_iter()
         .enumerate()
         .map(|(idx, desc)| {
@@ -363,8 +293,6 @@ fn parse_claude_command(input: &str) -> Option<Result<Vec<ClaudeTask>, String>> 
             ClaudeTask {
                 task_id,
                 description: desc,
-                worktree: worktree.clone(),
-                auto_enter,
             }
         })
         .collect();
@@ -487,10 +415,9 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
 
     let cwd = std::env::current_dir().context("getting current directory")?;
 
-    // Intercept `/claude` commands: send a ClaudeLaunch request instead of Chat.
-    // Checked before session::get_or_create to avoid unnecessary disk I/O for
-    // commands that don't use the chat session.
-    if let Some(parse_result) = parse_claude_command(&prompt) {
+    // Intercept slash commands before session::get_or_create to avoid
+    // unnecessary disk I/O for commands that don't use the chat session.
+    if let Some(SlashCommand::Claude(parse_result)) = parse_slash_command(&prompt) {
         let tasks = match parse_result {
             Ok(t) => t,
             Err(msg) => {
@@ -507,11 +434,11 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
                 .map(|t| TaskSpec {
                     task_id: t.task_id,
                     description: t.description,
-                    worktree: t.worktree,
+                    worktree: None,
                     client_cwd: std::env::current_dir()
                         .ok()
                         .map(|p| p.to_string_lossy().into_owned()),
-                    auto_enter: t.auto_enter,
+                    auto_enter: true,
                 })
                 .collect(),
         };
@@ -929,96 +856,91 @@ pub async fn run_chat_loop(
             }
         };
 
-        // Intercept `/claude` commands: send ClaudeLaunch and handle the response
-        // before resuming the normal chat loop.
-        if let Some(parse_result) = parse_claude_command(&prompt) {
-            let tasks = match parse_result {
-                Ok(t) => t,
-                Err(msg) => {
-                    stdout.write_all(msg.as_bytes()).await?;
-                    stdout.write_all(b"\n").await?;
-                    stdout.flush().await?;
-                    continue 'session;
-                }
-            };
-            let req = Request::ClaudeLaunch {
-                tasks: tasks
-                    .into_iter()
-                    .map(|t| TaskSpec {
-                        task_id: t.task_id,
-                        description: t.description,
-                        worktree: t.worktree,
-                        client_cwd: std::env::current_dir()
-                            .ok()
-                            .map(|p| p.to_string_lossy().into_owned()),
-                        auto_enter: t.auto_enter,
-                    })
-                    .collect(),
-            };
-            let mut req_line = serde_json::to_string(&req)?;
-            req_line.push('\n');
-            write_half.write_all(req_line.as_bytes()).await?;
-
-            // Read ClaudeLaunch responses until Done/Error.
-            loop {
-                let line = lines.next_line().await.context("reading daemon response")?;
-                let Some(line) = line else { break 'session };
-                let frame: Response =
-                    serde_json::from_str(&line).context("parsing daemon response")?;
-                match frame {
-                    Response::Done => break,
-                    Response::Error { message } => {
-                        stdout.write_all(message.as_bytes()).await?;
+        // Dispatch slash commands before sending to daemon.
+        match parse_slash_command(&prompt) {
+            Some(SlashCommand::Claude(parse_result)) => {
+                let tasks = match parse_result {
+                    Ok(t) => t,
+                    Err(msg) => {
+                        stdout.write_all(msg.as_bytes()).await?;
                         stdout.write_all(b"\n").await?;
-                        break;
+                        stdout.flush().await?;
+                        continue 'session;
                     }
-                    Response::PaneAssigned {
-                        task_id,
-                        pane_id,
-                        session_id: sid,
-                    } => {
-                        let msg = format!("[pane {pane_id}] {task_id} → session {sid}\n");
-                        stdout.write_all(msg.as_bytes()).await?;
-                    }
-                    Response::CapacityError {
-                        requested,
-                        max_panes,
-                        current_busy,
-                    } => {
-                        let msg = format!(
-                            "[error] capacity limit reached: max_panes={max_panes}, \
-                             busy={current_busy}, requested={requested}; \
-                             free existing panes to continue\n"
-                        );
-                        stdout.write_all(msg.as_bytes()).await?;
-                        break;
-                    }
-                    _ => {}
-                }
-            }
-            stdout.flush().await?;
-            // Continue the chat loop for the next user input.
-            continue 'session;
-        }
+                };
+                let req = Request::ClaudeLaunch {
+                    tasks: tasks
+                        .into_iter()
+                        .map(|t| TaskSpec {
+                            task_id: t.task_id,
+                            description: t.description,
+                            worktree: None,
+                            client_cwd: std::env::current_dir()
+                                .ok()
+                                .map(|p| p.to_string_lossy().into_owned()),
+                            auto_enter: true,
+                        })
+                        .collect(),
+                };
+                let mut req_line = serde_json::to_string(&req)?;
+                req_line.push('\n');
+                write_half.write_all(req_line.as_bytes()).await?;
 
-        // Intercept `/model [<name>]`: switch the model for this session without
-        // an LLM round-trip.  This is more reliable than relying on the model
-        // to call the switch_model tool, and correctly handles names like
-        // `claude-sonnet-4.6[1m]` that may confuse the model.
-        if let Some(new_model) = parse_model_command(&prompt) {
-            match new_model {
-                Some(name) => {
-                    model = name;
-                    let msg = format!("[model] switched to {model}\n");
-                    stdout.write_all(msg.as_bytes()).await?;
+                loop {
+                    let line = lines.next_line().await.context("reading daemon response")?;
+                    let Some(line) = line else { break 'session };
+                    let frame: Response =
+                        serde_json::from_str(&line).context("parsing daemon response")?;
+                    match frame {
+                        Response::Done => break,
+                        Response::Error { message } => {
+                            stdout.write_all(message.as_bytes()).await?;
+                            stdout.write_all(b"\n").await?;
+                            break;
+                        }
+                        Response::PaneAssigned {
+                            task_id,
+                            pane_id,
+                            session_id: sid,
+                        } => {
+                            let msg = format!("[pane {pane_id}] {task_id} → session {sid}\n");
+                            stdout.write_all(msg.as_bytes()).await?;
+                        }
+                        Response::CapacityError {
+                            requested,
+                            max_panes,
+                            current_busy,
+                        } => {
+                            let msg = format!(
+                                "[error] capacity limit reached: max_panes={max_panes}, \
+                                 busy={current_busy}, requested={requested}; \
+                                 free existing panes to continue\n"
+                            );
+                            stdout.write_all(msg.as_bytes()).await?;
+                            break;
+                        }
+                        _ => {}
+                    }
                 }
-                None => {
-                    let msg = format!("usage: /model <model-name>  (current: {model})\n");
-                    stdout.write_all(msg.as_bytes()).await?;
-                }
+                stdout.flush().await?;
+                continue 'session;
             }
-            stdout.flush().await?;
-            continue 'session;
+            Some(SlashCommand::Model(new_model)) => {
+                match new_model {
+                    Some(name) => {
+                        model = name;
+                        let msg = format!("[model] switched to {model}\n");
+                        stdout.write_all(msg.as_bytes()).await?;
+                    }
+                    None => {
+                        let msg = format!("usage: /model <model-name>  (current: {model})\n");
+                        stdout.write_all(msg.as_bytes()).await?;
+                    }
+                }
+                stdout.flush().await?;
+                continue 'session;
+            }
+            None => {}
         }
 
         let req = Request::Chat {
@@ -3403,146 +3325,123 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // /claude command parsing
+    // slash command parsing
     // -----------------------------------------------------------------------
+
+    fn claude_tasks(input: &str) -> Vec<ClaudeTask> {
+        match parse_slash_command(input) {
+            Some(SlashCommand::Claude(Ok(tasks))) => tasks,
+            other => panic!("expected Claude tasks, got {other:?}"),
+        }
+    }
+
+    fn claude_err(input: &str) -> String {
+        match parse_slash_command(input) {
+            Some(SlashCommand::Claude(Err(msg))) => msg,
+            other => panic!("expected Claude error, got {other:?}"),
+        }
+    }
 
     #[test]
     fn parse_claude_two_quoted_tasks() {
-        let result = parse_claude_command(r#"/claude "task one" "task two""#);
-        let tasks = result.expect("should be Some").expect("should be Ok");
+        let tasks = claude_tasks(r#"/claude "task one" "task two""#);
         assert_eq!(tasks.len(), 2);
         assert_eq!(tasks[0].description, "task one");
         assert_eq!(tasks[1].description, "task two");
-        assert!(tasks[0].auto_enter);
     }
 
     #[test]
     fn parse_claude_single_quoted_task() {
-        let result = parse_claude_command(r#"/claude "implement something""#);
-        let tasks = result.expect("should be Some").expect("should be Ok");
+        let tasks = claude_tasks(r#"/claude "implement something""#);
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].description, "implement something");
     }
 
     #[test]
     fn parse_claude_unquoted_tokens_join_as_single_task() {
-        let result = parse_claude_command("/claude implement something");
-        let tasks = result.expect("should be Some").expect("should be Ok");
-        // Unquoted words are joined into one task (avoids surprising N-task launch).
+        let tasks = claude_tasks("/claude implement something");
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].description, "implement something");
     }
 
     #[test]
-    fn parse_claude_no_args_returns_none() {
-        // No trailing space — not a /claude command at all.
-        assert!(parse_claude_command("/claude").is_none());
-    }
-
-    #[test]
-    fn parse_claude_only_space_returns_err() {
-        // Has trailing spaces → recognized as /claude command but missing description.
-        let result = parse_claude_command("/claude   ");
-        assert!(result.expect("should be Some").is_err());
+    fn parse_claude_bare_returns_err() {
+        assert!(!claude_err("/claude").is_empty());
+        assert!(!claude_err("/claude   ").is_empty());
     }
 
     #[test]
     fn parse_not_claude_command_returns_none() {
-        assert!(parse_claude_command("not a claude command").is_none());
-    }
-
-    #[test]
-    fn parse_claude_no_enter_flag() {
-        let result = parse_claude_command(r#"/claude --no-enter "do something""#);
-        let tasks = result.expect("should be Some").expect("should be Ok");
-        assert_eq!(tasks.len(), 1);
-        assert!(!tasks[0].auto_enter);
-        assert_eq!(tasks[0].description, "do something");
-    }
-
-    #[test]
-    fn parse_claude_worktree_flag() {
-        // Non-existent path: canonicalize falls back to the raw string.
-        let result = parse_claude_command(r#"/claude --worktree /repo/wt/t1 "implement X""#);
-        let tasks = result.expect("should be Some").expect("should be Ok");
-        assert_eq!(tasks.len(), 1);
-        assert_eq!(tasks[0].worktree.as_deref(), Some("/repo/wt/t1"));
-        assert_eq!(tasks[0].description, "implement X");
+        assert!(parse_slash_command("not a command").is_none());
     }
 
     #[test]
     fn parse_claude_escaped_quotes_in_description() {
-        let result = parse_claude_command(r#"/claude "task with \"quotes\"""#);
-        let tasks = result.expect("should be Some").expect("should be Ok");
-        assert_eq!(tasks.len(), 1);
+        let tasks = claude_tasks(r#"/claude "task with \"quotes\"""#);
         assert_eq!(tasks[0].description, r#"task with "quotes""#);
     }
 
     #[test]
     fn parse_claude_task_id_derived_from_description() {
-        let result = parse_claude_command(r#"/claude "Implement Cron Scheduling""#);
-        let tasks = result.expect("should be Some").expect("should be Ok");
+        let tasks = claude_tasks(r#"/claude "Implement Cron Scheduling""#);
         assert_eq!(tasks[0].task_id, "implement-cron-scheduling");
     }
 
     #[test]
     fn parse_claude_task_id_truncated() {
         let long = format!("/claude \"{}\"", "a".repeat(100));
-        let result = parse_claude_command(&long);
-        let tasks = result.expect("should be Some").expect("should be Ok");
+        let tasks = claude_tasks(&long);
         assert!(tasks[0].task_id.len() <= 32);
     }
 
-    // -----------------------------------------------------------------------
-    // /model command parsing
-    // -----------------------------------------------------------------------
-
     #[test]
-    fn parse_model_bare_returns_none_arg() {
-        assert_eq!(parse_model_command("/model"), Some(None));
-    }
-
-    #[test]
-    fn parse_model_with_spaces_only_returns_none_arg() {
-        assert_eq!(parse_model_command("/model   "), Some(None));
-    }
-
-    #[test]
-    fn parse_model_with_name_returns_name() {
+    fn parse_model_bare() {
         assert_eq!(
-            parse_model_command("/model claude-sonnet-4.6"),
-            Some(Some("claude-sonnet-4.6".to_string()))
+            parse_slash_command("/model"),
+            Some(SlashCommand::Model(None))
+        );
+    }
+
+    #[test]
+    fn parse_model_spaces_only() {
+        assert_eq!(
+            parse_slash_command("/model   "),
+            Some(SlashCommand::Model(None))
+        );
+    }
+
+    #[test]
+    fn parse_model_with_name() {
+        assert_eq!(
+            parse_slash_command("/model claude-sonnet-4.6"),
+            Some(SlashCommand::Model(Some("claude-sonnet-4.6".to_string())))
         );
     }
 
     #[test]
     fn parse_model_with_1m_suffix() {
         assert_eq!(
-            parse_model_command("/model claude-sonnet-4.6[1m]"),
-            Some(Some("claude-sonnet-4.6[1m]".to_string()))
+            parse_slash_command("/model claude-sonnet-4.6[1m]"),
+            Some(SlashCommand::Model(Some(
+                "claude-sonnet-4.6[1m]".to_string()
+            )))
         );
     }
 
     #[test]
     fn parse_model_with_provider_prefix() {
         assert_eq!(
-            parse_model_command("/model bedrock/claude-opus-4.6[1m]"),
-            Some(Some("bedrock/claude-opus-4.6[1m]".to_string()))
+            parse_slash_command("/model bedrock/claude-opus-4.6[1m]"),
+            Some(SlashCommand::Model(Some(
+                "bedrock/claude-opus-4.6[1m]".to_string()
+            )))
         );
     }
 
     #[test]
-    fn parse_model_not_a_model_command() {
-        assert!(parse_model_command("not a model command").is_none());
-        assert!(parse_model_command("/claude something").is_none());
-    }
-
-    #[test]
-    fn parse_model_false_positive_prefix_rejected() {
-        // "/modelx" and "/model--help" must NOT be treated as /model commands.
-        assert!(parse_model_command("/modelx").is_none());
-        assert!(parse_model_command("/model--help").is_none());
-        assert!(parse_model_command("/modelclaude").is_none());
+    fn parse_model_false_positive_rejected() {
+        assert!(parse_slash_command("/modelx").is_none());
+        assert!(parse_slash_command("/model--help").is_none());
     }
 
     #[test]
