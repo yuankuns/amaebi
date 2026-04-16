@@ -252,14 +252,23 @@ fn parse_model(input: &str) -> Option<Option<String>> {
 
 /// Parse `/claude "task" ["task2" ...]`.
 ///
-/// Quoted strings each become a separate task; unquoted words are joined
-/// into a single task (e.g. `/claude fix the bug` → one task).
+/// Task splitting rules:
+/// - All tokens quoted → each quoted string is a separate task
+///   (`/claude "fix bug" "add tests"` → two tasks)
+/// - Any unquoted token → all tokens joined into one task
+///   (`/claude fix the bug` or `/claude "fix" the bug` → one task)
 ///
 /// - `None` → not a `/claude` command
 /// - `Some(Err(msg))` → parse error
 /// - `Some(Ok(tasks))` → one or more tasks
 fn parse_claude(input: &str) -> Option<Result<Vec<ClaudeTask>, String>> {
-    let rest = input.strip_prefix("/claude")?.trim_start();
+    // Require "/claude" followed by end-of-string or whitespace to avoid
+    // false positives like "/claudefoo" or "/claude--help".
+    let rest = input.strip_prefix("/claude")?;
+    if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let rest = rest.trim_start();
     if rest.is_empty() {
         return Some(Err(
             "usage: /claude \"task description\" [\"task2\" ...]".to_string()
@@ -414,6 +423,7 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
         .unwrap_or_else(|| crate::provider::DEFAULT_MODEL.to_string());
 
     let cwd = std::env::current_dir().context("getting current directory")?;
+    let cwd_str = cwd.to_string_lossy().into_owned();
 
     // Intercept slash commands before session::get_or_create to avoid
     // unnecessary disk I/O for commands that don't use the chat session.
@@ -435,9 +445,7 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
                     task_id: t.task_id,
                     description: t.description,
                     worktree: None,
-                    client_cwd: std::env::current_dir()
-                        .ok()
-                        .map(|p| p.to_string_lossy().into_owned()),
+                    client_cwd: Some(cwd_str.clone()),
                     auto_enter: true,
                 })
                 .collect(),
@@ -796,6 +804,7 @@ pub async fn run_chat_loop(
         .unwrap_or_else(|| crate::provider::DEFAULT_MODEL.to_string());
 
     let cwd = std::env::current_dir().context("getting current directory")?;
+    let cwd_str = cwd.to_string_lossy().into_owned();
     let cwd_for_session = cwd.clone();
     let session_id = tokio::task::spawn_blocking(move || session::create_fresh(&cwd_for_session))
         .await
@@ -875,9 +884,7 @@ pub async fn run_chat_loop(
                             task_id: t.task_id,
                             description: t.description,
                             worktree: None,
-                            client_cwd: std::env::current_dir()
-                                .ok()
-                                .map(|p| p.to_string_lossy().into_owned()),
+                            client_cwd: Some(cwd_str.clone()),
                             auto_enter: true,
                         })
                         .collect(),
@@ -3373,6 +3380,12 @@ mod tests {
     #[test]
     fn parse_not_claude_command_returns_none() {
         assert!(parse_slash_command("not a command").is_none());
+    }
+
+    #[test]
+    fn parse_claude_false_positive_prefix_rejected() {
+        assert!(parse_slash_command("/claudefoo").is_none());
+        assert!(parse_slash_command("/claude--help").is_none());
     }
 
     #[test]
