@@ -208,8 +208,12 @@ fn render_markdown(text: &str) -> String {
 /// - `Some(Some(name))` — switch to `name`
 /// - `Some(None)` — bare `/model` with no argument (show usage)
 fn parse_model_command(input: &str) -> Option<Option<String>> {
-    // Match "/model" with optional trailing whitespace/argument.
+    // Require "/model" followed by end-of-string or whitespace to avoid
+    // false positives like "/modelx" or "/model--help".
     let rest = input.strip_prefix("/model")?;
+    if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
     let name = rest.trim();
     if name.is_empty() {
         Some(None)
@@ -3531,6 +3535,14 @@ mod tests {
     fn parse_model_not_a_model_command() {
         assert!(parse_model_command("not a model command").is_none());
         assert!(parse_model_command("/claude something").is_none());
+    }
+
+    #[test]
+    fn parse_model_false_positive_prefix_rejected() {
+        // "/modelx" and "/model--help" must NOT be treated as /model commands.
+        assert!(parse_model_command("/modelx").is_none());
+        assert!(parse_model_command("/model--help").is_none());
+        assert!(parse_model_command("/modelclaude").is_none());
     }
 
     #[test]
