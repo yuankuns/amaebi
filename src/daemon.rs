@@ -1728,10 +1728,16 @@ fn parse_switch_model_arg(raw: Option<&str>) -> Result<String, String> {
         Some(s) => {
             let trimmed = s.trim();
             if trimmed.is_empty() {
-                Err("error: switch_model: 'model' must not be empty".to_string())
-            } else {
-                Ok(trimmed.to_string())
+                return Err("error: switch_model: 'model' must not be empty".to_string());
             }
+            // Reject control characters (including newlines) to prevent prompt injection
+            // when the model name is embedded into the system message.
+            if trimmed.chars().any(|c| c.is_control()) {
+                return Err(
+                    "error: switch_model: 'model' must not contain control characters".to_string(),
+                );
+            }
+            Ok(trimmed.to_string())
         }
     }
 }
@@ -4315,6 +4321,13 @@ mod tests {
             assert!(result.is_ok(), "valid model must be accepted: {raw}");
             assert_eq!(result.unwrap(), raw);
         }
+    }
+
+    #[test]
+    fn switch_model_rejects_control_characters() {
+        assert!(parse_switch_model_arg(Some("model\nignore above")).is_err());
+        assert!(parse_switch_model_arg(Some("model\x00null")).is_err());
+        assert!(parse_switch_model_arg(Some("model\ttab")).is_err());
     }
 
     #[test]

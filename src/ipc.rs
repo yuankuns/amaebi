@@ -195,7 +195,10 @@ pub enum Response {
     /// [`Request::Chat`] carries the new model, keeping `carried_model` in
     /// sync on the daemon side.
     ModelSwitched {
-        /// The model that is now active (display name, e.g. `claude-opus-4.7`).
+        /// The exact active model string forwarded by the daemon verbatim.
+        /// May include provider prefixes such as `bedrock/...` or
+        /// `copilot/...`; clients should treat it as opaque and send it back
+        /// unchanged in the next [`Request::Chat`].
         model: String,
     },
     /// The [`Request::ClaudeLaunch`] was rejected because adding the requested
