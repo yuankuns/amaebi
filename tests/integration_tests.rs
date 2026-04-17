@@ -2657,3 +2657,68 @@ async fn chat_long_connection_ask_still_single_turn() {
     let reqs = server.take_requests();
     assert_eq!(reqs.len(), 1, "exactly 1 LLM request for single turn");
 }
+
+// ---------------------------------------------------------------------------
+// switch_model persists across turns
+// ---------------------------------------------------------------------------
+
+/// Verify that when the LLM calls switch_model, the daemon emits
+/// Response::ModelSwitched, the client updates its local model variable, and
+/// the *next* Request::Chat carries the switched model to the server.
+///
+/// Flow:
+///   Turn 1 (model=copilot/gpt-4o): LLM calls switch_model → copilot/gpt-4o-mini
+///   Turn 2 (should be copilot/gpt-4o-mini): LLM returns final text
+///
+/// After the test, the mock server must have seen exactly 2 requests, with the
+/// second request using "gpt-4o-mini".
+#[tokio::test]
+async fn switch_model_persists_to_next_turn() {
+    let server = MockLlmServer::start().await;
+
+    // Turn 1: LLM calls switch_model to gpt-4o-mini.
+    server.enqueue(ScriptedResponse::tool_call(
+        "call-switch",
+        "switch_model",
+        r#"{"model":"copilot/gpt-4o-mini"}"#,
+    ));
+    // Turn 2: LLM (now on gpt-4o-mini) returns final text.
+    server.enqueue(ScriptedResponse::text_chunks(vec!["switched ok"]));
+
+    let daemon = start_daemon_with_env(&server.url(), &[("AMAEBI_COMPACTION_THRESHOLD", "100000")])
+        .await
+        .expect("start_daemon");
+
+    let session_id = uuid::Uuid::new_v4().to_string();
+    let client = connect_client(&daemon.socket);
+
+    // Send turn 1 with the original model.
+    let responses = send_message_with_session(
+        &client,
+        "switch model please",
+        &session_id,
+        "copilot/gpt-4o",
+    )
+    .await
+    .expect("turn 1");
+
+    // Client must have received a ModelSwitched frame.
+    assert!(
+        responses.iter().any(
+            |r| matches!(r, Response::ModelSwitched { model } if model == "copilot/gpt-4o-mini")
+        ),
+        "expected ModelSwitched frame in turn 1 responses: {responses:?}"
+    );
+    assert!(collect_text(&responses).contains("switched ok"));
+
+    let reqs = server.take_requests();
+    assert_eq!(reqs.len(), 2, "expected 2 LLM requests, got {}", reqs.len());
+
+    // The second request must use the switched model.
+    assert_eq!(
+        reqs[1].model(),
+        Some("gpt-4o-mini"),
+        "turn 2 must use switched model, got: {:?}",
+        reqs[1].model()
+    );
+}
