@@ -48,6 +48,7 @@ pub enum Response {
     MemoryEntry { role: String, content: String },
     Compacting,
     WaitingForInput { prompt: String },
+    ModelSwitched { model: String },
 }
 
 // ---------------------------------------------------------------------------

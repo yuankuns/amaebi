@@ -189,6 +189,15 @@ pub enum Response {
         /// amaebi session UUID for the new chat session running in the pane.
         session_id: String,
     },
+    /// The LLM called the `switch_model` tool and the active model changed.
+    ///
+    /// The client should update its local model variable so the next
+    /// [`Request::Chat`] carries the new model, keeping `carried_model` in
+    /// sync on the daemon side.
+    ModelSwitched {
+        /// The model that is now active (display name, e.g. `claude-opus-4.7`).
+        model: String,
+    },
     /// The [`Request::ClaudeLaunch`] was rejected because adding the requested
     /// panes would exceed the configured maximum.
     CapacityError {

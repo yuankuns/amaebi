@@ -447,11 +447,18 @@ async fn build_and_trim_messages(
     let skill_msgs = load_skill_messages().await;
     // Build with full history and splice in skill files so the threshold check
     // accounts for their token cost (AGENTS.md / SOUL.md can be large).
-    let mut msgs = build_messages(prompt, tmux_pane, history, summaries, own_summary);
+    let mut msgs = build_messages(prompt, tmux_pane, history, summaries, own_summary, model);
     splice_skill_messages(&mut msgs, skill_msgs.clone());
     if count_message_tokens(&msgs) > threshold {
         // Rebuild with trimmed history and re-splice the already-loaded skill files.
-        msgs = build_messages(prompt, tmux_pane, hot_tail(history), summaries, own_summary);
+        msgs = build_messages(
+            prompt,
+            tmux_pane,
+            hot_tail(history),
+            summaries,
+            own_summary,
+            model,
+        );
         splice_skill_messages(&mut msgs, skill_msgs);
         (msgs, true)
     } else {
@@ -1500,6 +1507,7 @@ async fn handle_chat_request(
                 hot_tail(&hist2),
                 &sum2,
                 own2.as_deref(),
+                &model,
             );
             inject_skill_files(&mut rebuilt).await;
             (rebuilt, true)
@@ -2931,6 +2939,15 @@ where
                                         },
                                     )
                                     .await?;
+                                    // Notify the client so it can update its local model
+                                    // variable, keeping carried_model in sync on the next turn.
+                                    write_frame(
+                                        writer,
+                                        &Response::ModelSwitched {
+                                            model: current_model.clone(),
+                                        },
+                                    )
+                                    .await?;
                                     format!("Model switched to {current_model}")
                                 }
                             };
@@ -3184,6 +3201,7 @@ pub(crate) fn build_messages(
     history: &[memory_db::DbMemoryEntry],
     past_summaries: &[String],
     own_summary: Option<&str>,
+    model: &str,
 ) -> Vec<Message> {
     let mut system = "You are a helpful, concise AI assistant embedded in a tmux terminal. \
                       Answer in plain text; avoid markdown unless the user asks for it. \
@@ -3192,6 +3210,8 @@ pub(crate) fn build_messages(
                       After using any tool, you MUST always follow up with a text response \
                       summarising what you did and the outcome — never end silently after a tool call."
         .to_owned();
+
+    system.push_str(&format!(" You are currently running as model: {model}."));
 
     if let Some(pane) = tmux_pane {
         system.push_str(&format!(" The user's active tmux pane is {pane}."));
@@ -3306,7 +3326,7 @@ async fn run_cron_job(state: Arc<DaemonState>, job: &cron::CronJob) {
     let model = std::env::var("AMAEBI_MODEL")
         .unwrap_or_else(|_| crate::provider::DEFAULT_MODEL.to_string());
 
-    let mut messages = build_messages(&job.description, None, &[], &[], None);
+    let mut messages = build_messages(&job.description, None, &[], &[], None, &model);
     inject_skill_files(&mut messages).await;
     // Cron jobs are non-interactive: drop the sender immediately so steer_rx.recv()
     // returns None at once if the model ends with '?', rather than timing out.
@@ -3448,30 +3468,40 @@ mod tests {
 
     #[test]
     fn build_messages_empty_history() {
-        let msgs = build_messages("hello", None, &[], &[], None);
+        let msgs = build_messages("hello", None, &[], &[], None, "claude-sonnet-4.6");
         assert_eq!(msgs.len(), 2);
     }
 
     #[test]
     fn build_messages_injects_history_rows() {
         let history = make_history(2); // 4 rows: u0, a0, u1, a1
-        let msgs = build_messages("q3", None, &history, &[], None);
+        let msgs = build_messages("q3", None, &history, &[], None, "claude-sonnet-4.6");
         // system + 4 history rows + user
         assert_eq!(msgs.len(), 6);
+    }
+
+    #[test]
+    fn build_messages_injects_model_into_system() {
+        let msgs = build_messages("hi", None, &[], &[], None, "claude-opus-4.7");
+        let system = msgs[0].content.as_deref().unwrap_or("");
+        assert!(
+            system.contains("claude-opus-4.7"),
+            "system prompt must mention the current model"
+        );
     }
 
     #[test]
     fn build_messages_all_history_included() {
         // build_messages no longer caps — all rows are included.
         let history = make_history(10);
-        let msgs = build_messages("new", None, &history, &[], None);
+        let msgs = build_messages("new", None, &history, &[], None, "claude-sonnet-4.6");
         // system + 20 history rows + user
         assert_eq!(msgs.len(), 22);
     }
 
     #[test]
     fn build_messages_tmux_pane_in_system() {
-        let msgs = build_messages("prompt", Some("%3"), &[], &[], None);
+        let msgs = build_messages("prompt", Some("%3"), &[], &[], None, "claude-sonnet-4.6");
         let content = msgs[0].content.as_deref().unwrap_or("");
         assert!(
             content.contains("%3"),
@@ -3485,7 +3515,7 @@ mod tests {
             "- Fixed the auth bug.".to_owned(),
             "- Added cron.".to_owned(),
         ];
-        let msgs = build_messages("hi", None, &[], &summaries, None);
+        let msgs = build_messages("hi", None, &[], &summaries, None, "claude-sonnet-4.6");
         let system = msgs[0].content.as_deref().unwrap_or("");
         assert!(
             system.contains("Fixed the auth bug"),
@@ -3500,7 +3530,14 @@ mod tests {
     #[test]
     fn build_messages_own_summary_inserted_before_history() {
         let history = make_history(1); // 2 rows: u0, a0
-        let msgs = build_messages("q", None, &history, &[], Some("- Did X earlier."));
+        let msgs = build_messages(
+            "q",
+            None,
+            &history,
+            &[],
+            Some("- Did X earlier."),
+            "claude-sonnet-4.6",
+        );
         // system + [user summary label + assistant summary] + 2 history rows + user
         assert_eq!(msgs.len(), 6);
         // The summary pair comes before the history rows.
