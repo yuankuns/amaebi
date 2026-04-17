@@ -658,7 +658,8 @@ impl std::error::Error for BedrockHttpError {}
 /// 4 / 4.5 models support only the legacy `enabled`+`budget_tokens` form, and
 /// Claude 3.x models have no extended-thinking support at all.
 fn supports_adaptive_thinking(model_id: &str) -> bool {
-    model_id.starts_with("us.anthropic.claude-opus-4-6")
+    model_id.starts_with("us.anthropic.claude-opus-4-7")
+        || model_id.starts_with("us.anthropic.claude-opus-4-6")
         || model_id.starts_with("us.anthropic.claude-sonnet-4-6")
 }
 
@@ -670,6 +671,7 @@ fn supports_adaptive_thinking(model_id: &str) -> bool {
 /// The model_id must be a bare resolved Bedrock ID (no `[1m]` suffix).
 pub(crate) fn supports_1m_context(model_id: &str) -> bool {
     model_id.starts_with("us.anthropic.claude-sonnet-4")
+        || model_id.starts_with("us.anthropic.claude-opus-4-7")
         || model_id.starts_with("us.anthropic.claude-opus-4-6")
 }
 
