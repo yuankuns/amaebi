@@ -56,6 +56,8 @@ pub struct ModelSpec {
 /// To find the correct model ID, check the Bedrock console or run:
 ///   `aws bedrock list-foundation-models --by-provider Anthropic`
 const BEDROCK_ALIASES: &[(&str, &str)] = &[
+    // Claude 4.7 family
+    ("claude-opus-4.7", "us.anthropic.claude-opus-4-7"),
     // Claude 4.6 family (cross-region inference profiles — no `:0` suffix)
     ("claude-sonnet-4.6", "us.anthropic.claude-sonnet-4-6"),
     ("claude-opus-4.6", "us.anthropic.claude-opus-4-6-v1"),
@@ -240,6 +242,14 @@ mod tests {
         assert_eq!(
             resolve_bedrock_alias("claude-sonnet-4.6"),
             "us.anthropic.claude-sonnet-4-6"
+        );
+    }
+
+    #[test]
+    fn alias_claude_opus_4_7() {
+        assert_eq!(
+            resolve_bedrock_alias("claude-opus-4.7"),
+            "us.anthropic.claude-opus-4-7"
         );
     }
 
