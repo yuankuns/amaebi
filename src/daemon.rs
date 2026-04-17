@@ -1494,6 +1494,27 @@ async fn handle_chat_request(
     // First turn: load history from DB.  Subsequent turns: extend carried messages.
     // Apply token-budget trim either way so long-lived connections stay bounded.
     let (messages, pre_flight_trimmed) = if let Some(mut prev) = carried_messages.take() {
+        // Update the model name in the system message so the LLM always knows
+        // what model it's currently running as, even after a /model switch.
+        if let Some(sys) = prev.first_mut() {
+            if sys.role == "system" {
+                if let Some(content) = sys.content.as_mut() {
+                    // Replace the injected model line with the current model.
+                    // The marker text matches what build_messages injects.
+                    let old_marker = "You are currently running as model:";
+                    if let Some(pos) = content.find(old_marker) {
+                        let end = content[pos..]
+                            .find('.')
+                            .map(|i| pos + i + 1)
+                            .unwrap_or(content.len());
+                        content.replace_range(
+                            pos..end,
+                            &format!("You are currently running as model: {model}."),
+                        );
+                    }
+                }
+            }
+        }
         prev.push(Message::user(prompt.clone()));
         // Do NOT re-inject skill files — they were injected on the first turn and are
         // already in `prev`.  Re-injecting every turn grows context unboundedly.
