@@ -653,10 +653,10 @@ impl std::error::Error for BedrockHttpError {}
 
 /// Returns true for Bedrock Claude models that support `thinking.type=adaptive`.
 ///
-/// Based on the Anthropic API: adaptive thinking is available for claude-opus-4-6
-/// and claude-sonnet-4-6 (the -4-6 cross-region inference profiles).  Older Claude
-/// 4 / 4.5 models support only the legacy `enabled`+`budget_tokens` form, and
-/// Claude 3.x models have no extended-thinking support at all.
+/// Based on the Anthropic API: adaptive thinking is available for claude-opus-4-7,
+/// claude-opus-4-6, and claude-sonnet-4-6 (cross-region inference profiles).
+/// Older Claude 4 / 4.5 models support only the legacy `enabled`+`budget_tokens`
+/// form, and Claude 3.x models have no extended-thinking support at all.
 fn supports_adaptive_thinking(model_id: &str) -> bool {
     model_id.starts_with("us.anthropic.claude-opus-4-7")
         || model_id.starts_with("us.anthropic.claude-opus-4-6")
@@ -667,7 +667,7 @@ fn supports_adaptive_thinking(model_id: &str) -> bool {
 /// via the `context-1m-2025-08-07` Anthropic beta value passed in
 /// `additionalModelRequestFields.anthropic_beta` of the Bedrock request body.
 ///
-/// Matches the reference implementation: claude-sonnet-4 family and opus-4-6.
+/// Matches: claude-sonnet-4 family, claude-opus-4-7, and claude-opus-4-6.
 /// The model_id must be a bare resolved Bedrock ID (no `[1m]` suffix).
 pub(crate) fn supports_1m_context(model_id: &str) -> bool {
     model_id.starts_with("us.anthropic.claude-sonnet-4")
@@ -1132,6 +1132,11 @@ mod tests {
     // ---- supports_adaptive_thinking -----------------------------------------
 
     #[test]
+    fn adaptive_thinking_enabled_for_opus_4_7() {
+        assert!(supports_adaptive_thinking("us.anthropic.claude-opus-4-7"));
+    }
+
+    #[test]
     fn adaptive_thinking_enabled_for_opus_4_6() {
         assert!(supports_adaptive_thinking(
             "us.anthropic.claude-opus-4-6-v1"
@@ -1177,6 +1182,11 @@ mod tests {
         assert!(supports_1m_context(
             "us.anthropic.claude-sonnet-4-20250514-v1:0"
         ));
+    }
+
+    #[test]
+    fn supports_1m_context_opus_4_7() {
+        assert!(supports_1m_context("us.anthropic.claude-opus-4-7"));
     }
 
     #[test]

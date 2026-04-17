@@ -246,6 +246,14 @@ mod tests {
     }
 
     #[test]
+    fn alias_claude_opus_4_7() {
+        assert_eq!(
+            resolve_bedrock_alias("claude-opus-4.7"),
+            "us.anthropic.claude-opus-4-7"
+        );
+    }
+
+    #[test]
     fn alias_claude_opus_4_6() {
         assert_eq!(
             resolve_bedrock_alias("claude-opus-4.6"),
