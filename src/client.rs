@@ -1034,7 +1034,12 @@ pub async fn run_chat_loop(
                                 let _ = stdout.write_all(out.as_bytes()).await;
                                 let _ = stdout.flush().await;
                             }
-                            anyhow::bail!("{message}");
+                            // Print error but don't exit — let the user retry
+                            // with a different model or prompt.
+                            let msg = format!("Error: {message}\n");
+                            stdout.write_all(msg.as_bytes()).await?;
+                            stdout.flush().await?;
+                            break;
                         }
                         Response::ToolUse { name, detail } => {
                             // Flush pending markdown before the tool notice.
@@ -1103,13 +1108,41 @@ pub async fn run_chat_loop(
                     match steer_result {
                         // User typed a non-empty line — send as steer correction.
                         Ok(Ok(Some(text))) if !text.trim().is_empty() => {
-                            let steer_req = Request::Steer {
-                                session_id: session_id.clone(),
-                                message: text.trim().to_owned(),
-                            };
-                            if let Ok(mut frame) = serde_json::to_string(&steer_req) {
-                                frame.push('\n');
-                                let _ = write_half.write_all(frame.as_bytes()).await;
+                            let trimmed = text.trim();
+                            // Intercept /model in steer mode too — don't send
+                            // it to the LLM which would strip [1m].
+                            if let Some(rest) = trimmed.strip_prefix("/model") {
+                                let rest = rest.trim();
+                                if rest.is_empty() {
+                                    let msg = format!("Current model: {model}\n");
+                                    let _ = stdout.write_all(msg.as_bytes()).await;
+                                } else {
+                                    model = rest.to_string();
+                                    let msg = format!("Model set to {model}\n");
+                                    let _ = stdout.write_all(msg.as_bytes()).await;
+                                }
+                                let _ = stdout.flush().await;
+                                // The daemon is waiting for a Steer after the
+                                // Interrupt we sent.  Send "continue" so the
+                                // agentic loop resumes with the new model taking
+                                // effect on the next turn.
+                                let steer_req = Request::Steer {
+                                    session_id: session_id.clone(),
+                                    message: "continue".to_owned(),
+                                };
+                                if let Ok(mut frame) = serde_json::to_string(&steer_req) {
+                                    frame.push('\n');
+                                    let _ = write_half.write_all(frame.as_bytes()).await;
+                                }
+                            } else {
+                                let steer_req = Request::Steer {
+                                    session_id: session_id.clone(),
+                                    message: trimmed.to_owned(),
+                                };
+                                if let Ok(mut frame) = serde_json::to_string(&steer_req) {
+                                    frame.push('\n');
+                                    let _ = write_half.write_all(frame.as_bytes()).await;
+                                }
                             }
                             steer_pending = false;
                             last_ctrl_c = None;

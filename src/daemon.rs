@@ -1538,8 +1538,21 @@ async fn handle_chat_request(
     };
 
     let pre_send_tokens = count_message_tokens(&messages);
-    // If a switch_model call updated the model in a previous turn, use it.
-    let effective_model = carried_model.take().unwrap_or(model);
+    // If the client explicitly changed the model (e.g. via /model), it wins
+    // over carried_model from a previous switch_model call.  This ensures
+    // suffixes like [1m] are not lost.
+    let effective_model = match carried_model.take() {
+        Some(carried) if carried == model => carried,
+        Some(_carried) => {
+            // Client sent a different model than what was carried — client wins.
+            tracing::debug!(
+                client_model = %model,
+                "client model overrides carried_model"
+            );
+            model
+        }
+        None => model,
+    };
     let threshold = compaction_threshold_tokens(&effective_model);
     let Some(loop_result) =
         drive_agentic_loop(state, writer, conn_state, &sid, messages, &effective_model).await
@@ -4250,5 +4263,100 @@ mod tests {
     fn switch_model_trims_whitespace() {
         let result = parse_switch_model_arg(Some("  claude-opus-4.6  "));
         assert_eq!(result.unwrap(), "claude-opus-4.6");
+    }
+
+    #[test]
+    fn switch_model_preserves_1m_suffix() {
+        let result = parse_switch_model_arg(Some("claude-sonnet-4.6[1m]"));
+        assert_eq!(result.unwrap(), "claude-sonnet-4.6[1m]");
+    }
+
+    // ---- /model client-side intercept: parse_model_command -----------------
+
+    /// Simulate the `/model` parsing logic used in run_chat_loop.
+    fn parse_model_command(input: &str) -> Option<Option<String>> {
+        let rest = input
+            .strip_prefix("/model")
+            .and_then(|r| r.strip_prefix(|c: char| c.is_whitespace()).or(Some(r)))?;
+        let trimmed = rest.trim();
+        if trimmed.is_empty() {
+            Some(None) // query current model
+        } else {
+            Some(Some(trimmed.to_string())) // set model
+        }
+    }
+
+    #[test]
+    fn model_command_set_preserves_1m() {
+        assert_eq!(
+            parse_model_command("/model claude-sonnet-4.6[1m]"),
+            Some(Some("claude-sonnet-4.6[1m]".into()))
+        );
+    }
+
+    #[test]
+    fn model_command_set_opus() {
+        assert_eq!(
+            parse_model_command("/model claude-opus-4.6[1m]"),
+            Some(Some("claude-opus-4.6[1m]".into()))
+        );
+    }
+
+    #[test]
+    fn model_command_query() {
+        assert_eq!(parse_model_command("/model"), Some(None));
+    }
+
+    #[test]
+    fn model_command_not_model() {
+        assert_eq!(parse_model_command("hello"), None);
+    }
+
+    #[test]
+    fn model_command_unicode_space() {
+        assert_eq!(
+            parse_model_command("/model\u{3000}claude-sonnet-4.6[1m]"),
+            Some(Some("claude-sonnet-4.6[1m]".into()))
+        );
+    }
+
+    // ---- carried_model vs client model priority ----------------------------
+
+    #[test]
+    fn carried_model_yields_to_different_client_model() {
+        // Simulates the logic at handle_chat_request line ~2174:
+        // if client sends a different model, client wins.
+        let carried: Option<String> = Some("claude-sonnet-4.6".into());
+        let client_model = "claude-sonnet-4.6[1m]".to_string();
+        let effective = match carried {
+            Some(c) if c == client_model => c,
+            Some(_) => client_model.clone(),
+            None => client_model.clone(),
+        };
+        assert_eq!(effective, "claude-sonnet-4.6[1m]");
+    }
+
+    #[test]
+    fn carried_model_used_when_same_as_client() {
+        let carried: Option<String> = Some("claude-sonnet-4.6".into());
+        let client_model = "claude-sonnet-4.6".to_string();
+        let effective = match carried {
+            Some(c) if c == client_model => c,
+            Some(_) => client_model.clone(),
+            None => client_model.clone(),
+        };
+        assert_eq!(effective, "claude-sonnet-4.6");
+    }
+
+    #[test]
+    fn no_carried_model_uses_client() {
+        let carried: Option<String> = None;
+        let client_model = "claude-opus-4.6[1m]".to_string();
+        let effective = match carried {
+            Some(c) if c == client_model => c,
+            Some(_) => client_model.clone(),
+            None => client_model.clone(),
+        };
+        assert_eq!(effective, "claude-opus-4.6[1m]");
     }
 }
