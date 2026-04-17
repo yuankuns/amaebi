@@ -1496,21 +1496,21 @@ async fn handle_chat_request(
     let (messages, pre_flight_trimmed) = if let Some(mut prev) = carried_messages.take() {
         // Update the model name in the system message so the LLM always knows
         // what model it's currently running as, even after a /model switch.
+        // build_messages injects the model as "...as model: [<name>]." so we
+        // locate the bracket pair for a reliable, dot-safe replacement.
         if let Some(sys) = prev.first_mut() {
             if sys.role == "system" {
                 if let Some(content) = sys.content.as_mut() {
-                    // Replace the injected model line with the current model.
-                    // The marker text matches what build_messages injects.
-                    let old_marker = "You are currently running as model:";
-                    if let Some(pos) = content.find(old_marker) {
-                        let end = content[pos..]
-                            .find('.')
-                            .map(|i| pos + i + 1)
-                            .unwrap_or(content.len());
-                        content.replace_range(
-                            pos..end,
-                            &format!("You are currently running as model: {model}."),
-                        );
+                    const PREFIX: &str = "You are currently running as model: [";
+                    if let Some(start) = content.find(PREFIX) {
+                        let bracket_open = start + PREFIX.len() - 1; // position of '['
+                        if let Some(close_offset) = content[bracket_open..].find(']') {
+                            let close = bracket_open + close_offset;
+                            // Replace only the bracketed model name.
+                            let safe_model: String =
+                                model.chars().filter(|c| !c.is_control()).collect();
+                            content.replace_range(bracket_open..=close, &format!("[{safe_model}]"));
+                        }
                     }
                 }
             }
@@ -3238,7 +3238,11 @@ pub(crate) fn build_messages(
                       summarising what you did and the outcome — never end silently after a tool call."
         .to_owned();
 
-    system.push_str(&format!(" You are currently running as model: {model}."));
+    // Sanitize model name before embedding to prevent prompt injection.
+    let safe_model: String = model.chars().filter(|c| !c.is_control()).collect();
+    system.push_str(&format!(
+        " You are currently running as model: [{safe_model}]."
+    ));
 
     if let Some(pane) = tmux_pane {
         system.push_str(&format!(" The user's active tmux pane is {pane}."));
@@ -3511,9 +3515,10 @@ mod tests {
     fn build_messages_injects_model_into_system() {
         let msgs = build_messages("hi", None, &[], &[], None, "claude-opus-4.7");
         let system = msgs[0].content.as_deref().unwrap_or("");
+        // Model is bracketed: "...as model: [claude-opus-4.7]."
         assert!(
-            system.contains("claude-opus-4.7"),
-            "system prompt must mention the current model"
+            system.contains("[claude-opus-4.7]"),
+            "system prompt must mention the current model in brackets"
         );
     }
 
