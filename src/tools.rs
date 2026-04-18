@@ -629,6 +629,7 @@ async fn spawn_agent(args: serde_json::Value, ctx: &SpawnContext) -> Result<Stri
         &mut sink,
         &mut steer_rx,
         false,
+        None,
     )
     .await?;
 

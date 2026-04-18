@@ -268,6 +268,9 @@ impl acp::Agent for AmaebiAgent {
         let (steer_tx, mut steer_rx) = tokio::sync::mpsc::channel::<Option<String>>(1);
         drop(steer_tx);
         tokio::task::spawn_local(async move {
+            // ACP session IDs live in the ACP protocol namespace and do not map
+            // to our memory_db session IDs; pass None so in-loop compaction
+            // skips the DB-archive step (memory-only trim is still performed).
             let outcome = run_agentic_loop(
                 &state,
                 &model,
@@ -275,6 +278,7 @@ impl acp::Agent for AmaebiAgent {
                 &mut write_half,
                 &mut steer_rx,
                 true,
+                None,
             )
             .await
             .map(|(text, tokens, _messages, _model)| (text, tokens)) // discard messages Vec
