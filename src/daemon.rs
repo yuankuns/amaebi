@@ -447,11 +447,18 @@ async fn build_and_trim_messages(
     let skill_msgs = load_skill_messages().await;
     // Build with full history and splice in skill files so the threshold check
     // accounts for their token cost (AGENTS.md / SOUL.md can be large).
-    let mut msgs = build_messages(prompt, tmux_pane, history, summaries, own_summary);
+    let mut msgs = build_messages(prompt, tmux_pane, history, summaries, own_summary, model);
     splice_skill_messages(&mut msgs, skill_msgs.clone());
     if count_message_tokens(&msgs) > threshold {
         // Rebuild with trimmed history and re-splice the already-loaded skill files.
-        msgs = build_messages(prompt, tmux_pane, hot_tail(history), summaries, own_summary);
+        msgs = build_messages(
+            prompt,
+            tmux_pane,
+            hot_tail(history),
+            summaries,
+            own_summary,
+            model,
+        );
         splice_skill_messages(&mut msgs, skill_msgs);
         (msgs, true)
     } else {
@@ -1487,6 +1494,15 @@ async fn handle_chat_request(
     // First turn: load history from DB.  Subsequent turns: extend carried messages.
     // Apply token-budget trim either way so long-lived connections stay bounded.
     let (messages, pre_flight_trimmed) = if let Some(mut prev) = carried_messages.take() {
+        // Update the model name in the system message so the LLM always knows
+        // what model it's currently running as, even after a /model switch.
+        if let Some(sys) = prev.first_mut() {
+            if sys.role == "system" {
+                if let Some(content) = sys.content.as_mut() {
+                    update_embedded_model_name(content, &model);
+                }
+            }
+        }
         prev.push(Message::user(prompt.clone()));
         // Do NOT re-inject skill files — they were injected on the first turn and are
         // already in `prev`.  Re-injecting every turn grows context unboundedly.
@@ -1500,6 +1516,7 @@ async fn handle_chat_request(
                 hot_tail(&hist2),
                 &sum2,
                 own2.as_deref(),
+                &model,
             );
             inject_skill_files(&mut rebuilt).await;
             (rebuilt, true)
@@ -1693,16 +1710,49 @@ fn should_persist_tool_output(tool_name: &str) -> bool {
 /// Returns `Ok(trimmed_model)` on success, or `Err(error_message)` if the
 /// argument is missing or blank.  Trimming ensures leading/trailing whitespace
 /// does not silently change provider routing behaviour.
+/// In-place update of the model name embedded in a system-prompt string.
+///
+/// `build_messages` injects the model as `"...as model: [<name>]."` with the
+/// unambiguous `"]."` suffix — `.` cannot appear inside `[1m]` or inside any
+/// `provider/model` alias, so it reliably terminates the model field even for
+/// names like `claude-sonnet-4.6[1m]` that contain a closing bracket.
+///
+/// Returns `true` if the replacement succeeded.  Control characters in `model`
+/// are stripped to prevent prompt injection (mirrors `build_messages`).
+fn update_embedded_model_name(content: &mut String, model: &str) -> bool {
+    const PREFIX: &str = "You are currently running as model: [";
+    const SUFFIX: &str = "].";
+
+    let Some(start) = content.find(PREFIX) else {
+        return false;
+    };
+    let model_start = start + PREFIX.len();
+    let Some(close_offset) = content[model_start..].find(SUFFIX) else {
+        return false;
+    };
+    let model_end = model_start + close_offset;
+
+    let safe_model: String = model.chars().filter(|c| !c.is_control()).collect();
+    content.replace_range(model_start..model_end, &safe_model);
+    true
+}
+
 fn parse_switch_model_arg(raw: Option<&str>) -> Result<String, String> {
     match raw {
         None => Err("error: switch_model: missing 'model' argument".to_string()),
         Some(s) => {
             let trimmed = s.trim();
             if trimmed.is_empty() {
-                Err("error: switch_model: 'model' must not be empty".to_string())
-            } else {
-                Ok(trimmed.to_string())
+                return Err("error: switch_model: 'model' must not be empty".to_string());
             }
+            // Reject control characters (including newlines) to prevent prompt injection
+            // when the model name is embedded into the system message.
+            if trimmed.chars().any(|c| c.is_control()) {
+                return Err(
+                    "error: switch_model: 'model' must not contain control characters".to_string(),
+                );
+            }
+            Ok(trimmed.to_string())
         }
     }
 }
@@ -2931,6 +2981,15 @@ where
                                         },
                                     )
                                     .await?;
+                                    // Notify the client so it can update its local model
+                                    // variable, keeping carried_model in sync on the next turn.
+                                    write_frame(
+                                        writer,
+                                        &Response::ModelSwitched {
+                                            model: current_model.clone(),
+                                        },
+                                    )
+                                    .await?;
                                     format!("Model switched to {current_model}")
                                 }
                             };
@@ -3184,6 +3243,7 @@ pub(crate) fn build_messages(
     history: &[memory_db::DbMemoryEntry],
     past_summaries: &[String],
     own_summary: Option<&str>,
+    model: &str,
 ) -> Vec<Message> {
     let mut system = "You are a helpful, concise AI assistant embedded in a tmux terminal. \
                       Answer in plain text; avoid markdown unless the user asks for it. \
@@ -3192,6 +3252,12 @@ pub(crate) fn build_messages(
                       After using any tool, you MUST always follow up with a text response \
                       summarising what you did and the outcome — never end silently after a tool call."
         .to_owned();
+
+    // Sanitize model name before embedding to prevent prompt injection.
+    let safe_model: String = model.chars().filter(|c| !c.is_control()).collect();
+    system.push_str(&format!(
+        " You are currently running as model: [{safe_model}]."
+    ));
 
     if let Some(pane) = tmux_pane {
         system.push_str(&format!(" The user's active tmux pane is {pane}."));
@@ -3306,7 +3372,7 @@ async fn run_cron_job(state: Arc<DaemonState>, job: &cron::CronJob) {
     let model = std::env::var("AMAEBI_MODEL")
         .unwrap_or_else(|_| crate::provider::DEFAULT_MODEL.to_string());
 
-    let mut messages = build_messages(&job.description, None, &[], &[], None);
+    let mut messages = build_messages(&job.description, None, &[], &[], None, &model);
     inject_skill_files(&mut messages).await;
     // Cron jobs are non-interactive: drop the sender immediately so steer_rx.recv()
     // returns None at once if the model ends with '?', rather than timing out.
@@ -3448,30 +3514,41 @@ mod tests {
 
     #[test]
     fn build_messages_empty_history() {
-        let msgs = build_messages("hello", None, &[], &[], None);
+        let msgs = build_messages("hello", None, &[], &[], None, "claude-sonnet-4.6");
         assert_eq!(msgs.len(), 2);
     }
 
     #[test]
     fn build_messages_injects_history_rows() {
         let history = make_history(2); // 4 rows: u0, a0, u1, a1
-        let msgs = build_messages("q3", None, &history, &[], None);
+        let msgs = build_messages("q3", None, &history, &[], None, "claude-sonnet-4.6");
         // system + 4 history rows + user
         assert_eq!(msgs.len(), 6);
+    }
+
+    #[test]
+    fn build_messages_injects_model_into_system() {
+        let msgs = build_messages("hi", None, &[], &[], None, "claude-opus-4.7");
+        let system = msgs[0].content.as_deref().unwrap_or("");
+        // Model is bracketed: "...as model: [claude-opus-4.7]."
+        assert!(
+            system.contains("[claude-opus-4.7]"),
+            "system prompt must mention the current model in brackets"
+        );
     }
 
     #[test]
     fn build_messages_all_history_included() {
         // build_messages no longer caps — all rows are included.
         let history = make_history(10);
-        let msgs = build_messages("new", None, &history, &[], None);
+        let msgs = build_messages("new", None, &history, &[], None, "claude-sonnet-4.6");
         // system + 20 history rows + user
         assert_eq!(msgs.len(), 22);
     }
 
     #[test]
     fn build_messages_tmux_pane_in_system() {
-        let msgs = build_messages("prompt", Some("%3"), &[], &[], None);
+        let msgs = build_messages("prompt", Some("%3"), &[], &[], None, "claude-sonnet-4.6");
         let content = msgs[0].content.as_deref().unwrap_or("");
         assert!(
             content.contains("%3"),
@@ -3485,7 +3562,7 @@ mod tests {
             "- Fixed the auth bug.".to_owned(),
             "- Added cron.".to_owned(),
         ];
-        let msgs = build_messages("hi", None, &[], &summaries, None);
+        let msgs = build_messages("hi", None, &[], &summaries, None, "claude-sonnet-4.6");
         let system = msgs[0].content.as_deref().unwrap_or("");
         assert!(
             system.contains("Fixed the auth bug"),
@@ -3500,7 +3577,14 @@ mod tests {
     #[test]
     fn build_messages_own_summary_inserted_before_history() {
         let history = make_history(1); // 2 rows: u0, a0
-        let msgs = build_messages("q", None, &history, &[], Some("- Did X earlier."));
+        let msgs = build_messages(
+            "q",
+            None,
+            &history,
+            &[],
+            Some("- Did X earlier."),
+            "claude-sonnet-4.6",
+        );
         // system + [user summary label + assistant summary] + 2 history rows + user
         assert_eq!(msgs.len(), 6);
         // The summary pair comes before the history rows.
@@ -4229,6 +4313,51 @@ mod tests {
         );
     }
 
+    // ---- update_embedded_model_name ----------------------------------------
+
+    #[test]
+    fn update_embedded_model_name_handles_1m_suffix_across_turns() {
+        let mut content = String::from(
+            "System preface. You are currently running as model: [gpt-4o]. Continue helping.",
+        );
+
+        assert!(update_embedded_model_name(
+            &mut content,
+            "claude-sonnet-4.6[1m]"
+        ));
+        assert_eq!(
+            content,
+            "System preface. You are currently running as model: [claude-sonnet-4.6[1m]]. Continue helping."
+        );
+
+        // Second turn with the same 1m model must remain stable.
+        assert!(update_embedded_model_name(
+            &mut content,
+            "claude-sonnet-4.6[1m]"
+        ));
+        assert_eq!(
+            content,
+            "System preface. You are currently running as model: [claude-sonnet-4.6[1m]]. Continue helping."
+        );
+
+        // Switching back to a plain model must also work.
+        assert!(update_embedded_model_name(&mut content, "o3-mini"));
+        assert_eq!(
+            content,
+            "System preface. You are currently running as model: [o3-mini]. Continue helping."
+        );
+    }
+
+    #[test]
+    fn update_embedded_model_name_strips_control_chars() {
+        let mut content = String::from("You are currently running as model: [old]. rest of prompt");
+        assert!(update_embedded_model_name(&mut content, "evil\ninjected"));
+        assert_eq!(
+            content,
+            "You are currently running as model: [evilinjected]. rest of prompt"
+        );
+    }
+
     // ---- switch_model validation (via parse_switch_model_arg helper) -------
 
     #[test]
@@ -4257,6 +4386,13 @@ mod tests {
             assert!(result.is_ok(), "valid model must be accepted: {raw}");
             assert_eq!(result.unwrap(), raw);
         }
+    }
+
+    #[test]
+    fn switch_model_rejects_control_characters() {
+        assert!(parse_switch_model_arg(Some("model\nignore above")).is_err());
+        assert!(parse_switch_model_arg(Some("model\x00null")).is_err());
+        assert!(parse_switch_model_arg(Some("model\ttab")).is_err());
     }
 
     #[test]

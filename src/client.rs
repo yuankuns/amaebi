@@ -721,6 +721,9 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
                         // Not expected in a normal Chat response stream.
                         tracing::debug!("unexpected pane scheduler response in chat loop");
                     }
+                    Response::ModelSwitched { .. } => {
+                        // ask mode has no persistent model variable to update.
+                    }
                 }
             }
 
@@ -1094,6 +1097,12 @@ pub async fn run_chat_loop(
                             }
                             if std::io::stderr().is_terminal() { eprintln!("\n[compacting…]"); }
                         }
+                        Response::ModelSwitched { model: new_model } => {
+                            // Keep client model in sync so the next Request::Chat
+                            // carries the updated model, preserving carried_model
+                            // across turns in the daemon.
+                            model = new_model;
+                        }
                         _ => {}
                     }
                 }
@@ -1439,6 +1448,9 @@ pub async fn run_resume(
                     }
                     Response::PaneAssigned { .. } | Response::CapacityError { .. } => {
                         tracing::debug!("unexpected pane scheduler response in resume loop");
+                    }
+                    Response::ModelSwitched { .. } => {
+                        // resume mode has no persistent model variable to update.
                     }
                 }
             }

@@ -2657,3 +2657,80 @@ async fn chat_long_connection_ask_still_single_turn() {
     let reqs = server.take_requests();
     assert_eq!(reqs.len(), 1, "exactly 1 LLM request for single turn");
 }
+
+// ---------------------------------------------------------------------------
+// switch_model persists across turns
+// ---------------------------------------------------------------------------
+
+/// Verify that when the LLM calls switch_model, the daemon emits
+/// Response::ModelSwitched, the simulated client updates its local model, and
+/// a *subsequent* Request::Chat for the same session carries the switched
+/// model to the mock server.
+///
+/// Flow:
+///   IPC turn 1 (Request::Chat, model=copilot/gpt-4o):
+///     - LLM call A: tool_call switch_model → copilot/gpt-4o-mini
+///     - LLM call B: final text  (already on gpt-4o-mini)
+///     → client extracts the new model from Response::ModelSwitched
+///   IPC turn 2 (Request::Chat, model=copilot/gpt-4o-mini):
+///     - LLM call C: final text  ← must see gpt-4o-mini on the wire
+#[tokio::test]
+async fn switch_model_persists_to_next_turn() {
+    let server = MockLlmServer::start().await;
+
+    // IPC turn 1, LLM call A: tool_call switching to gpt-4o-mini.
+    server.enqueue(ScriptedResponse::tool_call(
+        "call-switch",
+        "switch_model",
+        r#"{"model":"copilot/gpt-4o-mini"}"#,
+    ));
+    // IPC turn 1, LLM call B: final text after the switch.
+    server.enqueue(ScriptedResponse::text_chunks(vec!["switched ok"]));
+    // IPC turn 2, LLM call C: next-turn reply.
+    server.enqueue(ScriptedResponse::text_chunks(vec!["turn 2 ok"]));
+
+    let daemon = start_daemon_with_env(&server.url(), &[("AMAEBI_COMPACTION_THRESHOLD", "100000")])
+        .await
+        .expect("start_daemon");
+
+    let session_id = uuid::Uuid::new_v4().to_string();
+    let client = connect_client(&daemon.socket);
+
+    // --- IPC turn 1 ---
+    let responses = send_message_with_session(
+        &client,
+        "switch model please",
+        &session_id,
+        "copilot/gpt-4o",
+    )
+    .await
+    .expect("turn 1");
+
+    // Simulate the client: extract the new model from ModelSwitched.
+    let new_model = responses
+        .iter()
+        .find_map(|r| match r {
+            Response::ModelSwitched { model } => Some(model.clone()),
+            _ => None,
+        })
+        .expect("turn 1 must include ModelSwitched");
+    assert_eq!(new_model, "copilot/gpt-4o-mini");
+    assert!(collect_text(&responses).contains("switched ok"));
+
+    // --- IPC turn 2: next Request::Chat uses the model from ModelSwitched ---
+    let responses2 = send_message_with_session(&client, "hello again", &session_id, &new_model)
+        .await
+        .expect("turn 2");
+    assert!(collect_text(&responses2).contains("turn 2 ok"));
+
+    let reqs = server.take_requests();
+    assert_eq!(reqs.len(), 3, "expected 3 LLM requests, got {}", reqs.len());
+
+    // The LLM request for IPC turn 2 (index 2) must use the switched model.
+    assert_eq!(
+        reqs[2].model(),
+        Some("gpt-4o-mini"),
+        "IPC turn 2 must use the switched model, got: {:?}",
+        reqs[2].model()
+    );
+}

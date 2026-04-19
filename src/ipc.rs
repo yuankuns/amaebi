@@ -189,6 +189,18 @@ pub enum Response {
         /// amaebi session UUID for the new chat session running in the pane.
         session_id: String,
     },
+    /// The LLM called the `switch_model` tool and the active model changed.
+    ///
+    /// The client should update its local model variable so the next
+    /// [`Request::Chat`] carries the new model, keeping `carried_model` in
+    /// sync on the daemon side.
+    ModelSwitched {
+        /// The exact active model string forwarded by the daemon verbatim.
+        /// May include provider prefixes such as `bedrock/...` or
+        /// `copilot/...`; clients should treat it as opaque and send it back
+        /// unchanged in the next [`Request::Chat`].
+        model: String,
+    },
     /// The [`Request::ClaudeLaunch`] was rejected because adding the requested
     /// panes would exceed the configured maximum.
     CapacityError {
@@ -499,6 +511,7 @@ mod tests {
             r#"{"type":"compacting"}"#,
             r#"{"type":"pane_assigned","task_id":"pr-1","pane_id":"%3","session_id":"uuid-abc"}"#,
             r#"{"type":"capacity_error","requested":3,"max_panes":16,"current_busy":14}"#,
+            r#"{"type":"model_switched","model":"bedrock/claude-opus-4.7"}"#,
         ];
         for frame in frames {
             let r: Response = serde_json::from_str(frame).unwrap();
@@ -515,6 +528,7 @@ mod tests {
                     | Response::Compacting
                     | Response::PaneAssigned { .. }
                     | Response::CapacityError { .. }
+                    | Response::ModelSwitched { .. }
             ));
         }
     }
