@@ -511,6 +511,7 @@ mod tests {
             r#"{"type":"compacting"}"#,
             r#"{"type":"pane_assigned","task_id":"pr-1","pane_id":"%3","session_id":"uuid-abc"}"#,
             r#"{"type":"capacity_error","requested":3,"max_panes":16,"current_busy":14}"#,
+            r#"{"type":"model_switched","model":"bedrock/claude-opus-4.7"}"#,
         ];
         for frame in frames {
             let r: Response = serde_json::from_str(frame).unwrap();
@@ -527,6 +528,7 @@ mod tests {
                     | Response::Compacting
                     | Response::PaneAssigned { .. }
                     | Response::CapacityError { .. }
+                    | Response::ModelSwitched { .. }
             ));
         }
     }

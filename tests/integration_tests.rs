@@ -2663,27 +2663,31 @@ async fn chat_long_connection_ask_still_single_turn() {
 // ---------------------------------------------------------------------------
 
 /// Verify that when the LLM calls switch_model, the daemon emits
-/// Response::ModelSwitched, the client updates its local model variable, and
-/// the *next* Request::Chat carries the switched model to the server.
+/// Response::ModelSwitched, the simulated client updates its local model, and
+/// a *subsequent* Request::Chat for the same session carries the switched
+/// model to the mock server.
 ///
 /// Flow:
-///   Turn 1 (model=copilot/gpt-4o): LLM calls switch_model → copilot/gpt-4o-mini
-///   Turn 2 (should be copilot/gpt-4o-mini): LLM returns final text
-///
-/// After the test, the mock server must have seen exactly 2 requests, with the
-/// second request using "gpt-4o-mini".
+///   IPC turn 1 (Request::Chat, model=copilot/gpt-4o):
+///     - LLM call A: tool_call switch_model → copilot/gpt-4o-mini
+///     - LLM call B: final text  (already on gpt-4o-mini)
+///     → client extracts the new model from Response::ModelSwitched
+///   IPC turn 2 (Request::Chat, model=copilot/gpt-4o-mini):
+///     - LLM call C: final text  ← must see gpt-4o-mini on the wire
 #[tokio::test]
 async fn switch_model_persists_to_next_turn() {
     let server = MockLlmServer::start().await;
 
-    // Turn 1: LLM calls switch_model to gpt-4o-mini.
+    // IPC turn 1, LLM call A: tool_call switching to gpt-4o-mini.
     server.enqueue(ScriptedResponse::tool_call(
         "call-switch",
         "switch_model",
         r#"{"model":"copilot/gpt-4o-mini"}"#,
     ));
-    // Turn 2: LLM (now on gpt-4o-mini) returns final text.
+    // IPC turn 1, LLM call B: final text after the switch.
     server.enqueue(ScriptedResponse::text_chunks(vec!["switched ok"]));
+    // IPC turn 2, LLM call C: next-turn reply.
+    server.enqueue(ScriptedResponse::text_chunks(vec!["turn 2 ok"]));
 
     let daemon = start_daemon_with_env(&server.url(), &[("AMAEBI_COMPACTION_THRESHOLD", "100000")])
         .await
@@ -2692,7 +2696,7 @@ async fn switch_model_persists_to_next_turn() {
     let session_id = uuid::Uuid::new_v4().to_string();
     let client = connect_client(&daemon.socket);
 
-    // Send turn 1 with the original model.
+    // --- IPC turn 1 ---
     let responses = send_message_with_session(
         &client,
         "switch model please",
@@ -2702,23 +2706,31 @@ async fn switch_model_persists_to_next_turn() {
     .await
     .expect("turn 1");
 
-    // Client must have received a ModelSwitched frame.
-    assert!(
-        responses.iter().any(
-            |r| matches!(r, Response::ModelSwitched { model } if model == "copilot/gpt-4o-mini")
-        ),
-        "expected ModelSwitched frame in turn 1 responses: {responses:?}"
-    );
+    // Simulate the client: extract the new model from ModelSwitched.
+    let new_model = responses
+        .iter()
+        .find_map(|r| match r {
+            Response::ModelSwitched { model } => Some(model.clone()),
+            _ => None,
+        })
+        .expect("turn 1 must include ModelSwitched");
+    assert_eq!(new_model, "copilot/gpt-4o-mini");
     assert!(collect_text(&responses).contains("switched ok"));
 
-    let reqs = server.take_requests();
-    assert_eq!(reqs.len(), 2, "expected 2 LLM requests, got {}", reqs.len());
+    // --- IPC turn 2: next Request::Chat uses the model from ModelSwitched ---
+    let responses2 = send_message_with_session(&client, "hello again", &session_id, &new_model)
+        .await
+        .expect("turn 2");
+    assert!(collect_text(&responses2).contains("turn 2 ok"));
 
-    // The second request must use the switched model.
+    let reqs = server.take_requests();
+    assert_eq!(reqs.len(), 3, "expected 3 LLM requests, got {}", reqs.len());
+
+    // The LLM request for IPC turn 2 (index 2) must use the switched model.
     assert_eq!(
-        reqs[1].model(),
+        reqs[2].model(),
         Some("gpt-4o-mini"),
-        "turn 2 must use switched model, got: {:?}",
-        reqs[1].model()
+        "IPC turn 2 must use the switched model, got: {:?}",
+        reqs[2].model()
     );
 }

@@ -1496,22 +1496,10 @@ async fn handle_chat_request(
     let (messages, pre_flight_trimmed) = if let Some(mut prev) = carried_messages.take() {
         // Update the model name in the system message so the LLM always knows
         // what model it's currently running as, even after a /model switch.
-        // build_messages injects the model as "...as model: [<name>]." so we
-        // locate the bracket pair for a reliable, dot-safe replacement.
         if let Some(sys) = prev.first_mut() {
             if sys.role == "system" {
                 if let Some(content) = sys.content.as_mut() {
-                    const PREFIX: &str = "You are currently running as model: [";
-                    if let Some(start) = content.find(PREFIX) {
-                        let bracket_open = start + PREFIX.len() - 1; // position of '['
-                        if let Some(close_offset) = content[bracket_open..].find(']') {
-                            let close = bracket_open + close_offset;
-                            // Replace only the bracketed model name.
-                            let safe_model: String =
-                                model.chars().filter(|c| !c.is_control()).collect();
-                            content.replace_range(bracket_open..=close, &format!("[{safe_model}]"));
-                        }
-                    }
+                    update_embedded_model_name(content, &model);
                 }
             }
         }
@@ -1722,6 +1710,33 @@ fn should_persist_tool_output(tool_name: &str) -> bool {
 /// Returns `Ok(trimmed_model)` on success, or `Err(error_message)` if the
 /// argument is missing or blank.  Trimming ensures leading/trailing whitespace
 /// does not silently change provider routing behaviour.
+/// In-place update of the model name embedded in a system-prompt string.
+///
+/// `build_messages` injects the model as `"...as model: [<name>]."` with the
+/// unambiguous `"]."` suffix — `.` cannot appear inside `[1m]` or inside any
+/// `provider/model` alias, so it reliably terminates the model field even for
+/// names like `claude-sonnet-4.6[1m]` that contain a closing bracket.
+///
+/// Returns `true` if the replacement succeeded.  Control characters in `model`
+/// are stripped to prevent prompt injection (mirrors `build_messages`).
+fn update_embedded_model_name(content: &mut String, model: &str) -> bool {
+    const PREFIX: &str = "You are currently running as model: [";
+    const SUFFIX: &str = "].";
+
+    let Some(start) = content.find(PREFIX) else {
+        return false;
+    };
+    let model_start = start + PREFIX.len();
+    let Some(close_offset) = content[model_start..].find(SUFFIX) else {
+        return false;
+    };
+    let model_end = model_start + close_offset;
+
+    let safe_model: String = model.chars().filter(|c| !c.is_control()).collect();
+    content.replace_range(model_start..model_end, &safe_model);
+    true
+}
+
 fn parse_switch_model_arg(raw: Option<&str>) -> Result<String, String> {
     match raw {
         None => Err("error: switch_model: missing 'model' argument".to_string()),
@@ -4295,6 +4310,51 @@ mod tests {
         assert!(
             !is_stub,
             "after file change, dedup must NOT produce a stub (cache key differs)"
+        );
+    }
+
+    // ---- update_embedded_model_name ----------------------------------------
+
+    #[test]
+    fn update_embedded_model_name_handles_1m_suffix_across_turns() {
+        let mut content = String::from(
+            "System preface. You are currently running as model: [gpt-4o]. Continue helping.",
+        );
+
+        assert!(update_embedded_model_name(
+            &mut content,
+            "claude-sonnet-4.6[1m]"
+        ));
+        assert_eq!(
+            content,
+            "System preface. You are currently running as model: [claude-sonnet-4.6[1m]]. Continue helping."
+        );
+
+        // Second turn with the same 1m model must remain stable.
+        assert!(update_embedded_model_name(
+            &mut content,
+            "claude-sonnet-4.6[1m]"
+        ));
+        assert_eq!(
+            content,
+            "System preface. You are currently running as model: [claude-sonnet-4.6[1m]]. Continue helping."
+        );
+
+        // Switching back to a plain model must also work.
+        assert!(update_embedded_model_name(&mut content, "o3-mini"));
+        assert_eq!(
+            content,
+            "System preface. You are currently running as model: [o3-mini]. Continue helping."
+        );
+    }
+
+    #[test]
+    fn update_embedded_model_name_strips_control_chars() {
+        let mut content = String::from("You are currently running as model: [old]. rest of prompt");
+        assert!(update_embedded_model_name(&mut content, "evil\ninjected"));
+        assert_eq!(
+            content,
+            "You are currently running as model: [evilinjected]. rest of prompt"
         );
     }
 
