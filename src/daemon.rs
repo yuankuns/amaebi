@@ -2158,6 +2158,14 @@ async fn compact_in_loop(
         .unwrap_or(messages.len());
 
     let tail_start = find_hot_tail_start(messages, HOT_TAIL_PAIRS);
+    // `find_hot_tail_start` returns `messages.len()` as a sentinel meaning
+    // "nothing historical to split off" (≤1 user turn).  If we spliced at
+    // that point we would overwrite the active user prompt and leave the
+    // message list ending with the assistant summary — an invalid request
+    // shape for every provider.  Bail in that case.
+    if tail_start >= messages.len() {
+        anyhow::bail!("compact_in_loop: no hot tail boundary (would overwrite current prompt)");
+    }
     let tail_start = tail_start.max(head_end);
     if tail_start <= head_end {
         anyhow::bail!("compact_in_loop: no middle section to summarise");
@@ -3870,6 +3878,18 @@ mod tests {
             Message::user("u4"),
         ];
         assert_eq!(find_hot_tail_start(&msgs, 1), 7);
+    }
+
+    #[test]
+    fn compact_in_loop_bails_when_only_current_prompt_present() {
+        // Regression: when the message list has ≤1 user turn (only the
+        // active prompt), find_hot_tail_start returns messages.len() as a
+        // sentinel.  compact_in_loop must detect that and bail rather than
+        // splicing over the current prompt and producing an invalid request
+        // ending on the assistant summary.
+        let msgs = vec![Message::system("sys"), Message::user("only prompt")];
+        let start = find_hot_tail_start(&msgs, 3);
+        assert_eq!(start, msgs.len(), "sentinel must equal messages.len()");
     }
 
     #[test]
