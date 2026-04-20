@@ -2131,6 +2131,11 @@ async fn compact_in_loop(
 
     // Build a self-contained summariser prompt that does not inherit the
     // agent's tool schemas — the summariser must never execute tools.
+    // Only user text and assistant text turns are kept: tool_call-only
+    // assistant turns (content=None, tool_calls!=[]) and `tool` results
+    // carry no durable semantics once the surrounding assistant text has
+    // described the outcome, and sending empty assistant messages would
+    // add noise to the summariser input.
     let middle = &messages[head_end..tail_start];
     let mut summary_msgs = vec![Message::system(
         "You are a memory compactor. Output 3-5 bullet points capturing the key outcomes, \
@@ -2138,14 +2143,24 @@ async fn compact_in_loop(
     )];
     for m in middle {
         match m.role.as_str() {
-            "user" => summary_msgs.push(Message::user(m.content.clone().unwrap_or_default())),
-            "assistant" => summary_msgs.push(Message::assistant(
-                Some(m.content.clone().unwrap_or_default()),
-                vec![],
-            )),
-            // Skip tool calls/results — they inflate context without carrying
-            // durable semantics; the surrounding assistant text already summarises
-            // the outcome.
+            "user" => {
+                if let Some(text) = m.content.as_deref() {
+                    if !text.is_empty() {
+                        summary_msgs.push(Message::user(text.to_owned()));
+                    }
+                }
+            }
+            "assistant" => {
+                // Skip tool-call-only turns (content=None or empty) — they
+                // add no information once the following assistant text has
+                // reported the outcome.
+                if let Some(text) = m.content.as_deref() {
+                    if !text.is_empty() {
+                        summary_msgs.push(Message::assistant(Some(text.to_owned()), vec![]));
+                    }
+                }
+            }
+            // Skip `tool` results and any other role — no durable semantics.
             _ => {}
         }
     }
@@ -2184,9 +2199,12 @@ async fn compact_in_loop(
     if summary_text.is_empty() {
         anyhow::bail!("compact_in_loop: empty summary");
     }
-    // Truncate before splicing/storing so an unusually verbose summary
-    // cannot blow through the DB-persisted summary cap either.
-    let summary_text = truncate_chars(&summary_text, MAX_SUMMARY_CHARS * 4);
+    // Truncate to the same cap `build_messages()` applies to `own_summary`
+    // on resume-injection (`MAX_SUMMARY_CHARS * 2`).  Storing a longer
+    // string is pointless — it would be silently re-truncated the next
+    // time the session resumes — and aligning the caps keeps in-memory
+    // and persisted forms identical.
+    let summary_text = truncate_chars(&summary_text, MAX_SUMMARY_CHARS * 2);
 
     // Count the user+assistant rows that were actually fed to the summariser.
     // This — not `total - HOT_TAIL_PAIRS*2` — is the right number of DB turns
@@ -2201,8 +2219,15 @@ async fn compact_in_loop(
     let pre_tokens = count_message_tokens(messages);
 
     // Replace [head_end..tail_start] with a user/assistant summary pair.
+    // Use the SAME marker string that `build_messages()` uses for
+    // own_summary injection so that on a subsequent in-loop compaction
+    // within the same connection the `head_end` guard (which looks for
+    // this exact marker) preserves this pair rather than feeding it
+    // back to the summariser — and so `summarised_row_count` cannot
+    // include synthetic in-memory rows that have no DB-row counterpart
+    // (which would make the archive step overshoot).
     let replacement = vec![
-        Message::user("[Compacted summary of earlier turns]".to_owned()),
+        Message::user("[Summary of earlier in this session]".to_owned()),
         Message::assistant(Some(summary_text.clone()), vec![]),
     ];
     messages.splice(head_end..tail_start, replacement);
@@ -3907,9 +3932,16 @@ mod tests {
     fn build_messages_own_summary_marker_matches_compact_head_end_guard() {
         // Invariant: the exact marker string that `build_messages()` injects
         // as the own_summary user turn must match the prefix that
-        // `compact_in_loop`'s head_end guard looks for.  If either string
-        // drifts the guard silently stops preserving the running summary
-        // and it gets fed to the summariser on every compact.
+        // `compact_in_loop`'s head_end guard looks for AND the marker that
+        // `compact_in_loop` itself writes when splicing a new summary pair.
+        //
+        // Unifying these three places means: (1) on resume, the injected
+        // own_summary pair is preserved by the head_end guard rather than
+        // re-summarised on every compaction; (2) within a single connection,
+        // a previously-spliced in-memory summary pair is also preserved by
+        // the same guard and therefore does NOT leak into `summarised_row_count`
+        // (which would cause the DB archive step to overshoot, archiving
+        // real rows that the summariser never saw).
         let history = make_history(1);
         let msgs = build_messages(
             "q",
@@ -3921,8 +3953,8 @@ mod tests {
         );
         // msgs[1] should be the own_summary user label.
         let label = msgs[1].content.as_deref().unwrap_or("");
-        assert!(
-            label.starts_with("[Summary of earlier in this session]"),
+        assert_eq!(
+            label, "[Summary of earlier in this session]",
             "own_summary user marker drifted: {label:?}"
         );
         // And msgs[2] should be the assistant-role summary body.
