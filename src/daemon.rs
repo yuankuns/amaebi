@@ -2206,15 +2206,22 @@ async fn compact_in_loop(
     // and persisted forms identical.
     let summary_text = truncate_chars(&summary_text, MAX_SUMMARY_CHARS * 2);
 
-    // Count the user+assistant rows that were actually fed to the summariser.
-    // This — not `total - HOT_TAIL_PAIRS*2` — is the right number of DB turns
-    // to archive: otherwise a pre-flight `hot_tail` trim could drop older DB
-    // rows from memory and we would then archive turns that were never seen
-    // by the summariser, silently losing context on future resumes.
-    let summarised_row_count = messages[head_end..tail_start]
+    // Count the user turns in the summarised middle slice and derive the
+    // DB-row archive count from that.  `store_conversation` writes exactly
+    // two `memories` rows per turn (one `user`, one `assistant` text), so
+    // `user_turns * 2` is the authoritative DB row count for those turns.
+    //
+    // Counting *all* in-memory `user`/`assistant` messages here would be
+    // wrong: a single agentic turn can produce many in-memory assistant
+    // messages (tool-call-only turns, intermediate text) that are never
+    // persisted.  Including them would inflate `summarised_row_count`
+    // and cause `archive_session_turns` to overshoot into real DB rows
+    // the summariser never saw — silently losing their content on resume.
+    let middle_user_count = messages[head_end..tail_start]
         .iter()
-        .filter(|m| m.role == "user" || m.role == "assistant")
+        .filter(|m| m.role == "user")
         .count();
+    let summarised_row_count = middle_user_count * 2;
 
     let pre_tokens = count_message_tokens(messages);
 
