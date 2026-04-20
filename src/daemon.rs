@@ -400,17 +400,6 @@ where
     })?
 }
 
-/// Return the last `HOT_TAIL_PAIRS * 2` entries of `history`, or the whole
-/// slice when it is shorter.  Used to trim over-budget message lists.
-fn hot_tail(history: &[memory_db::DbMemoryEntry]) -> &[memory_db::DbMemoryEntry] {
-    let hot = HOT_TAIL_PAIRS * 2;
-    if history.len() > hot {
-        &history[history.len() - hot..]
-    } else {
-        history
-    }
-}
-
 /// Load the three pieces of session state needed to build a message list.
 ///
 /// Returns `(history, summaries, own_summary)`.  On error, logs a warning and
@@ -434,46 +423,6 @@ async fn load_session_state(
         tracing::warn!(error = %e, session_id, "failed to load session state");
         (vec![], vec![], None)
     })
-}
-
-/// Build a message list from session state, trim to the token budget, and
-/// inject skill files.
-///
-/// Injects skill files into the full-history list first so the threshold check
-/// accounts for their token cost (AGENTS.md/SOUL.md can be large).  If the
-/// result still exceeds the budget, rebuilds with the hot-tail history slice
-/// and injects again so the returned messages always include the skill files.
-async fn build_and_trim_messages(
-    prompt: &str,
-    tmux_pane: Option<&str>,
-    history: &[memory_db::DbMemoryEntry],
-    summaries: &[String],
-    own_summary: Option<&str>,
-    model: &str,
-) -> (Vec<Message>, bool) {
-    let threshold = compaction_threshold_tokens(model);
-    // Load skill files once — reused in both the full and trimmed builds so
-    // disk reads and log lines are not duplicated on a threshold-triggered rebuild.
-    let skill_msgs = load_skill_messages().await;
-    // Build with full history and splice in skill files so the threshold check
-    // accounts for their token cost (AGENTS.md / SOUL.md can be large).
-    let mut msgs = build_messages(prompt, tmux_pane, history, summaries, own_summary, model);
-    splice_skill_messages(&mut msgs, skill_msgs.clone());
-    if count_message_tokens(&msgs) > threshold {
-        // Rebuild with trimmed history and re-splice the already-loaded skill files.
-        msgs = build_messages(
-            prompt,
-            tmux_pane,
-            hot_tail(history),
-            summaries,
-            own_summary,
-            model,
-        );
-        splice_skill_messages(&mut msgs, skill_msgs);
-        (msgs, true)
-    } else {
-        (msgs, false)
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -608,15 +557,9 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                     })
                     .await
                     .unwrap_or_default();
-                    let (messages, _) = build_and_trim_messages(
-                        &prompt,
-                        tmux_pane.as_deref(),
-                        &history,
-                        &[],
-                        None,
-                        &model,
-                    )
-                    .await;
+                    let mut messages =
+                        build_messages(&prompt, tmux_pane.as_deref(), &history, &[], None, &model);
+                    inject_skill_files(&mut messages).await;
                     let mut sink = tokio::io::sink();
                     let (_, mut steer_rx) = tokio::sync::mpsc::channel::<Option<String>>(1);
                     let task_desc = truncate_chars(&prompt, 200);
@@ -1408,15 +1351,15 @@ async fn handle_resume_request(
         }
     }
     let (history, summaries, own_summary) = load_session_state(state, &session_id).await;
-    let (messages, _) = build_and_trim_messages(
+    let mut messages = build_messages(
         &prompt,
         tmux_pane.as_deref(),
         &history,
         &summaries,
         own_summary.as_deref(),
         &model,
-    )
-    .await;
+    );
+    inject_skill_files(&mut messages).await;
     let Some(result) =
         drive_agentic_loop(state, writer, conn_state, &session_id, messages, &model).await
     else {
@@ -1512,7 +1455,14 @@ async fn handle_chat_request(
     }
 
     // First turn: load history from DB.  Subsequent turns: extend carried messages.
-    // Apply token-budget trim either way so long-lived connections stay bounded.
+    //
+    // No pre-flight trim here: `run_agentic_loop` runs a synchronous
+    // compaction check before every `invoke_model` call and archives exactly
+    // the DB turns it summarises.  A pre-flight `hot_tail` trim would drop
+    // older DB rows from memory without the summariser ever seeing them,
+    // and the subsequent DB archive would then silently lose their content
+    // on future resumes.  Feeding the full history through is also what
+    // keeps the in-memory middle and the persisted archive aligned.
     let messages = if let Some(mut prev) = carried_messages.take() {
         // Update the model name in the system message so the LLM always knows
         // what model it's currently running as, even after a /model switch.
@@ -1526,23 +1476,7 @@ async fn handle_chat_request(
         prev.push(Message::user(prompt.clone()));
         // Do NOT re-inject skill files — they were injected on the first turn and are
         // already in `prev`.  Re-injecting every turn grows context unboundedly.
-        let threshold_inner = compaction_threshold_tokens(&model);
-        if count_message_tokens(&prev) > threshold_inner {
-            // Rebuild from persisted history when over budget.
-            let (hist2, sum2, own2) = load_session_state(state, &sid).await;
-            let mut rebuilt = build_messages(
-                &prompt,
-                tmux_pane.as_deref(),
-                hot_tail(&hist2),
-                &sum2,
-                own2.as_deref(),
-                &model,
-            );
-            inject_skill_files(&mut rebuilt).await;
-            rebuilt
-        } else {
-            prev
-        }
+        prev
     } else {
         let (history, summaries, own_summary) = load_session_state(state, &sid).await;
 
@@ -1563,15 +1497,15 @@ async fn handle_chat_request(
             }
         }
 
-        let (msgs, _trimmed) = build_and_trim_messages(
+        let mut msgs = build_messages(
             &prompt,
             tmux_pane.as_deref(),
             &history,
             &summaries,
             own_summary.as_deref(),
             &model,
-        )
-        .await;
+        );
+        inject_skill_files(&mut msgs).await;
         msgs
     };
 
@@ -2109,9 +2043,7 @@ async fn compact_session(
 /// `assistant` tool_call would be rejected by every provider).
 ///
 /// `desired_pairs` is the number of **user/assistant pairs** (i.e. user
-/// turns) to keep in the tail.  This matches the DB-side `hot_tail()` helper
-/// and the `keep_recent = HOT_TAIL_PAIRS * 2` row count used for archiving,
-/// so in-memory and persisted trimming stay consistent.
+/// turns) to keep in the tail.
 ///
 /// Always leaves at least one user turn in the middle so the compactor has
 /// something to summarise.  When there is only one user message in the
@@ -2256,6 +2188,16 @@ async fn compact_in_loop(
     // cannot blow through the DB-persisted summary cap either.
     let summary_text = truncate_chars(&summary_text, MAX_SUMMARY_CHARS * 4);
 
+    // Count the user+assistant rows that were actually fed to the summariser.
+    // This — not `total - HOT_TAIL_PAIRS*2` — is the right number of DB turns
+    // to archive: otherwise a pre-flight `hot_tail` trim could drop older DB
+    // rows from memory and we would then archive turns that were never seen
+    // by the summariser, silently losing context on future resumes.
+    let summarised_row_count = messages[head_end..tail_start]
+        .iter()
+        .filter(|m| m.role == "user" || m.role == "assistant")
+        .count();
+
     let pre_tokens = count_message_tokens(messages);
 
     // Replace [head_end..tail_start] with a user/assistant summary pair.
@@ -2288,18 +2230,22 @@ async fn compact_in_loop(
         );
     }
 
-    // Best-effort DB archive: persist the summary and mark the compacted
-    // turns archived so resuming this session later starts from the summary
-    // rather than replaying the raw history.  Log and continue on failure.
+    // Best-effort DB archive: persist the summary and mark exactly the
+    // turns that the summariser saw as archived so resuming this session
+    // later starts from the summary rather than replaying the raw history.
+    // Crucially we archive `summarised_row_count` (what was actually fed
+    // into the summariser) rather than `total - keep_recent`: pre-flight
+    // trimming in `handle_chat_request` can drop older DB rows from
+    // memory before `run_agentic_loop` starts, and archiving rows the
+    // summariser never saw would silently lose their content on resume
+    // (the summary would not cover them either).  Log and continue on
+    // failure.
     if let Some(sid) = session_id {
         let db = Arc::clone(&state.db);
         let sid_owned = sid.to_owned();
         let ts = chrono::Utc::now().to_rfc3339();
-        let keep_recent = HOT_TAIL_PAIRS * 2;
         let archive_result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
             let conn = db.lock().unwrap_or_else(|p| p.into_inner());
-            let total = memory_db::count_session_turns(&conn, &sid_owned)?;
-            let to_archive_count = total.saturating_sub(keep_recent);
             // Always persist the summary (even when nothing is archived) so a
             // later resume rebuilds from the compacted state rather than the
             // raw history — the in-memory splice has already happened, so
@@ -2308,8 +2254,8 @@ async fn compact_in_loop(
                 .unchecked_transaction()
                 .context("compact_in_loop: begin transaction")?;
             memory_db::store_session_summary(&conn, &sid_owned, &summary_text, &ts)?;
-            if to_archive_count > 0 {
-                let rows = memory_db::get_session_oldest(&conn, &sid_owned, to_archive_count)?;
+            if summarised_row_count > 0 {
+                let rows = memory_db::get_session_oldest(&conn, &sid_owned, summarised_row_count)?;
                 let ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
                 memory_db::archive_session_turns(&conn, &ids)?;
             }
@@ -3934,13 +3880,11 @@ mod tests {
     }
 
     #[test]
-    fn hot_tail_start_matches_db_hot_tail_row_count() {
-        // Invariant: the number of user turns preserved in-memory equals the
-        // user-turn half of the DB-side `HOT_TAIL_PAIRS * 2` row count.  With
-        // 5 historical user turns and HOT_TAIL_PAIRS = 3 we keep 3 user
-        // turns (index of 3rd-from-last user = 5).  Each preserved user
-        // turn carries its assistant reply → 3 pairs = 6 rows, matching
-        // `hot_tail()`.
+    fn hot_tail_start_preserves_exactly_hot_tail_pairs_user_turns() {
+        // Invariant: the number of user turns preserved in-memory equals
+        // HOT_TAIL_PAIRS.  With 5 historical user turns and
+        // HOT_TAIL_PAIRS = 3 we keep the 3 most recent user turns, each
+        // with its assistant reply.
         let msgs = vec![
             Message::system("sys"),
             Message::user("u0"),
