@@ -364,15 +364,18 @@ async fn test_compaction_preserves_summary() {
     let session_id = uuid::Uuid::new_v4().to_string();
 
     for i in 1..=4u32 {
-        server.enqueue(ScriptedResponse::text_chunks(vec![&format!("Seed {i}.")]));
-        send_message_with_session(
-            &seed_client,
-            &format!("Seed message {i}."),
-            &session_id,
-            "copilot/gpt-4o",
-        )
-        .await
-        .unwrap_or_else(|e| panic!("seed turn {i}: {e}"));
+        // Use long content so the compacted summary actually shrinks the
+        // token count (threshold=50 is aggressive; a 1-sentence seed would
+        // compact to a pair whose overhead alone exceeds the original).
+        let long_reply = format!("Seed {i}. {}", "lorem ipsum dolor sit amet ".repeat(30));
+        let long_prompt = format!(
+            "Seed message {i}. {}",
+            "dolor sit amet consectetur ".repeat(30)
+        );
+        server.enqueue(ScriptedResponse::text_chunks(vec![&long_reply]));
+        send_message_with_session(&seed_client, &long_prompt, &session_id, "copilot/gpt-4o")
+            .await
+            .unwrap_or_else(|e| panic!("seed turn {i}: {e}"));
     }
     server.take_requests();
 

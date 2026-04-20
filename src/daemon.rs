@@ -113,6 +113,12 @@ const MAX_SUMMARY_CHARS: usize = 500;
 /// Mirrors Claude Code's `MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES` circuit breaker
 /// so an irrecoverably-oversized context does not trigger a retry storm.
 const MAX_CONSECUTIVE_COMPACT_FAILURES: u32 = 3;
+/// Cap on the summariser's `max_tokens`.  The summary prompt asks for 3-5
+/// bullet points; hard-capping the output budget prevents a verbose summary
+/// from failing to reduce context (which would re-trigger compaction on the
+/// next iteration).  Matches the same order of magnitude as the DB-persisted
+/// summary truncation in [`MAX_SUMMARY_CHARS`].
+const COMPACT_SUMMARY_MAX_TOKENS: usize = 2_048;
 
 /// State shared across all concurrent client connections via `Arc`.
 pub struct DaemonState {
@@ -2102,8 +2108,12 @@ async fn compact_session(
 /// pairings are never split (an orphan `tool` result with no preceding
 /// `assistant` tool_call would be rejected by every provider).
 ///
-/// Targets up to `desired_pairs * 2` user turns in the tail, but always
-/// leaves at least one user turn in the middle so the compactor has
+/// `desired_pairs` is the number of **user/assistant pairs** (i.e. user
+/// turns) to keep in the tail.  This matches the DB-side `hot_tail()` helper
+/// and the `keep_recent = HOT_TAIL_PAIRS * 2` row count used for archiving,
+/// so in-memory and persisted trimming stay consistent.
+///
+/// Always leaves at least one user turn in the middle so the compactor has
 /// something to summarise.  When there is only one user message in the
 /// list, returns `messages.len()` — the caller must treat that as
 /// "nothing to summarise" and bail out.
@@ -2121,10 +2131,9 @@ fn find_hot_tail_start(messages: &[Message], desired_pairs: usize) -> usize {
         // Zero or one user turn: nothing historical to split off.
         return messages.len();
     }
-    let desired = desired_pairs * 2;
     // Leave at least one user turn in the middle for the summariser, so cap
     // the tail at (n_users - 1) user turns.
-    let tail_user_count = desired.min(n_users - 1);
+    let tail_user_count = desired_pairs.min(n_users - 1);
     user_indexes[n_users - tail_user_count]
 }
 
@@ -2149,13 +2158,30 @@ async fn compact_in_loop(
     main_model: &str,
     session_id: Option<&str>,
 ) -> Result<()> {
-    // Partition: [system/skill head] + [middle to summarise] + [hot tail].
+    // Partition: [system/skill head] + [preserved own_summary prefix, if any]
+    // + [middle to summarise] + [hot tail].
+    //
     // Leading system (and any skill system messages immediately after) are
     // preserved so the agent keeps its identity and loaded skills post-compact.
-    let head_end = messages
+    // When `build_messages()` has injected the running session summary
+    // immediately after that head as a user/assistant pair (see `own_summary`
+    // handling in `build_messages`), preserve that pair too — otherwise the
+    // summariser would re-summarise or discard the already-stored running
+    // summary, causing summary drift across turns.
+    let mut head_end = messages
         .iter()
         .position(|m| m.role != "system")
         .unwrap_or(messages.len());
+    if head_end + 1 < messages.len()
+        && messages[head_end].role == "user"
+        && messages[head_end]
+            .content
+            .as_deref()
+            .is_some_and(|s| s.starts_with("[Summary of earlier in this session]"))
+        && messages[head_end + 1].role == "assistant"
+    {
+        head_end += 2;
+    }
 
     let tail_start = find_hot_tail_start(messages, HOT_TAIL_PAIRS);
     // `find_hot_tail_start` returns `messages.len()` as a sentinel meaning
@@ -2204,13 +2230,20 @@ async fn compact_in_loop(
     // provider prefix so e.g. copilot sessions stay on copilot.
     let summary_model = compact_model(main_model);
 
+    // Cap the summariser's output so a verbose reply cannot defeat the whole
+    // point of compaction.  A bullet-point summary fits comfortably in 2k
+    // tokens; letting the model run up to `response_max_tokens` (half the
+    // context window) could return tens of thousands of tokens and keep the
+    // prompt over threshold, re-triggering compaction next iteration.
+    let summary_budget = COMPACT_SUMMARY_MAX_TOKENS.min(response_max_tokens(&summary_model));
+
     let mut sink = tokio::io::sink();
     let resp = invoke_model(
         state,
         &summary_model,
         &summary_msgs,
         &[],
-        response_max_tokens(&summary_model),
+        summary_budget,
         &mut sink,
     )
     .await
@@ -2219,8 +2252,10 @@ async fn compact_in_loop(
     if summary_text.is_empty() {
         anyhow::bail!("compact_in_loop: empty summary");
     }
+    // Truncate before splicing/storing so an unusually verbose summary
+    // cannot blow through the DB-persisted summary cap either.
+    let summary_text = truncate_chars(&summary_text, MAX_SUMMARY_CHARS * 4);
 
-    // Compute pre/post token counts for observability before mutating `messages`.
     let pre_tokens = count_message_tokens(messages);
 
     // Replace [head_end..tail_start] with a user/assistant summary pair.
@@ -2229,7 +2264,6 @@ async fn compact_in_loop(
         Message::assistant(Some(summary_text.clone()), vec![]),
     ];
     messages.splice(head_end..tail_start, replacement);
-
     let post_tokens = count_message_tokens(messages);
     tracing::info!(
         session = ?session_id,
@@ -2237,6 +2271,22 @@ async fn compact_in_loop(
         post_tokens,
         "compact_in_loop: summary applied"
     );
+
+    // If the summary did not reduce the total token count at all, treat it
+    // as a compaction failure so the caller's circuit breaker can engage
+    // rather than hammering the API in a retry storm.  This catches the
+    // pathological case where a verbose summary is larger than the turns
+    // it replaced — which would otherwise re-trigger compaction on the
+    // very next iteration and loop forever.  We do NOT gate on the
+    // threshold itself: even a small reduction is progress, and a system
+    // prompt that alone exceeds the threshold is a configuration bug
+    // rather than something compaction can fix.
+    if post_tokens >= pre_tokens {
+        anyhow::bail!(
+            "compact_in_loop: summary did not reduce token count \
+             (pre={pre_tokens}, post={post_tokens})"
+        );
+    }
 
     // Best-effort DB archive: persist the summary and mark the compacted
     // turns archived so resuming this session later starts from the summary
@@ -3844,9 +3894,8 @@ mod tests {
 
     #[test]
     fn hot_tail_start_keeps_one_middle_user() {
-        // Four user turns, desired tail pairs = 3 (= 6 user turns).  Cap at
-        // n_users - 1 = 3, leaving exactly one user turn in the middle for
-        // the summariser.
+        // Four user turns, desired = 3 user turns.  Cap at n_users - 1 = 3,
+        // leaving exactly one user turn in the middle for the summariser.
         let msgs = vec![
             Message::system("sys"),
             Message::user("u0"),
@@ -3863,8 +3912,9 @@ mod tests {
 
     #[test]
     fn hot_tail_start_small_desired_keeps_most_as_middle() {
-        // Five user turns with desired = 1 pair = 2 user turns → tail starts
-        // at the second-to-last user turn (index 7).
+        // Five user turns with desired = 1 user turn → tail starts at the
+        // last user turn (index 9), leaving u0..u3 + their assistants as
+        // the middle.
         let msgs = vec![
             Message::system("sys"),
             Message::user("u0"),
@@ -3877,7 +3927,59 @@ mod tests {
             Message::assistant(Some("a3".into()), vec![]),
             Message::user("u4"),
         ];
-        assert_eq!(find_hot_tail_start(&msgs, 1), 7);
+        assert_eq!(find_hot_tail_start(&msgs, 1), 9);
+    }
+
+    #[test]
+    fn hot_tail_start_matches_db_hot_tail_row_count() {
+        // Invariant: the number of user turns preserved in-memory equals the
+        // user-turn half of the DB-side `HOT_TAIL_PAIRS * 2` row count.  With
+        // 5 historical user turns and HOT_TAIL_PAIRS = 3 we keep 3 user
+        // turns (index of 3rd-from-last user = 5).  Each preserved user
+        // turn carries its assistant reply → 3 pairs = 6 rows, matching
+        // `hot_tail()`.
+        let msgs = vec![
+            Message::system("sys"),
+            Message::user("u0"),
+            Message::assistant(Some("a0".into()), vec![]),
+            Message::user("u1"),
+            Message::assistant(Some("a1".into()), vec![]),
+            Message::user("u2"),
+            Message::assistant(Some("a2".into()), vec![]),
+            Message::user("u3"),
+            Message::assistant(Some("a3".into()), vec![]),
+            Message::user("u4"),
+        ];
+        let start = find_hot_tail_start(&msgs, HOT_TAIL_PAIRS);
+        // Count user turns from `start` to end.
+        let preserved_users = msgs[start..].iter().filter(|m| m.role == "user").count();
+        assert_eq!(preserved_users, HOT_TAIL_PAIRS);
+    }
+
+    #[test]
+    fn build_messages_own_summary_marker_matches_compact_head_end_guard() {
+        // Invariant: the exact marker string that `build_messages()` injects
+        // as the own_summary user turn must match the prefix that
+        // `compact_in_loop`'s head_end guard looks for.  If either string
+        // drifts the guard silently stops preserving the running summary
+        // and it gets fed to the summariser on every compact.
+        let history = make_history(1);
+        let msgs = build_messages(
+            "q",
+            None,
+            &history,
+            &[],
+            Some("- Did X earlier."),
+            "claude-sonnet-4.6",
+        );
+        // msgs[1] should be the own_summary user label.
+        let label = msgs[1].content.as_deref().unwrap_or("");
+        assert!(
+            label.starts_with("[Summary of earlier in this session]"),
+            "own_summary user marker drifted: {label:?}"
+        );
+        // And msgs[2] should be the assistant-role summary body.
+        assert_eq!(msgs[2].role, "assistant");
     }
 
     #[test]
