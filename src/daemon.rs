@@ -2300,16 +2300,19 @@ async fn compact_in_loop(
             let conn = db.lock().unwrap_or_else(|p| p.into_inner());
             let total = memory_db::count_session_turns(&conn, &sid_owned)?;
             let to_archive_count = total.saturating_sub(keep_recent);
-            if to_archive_count == 0 {
-                return Ok(());
-            }
-            let rows = memory_db::get_session_oldest(&conn, &sid_owned, to_archive_count)?;
-            let ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
+            // Always persist the summary (even when nothing is archived) so a
+            // later resume rebuilds from the compacted state rather than the
+            // raw history — the in-memory splice has already happened, so
+            // skipping the DB write here would desync memory vs. persistence.
             let tx = conn
                 .unchecked_transaction()
                 .context("compact_in_loop: begin transaction")?;
             memory_db::store_session_summary(&conn, &sid_owned, &summary_text, &ts)?;
-            memory_db::archive_session_turns(&conn, &ids)?;
+            if to_archive_count > 0 {
+                let rows = memory_db::get_session_oldest(&conn, &sid_owned, to_archive_count)?;
+                let ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
+                memory_db::archive_session_turns(&conn, &ids)?;
+            }
             tx.commit().context("compact_in_loop: commit transaction")?;
             Ok(())
         })
