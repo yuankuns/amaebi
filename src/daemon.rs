@@ -2654,9 +2654,14 @@ where
     let mut last_prompt_tokens: usize;
     // Mutable so switch_model tool calls can change the model mid-session.
     let mut current_model = model.to_string();
-    // Circuit breaker: once we exhaust MAX_CONSECUTIVE_COMPACT_FAILURES in a row,
-    // stop attempting in-loop compaction so the loop cannot hammer the API in a
-    // retry storm when the context is irrecoverably over the limit.
+    // Circuit breaker: once we exhaust MAX_CONSECUTIVE_COMPACT_FAILURES in a row
+    // within this loop invocation, stop attempting in-loop compaction so the
+    // loop cannot hammer the API in a retry storm when the context is
+    // irrecoverably over the limit.  Scope is intentionally per-invocation —
+    // each new user message starts a fresh `run_agentic_loop` with the
+    // counter reset to 0, so a transient failure (rate limit, flake) on one
+    // turn does not permanently disable compaction for the rest of the
+    // session.
     let mut consecutive_compact_failures: u32 = 0;
 
     // Per-run scratch directory for large tool outputs (unix only).
