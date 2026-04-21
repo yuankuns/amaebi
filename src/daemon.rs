@@ -1184,6 +1184,14 @@ fn capture_pane_text(pane_id: &str) -> String {
 }
 
 /// Send literal text + Enter to a tmux pane (best-effort).
+///
+/// Sends the text with `send-keys -l --` (literal, no keyname interpretation),
+/// pauses for 1 s to let the receiving TUI's paste buffer drain, then sends
+/// Enter as a separate key press.  The pause matches the `handle_claude_launch`
+/// injection path (daemon.rs:1081) and exists because Claude Code's TUI can
+/// swallow or defer the trailing Enter when it arrives before the pasted text
+/// has been rendered into the input field — which manifests as a STEER
+/// message appearing in the pane input but never submitting.
 fn send_pane_keys(pane_id: &str, text: &str) {
     match std::process::Command::new("tmux")
         .args(["send-keys", "-t", pane_id, "-l", "--", text])
@@ -1197,6 +1205,8 @@ fn send_pane_keys(pane_id: &str, text: &str) {
         }
         _ => {}
     }
+    // Let the TUI process the pasted text before pressing Enter.
+    std::thread::sleep(std::time::Duration::from_secs(1));
     match std::process::Command::new("tmux")
         .args(["send-keys", "-t", pane_id, "Enter"])
         .status()
