@@ -2095,7 +2095,22 @@ fn compaction_boundaries(messages: &[Message]) -> (usize, usize) {
     {
         head_end += 2;
     }
-    let tail_start = find_hot_tail_start(messages, HOT_TAIL_PAIRS).max(head_end);
+    // `find_hot_tail_start` returns `messages.len()` as a sentinel meaning
+    // "≤1 user turn, nothing historical to split off".  If we let that
+    // through, `tail_start` would be `messages.len()` and the caller's
+    // middle slice would cover everything from `head_end` to the end —
+    // including the active user prompt and any trailing assistant/tool
+    // messages.  Splicing that away would either overwrite the current
+    // prompt or leave messages ending on an assistant turn (which the
+    // Bedrock converse endpoint rejects with 400 "must end with a user
+    // message").  Collapse to `head_end` so the caller sees "nothing to
+    // compact" and bails cleanly.
+    let raw_tail_start = find_hot_tail_start(messages, HOT_TAIL_PAIRS);
+    let tail_start = if raw_tail_start >= messages.len() {
+        head_end
+    } else {
+        raw_tail_start.max(head_end)
+    };
     (head_end, tail_start)
 }
 
@@ -3991,6 +4006,34 @@ mod tests {
         );
         // And msgs[2] should be the assistant-role summary body.
         assert_eq!(msgs[2].role, "assistant");
+    }
+
+    #[test]
+    fn compactable_middle_tokens_zero_when_only_current_prompt() {
+        // Regression: when messages = [system*, user_prompt] (only the
+        // active user prompt, no history), `find_hot_tail_start` returns
+        // the `messages.len()` sentinel.  Previously `compaction_boundaries`
+        // would let that sentinel survive as `tail_start`, making the
+        // caller's middle slice cover everything including the active
+        // prompt — so `compact_in_loop` would splice it away and leave
+        // messages ending on an assistant summary, which Bedrock rejects
+        // with a 400 "must end with a user message".
+        //
+        // `compactable_middle_tokens` must return 0 in this case so the
+        // pre-send threshold check in `run_agentic_loop` does NOT invoke
+        // `compact_in_loop` at all.
+        let msgs = vec![
+            Message::system("base"),
+            Message::system("soul"),
+            Message::system("agents"),
+            Message::user("first prompt in fresh session"),
+        ];
+        assert_eq!(compactable_middle_tokens(&msgs), 0);
+        let (head_end, tail_start) = compaction_boundaries(&msgs);
+        assert_eq!(
+            tail_start, head_end,
+            "boundaries must collapse so middle is empty (got head_end={head_end}, tail_start={tail_start})"
+        );
     }
 
     #[test]
