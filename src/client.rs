@@ -3730,7 +3730,7 @@ mod tests {
     fn parse_claude_unicode_whitespace_ideographic_space() {
         // Chinese IMEs often produce U+3000 (ideographic space).
         let input = "/claude\u{3000}\"do something\"";
-        let result = parse_claude_command(input);
+        let result = parse_claude(input);
         let tasks = result.expect("should be Some").expect("should be Ok");
         assert_eq!(tasks[0].description, "do something");
     }
@@ -3738,7 +3738,7 @@ mod tests {
     #[test]
     fn parse_claude_unicode_whitespace_nbsp() {
         let input = "/claude\u{00A0}\"do something\"";
-        let result = parse_claude_command(input);
+        let result = parse_claude(input);
         let tasks = result.expect("should be Some").expect("should be Ok");
         assert_eq!(tasks[0].description, "do something");
     }
@@ -3746,13 +3746,13 @@ mod tests {
     #[test]
     fn parse_claude_no_whitespace_returns_none() {
         // "/claudefoo" is not a /claude command.
-        assert!(parse_claude_command("/claudefoo").is_none());
+        assert!(parse_claude("/claudefoo").is_none());
     }
 
     #[test]
     fn parse_claude_cwd_flag() {
         let input = r#"/claude --cwd /tmp/myrepo "fix the bug""#;
-        let result = parse_claude_command(input);
+        let result = parse_claude(input);
         let tasks = result.expect("should be Some").expect("should be Ok");
         assert_eq!(tasks[0].description, "fix the bug");
         // cwd is canonicalized; /tmp exists so it should resolve.
@@ -3762,7 +3762,7 @@ mod tests {
     #[test]
     fn parse_claude_cwd_missing_arg_returns_err() {
         let input = "/claude --cwd";
-        let result = parse_claude_command(input);
+        let result = parse_claude(input);
         let err = result.expect("should be Some").unwrap_err();
         assert!(err.contains("--cwd requires a path"));
     }
