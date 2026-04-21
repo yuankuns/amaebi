@@ -1157,11 +1157,15 @@ async fn handle_claude_launch(
     Ok(())
 }
 
-/// Capture the last 60 lines of a tmux pane as plain text.
+/// Capture the last 200 lines of a tmux pane as plain text.
 /// Returns an empty string on failure so supervision can continue.
+///
+/// 200-line window matches Claude Code's own default capture depth — enough
+/// that a busy pane (tool outputs, build logs) still shows what the Claude
+/// agent most recently did, not just the idle prompt that followed.
 fn capture_pane_text(pane_id: &str) -> String {
     match std::process::Command::new("tmux")
-        .args(["capture-pane", "-t", pane_id, "-p", "-S", "-60"])
+        .args(["capture-pane", "-t", pane_id, "-p", "-S", "-200"])
         .output()
     {
         Ok(output) => {
@@ -1179,6 +1183,55 @@ fn capture_pane_text(pane_id: &str) -> String {
         Err(e) => {
             tracing::warn!(pane_id, error = %e, "failed to spawn tmux capture-pane");
             String::new()
+        }
+    }
+}
+
+/// Wait until the target pane's output has been stable for `idle_secs`, or
+/// until `timeout` elapses, then return the final snapshot.
+///
+/// This is the supervision-side equivalent of the `tmux_wait` LLM tool: the
+/// supervisor gets a *stable* pane snapshot (not mid-render garbage) but
+/// also gives up after `timeout` so a long-running Claude session cannot
+/// block supervision indefinitely.
+///
+/// Returns `(snapshot, idle)` — `idle=true` when the pane stabilised before
+/// timeout, `idle=false` when we hit the timeout with the pane still active.
+/// Either way the snapshot is the latest captured content, suitable for
+/// feeding to the supervision LLM.
+async fn wait_for_pane_idle(
+    pane_id: &str,
+    idle: std::time::Duration,
+    timeout: std::time::Duration,
+    poll: std::time::Duration,
+) -> (String, bool) {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let pid = pane_id.to_owned();
+    let mut last_content = {
+        let pid = pid.clone();
+        tokio::task::spawn_blocking(move || capture_pane_text(&pid))
+            .await
+            .unwrap_or_default()
+    };
+    let mut stable_since = tokio::time::Instant::now();
+
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            return (last_content, false);
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let sleep_dur = poll.min(remaining);
+        tokio::time::sleep(sleep_dur).await;
+
+        let pid = pid.clone();
+        let content = tokio::task::spawn_blocking(move || capture_pane_text(&pid))
+            .await
+            .unwrap_or_default();
+        if content != last_content {
+            last_content = content;
+            stable_since = tokio::time::Instant::now();
+        } else if stable_since.elapsed() >= idle {
+            return (last_content, true);
         }
     }
 }
@@ -1242,8 +1295,11 @@ async fn handle_supervision(
     state: &Arc<DaemonState>,
     session_id: Option<String>,
 ) -> Result<()> {
-    // How long to wait between checks. Default 60 s; override with
-    // AMAEBI_SUPERVISION_INTERVAL_SECS.
+    // Max time to wait between LLM checks.  Default 60 s; override with
+    // AMAEBI_SUPERVISION_INTERVAL_SECS.  This is the *ceiling*: each iteration
+    // actually waits for the pane to go idle (see `IDLE_SECS` below) so that
+    // the snapshot fed to the LLM is stable, and only falls back to the
+    // ceiling when Claude is continuously producing output.
     let poll_interval = tokio::time::Duration::from_secs(
         std::env::var("AMAEBI_SUPERVISION_INTERVAL_SECS")
             .ok()
@@ -1251,6 +1307,10 @@ async fn handle_supervision(
             .unwrap_or(60u64)
             .max(1), // clamp to >= 1 s to prevent a tight loop
     );
+    // How long a pane must be unchanged to be considered idle.  3 s matches
+    // the default of the `tmux_wait` LLM tool.
+    const IDLE_SECS: u64 = 3;
+    const IDLE_POLL_SECS: u64 = 2;
 
     // Hard wall-clock limit before supervision gives up. Default 10 hours;
     // override with AMAEBI_SUPERVISION_TIMEOUT_SECS.
@@ -1267,6 +1327,12 @@ async fn handle_supervision(
     let deadline = supervision_start + max_duration;
     let mut turn: u64 = 0;
 
+    // Remember the previous turn's verdict so the LLM has continuity across
+    // iterations (e.g. "last turn you STEERed X; did Claude pick it up?").
+    // Stored as a short one-line summary that we feed back into `user_content`
+    // on the next iteration.
+    let mut last_verdict: Option<String> = None;
+
     // Load skill files (SOUL.md, AGENTS.md, GPU_KERNEL.md) once and reuse
     // across all supervision turns so the LLM has project context for
     // higher-quality STEER decisions.
@@ -1274,17 +1340,32 @@ async fn handle_supervision(
 
     let system_prompt =
         "You are supervising a Claude Code session executing a task in a tmux pane.\n\
-        Analyse the provided pane content and respond with EXACTLY ONE of these formats:\n\
+        Compare the pane content to the task description and respond with EXACTLY ONE of:\n\
         \n\
         WAIT: <one sentence — what is Claude currently doing?>\n\
-          Claude is on track. No intervention needed.\n\
+          Claude is actively working AND on track. No intervention needed.\n\
+          Use WAIT as the default when you're not certain between WAIT and DONE/STEER.\n\
         \n\
         STEER: <pane_id>: <message to send>\n\
-          Claude needs correction. The message will be typed into the pane.\n\
-          Use when Claude is stuck, going in the wrong direction, or needs context.\n\
+          Claude needs input or correction. The message will be typed into the pane.\n\
+          Use STEER when:\n\
+          - Claude is at an idle prompt and is ASKING A QUESTION or presenting OPTIONS\n\
+            (e.g. 'Should I also do X?', 'Which approach would you prefer?') — answer it.\n\
+          - Claude reports partial completion and the task description is NOT fully done yet\n\
+            (e.g. claims 'step 1 done' but step 2 was also requested).\n\
+          - Claude is stuck on an error and a concrete hint will unblock it.\n\
+          - Claude is going in the wrong direction vs. the task description.\n\
         \n\
         DONE: <paragraph summary of what was accomplished>\n\
-          The task is complete and Claude has returned to its idle prompt.\n\
+          The task is FULLY complete. Require ALL of:\n\
+          1. Pane shows an explicit completion signal — a finished report, passing tests,\n\
+             a merged PR URL, 'done', '✓', 'all tests passed', or similar.\n\
+          2. That completion directly covers the task description given at session start\n\
+             (not just a sub-step or unrelated output).\n\
+          3. Claude is no longer working (idle prompt or returned to shell).\n\
+          An idle prompt alone is NOT sufficient — Claude may be waiting for user input\n\
+          (see STEER) or may have been interrupted. If unsure, prefer WAIT and re-check\n\
+          next turn.\n\
         \n\
         Your response must start with WAIT:, STEER:, or DONE: — nothing else before it."
             .to_string();
@@ -1307,10 +1388,22 @@ async fn handle_supervision(
             return Ok(());
         }
 
-        // --- Interruptible sleep (skip on first iteration) ---
+        // --- Interruptible wait-for-pane-idle (skip on first iteration) ---
+        // Instead of a blind fixed-interval sleep, wait until the first pane
+        // in the set has been stable for IDLE_SECS seconds, falling back to
+        // `poll_interval` as the hard ceiling if the pane stays active.  This
+        // guarantees the snapshot we feed to the LLM is not mid-render and
+        // that busy Claude sessions do not waste LLM calls on near-identical
+        // frames.  Client `Interrupt` frames still preempt the wait.
         if turn > 0 {
-            let sleep = tokio::time::sleep(poll_interval);
-            tokio::pin!(sleep);
+            let primary_pane = panes.first().map(|t| t.pane_id.clone()).unwrap_or_default();
+            let wait_fut = wait_for_pane_idle(
+                &primary_pane,
+                std::time::Duration::from_secs(IDLE_SECS),
+                poll_interval,
+                std::time::Duration::from_secs(IDLE_POLL_SECS),
+            );
+            tokio::pin!(wait_fut);
             let interrupted = loop {
                 tokio::select! {
                     biased;
@@ -1334,7 +1427,7 @@ async fn handle_supervision(
                             }
                         }
                     }
-                    _ = &mut sleep => break false,
+                    _ = &mut wait_fut => break false,
                 }
             };
             if interrupted {
@@ -1417,8 +1510,16 @@ async fn handle_supervision(
             ));
         }
 
+        // Thread the previous verdict into the prompt so the LLM can judge
+        // whether its last STEER landed, whether Claude actually finished
+        // the step it last reported, etc.  First iteration sends "(none)".
+        let prior = last_verdict
+            .as_deref()
+            .unwrap_or("(none yet — this is the first check)");
         let user_content = format!(
-            "Current pane snapshots (check #{turn}, elapsed {elapsed_mins}m):\n\n{pane_snapshots}"
+            "Current pane snapshots (check #{turn}, elapsed {elapsed_mins}m):\n\n\
+             {pane_snapshots}\n\
+             Your previous verdict this session: {prior}"
         );
 
         let mut messages = vec![Message::system(system_prompt.clone())];
@@ -1526,6 +1627,17 @@ async fn handle_supervision(
                 format!("  → WAIT: {note}\n")
             }
         };
+        // Remember this verdict (minus the display prefix) so the next
+        // iteration can pass it back into the user prompt.  `verdict_line`
+        // starts with "  → " and ends with "\n"; strip both for a compact
+        // one-line carry-over.
+        last_verdict = Some(
+            verdict_line
+                .trim_start_matches("  → ")
+                .trim_end_matches('\n')
+                .to_string(),
+        );
+
         let mut w = writer.lock().await;
         write_frame(
             &mut *w,
