@@ -109,6 +109,16 @@ const HOT_TAIL_PAIRS: usize = 3;
 const MAX_SUMMARIES: usize = 5;
 /// Maximum chars per injected past-session summary.
 const MAX_SUMMARY_CHARS: usize = 500;
+/// Stop attempting in-loop compaction after this many consecutive failures.
+/// Mirrors Claude Code's `MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES` circuit breaker
+/// so an irrecoverably-oversized context does not trigger a retry storm.
+const MAX_CONSECUTIVE_COMPACT_FAILURES: u32 = 3;
+/// Cap on the summariser's `max_tokens`.  The summary prompt asks for 3-5
+/// bullet points; hard-capping the output budget prevents a verbose summary
+/// from failing to reduce context (which would re-trigger compaction on the
+/// next iteration).  Matches the same order of magnitude as the DB-persisted
+/// summary truncation in [`MAX_SUMMARY_CHARS`].
+const COMPACT_SUMMARY_MAX_TOKENS: usize = 2_048;
 
 /// State shared across all concurrent client connections via `Arc`.
 pub struct DaemonState {
@@ -390,17 +400,6 @@ where
     })?
 }
 
-/// Return the last `HOT_TAIL_PAIRS * 2` entries of `history`, or the whole
-/// slice when it is shorter.  Used to trim over-budget message lists.
-fn hot_tail(history: &[memory_db::DbMemoryEntry]) -> &[memory_db::DbMemoryEntry] {
-    let hot = HOT_TAIL_PAIRS * 2;
-    if history.len() > hot {
-        &history[history.len() - hot..]
-    } else {
-        history
-    }
-}
-
 /// Load the three pieces of session state needed to build a message list.
 ///
 /// Returns `(history, summaries, own_summary)`.  On error, logs a warning and
@@ -424,46 +423,6 @@ async fn load_session_state(
         tracing::warn!(error = %e, session_id, "failed to load session state");
         (vec![], vec![], None)
     })
-}
-
-/// Build a message list from session state, trim to the token budget, and
-/// inject skill files.
-///
-/// Injects skill files into the full-history list first so the threshold check
-/// accounts for their token cost (AGENTS.md/SOUL.md can be large).  If the
-/// result still exceeds the budget, rebuilds with the hot-tail history slice
-/// and injects again so the returned messages always include the skill files.
-async fn build_and_trim_messages(
-    prompt: &str,
-    tmux_pane: Option<&str>,
-    history: &[memory_db::DbMemoryEntry],
-    summaries: &[String],
-    own_summary: Option<&str>,
-    model: &str,
-) -> (Vec<Message>, bool) {
-    let threshold = compaction_threshold_tokens(model);
-    // Load skill files once — reused in both the full and trimmed builds so
-    // disk reads and log lines are not duplicated on a threshold-triggered rebuild.
-    let skill_msgs = load_skill_messages().await;
-    // Build with full history and splice in skill files so the threshold check
-    // accounts for their token cost (AGENTS.md / SOUL.md can be large).
-    let mut msgs = build_messages(prompt, tmux_pane, history, summaries, own_summary, model);
-    splice_skill_messages(&mut msgs, skill_msgs.clone());
-    if count_message_tokens(&msgs) > threshold {
-        // Rebuild with trimmed history and re-splice the already-loaded skill files.
-        msgs = build_messages(
-            prompt,
-            tmux_pane,
-            hot_tail(history),
-            summaries,
-            own_summary,
-            model,
-        );
-        splice_skill_messages(&mut msgs, skill_msgs);
-        (msgs, true)
-    } else {
-        (msgs, false)
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -598,20 +557,22 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                     })
                     .await
                     .unwrap_or_default();
-                    let (messages, _) = build_and_trim_messages(
-                        &prompt,
-                        tmux_pane.as_deref(),
-                        &history,
-                        &[],
-                        None,
-                        &model,
-                    )
-                    .await;
+                    let mut messages =
+                        build_messages(&prompt, tmux_pane.as_deref(), &history, &[], None, &model);
+                    inject_skill_files(&mut messages).await;
                     let mut sink = tokio::io::sink();
                     let (_, mut steer_rx) = tokio::sync::mpsc::channel::<Option<String>>(1);
                     let task_desc = truncate_chars(&prompt, 200);
-                    match run_agentic_loop(&state, &model, messages, &mut sink, &mut steer_rx, true)
-                        .await
+                    match run_agentic_loop(
+                        &state,
+                        &model,
+                        messages,
+                        &mut sink,
+                        &mut steer_rx,
+                        true,
+                        Some(&sid),
+                    )
+                    .await
                     {
                         Ok((final_text, _, _, _)) => {
                             store_conversation(
@@ -746,6 +707,7 @@ async fn drive_agentic_loop(
     let writer_loop = Arc::clone(writer);
     let state_loop = Arc::clone(state);
     let model_loop = model.to_owned();
+    let sid_loop = expected_sid.to_owned();
     let mut loop_handle = tokio::spawn(async move {
         let mut w = writer_loop.lock().await;
         run_agentic_loop(
@@ -755,6 +717,7 @@ async fn drive_agentic_loop(
             &mut *w,
             &mut steer_rx,
             true,
+            Some(&sid_loop),
         )
         .await
     });
@@ -1388,15 +1351,15 @@ async fn handle_resume_request(
         }
     }
     let (history, summaries, own_summary) = load_session_state(state, &session_id).await;
-    let (messages, _) = build_and_trim_messages(
+    let mut messages = build_messages(
         &prompt,
         tmux_pane.as_deref(),
         &history,
         &summaries,
         own_summary.as_deref(),
         &model,
-    )
-    .await;
+    );
+    inject_skill_files(&mut messages).await;
     let Some(result) =
         drive_agentic_loop(state, writer, conn_state, &session_id, messages, &model).await
     else {
@@ -1492,8 +1455,15 @@ async fn handle_chat_request(
     }
 
     // First turn: load history from DB.  Subsequent turns: extend carried messages.
-    // Apply token-budget trim either way so long-lived connections stay bounded.
-    let (messages, pre_flight_trimmed) = if let Some(mut prev) = carried_messages.take() {
+    //
+    // No pre-flight trim here: `run_agentic_loop` runs a synchronous
+    // compaction check before every `invoke_model` call and archives exactly
+    // the DB turns it summarises.  A pre-flight `hot_tail` trim would drop
+    // older DB rows from memory without the summariser ever seeing them,
+    // and the subsequent DB archive would then silently lose their content
+    // on future resumes.  Feeding the full history through is also what
+    // keeps the in-memory middle and the persisted archive aligned.
+    let messages = if let Some(mut prev) = carried_messages.take() {
         // Update the model name in the system message so the LLM always knows
         // what model it's currently running as, even after a /model switch.
         if let Some(sys) = prev.first_mut() {
@@ -1506,23 +1476,7 @@ async fn handle_chat_request(
         prev.push(Message::user(prompt.clone()));
         // Do NOT re-inject skill files — they were injected on the first turn and are
         // already in `prev`.  Re-injecting every turn grows context unboundedly.
-        let threshold_inner = compaction_threshold_tokens(&model);
-        if count_message_tokens(&prev) > threshold_inner {
-            // Rebuild from persisted history when over budget.
-            let (hist2, sum2, own2) = load_session_state(state, &sid).await;
-            let mut rebuilt = build_messages(
-                &prompt,
-                tmux_pane.as_deref(),
-                hot_tail(&hist2),
-                &sum2,
-                own2.as_deref(),
-                &model,
-            );
-            inject_skill_files(&mut rebuilt).await;
-            (rebuilt, true)
-        } else {
-            (prev, false)
-        }
+        prev
     } else {
         let (history, summaries, own_summary) = load_session_state(state, &sid).await;
 
@@ -1543,18 +1497,18 @@ async fn handle_chat_request(
             }
         }
 
-        build_and_trim_messages(
+        let mut msgs = build_messages(
             &prompt,
             tmux_pane.as_deref(),
             &history,
             &summaries,
             own_summary.as_deref(),
             &model,
-        )
-        .await
+        );
+        inject_skill_files(&mut msgs).await;
+        msgs
     };
 
-    let pre_send_tokens = count_message_tokens(&messages);
     // If the client explicitly changed the model (e.g. via /model), it wins
     // over carried_model from a previous switch_model call.  This ensures
     // suffixes like [1m] are not lost.
@@ -1570,7 +1524,6 @@ async fn handle_chat_request(
         }
         None => model,
     };
-    let threshold = compaction_threshold_tokens(&effective_model);
     let Some(loop_result) =
         drive_agentic_loop(state, writer, conn_state, &sid, messages, &effective_model).await
     else {
@@ -1579,7 +1532,7 @@ async fn handle_chat_request(
     flush_pending_unsolicited(writer, conn_state.pending_unsolicited).await;
 
     match loop_result {
-        Ok((response_text, prompt_tokens, final_messages, final_model)) => {
+        Ok((response_text, _prompt_tokens, final_messages, final_model)) => {
             store_conversation(
                 state,
                 &sid,
@@ -1587,31 +1540,11 @@ async fn handle_chat_request(
                 &truncate_chars(&response_text, MAX_RESPONSE_CHARS),
             )
             .await;
-            let effective_tokens = if prompt_tokens > 0 {
-                prompt_tokens
-            } else {
-                pre_send_tokens
-            };
+            // Compaction is now driven synchronously from inside the agentic
+            // loop (see `compact_in_loop`), so no post-loop spawn is needed:
+            // by the time we reach this branch, `final_messages` is already
+            // bounded by the compaction threshold.
             let mut w = writer.lock().await;
-            if pre_flight_trimmed || effective_tokens > threshold {
-                tracing::info!(session=%sid, effective_tokens, threshold, "compacting conversation history");
-                let _ = write_frame(&mut *w, &Response::Compacting).await;
-                let already = {
-                    let mut g = state
-                        .compacting_sessions
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner());
-                    !g.insert(sid.clone())
-                };
-                if !already {
-                    tokio::spawn(compact_session(
-                        Arc::clone(state),
-                        sid.clone(),
-                        compact_model(&effective_model),
-                        HOT_TAIL_PAIRS * 2,
-                    ));
-                }
-            }
             write_frame(&mut *w, &Response::Done).await?;
             drop(w);
             *carried_messages = Some(final_messages);
@@ -2103,6 +2036,274 @@ async fn compact_session(
     // _guard is dropped here (and on any earlier return), releasing the slot.
 }
 
+/// Find the index at which a safe "hot tail" begins in a message list.
+///
+/// The hot tail starts at a `user`-role message so tool_call/tool_result
+/// pairings are never split (an orphan `tool` result with no preceding
+/// `assistant` tool_call would be rejected by every provider).
+///
+/// `desired_pairs` is the number of **user/assistant pairs** (i.e. user
+/// turns) to keep in the tail.
+///
+/// Always leaves at least one user turn in the middle so the compactor has
+/// something to summarise.  When there is only one user message in the
+/// list, returns `messages.len()` — the caller must treat that as
+/// "nothing to summarise" and bail out.
+fn find_hot_tail_start(messages: &[Message], desired_pairs: usize) -> usize {
+    if messages.is_empty() {
+        return 0;
+    }
+    let user_indexes: Vec<usize> = messages
+        .iter()
+        .enumerate()
+        .filter_map(|(i, m)| (m.role == "user").then_some(i))
+        .collect();
+    let n_users = user_indexes.len();
+    if n_users <= 1 {
+        // Zero or one user turn: nothing historical to split off.
+        return messages.len();
+    }
+    // Leave at least one user turn in the middle for the summariser, so cap
+    // the tail at (n_users - 1) user turns.
+    let tail_user_count = desired_pairs.min(n_users - 1);
+    user_indexes[n_users - tail_user_count]
+}
+
+/// Synchronously compact `messages` in-place when it exceeds the token threshold.
+///
+/// Called from [`run_agentic_loop`] before each `invoke_model` call.  On success:
+/// 1. Generates a summary via a dedicated LLM call (non-streaming, no tools,
+///    cheap default model preserving provider prefix).
+/// 2. Replaces the middle of `messages` with a
+///    `[user "[Compacted summary]"] [assistant <summary>]` pair, keeping the
+///    leading system/skill block and a trailing hot tail.
+/// 3. If `session_id` is `Some`, archives the corresponding DB turns and
+///    upserts the session summary so future resumes start from the compacted
+///    state rather than the raw history.
+///
+/// Returns `Ok(())` on success, `Err(_)` on failure — the caller increments a
+/// consecutive-failure counter and trips a circuit breaker after repeated
+/// failures so an irrecoverably-oversized context cannot loop forever.
+async fn compact_in_loop(
+    state: &DaemonState,
+    messages: &mut Vec<Message>,
+    main_model: &str,
+    session_id: Option<&str>,
+) -> Result<()> {
+    // Partition: [system/skill head] + [preserved own_summary prefix, if any]
+    // + [middle to summarise] + [hot tail].
+    //
+    // Leading system (and any skill system messages immediately after) are
+    // preserved so the agent keeps its identity and loaded skills post-compact.
+    // When `build_messages()` has injected the running session summary
+    // immediately after that head as a user/assistant pair (see `own_summary`
+    // handling in `build_messages`), preserve that pair too — otherwise the
+    // summariser would re-summarise or discard the already-stored running
+    // summary, causing summary drift across turns.
+    let mut head_end = messages
+        .iter()
+        .position(|m| m.role != "system")
+        .unwrap_or(messages.len());
+    if head_end + 1 < messages.len()
+        && messages[head_end].role == "user"
+        && messages[head_end]
+            .content
+            .as_deref()
+            .is_some_and(|s| s.starts_with("[Summary of earlier in this session]"))
+        && messages[head_end + 1].role == "assistant"
+    {
+        head_end += 2;
+    }
+
+    let tail_start = find_hot_tail_start(messages, HOT_TAIL_PAIRS);
+    // `find_hot_tail_start` returns `messages.len()` as a sentinel meaning
+    // "nothing historical to split off" (≤1 user turn).  If we spliced at
+    // that point we would overwrite the active user prompt and leave the
+    // message list ending with the assistant summary — an invalid request
+    // shape for every provider.  Bail in that case.
+    if tail_start >= messages.len() {
+        anyhow::bail!("compact_in_loop: no hot tail boundary (would overwrite current prompt)");
+    }
+    let tail_start = tail_start.max(head_end);
+    if tail_start <= head_end {
+        anyhow::bail!("compact_in_loop: no middle section to summarise");
+    }
+
+    // Build a self-contained summariser prompt that does not inherit the
+    // agent's tool schemas — the summariser must never execute tools.
+    // Only user text and assistant text turns are kept: tool_call-only
+    // assistant turns (content=None, tool_calls!=[]) and `tool` results
+    // carry no durable semantics once the surrounding assistant text has
+    // described the outcome, and sending empty assistant messages would
+    // add noise to the summariser input.
+    let middle = &messages[head_end..tail_start];
+    let mut summary_msgs = vec![Message::system(
+        "You are a memory compactor. Output 3-5 bullet points capturing the key outcomes, \
+         decisions, and facts. Be concise and factual. Output only the bullet points, no preamble.",
+    )];
+    for m in middle {
+        match m.role.as_str() {
+            "user" => {
+                if let Some(text) = m.content.as_deref() {
+                    if !text.is_empty() {
+                        summary_msgs.push(Message::user(text.to_owned()));
+                    }
+                }
+            }
+            "assistant" => {
+                // Skip tool-call-only turns (content=None or empty) — they
+                // add no information once the following assistant text has
+                // reported the outcome.
+                if let Some(text) = m.content.as_deref() {
+                    if !text.is_empty() {
+                        summary_msgs.push(Message::assistant(Some(text.to_owned()), vec![]));
+                    }
+                }
+            }
+            // Skip `tool` results and any other role — no durable semantics.
+            _ => {}
+        }
+    }
+    if summary_msgs
+        .last()
+        .is_some_and(|m| m.role == "assistant" || m.role == "system")
+    {
+        summary_msgs.push(Message::user(
+            "Summarise the conversation above into 3-5 bullet points.".to_owned(),
+        ));
+    }
+
+    // Use the cheap default model (sonnet) for the summary; preserve the
+    // provider prefix so e.g. copilot sessions stay on copilot.
+    let summary_model = compact_model(main_model);
+
+    // Cap the summariser's output so a verbose reply cannot defeat the whole
+    // point of compaction.  A bullet-point summary fits comfortably in 2k
+    // tokens; letting the model run up to `response_max_tokens` (half the
+    // context window) could return tens of thousands of tokens and keep the
+    // prompt over threshold, re-triggering compaction next iteration.
+    let summary_budget = COMPACT_SUMMARY_MAX_TOKENS.min(response_max_tokens(&summary_model));
+
+    let mut sink = tokio::io::sink();
+    let resp = invoke_model(
+        state,
+        &summary_model,
+        &summary_msgs,
+        &[],
+        summary_budget,
+        &mut sink,
+    )
+    .await
+    .context("compact_in_loop: summary model call failed")?;
+    let summary_text = resp.text.trim().to_owned();
+    if summary_text.is_empty() {
+        anyhow::bail!("compact_in_loop: empty summary");
+    }
+    // Truncate to the same cap `build_messages()` applies to `own_summary`
+    // on resume-injection (`MAX_SUMMARY_CHARS * 2`).  Storing a longer
+    // string is pointless — it would be silently re-truncated the next
+    // time the session resumes — and aligning the caps keeps in-memory
+    // and persisted forms identical.
+    let summary_text = truncate_chars(&summary_text, MAX_SUMMARY_CHARS * 2);
+
+    // Count the user turns in the summarised middle slice and derive the
+    // DB-row archive count from that.  `store_conversation` writes exactly
+    // two `memories` rows per turn (one `user`, one `assistant` text), so
+    // `user_turns * 2` is the authoritative DB row count for those turns.
+    //
+    // Counting *all* in-memory `user`/`assistant` messages here would be
+    // wrong: a single agentic turn can produce many in-memory assistant
+    // messages (tool-call-only turns, intermediate text) that are never
+    // persisted.  Including them would inflate `summarised_row_count`
+    // and cause `archive_session_turns` to overshoot into real DB rows
+    // the summariser never saw — silently losing their content on resume.
+    let middle_user_count = messages[head_end..tail_start]
+        .iter()
+        .filter(|m| m.role == "user")
+        .count();
+    let summarised_row_count = middle_user_count * 2;
+
+    let pre_tokens = count_message_tokens(messages);
+
+    // Replace [head_end..tail_start] with a user/assistant summary pair.
+    // Use the SAME marker string that `build_messages()` uses for
+    // own_summary injection so that on a subsequent in-loop compaction
+    // within the same connection the `head_end` guard (which looks for
+    // this exact marker) preserves this pair rather than feeding it
+    // back to the summariser — and so `summarised_row_count` cannot
+    // include synthetic in-memory rows that have no DB-row counterpart
+    // (which would make the archive step overshoot).
+    let replacement = vec![
+        Message::user("[Summary of earlier in this session]".to_owned()),
+        Message::assistant(Some(summary_text.clone()), vec![]),
+    ];
+    messages.splice(head_end..tail_start, replacement);
+    let post_tokens = count_message_tokens(messages);
+    tracing::info!(
+        session = ?session_id,
+        pre_tokens,
+        post_tokens,
+        "compact_in_loop: summary applied"
+    );
+
+    // If the summary did not reduce the total token count at all, treat it
+    // as a compaction failure so the caller's circuit breaker can engage
+    // rather than hammering the API in a retry storm.  This catches the
+    // pathological case where a verbose summary is larger than the turns
+    // it replaced — which would otherwise re-trigger compaction on the
+    // very next iteration and loop forever.  We do NOT gate on the
+    // threshold itself: even a small reduction is progress, and a system
+    // prompt that alone exceeds the threshold is a configuration bug
+    // rather than something compaction can fix.
+    if post_tokens >= pre_tokens {
+        anyhow::bail!(
+            "compact_in_loop: summary did not reduce token count \
+             (pre={pre_tokens}, post={post_tokens})"
+        );
+    }
+
+    // Best-effort DB archive: persist the summary and mark exactly the
+    // turns that the summariser saw as archived so resuming this session
+    // later starts from the summary rather than replaying the raw history.
+    // Crucially we archive `summarised_row_count` (what was actually fed
+    // into the summariser) rather than `total - keep_recent`: pre-flight
+    // trimming in `handle_chat_request` can drop older DB rows from
+    // memory before `run_agentic_loop` starts, and archiving rows the
+    // summariser never saw would silently lose their content on resume
+    // (the summary would not cover them either).  Log and continue on
+    // failure.
+    if let Some(sid) = session_id {
+        let db = Arc::clone(&state.db);
+        let sid_owned = sid.to_owned();
+        let ts = chrono::Utc::now().to_rfc3339();
+        let archive_result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let conn = db.lock().unwrap_or_else(|p| p.into_inner());
+            // Always persist the summary (even when nothing is archived) so a
+            // later resume rebuilds from the compacted state rather than the
+            // raw history — the in-memory splice has already happened, so
+            // skipping the DB write here would desync memory vs. persistence.
+            let tx = conn
+                .unchecked_transaction()
+                .context("compact_in_loop: begin transaction")?;
+            memory_db::store_session_summary(&conn, &sid_owned, &summary_text, &ts)?;
+            if summarised_row_count > 0 {
+                let rows = memory_db::get_session_oldest(&conn, &sid_owned, summarised_row_count)?;
+                let ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
+                memory_db::archive_session_turns(&conn, &ids)?;
+            }
+            tx.commit().context("compact_in_loop: commit transaction")?;
+            Ok(())
+        })
+        .await
+        .unwrap_or_else(|e| Err(anyhow::anyhow!("compact_in_loop archive panicked: {e}")));
+        if let Err(e) = archive_result {
+            tracing::warn!(error = %e, session = %sid, "compact_in_loop: DB archive failed");
+        }
+    }
+
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Model dispatch
 // ---------------------------------------------------------------------------
@@ -2412,6 +2613,7 @@ pub(crate) async fn run_agentic_loop<W>(
     writer: &mut W,
     steer_rx: &mut tokio::sync::mpsc::Receiver<Option<String>>,
     include_spawn_agent: bool,
+    session_id: Option<&str>,
 ) -> Result<(String, usize, Vec<Message>, String)>
 where
     W: AsyncWriteExt + Unpin,
@@ -2423,6 +2625,10 @@ where
     let mut last_prompt_tokens: usize;
     // Mutable so switch_model tool calls can change the model mid-session.
     let mut current_model = model.to_string();
+    // Circuit breaker: once we exhaust MAX_CONSECUTIVE_COMPACT_FAILURES in a row,
+    // stop attempting in-loop compaction so the loop cannot hammer the API in a
+    // retry storm when the context is irrecoverably over the limit.
+    let mut consecutive_compact_failures: u32 = 0;
 
     // Per-run scratch directory for large tool outputs (unix only).
     // Intentionally not cleaned up on exit — see comment near ScratchDirGuard
@@ -2470,6 +2676,35 @@ where
             }
             // None = interrupt-only (no user message to inject; loop already
             // skipped the tool chain at execution time).  No SteerAck is sent.
+        }
+
+        // Pre-send compaction: if messages are about to exceed the model's
+        // compaction threshold, synchronously summarise the middle section
+        // before dispatching.  Claude Code does the same check at the start
+        // of every query iteration (query.ts:453).  The summariser uses the
+        // cheap default model (sonnet), not `current_model`.
+        //
+        // A circuit breaker caps consecutive failures so an irrecoverably
+        // oversized context does not trigger an infinite retry storm.
+        if consecutive_compact_failures < MAX_CONSECUTIVE_COMPACT_FAILURES {
+            let threshold = compaction_threshold_tokens(&current_model);
+            let current_tokens = count_message_tokens(&messages);
+            if current_tokens > threshold {
+                let _ = write_frame(writer, &Response::Compacting).await;
+                match compact_in_loop(state, &mut messages, &current_model, session_id).await {
+                    Ok(()) => {
+                        consecutive_compact_failures = 0;
+                    }
+                    Err(e) => {
+                        consecutive_compact_failures += 1;
+                        tracing::warn!(
+                            error = %e,
+                            attempt = consecutive_compact_failures,
+                            "compact_in_loop failed; continuing without compaction"
+                        );
+                    }
+                }
+            }
         }
 
         // All models route through the Copilot JWT endpoint; invoke_model
@@ -3379,7 +3614,16 @@ async fn run_cron_job(state: Arc<DaemonState>, job: &cron::CronJob) {
     let mut sink = tokio::io::sink();
     let (_, mut steer_rx) = tokio::sync::mpsc::channel::<Option<String>>(1);
 
-    let result = run_agentic_loop(&state, &model, messages, &mut sink, &mut steer_rx, true).await;
+    let result = run_agentic_loop(
+        &state,
+        &model,
+        messages,
+        &mut sink,
+        &mut steer_rx,
+        true,
+        Some(&session_id),
+    )
+    .await;
 
     let (output, run_ok) = match result {
         Ok((final_text, _, _, _)) => {
@@ -3611,6 +3855,147 @@ mod tests {
     fn count_message_tokens_empty_list() {
         // Empty list: only the 3 priming tokens.
         assert_eq!(count_message_tokens(&[]), 3);
+    }
+
+    // ------------------------------------------------------------------
+    // find_hot_tail_start tests — boundary selection for in-loop compaction
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn hot_tail_start_empty_returns_zero() {
+        assert_eq!(find_hot_tail_start(&[], 3), 0);
+    }
+
+    #[test]
+    fn hot_tail_start_single_user_returns_len() {
+        // Only one user turn means there is nothing historical to split off.
+        let msgs = vec![Message::system("sys"), Message::user("u0")];
+        assert_eq!(find_hot_tail_start(&msgs, 3), msgs.len());
+    }
+
+    #[test]
+    fn hot_tail_start_keeps_one_middle_user() {
+        // Four user turns, desired = 3 user turns.  Cap at n_users - 1 = 3,
+        // leaving exactly one user turn in the middle for the summariser.
+        let msgs = vec![
+            Message::system("sys"),
+            Message::user("u0"),
+            Message::assistant(Some("a0".into()), vec![]),
+            Message::user("u1"),
+            Message::assistant(Some("a1".into()), vec![]),
+            Message::user("u2"),
+            Message::assistant(Some("a2".into()), vec![]),
+            Message::user("u3"),
+        ];
+        // Tail starts at the 2nd user (index 3), leaving u0/a0 as the middle.
+        assert_eq!(find_hot_tail_start(&msgs, 3), 3);
+    }
+
+    #[test]
+    fn hot_tail_start_small_desired_keeps_most_as_middle() {
+        // Five user turns with desired = 1 user turn → tail starts at the
+        // last user turn (index 9), leaving u0..u3 + their assistants as
+        // the middle.
+        let msgs = vec![
+            Message::system("sys"),
+            Message::user("u0"),
+            Message::assistant(Some("a0".into()), vec![]),
+            Message::user("u1"),
+            Message::assistant(Some("a1".into()), vec![]),
+            Message::user("u2"),
+            Message::assistant(Some("a2".into()), vec![]),
+            Message::user("u3"),
+            Message::assistant(Some("a3".into()), vec![]),
+            Message::user("u4"),
+        ];
+        assert_eq!(find_hot_tail_start(&msgs, 1), 9);
+    }
+
+    #[test]
+    fn hot_tail_start_preserves_exactly_hot_tail_pairs_user_turns() {
+        // Invariant: the number of user turns preserved in-memory equals
+        // HOT_TAIL_PAIRS.  With 5 historical user turns and
+        // HOT_TAIL_PAIRS = 3 we keep the 3 most recent user turns, each
+        // with its assistant reply.
+        let msgs = vec![
+            Message::system("sys"),
+            Message::user("u0"),
+            Message::assistant(Some("a0".into()), vec![]),
+            Message::user("u1"),
+            Message::assistant(Some("a1".into()), vec![]),
+            Message::user("u2"),
+            Message::assistant(Some("a2".into()), vec![]),
+            Message::user("u3"),
+            Message::assistant(Some("a3".into()), vec![]),
+            Message::user("u4"),
+        ];
+        let start = find_hot_tail_start(&msgs, HOT_TAIL_PAIRS);
+        // Count user turns from `start` to end.
+        let preserved_users = msgs[start..].iter().filter(|m| m.role == "user").count();
+        assert_eq!(preserved_users, HOT_TAIL_PAIRS);
+    }
+
+    #[test]
+    fn build_messages_own_summary_marker_matches_compact_head_end_guard() {
+        // Invariant: the exact marker string that `build_messages()` injects
+        // as the own_summary user turn must match the prefix that
+        // `compact_in_loop`'s head_end guard looks for AND the marker that
+        // `compact_in_loop` itself writes when splicing a new summary pair.
+        //
+        // Unifying these three places means: (1) on resume, the injected
+        // own_summary pair is preserved by the head_end guard rather than
+        // re-summarised on every compaction; (2) within a single connection,
+        // a previously-spliced in-memory summary pair is also preserved by
+        // the same guard and therefore does NOT leak into `summarised_row_count`
+        // (which would cause the DB archive step to overshoot, archiving
+        // real rows that the summariser never saw).
+        let history = make_history(1);
+        let msgs = build_messages(
+            "q",
+            None,
+            &history,
+            &[],
+            Some("- Did X earlier."),
+            "claude-sonnet-4.6",
+        );
+        // msgs[1] should be the own_summary user label.
+        let label = msgs[1].content.as_deref().unwrap_or("");
+        assert_eq!(
+            label, "[Summary of earlier in this session]",
+            "own_summary user marker drifted: {label:?}"
+        );
+        // And msgs[2] should be the assistant-role summary body.
+        assert_eq!(msgs[2].role, "assistant");
+    }
+
+    #[test]
+    fn compact_in_loop_bails_when_only_current_prompt_present() {
+        // Regression: when the message list has ≤1 user turn (only the
+        // active prompt), find_hot_tail_start returns messages.len() as a
+        // sentinel.  compact_in_loop must detect that and bail rather than
+        // splicing over the current prompt and producing an invalid request
+        // ending on the assistant summary.
+        let msgs = vec![Message::system("sys"), Message::user("only prompt")];
+        let start = find_hot_tail_start(&msgs, 3);
+        assert_eq!(start, msgs.len(), "sentinel must equal messages.len()");
+    }
+
+    #[test]
+    fn hot_tail_start_boundary_is_always_a_user_role() {
+        // Invariant: whatever index is returned (if < len) must point at a
+        // user-role message so tool_call/tool_result pairings are not split.
+        let msgs = vec![
+            Message::system("sys"),
+            Message::user("u0"),
+            Message::assistant(Some("a0".into()), vec![]),
+            Message::user("u1"),
+            Message::assistant(Some("a1".into()), vec![]),
+            Message::user("u2"),
+        ];
+        let idx = find_hot_tail_start(&msgs, 3);
+        if idx < msgs.len() {
+            assert_eq!(msgs[idx].role, "user");
+        }
     }
 
     #[test]

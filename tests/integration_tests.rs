@@ -267,10 +267,13 @@ async fn test_compaction_triggered_at_threshold() {
     // while killing only the child process and cleaning up the socket.
     let (home_path, _home_dir) = seed_daemon.kill_and_keep_home().await;
 
-    server.enqueue(ScriptedResponse::text_chunks(vec!["Trigger reply."]));
+    // In the synchronous in-loop compaction model, the summary LLM call fires
+    // BEFORE the chat reply (pre-send check inside run_agentic_loop).  Enqueue
+    // summary first, then chat reply.
     server.enqueue(ScriptedResponse::text_chunks(vec![
         "- Key fact: user triggered compaction.",
     ]));
+    server.enqueue(ScriptedResponse::text_chunks(vec!["Trigger reply."]));
 
     let (trigger_socket, mut trigger_child, _dir) = start_daemon_at_home_with_env(
         &home_path,
@@ -361,23 +364,28 @@ async fn test_compaction_preserves_summary() {
     let session_id = uuid::Uuid::new_v4().to_string();
 
     for i in 1..=4u32 {
-        server.enqueue(ScriptedResponse::text_chunks(vec![&format!("Seed {i}.")]));
-        send_message_with_session(
-            &seed_client,
-            &format!("Seed message {i}."),
-            &session_id,
-            "copilot/gpt-4o",
-        )
-        .await
-        .unwrap_or_else(|e| panic!("seed turn {i}: {e}"));
+        // Use long content so the compacted summary actually shrinks the
+        // token count (threshold=50 is aggressive; a 1-sentence seed would
+        // compact to a pair whose overhead alone exceeds the original).
+        let long_reply = format!("Seed {i}. {}", "lorem ipsum dolor sit amet ".repeat(30));
+        let long_prompt = format!(
+            "Seed message {i}. {}",
+            "dolor sit amet consectetur ".repeat(30)
+        );
+        server.enqueue(ScriptedResponse::text_chunks(vec![&long_reply]));
+        send_message_with_session(&seed_client, &long_prompt, &session_id, "copilot/gpt-4o")
+            .await
+            .unwrap_or_else(|e| panic!("seed turn {i}: {e}"));
     }
     server.take_requests();
 
     let (home_path, _home_dir2) = seed_daemon.kill_and_keep_home().await;
 
     // Phase 2: restart with low threshold → compaction fires on first turn.
-    server.enqueue(ScriptedResponse::text_chunks(vec!["Turn A reply."]));
+    // Synchronous in-loop compaction runs the summary LLM call FIRST, then
+    // the chat reply, so the queue order is [summary, chat reply].
     server.enqueue(ScriptedResponse::text_chunks(vec![SUMMARY_TEXT]));
+    server.enqueue(ScriptedResponse::text_chunks(vec!["Turn A reply."]));
 
     let (socket2, mut child2, _dir2) = start_daemon_at_home_with_env(
         &home_path,
@@ -424,6 +432,16 @@ async fn test_compaction_preserves_summary() {
     tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
 
     // Phase 3: follow-up turn on same daemon — summary should appear in context.
+    //
+    // With synchronous in-loop compaction the summary threshold check runs on
+    // every iteration of `run_agentic_loop`, so a second recompaction may fire
+    // on Turn B before the chat reply.  Enqueue a second summary response to
+    // absorb it; the chat reply must come last.  Any LLM call made during
+    // Turn B sees the prior session's summary via the injected own_summary
+    // pair, so the "Key fact" assertion holds regardless of which call fires.
+    server.enqueue(ScriptedResponse::text_chunks(vec![
+        "- Recompaction summary.",
+    ]));
     server.enqueue(ScriptedResponse::text_chunks(vec!["Turn B reply."]));
     let rb = send_message_with_session(
         &client2,
@@ -442,10 +460,21 @@ async fn test_compaction_preserves_summary() {
     let reqs_b = server.take_requests();
     assert!(!reqs_b.is_empty(), "no requests for turn B");
 
-    let messages = reqs_b[0].messages().expect("messages array");
-    let all_content: String = messages
+    // Walk every request issued on Turn B (there may be 1 or 2 depending on
+    // whether recompaction fired) and concatenate all message content.  The
+    // prior summary is injected as the own_summary user/assistant pair so it
+    // must appear in at least one of those requests.
+    let all_content: String = reqs_b
         .iter()
-        .filter_map(|m| m.get("content").and_then(|c| c.as_str()))
+        .filter_map(|r| r.messages())
+        .flat_map(|msgs| {
+            msgs.iter()
+                .filter_map(|m| {
+                    m.get("content")
+                        .and_then(|c| c.as_str().map(|s| s.to_owned()))
+                })
+                .collect::<Vec<_>>()
+        })
         .collect::<Vec<_>>()
         .join(" ");
     assert!(
@@ -499,8 +528,10 @@ async fn test_hot_tail_preserved_after_compaction() {
     let (home_path, _home_dir3) = seed_daemon.kill_and_keep_home().await;
 
     // Phase 2: trigger compaction.
-    server.enqueue(ScriptedResponse::text_chunks(vec!["Trigger reply."]));
+    // Synchronous in-loop compaction runs the summary LLM call FIRST, then
+    // the chat reply, so the queue order is [summary, chat reply].
     server.enqueue(ScriptedResponse::text_chunks(vec![SUMMARY_TEXT]));
+    server.enqueue(ScriptedResponse::text_chunks(vec!["Trigger reply."]));
 
     let (socket2, mut child2, _dir2) = start_daemon_at_home_with_env(
         &home_path,
@@ -537,6 +568,12 @@ async fn test_hot_tail_preserved_after_compaction() {
     tokio::time::sleep(std::time::Duration::from_millis(600)).await;
 
     // Phase 3: follow-up turn — should only include hot tail + summary, not full history.
+    // In-loop compaction may fire again before the chat reply when the
+    // rebuilt context still sits above threshold=50; enqueue a recompaction
+    // response first so the chat reply is served second.
+    server.enqueue(ScriptedResponse::text_chunks(vec![
+        "- Recompaction summary.",
+    ]));
     server.enqueue(ScriptedResponse::text_chunks(vec!["Hot tail reply."]));
     let rh = send_message_with_session(
         &client2,
@@ -555,7 +592,14 @@ async fn test_hot_tail_preserved_after_compaction() {
     let reqs = server.take_requests();
     assert!(!reqs.is_empty(), "no request for hot tail turn");
 
-    let messages = reqs[0].messages().expect("messages array");
+    // The chat reply request is always the LAST one (post-compact).  Any
+    // earlier requests are summary LLM calls whose message lists are
+    // intentionally self-contained and do not reflect the main context.
+    let messages = reqs
+        .last()
+        .expect("last request")
+        .messages()
+        .expect("messages array");
     let history_count = messages
         .iter()
         .filter(|m| {
@@ -687,9 +731,10 @@ async fn test_pre_flight_trim_on_resume() {
     let _ = child2.wait().await;
 
     // Restart with low threshold; the resume/chat request should apply pre-flight trim.
-    server.enqueue(ScriptedResponse::text_chunks(vec!["Trim resume reply."]));
-    // Background summary if compaction also fires.
+    // In-loop compaction runs the summary LLM call FIRST, then the chat
+    // reply, so the queue order is [summary, chat reply].
     server.enqueue(ScriptedResponse::text_chunks(vec!["- Trim summary."]));
+    server.enqueue(ScriptedResponse::text_chunks(vec!["Trim resume reply."]));
 
     let (socket3, mut child3, _dir3) = start_daemon_at_home_with_env(
         &home_path,
@@ -717,8 +762,14 @@ async fn test_pre_flight_trim_on_resume() {
     let reqs3 = server.take_requests();
     assert!(!reqs3.is_empty(), "no request for trim resume turn");
 
-    // The trim request should have ≤ HOT_TAIL_PAIRS*2 + 2 user/assistant messages.
-    let msg3 = reqs3[0].messages().expect("messages");
+    // The chat reply request is always the LAST one (post-compact); any
+    // earlier requests are the summary LLM call whose message list is
+    // self-contained and does not reflect the main context.
+    let msg3 = reqs3
+        .last()
+        .expect("last request")
+        .messages()
+        .expect("messages");
     let hist3 = msg3
         .iter()
         .filter(|m| {
