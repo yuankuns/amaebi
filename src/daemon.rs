@@ -2069,6 +2069,52 @@ fn find_hot_tail_start(messages: &[Message], desired_pairs: usize) -> usize {
     user_indexes[n_users - tail_user_count]
 }
 
+/// Partition `messages` into `[head | middle | tail]` for compaction.
+///
+/// - `head` (0..head_end) is the leading `system` block plus any injected
+///   own_summary user/assistant pair — always preserved.
+/// - `middle` (head_end..tail_start) is the only region the summariser
+///   touches.  Empty when there is no compactable history.
+/// - `tail` (tail_start..) is the hot tail up through the active user
+///   prompt — always preserved.
+///
+/// Returns `(head_end, tail_start)`.  Callers should treat
+/// `tail_start <= head_end` as "nothing to compact".
+fn compaction_boundaries(messages: &[Message]) -> (usize, usize) {
+    let mut head_end = messages
+        .iter()
+        .position(|m| m.role != "system")
+        .unwrap_or(messages.len());
+    if head_end + 1 < messages.len()
+        && messages[head_end].role == "user"
+        && messages[head_end]
+            .content
+            .as_deref()
+            .is_some_and(|s| s.starts_with("[Summary of earlier in this session]"))
+        && messages[head_end + 1].role == "assistant"
+    {
+        head_end += 2;
+    }
+    let tail_start = find_hot_tail_start(messages, HOT_TAIL_PAIRS).max(head_end);
+    (head_end, tail_start)
+}
+
+/// Token cost of the compactable middle section only.
+///
+/// Used by the pre-send threshold check in `run_agentic_loop` so that
+/// un-compactable overhead (system prompt, skill files, the preserved
+/// own_summary prefix, the hot tail, and the active user prompt) cannot
+/// single-handedly trigger a compaction attempt that would immediately
+/// bail with "no middle section to summarise".  Only tokens that
+/// `compact_in_loop` can actually remove count toward the threshold.
+fn compactable_middle_tokens(messages: &[Message]) -> usize {
+    let (head_end, tail_start) = compaction_boundaries(messages);
+    if tail_start <= head_end {
+        return 0;
+    }
+    count_message_tokens(&messages[head_end..tail_start])
+}
+
 /// Synchronously compact `messages` in-place when it exceeds the token threshold.
 ///
 /// Called from [`run_agentic_loop`] before each `invoke_model` call.  On success:
@@ -2091,40 +2137,8 @@ async fn compact_in_loop(
     session_id: Option<&str>,
 ) -> Result<()> {
     // Partition: [system/skill head] + [preserved own_summary prefix, if any]
-    // + [middle to summarise] + [hot tail].
-    //
-    // Leading system (and any skill system messages immediately after) are
-    // preserved so the agent keeps its identity and loaded skills post-compact.
-    // When `build_messages()` has injected the running session summary
-    // immediately after that head as a user/assistant pair (see `own_summary`
-    // handling in `build_messages`), preserve that pair too — otherwise the
-    // summariser would re-summarise or discard the already-stored running
-    // summary, causing summary drift across turns.
-    let mut head_end = messages
-        .iter()
-        .position(|m| m.role != "system")
-        .unwrap_or(messages.len());
-    if head_end + 1 < messages.len()
-        && messages[head_end].role == "user"
-        && messages[head_end]
-            .content
-            .as_deref()
-            .is_some_and(|s| s.starts_with("[Summary of earlier in this session]"))
-        && messages[head_end + 1].role == "assistant"
-    {
-        head_end += 2;
-    }
-
-    let tail_start = find_hot_tail_start(messages, HOT_TAIL_PAIRS);
-    // `find_hot_tail_start` returns `messages.len()` as a sentinel meaning
-    // "nothing historical to split off" (≤1 user turn).  If we spliced at
-    // that point we would overwrite the active user prompt and leave the
-    // message list ending with the assistant summary — an invalid request
-    // shape for every provider.  Bail in that case.
-    if tail_start >= messages.len() {
-        anyhow::bail!("compact_in_loop: no hot tail boundary (would overwrite current prompt)");
-    }
-    let tail_start = tail_start.max(head_end);
+    // + [middle to summarise] + [hot tail].  See `compaction_boundaries`.
+    let (head_end, tail_start) = compaction_boundaries(messages);
     if tail_start <= head_end {
         anyhow::bail!("compact_in_loop: no middle section to summarise");
     }
@@ -2678,18 +2692,29 @@ where
             // skipped the tool chain at execution time).  No SteerAck is sent.
         }
 
-        // Pre-send compaction: if messages are about to exceed the model's
-        // compaction threshold, synchronously summarise the middle section
-        // before dispatching.  Claude Code does the same check at the start
-        // of every query iteration (query.ts:453).  The summariser uses the
-        // cheap default model (sonnet), not `current_model`.
+        // Pre-send compaction: if the total token count exceeds the
+        // model's compaction threshold AND there is actually compactable
+        // content in the middle slice, synchronously summarise it before
+        // dispatching.  Claude Code does the same check at the start of
+        // every query iteration (query.ts:453).  The summariser uses
+        // the cheap default model (sonnet), not `current_model`.
+        //
+        // The `middle_tokens > 0` guard matters: on the very first turn
+        // of a session, system + skills + current prompt can already
+        // exceed the threshold (especially with very low
+        // AMAEBI_COMPACTION_THRESHOLD values), but there is nothing
+        // compactable — no history between the preserved head and the
+        // hot tail.  Triggering compaction here would immediately bail
+        // with "no middle section to summarise", tripping the circuit
+        // breaker on every iteration for no benefit.
         //
         // A circuit breaker caps consecutive failures so an irrecoverably
         // oversized context does not trigger an infinite retry storm.
         if consecutive_compact_failures < MAX_CONSECUTIVE_COMPACT_FAILURES {
             let threshold = compaction_threshold_tokens(&current_model);
             let current_tokens = count_message_tokens(&messages);
-            if current_tokens > threshold {
+            let middle_tokens = compactable_middle_tokens(&messages);
+            if current_tokens > threshold && middle_tokens > 0 {
                 let _ = write_frame(writer, &Response::Compacting).await;
                 match compact_in_loop(state, &mut messages, &current_model, session_id).await {
                     Ok(()) => {
