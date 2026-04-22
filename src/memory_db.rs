@@ -221,6 +221,31 @@ pub fn get_recent(conn: &Connection, limit: usize) -> Result<Vec<DbMemoryEntry>>
     Ok(entries)
 }
 
+/// Return the most-recent entry for each distinct `session_id`, newest first.
+///
+/// Used by the dashboard to show one "latest activity" line per session
+/// without being swamped by intra-session chatter.  Honors `archived = 0`.
+pub fn get_latest_per_session(conn: &Connection, limit: usize) -> Result<Vec<DbMemoryEntry>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, timestamp, session_id, role, content, summary
+             FROM memories
+             WHERE archived = 0 AND id IN (
+                 SELECT MAX(id) FROM memories WHERE archived = 0 GROUP BY session_id
+             )
+             ORDER BY id DESC
+             LIMIT ?1",
+        )
+        .context("preparing get_latest_per_session query")?;
+
+    let entries = stmt
+        .query_map(params![limit as i64], row_to_entry)
+        .context("executing get_latest_per_session")?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .context("collecting get_latest_per_session results")?;
+    Ok(entries)
+}
+
 /// Return all messages for a given `session_id` in chronological order.
 ///
 /// Used by `--resume` to reload full conversation history from the DB

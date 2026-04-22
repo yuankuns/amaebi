@@ -12,6 +12,7 @@ mod config;
 mod copilot;
 mod cron;
 mod daemon;
+mod dashboard;
 mod inbox;
 mod ipc;
 mod memory_db;
@@ -122,6 +123,7 @@ async fn main() -> Result<()> {
         cli::Command::Cache { action } => run_cache(action),
         cli::Command::Inbox { action } => run_inbox(action),
         cli::Command::Cron { action } => run_cron(action),
+        cli::Command::Dashboard => dashboard::run().await,
     }
 }
 
