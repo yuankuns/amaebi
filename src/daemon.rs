@@ -1295,21 +1295,29 @@ async fn handle_supervision(
     state: &Arc<DaemonState>,
     session_id: Option<String>,
 ) -> Result<()> {
-    // Max time to wait between LLM checks.  Default 60 s; override with
+    // Max time to wait between LLM checks.  Default 5 min; override with
     // AMAEBI_SUPERVISION_INTERVAL_SECS.  This is the *ceiling*: each iteration
     // actually waits for the pane to go idle (see `IDLE_SECS` below) so that
     // the snapshot fed to the LLM is stable, and only falls back to the
-    // ceiling when Claude is continuously producing output.
+    // ceiling when Claude is continuously producing output.  The higher
+    // ceiling reduces supervision LLM cost when Claude is in a long
+    // compile / test / think phase where the pane barely changes for
+    // minutes at a time.
     let poll_interval = tokio::time::Duration::from_secs(
         std::env::var("AMAEBI_SUPERVISION_INTERVAL_SECS")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(60u64)
+            .unwrap_or(300u64) // 5 min
             .max(1), // clamp to >= 1 s to prevent a tight loop
     );
-    // How long a pane must be unchanged to be considered idle.  3 s matches
-    // the default of the `tmux_wait` LLM tool.
-    const IDLE_SECS: u64 = 3;
+    // How long a pane must be unchanged to be considered idle before
+    // triggering a supervision LLM call.  10 s is a deliberately loose
+    // threshold: short inter-tool-call pauses (2-5 s) during active work
+    // no longer trigger a supervision check, so the LLM only runs when
+    // Claude has genuinely paused (waiting for user input, finished,
+    // stuck on an error).  Reduces noise checks and LLM cost by ~70-80 %
+    // in typical sessions.
+    const IDLE_SECS: u64 = 10;
     const IDLE_POLL_SECS: u64 = 2;
 
     // Hard wall-clock limit before supervision gives up. Default 10 hours;
