@@ -897,6 +897,7 @@ pub async fn run_chat_loop(
     socket: PathBuf,
     initial_prompt: Option<String>,
     model: Option<String>,
+    resumed_session_id: Option<String>,
 ) -> Result<()> {
     let mut sigint = signal(SignalKind::interrupt()).context("setting up SIGINT handler")?;
 
@@ -906,14 +907,19 @@ pub async fn run_chat_loop(
 
     let cwd = std::env::current_dir().context("getting current directory")?;
     let cwd_str = cwd.to_string_lossy().into_owned();
-    let cwd_for_session = cwd.clone();
-    let session_id = tokio::task::spawn_blocking(move || session::create_fresh(&cwd_for_session))
-        .await
-        .context("session::create_fresh panicked")?
-        .unwrap_or_else(|e| {
-            tracing::warn!(error = %e, "failed to create fresh session id; using \"global\"");
-            "global".to_string()
-        });
+    let session_id = match resumed_session_id {
+        Some(id) => id,
+        None => {
+            let cwd_for_session = cwd.clone();
+            tokio::task::spawn_blocking(move || session::create_fresh(&cwd_for_session))
+                .await
+                .context("session::create_fresh panicked")?
+                .unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "failed to create fresh session id; using \"global\"");
+                    "global".to_string()
+                })
+        }
+    };
 
     if crate::banner::should_show() {
         crate::banner::print(&model, &session_id, &cwd);

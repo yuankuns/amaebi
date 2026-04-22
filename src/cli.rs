@@ -37,10 +37,20 @@ pub enum Command {
         /// Cannot be combined with --resume.
         #[arg(long, conflicts_with = "resume")]
         detach: bool,
-        /// Resume a prior session by UUID, loading its full chronological history
+        /// Resume a prior session, loading its full chronological history
         /// instead of the normal sliding-window context (last N turns).
+        ///
+        /// Accepts a session UUID (or unique prefix ≥ 4 chars).  If no value
+        /// is given, an interactive picker lists this directory's session
+        /// history (newest first) for you to choose from.
         /// Cannot be combined with --detach.
-        #[arg(long, conflicts_with = "detach")]
+        #[arg(
+            short = 'r',
+            long,
+            conflicts_with = "detach",
+            num_args = 0..=1,
+            default_missing_value = "",
+        )]
         resume: Option<String>,
     },
     /// Start an interactive multi-turn chat session (long connection).
@@ -56,6 +66,18 @@ pub enum Command {
         /// Format: [provider/]model — e.g. bedrock/claude-sonnet-4.6, copilot/gpt-4o.
         #[arg(long)]
         model: Option<String>,
+        /// Resume a prior chat session, loading its full chronological history.
+        ///
+        /// Accepts a session UUID (or unique prefix ≥ 4 chars).  If no value
+        /// is given, an interactive picker lists this directory's session
+        /// history (newest first) for you to choose from.
+        #[arg(
+            short = 'r',
+            long,
+            num_args = 0..=1,
+            default_missing_value = "",
+        )]
+        resume: Option<String>,
     },
     /// Authenticate with GitHub Copilot via the device flow.
     Auth {
