@@ -881,10 +881,28 @@ pub fn tool_schemas(include_spawn_agent: bool) -> Vec<serde_json::Value> {
             "type": "function",
             "function": {
                 "name": "spawn_agent",
-                "description": "Spawn a child agent session to complete a task. \
-                                By default the child runs in an isolated Docker sandbox \
-                                (--network none). Set sandbox to 'noop' for host-direct \
-                                execution (needed for tasks requiring network or host toolchain).",
+                "description": "Run an independent sub-task in a child agent. \
+                                \n\n\
+                                WHEN TO USE — mandate:\n\
+                                If the user request contains >= 2 independent sub-tasks, \
+                                you MUST emit one spawn_agent call per sub-task in the SAME \
+                                tool-call batch, each with `parallel: true`. Do NOT run them \
+                                sequentially via shell_command / edit_file — that is strictly \
+                                slower and wastes context.\n\n\
+                                \"Independent\" means: no data dependency, separate files or \
+                                directories, either execution order is valid.\n\n\
+                                MUST fan out via parallel spawn_agent:\n\
+                                - Reviewing multiple files → one spawn per file\n\
+                                - Running multiple benchmarks / test suites → one spawn each\n\
+                                - Fixing multiple unrelated bugs → one spawn per bug\n\
+                                - Summarizing multiple docs → one spawn per doc\n\n\
+                                MUST NOT spawn_agent:\n\
+                                - Single-file edit or single shell command\n\
+                                - Strict ordering (build → test → deploy)\n\
+                                - Any step whose input is the previous step's output\n\n\
+                                Sandbox: default Docker with --network none. Set sandbox='noop' \
+                                for host-direct execution when the task needs network or the \
+                                host toolchain (cargo, git push, etc.).",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -932,8 +950,11 @@ pub fn tool_schemas(include_spawn_agent: bool) -> Vec<serde_json::Value> {
                         },
                         "parallel": {
                             "type": "boolean",
-                            "description": "If true, this call may run concurrently with other spawn_agent calls \
-                                            in the same batch (default: false)."
+                            "description": "Run concurrently with sibling spawn_agent calls in the same batch. \
+                                            DEFAULT INTENT IS TRUE — set `parallel: true` unless the sub-tasks \
+                                            have a strict ordering dependency. Only set `parallel: false` when \
+                                            this sub-task must wait for another's output. Wire default remains \
+                                            false for backward compat; you should almost always pass true explicitly."
                         },
                         "sandbox": {
                             "type": "string",

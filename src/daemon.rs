@@ -4020,6 +4020,28 @@ where
                             .unwrap_or(false)
                     });
 
+                // Diagnostic probe: when the LLM emits a multi-call batch that
+                // does not qualify for the concurrent `all_spawn_agent` fast
+                // path, log once so the user can audit missed parallelism.
+                // Behavior is unchanged — this is a pure `tracing::warn!`.
+                if tool_calls_snapshot.len() > 1 && !all_spawn_agent {
+                    let names: Vec<&str> = tool_calls_snapshot
+                        .iter()
+                        .map(|tc| tc.name.as_str())
+                        .collect();
+                    let spawn_count = tool_calls_snapshot
+                        .iter()
+                        .filter(|tc| tc.name == "spawn_agent")
+                        .count();
+                    tracing::warn!(
+                        session_id = ?session_id,
+                        tools = ?names,
+                        spawn_agent_count = spawn_count,
+                        batch_size = tool_calls_snapshot.len(),
+                        "sequential multi-tool batch — consider spawn_agent with parallel: true"
+                    );
+                }
+
                 if all_spawn_agent {
                     // Emit all ToolUse frames sequentially first: the writer
                     // is not Sync so we cannot interleave writes.
