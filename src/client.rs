@@ -604,6 +604,11 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
         });
     let session_id_copy = session_id.clone();
 
+    // Show startup banner when running interactively (TTY, not opted out).
+    if crate::banner::should_show() {
+        crate::banner::print(&model, &session_id_copy, &cwd);
+    }
+
     // Build and send the request as a single JSON line.
     let req = Request::Chat {
         prompt,
@@ -910,7 +915,10 @@ pub async fn run_chat_loop(
             "global".to_string()
         });
 
-    if std::io::stderr().is_terminal() {
+    if crate::banner::should_show() {
+        crate::banner::print(&model, &session_id, &cwd);
+    } else if std::io::stderr().is_terminal() {
+        // Minimal fallback when the banner is opted out but we're still on a TTY.
         eprintln!("Chat session started (ID: {session_id}). Empty line or Ctrl-D to exit.\n");
     }
 
@@ -1520,6 +1528,12 @@ pub async fn run_resume(
     let model = model
         .or_else(|| std::env::var("AMAEBI_MODEL").ok())
         .unwrap_or_else(|| crate::provider::DEFAULT_MODEL.to_string());
+
+    // Show startup banner when running interactively (TTY, not opted out).
+    if crate::banner::should_show() {
+        let cwd = std::env::current_dir().context("getting current directory")?;
+        crate::banner::print(&model, &session_uuid, &cwd);
+    }
 
     let req = Request::Resume {
         prompt,
