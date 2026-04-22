@@ -381,8 +381,41 @@ pub(crate) fn expand_user_alias(
 // Listener loop
 // ---------------------------------------------------------------------------
 
+/// Probe whether a Unix socket at `path` is backed by a live listener.
+///
+/// Returns `Ok(true)` if a peer accepts our connect (another daemon is alive);
+/// `Ok(false)` if the file is stale (no listener, or missing). Any other
+/// failure (permissions, hung peer, etc.) is bubbled up as an error so we
+/// never silently unlink a socket we can't reason about.
+async fn socket_in_use(path: &std::path::Path) -> Result<bool> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    let connect = tokio::net::UnixStream::connect(path);
+    match tokio::time::timeout(std::time::Duration::from_millis(500), connect).await {
+        Ok(Ok(_stream)) => Ok(true),
+        Ok(Err(e)) => {
+            match e.kind() {
+                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound => Ok(false),
+                _ => Err(anyhow::Error::new(e)
+                    .context(format!("probing daemon socket {}", path.display()))),
+            }
+        }
+        Err(_) => anyhow::bail!(
+            "timed out probing daemon socket {}; assuming another daemon is alive",
+            path.display()
+        ),
+    }
+}
+
 pub async fn run(socket: PathBuf) -> Result<()> {
     if socket.exists() {
+        if socket_in_use(&socket).await? {
+            anyhow::bail!(
+                "daemon already running on {}; refusing to start a second instance",
+                socket.display()
+            );
+        }
         std::fs::remove_file(&socket)
             .with_context(|| format!("removing stale socket {}", socket.display()))?;
     }
@@ -6067,5 +6100,37 @@ mod tests {
         // `a -> b`, `b -> bedrock/...`.  Expanding "a" must stop at "b".
         let map = aliases(&[("a", "b"), ("b", "bedrock/claude-opus-4.7")]);
         assert_eq!(expand_user_alias("a", &map), "b");
+    }
+
+    // ------------------------------------------------------------------
+    // socket_in_use tests
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn socket_in_use_detects_live_listener_then_stale() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("amaebi.sock");
+
+        // Bind a listener: the probe must report the socket as in-use.
+        let listener = tokio::net::UnixListener::bind(&sock).expect("bind");
+        assert!(
+            socket_in_use(&sock).await.expect("probe live"),
+            "live listener should be reported as in-use"
+        );
+
+        // Drop the listener and unlink the file: probe must report stale.
+        drop(listener);
+        let _ = std::fs::remove_file(&sock);
+        assert!(
+            !socket_in_use(&sock).await.expect("probe missing"),
+            "missing socket should be reported as stale"
+        );
+
+        // A leftover file with no listener is also stale.
+        std::fs::write(&sock, b"").expect("touch stale socket file");
+        assert!(
+            !socket_in_use(&sock).await.expect("probe stale"),
+            "socket file with no listener should be reported as stale"
+        );
     }
 }
