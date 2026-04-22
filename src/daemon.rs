@@ -2400,6 +2400,55 @@ fn should_persist_tool_output(tool_name: &str) -> bool {
     tool_name != "read_file"
 }
 
+/// Build a short human-readable detail string for a tool call, used in
+/// `Response::ToolUse` frames so the client can render something like
+/// `shell_command: ls -la`.
+///
+/// Must operate on Unicode scalar boundaries: shell commands routinely contain
+/// non-ASCII text (Chinese comments, em-dashes) and a raw byte slice like
+/// `&s[..80]` panics when the truncation index falls inside a multi-byte UTF-8
+/// sequence.  The `shell_command` branch truncates at 80 chars, appending `…`
+/// when the original was longer; other tools return their primary argument
+/// verbatim.
+fn summarise_tool_detail(tool_name: &str, args: &serde_json::Value) -> String {
+    const SHELL_MAX_CHARS: usize = 80;
+    match tool_name {
+        "shell_command" => args
+            .get("command")
+            .and_then(|v| v.as_str())
+            .map(|s| {
+                if s.chars().nth(SHELL_MAX_CHARS).is_some() {
+                    let head: String = s.chars().take(SHELL_MAX_CHARS).collect();
+                    format!("{head}…")
+                } else {
+                    s.to_string()
+                }
+            })
+            .unwrap_or_default(),
+        "read_file" | "edit_file" => args
+            .get("path")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        "tmux_send_keys" => args
+            .get("keys")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        "tmux_capture_pane" => args
+            .get("target")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        "switch_model" => args
+            .get("model")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        _ => String::new(),
+    }
+}
+
 /// Validate and normalise the `model` argument from a `switch_model` tool call.
 ///
 /// Returns `Ok(trimmed_model)` on success, or `Err(error_message)` if the
@@ -3983,40 +4032,7 @@ where
                             }
                         }
 
-                        let tool_detail = match tc.name.as_str() {
-                            "shell_command" => args
-                                .get("command")
-                                .and_then(|v| v.as_str())
-                                .map(|s| {
-                                    if s.len() > 80 {
-                                        format!("{}…", &s[..80])
-                                    } else {
-                                        s.to_string()
-                                    }
-                                })
-                                .unwrap_or_default(),
-                            "read_file" | "edit_file" => args
-                                .get("path")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or_default()
-                                .to_string(),
-                            "tmux_send_keys" => args
-                                .get("keys")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or_default()
-                                .to_string(),
-                            "tmux_capture_pane" => args
-                                .get("target")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or_default()
-                                .to_string(),
-                            "switch_model" => args
-                                .get("model")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or_default()
-                                .to_string(),
-                            _ => String::new(),
-                        };
+                        let tool_detail = summarise_tool_detail(&tc.name, &args);
                         write_frame(
                             writer,
                             &Response::ToolUse {
@@ -5857,5 +5873,75 @@ mod tests {
             sanitize_remote_url("ssh://user@host/path"),
             "ssh://***@host/path"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // summarise_tool_detail
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn summarise_tool_detail_shell_short_ascii() {
+        let args = serde_json::json!({ "command": "ls -la" });
+        assert_eq!(summarise_tool_detail("shell_command", &args), "ls -la");
+    }
+
+    #[test]
+    fn summarise_tool_detail_shell_long_ascii_truncates_with_ellipsis() {
+        let cmd: String = "x".repeat(200);
+        let args = serde_json::json!({ "command": cmd });
+        let detail = summarise_tool_detail("shell_command", &args);
+        // 80 chars + `…`; total 81 Unicode scalars.
+        assert_eq!(detail.chars().count(), 81);
+        assert!(detail.ends_with('…'));
+        assert!(detail.starts_with(&"x".repeat(80)));
+    }
+
+    #[test]
+    fn summarise_tool_detail_shell_multibyte_utf8_does_not_panic() {
+        // Regression: previously the branch used `&s[..80]` (byte slice) which
+        // panicked when byte 80 landed inside a multi-byte UTF-8 sequence.
+        // This exact input — mixed ASCII + Chinese + em-dash + newline + path —
+        // was seen in a real Bedrock supervision turn and crashed the daemon.
+        let cmd = "# 看 flash-attention 的 tile_scheduler 怎么 dispatch m_block — \
+                   它是怎么避免 OOB 的\nsed -n '440,480p' /home/yuankuns/path.hpp";
+        let args = serde_json::json!({ "command": cmd });
+        // Should return Ok without panicking.
+        let detail = summarise_tool_detail("shell_command", &args);
+        // If the input has >80 chars, output should end with '…'; in any case
+        // the first 80 chars must be a valid prefix of the input by char count.
+        if cmd.chars().count() > 80 {
+            assert!(detail.ends_with('…'));
+            assert_eq!(detail.chars().count(), 81);
+        } else {
+            assert_eq!(detail, cmd);
+        }
+    }
+
+    #[test]
+    fn summarise_tool_detail_shell_exactly_80_chars_not_truncated() {
+        // Boundary: exactly 80 Unicode scalars → return as-is, no ellipsis.
+        let cmd: String = "a".repeat(80);
+        let args = serde_json::json!({ "command": cmd.clone() });
+        assert_eq!(summarise_tool_detail("shell_command", &args), cmd);
+    }
+
+    #[test]
+    fn summarise_tool_detail_read_file_returns_path() {
+        let args = serde_json::json!({ "path": "/tmp/foo.rs" });
+        assert_eq!(summarise_tool_detail("read_file", &args), "/tmp/foo.rs");
+        assert_eq!(summarise_tool_detail("edit_file", &args), "/tmp/foo.rs");
+    }
+
+    #[test]
+    fn summarise_tool_detail_missing_arg_returns_empty() {
+        let args = serde_json::json!({});
+        assert_eq!(summarise_tool_detail("shell_command", &args), "");
+        assert_eq!(summarise_tool_detail("read_file", &args), "");
+    }
+
+    #[test]
+    fn summarise_tool_detail_unknown_tool_returns_empty() {
+        let args = serde_json::json!({ "command": "ignored" });
+        assert_eq!(summarise_tool_detail("bogus_tool", &args), "");
     }
 }
