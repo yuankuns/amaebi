@@ -40,15 +40,19 @@ pub enum Command {
         /// Resume a prior session, loading its full chronological history
         /// instead of the normal sliding-window context (last N turns).
         ///
-        /// Accepts a session UUID (or unique prefix ≥ 4 chars).  If no value
-        /// is given, an interactive picker lists this directory's session
-        /// history (newest first) for you to choose from.
+        /// To pass a UUID you must use `=` syntax (`-r=<uuid>` or
+        /// `--resume=<uuid>`) so the value cannot be confused with the
+        /// required `<PROMPT>` positional.  Bare `-r` / `--resume` opens an
+        /// interactive picker of this directory's session history.
+        ///
+        /// Accepts a session UUID (or unique prefix ≥ 4 chars).
         /// Cannot be combined with --detach.
         #[arg(
             short = 'r',
             long,
             conflicts_with = "detach",
             num_args = 0..=1,
+            require_equals = true,
             default_missing_value = "",
         )]
         resume: Option<String>,
@@ -68,13 +72,17 @@ pub enum Command {
         model: Option<String>,
         /// Resume a prior chat session, loading its full chronological history.
         ///
-        /// Accepts a session UUID (or unique prefix ≥ 4 chars).  If no value
-        /// is given, an interactive picker lists this directory's session
-        /// history (newest first) for you to choose from.
+        /// To pass a UUID you must use `=` syntax (`-r=<uuid>` or
+        /// `--resume=<uuid>`) so the value cannot be confused with the
+        /// optional `[PROMPT]` positional.  Bare `-r` / `--resume` opens an
+        /// interactive picker of this directory's session history.
+        ///
+        /// Accepts a session UUID (or unique prefix ≥ 4 chars).
         #[arg(
             short = 'r',
             long,
             num_args = 0..=1,
+            require_equals = true,
             default_missing_value = "",
         )]
         resume: Option<String>,

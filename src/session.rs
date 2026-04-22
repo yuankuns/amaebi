@@ -355,8 +355,11 @@ pub fn resolve_resume(dir: &Path, arg: Option<String>) -> Result<Option<String>>
     let want_picker = trimmed.is_empty() || trimmed.eq_ignore_ascii_case("list");
 
     if !want_picker {
-        // Direct UUID or unique prefix.
-        let history = list_for_dir(dir)?;
+        // Direct UUID or unique prefix.  `list_for_dir` failures (missing
+        // $HOME, unreadable sessions.json, etc.) are best-effort downgraded
+        // to an empty history so the user can still resume an opaque UUID
+        // when the local index is unavailable.
+        let history = list_for_dir(dir).unwrap_or_default();
         if let Some(rec) = history.iter().find(|r| r.uuid == trimmed) {
             return Ok(Some(rec.uuid.clone()));
         }
@@ -400,7 +403,10 @@ pub fn resolve_resume(dir: &Path, arg: Option<String>) -> Result<Option<String>>
 fn prompt_for_session(history: &[SessionRecord]) -> Result<Option<String>> {
     use std::io::{BufRead, IsTerminal, Write};
 
-    if !std::io::stderr().is_terminal() {
+    // Both stderr (where we draw the prompt) and stdin (where we read the
+    // choice) must be TTYs.  Otherwise the picker could silently consume
+    // piped input as the selection (e.g. `echo foo | amaebi chat -r`).
+    if !std::io::stderr().is_terminal() || !std::io::stdin().is_terminal() {
         anyhow::bail!("--resume without a UUID requires an interactive terminal");
     }
 
