@@ -656,6 +656,15 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
             Request::ClaudeLaunch { tasks } => {
                 handle_claude_launch(&writer, tasks).await?;
             }
+
+            Request::SupervisePanes {
+                panes,
+                model,
+                session_id,
+            } => {
+                handle_supervision(&writer, &mut frame_rx, panes, model, &state, session_id)
+                    .await?;
+            }
         }
     }
 
@@ -795,8 +804,24 @@ async fn handle_claude_launch(
     let total_tasks = tasks.len();
     for (task_idx, task) in tasks.into_iter().enumerate() {
         let task_id = task.task_id.clone();
-        let description = task.description.clone();
         let auto_enter = task.auto_enter;
+
+        // Gather git context from the client's working directory: current
+        // branch, remote URL, recent commits, and PR-specific information if
+        // the task description mentions a PR number.  The context is prepended
+        // to the description so Claude knows where to start, what branch it is
+        // on, and how to push when done.
+        let (description, ctx_start_branch) = {
+            let raw_desc = task.description.clone();
+            let cwd = task.client_cwd.clone();
+            tokio::task::spawn_blocking(move || {
+                let ctx = gather_task_context(cwd.as_deref(), &raw_desc);
+                let enriched = format!("{}\n{}", ctx.preamble, raw_desc);
+                (enriched, ctx.start_branch)
+            })
+            .await
+            .unwrap_or_else(|_| (task.description.clone(), None))
+        };
 
         // Each parallel Claude session must work in its own git worktree so
         // concurrent tasks cannot trample each other's in-progress file edits.
@@ -809,8 +834,9 @@ async fn handle_claude_launch(
             None => {
                 let tid = task_id.clone();
                 let cwd = task.client_cwd.clone();
+                let base = ctx_start_branch.clone();
                 match tokio::task::spawn_blocking(move || {
-                    create_task_worktree(&tid, cwd.as_deref())
+                    create_task_worktree(&tid, cwd.as_deref(), base.as_deref())
                 })
                 .await
                 .context("create_task_worktree panicked")?
@@ -1013,19 +1039,33 @@ async fn handle_claude_launch(
 
         let send_pane = pane_id.clone();
 
-        // Send all key sequences to the pane.
+        // Send key sequences to the pane.  Each step: send text literally
+        // with `send-keys -l --`, then send Enter as a separate key press.
         //
-        // Text (user-provided descriptions and shell commands) is sent with
-        // `send-keys -l --` so tmux treats the argument as a literal string
-        // rather than a key name.  Without `-l`, strings like "Enter" or
-        // "C-c" would be interpreted as key presses, and strings starting
-        // with "-" would be parsed as send-keys options.
-        //
-        // The Enter key itself is sent in a separate invocation without `-l`
-        // so it remains a real key press (not the literal text "Enter").
-        // Returns Ok(None) on success, Ok(Some(stderr)) on tmux failure.
+        // Timing: 1 s pause before the first send (bash init), 5 s before
+        // subsequent sends (e.g. claude startup), then 1 s after each text
+        // injection before pressing Enter.  No prompt-polling — simple
+        // fixed delays are robust against prompt character variations
+        // (❯, >, $, etc.).
         let send_result = tokio::task::spawn_blocking(move || {
-            for (keys, press_enter) in &key_sequence {
+            for (idx, (keys, press_enter)) in key_sequence.iter().enumerate() {
+                // Before the very first send: let the new pane's shell
+                // initialise (.bashrc, prompt rendering, etc.).
+                // Before subsequent sends (e.g. description after claude
+                // launch): let the target process start up.
+                let wait = if idx == 0 { 1 } else { 5 };
+                std::thread::sleep(std::time::Duration::from_secs(wait));
+
+                // For the description injection (idx > 0 on a fresh pane),
+                // dismiss any Claude Code splash/welcome overlay first.
+                // Escape is a safe no-op if no overlay is active.
+                if idx > 0 && !had_claude {
+                    let _ = std::process::Command::new("tmux")
+                        .args(["send-keys", "-t", &send_pane, "Escape"])
+                        .output();
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                }
+
                 // Send text literally.
                 let out = std::process::Command::new("tmux")
                     .args(["send-keys", "-t", &send_pane, "-l", "--", keys.as_str()])
@@ -1035,8 +1075,10 @@ async fn handle_claude_launch(
                         String::from_utf8_lossy(&out.stderr).trim().to_string(),
                     ));
                 }
-                // Press Enter as a real key in a separate call.
                 if *press_enter {
+                    // Wait for the TUI to render and accept the pasted text,
+                    // then press Enter.
+                    std::thread::sleep(std::time::Duration::from_secs(1));
                     let out = std::process::Command::new("tmux")
                         .args(["send-keys", "-t", &send_pane, "Enter"])
                         .output()?;
@@ -1115,6 +1157,506 @@ async fn handle_claude_launch(
     Ok(())
 }
 
+/// Capture the last 200 lines of a tmux pane as plain text.
+/// Returns an empty string on failure so supervision can continue.
+///
+/// 200-line window matches Claude Code's own default capture depth — enough
+/// that a busy pane (tool outputs, build logs) still shows what the Claude
+/// agent most recently did, not just the idle prompt that followed.
+fn capture_pane_text(pane_id: &str) -> String {
+    match std::process::Command::new("tmux")
+        .args(["capture-pane", "-t", pane_id, "-p", "-S", "-200"])
+        .output()
+    {
+        Ok(output) => {
+            if !output.status.success() {
+                tracing::warn!(
+                    pane_id,
+                    status = %output.status,
+                    stderr = %String::from_utf8_lossy(&output.stderr),
+                    "tmux capture-pane failed"
+                );
+                return String::new();
+            }
+            String::from_utf8_lossy(&output.stdout).into_owned()
+        }
+        Err(e) => {
+            tracing::warn!(pane_id, error = %e, "failed to spawn tmux capture-pane");
+            String::new()
+        }
+    }
+}
+
+/// Wait until the target pane's output has been stable for `idle_secs`, or
+/// until `timeout` elapses, then return the final snapshot.
+///
+/// This is the supervision-side equivalent of the `tmux_wait` LLM tool: the
+/// supervisor gets a *stable* pane snapshot (not mid-render garbage) but
+/// also gives up after `timeout` so a long-running Claude session cannot
+/// block supervision indefinitely.
+///
+/// Returns `(snapshot, idle)` — `idle=true` when the pane stabilised before
+/// timeout, `idle=false` when we hit the timeout with the pane still active.
+/// Either way the snapshot is the latest captured content, suitable for
+/// feeding to the supervision LLM.
+async fn wait_for_pane_idle(
+    pane_id: &str,
+    idle: std::time::Duration,
+    timeout: std::time::Duration,
+    poll: std::time::Duration,
+) -> (String, bool) {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let pid = pane_id.to_owned();
+    let mut last_content = {
+        let pid = pid.clone();
+        tokio::task::spawn_blocking(move || capture_pane_text(&pid))
+            .await
+            .unwrap_or_default()
+    };
+    let mut stable_since = tokio::time::Instant::now();
+
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            return (last_content, false);
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let sleep_dur = poll.min(remaining);
+        tokio::time::sleep(sleep_dur).await;
+
+        let pid = pid.clone();
+        let content = tokio::task::spawn_blocking(move || capture_pane_text(&pid))
+            .await
+            .unwrap_or_default();
+        if content != last_content {
+            last_content = content;
+            stable_since = tokio::time::Instant::now();
+        } else if stable_since.elapsed() >= idle {
+            return (last_content, true);
+        }
+    }
+}
+
+/// Send literal text + Enter to a tmux pane (best-effort).
+///
+/// Sends the text with `send-keys -l --` (literal, no keyname interpretation),
+/// pauses for 1 s to let the receiving TUI's paste buffer drain, then sends
+/// Enter as a separate key press.  The pause matches the `handle_claude_launch`
+/// injection path (daemon.rs:1081) and exists because Claude Code's TUI can
+/// swallow or defer the trailing Enter when it arrives before the pasted text
+/// has been rendered into the input field — which manifests as a STEER
+/// message appearing in the pane input but never submitting.
+fn send_pane_keys(pane_id: &str, text: &str) {
+    match std::process::Command::new("tmux")
+        .args(["send-keys", "-t", pane_id, "-l", "--", text])
+        .status()
+    {
+        Ok(s) if !s.success() => {
+            tracing::warn!(pane_id, status = %s, "tmux send-keys (text) failed");
+        }
+        Err(e) => {
+            tracing::warn!(pane_id, error = %e, "failed to spawn tmux send-keys (text)");
+        }
+        _ => {}
+    }
+    // Let the TUI process the pasted text before pressing Enter.
+    std::thread::sleep(std::time::Duration::from_secs(1));
+    match std::process::Command::new("tmux")
+        .args(["send-keys", "-t", pane_id, "Enter"])
+        .status()
+    {
+        Ok(s) if !s.success() => {
+            tracing::warn!(pane_id, status = %s, "tmux send-keys (Enter) failed");
+        }
+        Err(e) => {
+            tracing::warn!(pane_id, error = %e, "failed to spawn tmux send-keys (Enter)");
+        }
+        _ => {}
+    }
+}
+
+/// Handle `Request::SupervisePanes`: run a Rust polling loop that captures pane
+/// content, calls the LLM for analysis (no tools), and acts on the response.
+///
+/// The loop iterates with a 60-second sleep between turns (override with
+/// `AMAEBI_SUPERVISION_INTERVAL_SECS`). Each turn the LLM
+/// returns exactly one of:
+/// - `WAIT` — still working, check again
+/// - `STEER: <pane_id>: <message>` — send a correction to the pane
+/// - `DONE: <summary>` — task is complete; stream the summary and exit
+///
+/// The loop can also be interrupted by an `Interrupt` frame arriving on
+/// `frame_rx`.  A maximum of 240 completion tokens is requested (sufficient for
+/// the short WAIT/STEER/DONE responses).
+async fn handle_supervision(
+    writer: &Arc<tokio::sync::Mutex<tokio::net::unix::OwnedWriteHalf>>,
+    frame_rx: &mut tokio::sync::mpsc::Receiver<String>,
+    panes: Vec<crate::ipc::SupervisionTarget>,
+    model: String,
+    state: &Arc<DaemonState>,
+    session_id: Option<String>,
+) -> Result<()> {
+    // Max time to wait between LLM checks.  Default 5 min; override with
+    // AMAEBI_SUPERVISION_INTERVAL_SECS.  This is the *ceiling*: each iteration
+    // actually waits for the pane to go idle (see `IDLE_SECS` below) so that
+    // the snapshot fed to the LLM is stable, and only falls back to the
+    // ceiling when Claude is continuously producing output.  The higher
+    // ceiling reduces supervision LLM cost when Claude is in a long
+    // compile / test / think phase where the pane barely changes for
+    // minutes at a time.
+    let poll_interval = tokio::time::Duration::from_secs(
+        std::env::var("AMAEBI_SUPERVISION_INTERVAL_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(300u64) // 5 min
+            .max(1), // clamp to >= 1 s to prevent a tight loop
+    );
+    // How long a pane must be unchanged to be considered idle before
+    // triggering a supervision LLM call.  10 s is a deliberately loose
+    // threshold: short inter-tool-call pauses (2-5 s) during active work
+    // no longer trigger a supervision check, so the LLM only runs when
+    // Claude has genuinely paused (waiting for user input, finished,
+    // stuck on an error).  Reduces noise checks and LLM cost by ~70-80 %
+    // in typical sessions.
+    const IDLE_SECS: u64 = 10;
+    const IDLE_POLL_SECS: u64 = 2;
+
+    // Hard wall-clock limit before supervision gives up. Default 10 hours;
+    // override with AMAEBI_SUPERVISION_TIMEOUT_SECS.
+    let max_duration = std::time::Duration::from_secs(
+        std::env::var("AMAEBI_SUPERVISION_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10 * 3600u64), // 10 hours default — enough for a night shift
+    );
+
+    const MAX_SUPERVISION_TOKENS: usize = 1024;
+
+    let supervision_start = std::time::Instant::now();
+    let deadline = supervision_start + max_duration;
+    let mut turn: u64 = 0;
+
+    // Remember the previous turn's verdict so the LLM has continuity across
+    // iterations (e.g. "last turn you STEERed X; did Claude pick it up?").
+    // Stored as a short one-line summary that we feed back into `user_content`
+    // on the next iteration.
+    let mut last_verdict: Option<String> = None;
+
+    // Load skill files (SOUL.md, AGENTS.md, GPU_KERNEL.md) once and reuse
+    // across all supervision turns so the LLM has project context for
+    // higher-quality STEER decisions.
+    let skill_msgs = load_skill_messages().await;
+
+    let system_prompt =
+        "You are supervising a Claude Code session executing a task in a tmux pane.\n\
+        Compare the pane content to the task description and respond with EXACTLY ONE of:\n\
+        \n\
+        WAIT: <one sentence — what is Claude currently doing?>\n\
+          Claude is actively working AND on track. No intervention needed.\n\
+          Use WAIT as the default when you're not certain between WAIT and DONE/STEER.\n\
+        \n\
+        STEER: <pane_id>: <message to send>\n\
+          Claude needs input or correction. The message will be typed into the pane.\n\
+          Use STEER when:\n\
+          - Claude is at an idle prompt and is ASKING A QUESTION or presenting OPTIONS\n\
+            (e.g. 'Should I also do X?', 'Which approach would you prefer?') — answer it.\n\
+          - Claude reports partial completion and the task description is NOT fully done yet\n\
+            (e.g. claims 'step 1 done' but step 2 was also requested).\n\
+          - Claude is stuck on an error and a concrete hint will unblock it.\n\
+          - Claude is going in the wrong direction vs. the task description.\n\
+        \n\
+        DONE: <paragraph summary of what was accomplished>\n\
+          The task is FULLY complete. Require ALL of:\n\
+          1. Pane shows an explicit completion signal — a finished report, passing tests,\n\
+             a merged PR URL, 'done', '✓', 'all tests passed', or similar.\n\
+          2. That completion directly covers the task description given at session start\n\
+             (not just a sub-step or unrelated output).\n\
+          3. Claude is no longer working (idle prompt or returned to shell).\n\
+          An idle prompt alone is NOT sufficient — Claude may be waiting for user input\n\
+          (see STEER) or may have been interrupted. If unsure, prefer WAIT and re-check\n\
+          next turn.\n\
+        \n\
+        Your response must start with WAIT:, STEER:, or DONE: — nothing else before it."
+            .to_string();
+
+    loop {
+        // --- Check wall-clock deadline ---
+        if std::time::Instant::now() >= deadline {
+            let mut w = writer.lock().await;
+            write_frame(
+                &mut *w,
+                &Response::Text {
+                    chunk: format!(
+                        "[supervision] timeout after {:.1} hours; stopping\n",
+                        max_duration.as_secs_f64() / 3600.0
+                    ),
+                },
+            )
+            .await?;
+            write_frame(&mut *w, &Response::Done).await?;
+            return Ok(());
+        }
+
+        // --- Interruptible wait-for-pane-idle (skip on first iteration) ---
+        // Instead of a blind fixed-interval sleep, wait until the first pane
+        // in the set has been stable for IDLE_SECS seconds, falling back to
+        // `poll_interval` as the hard ceiling if the pane stays active.  This
+        // guarantees the snapshot we feed to the LLM is not mid-render and
+        // that busy Claude sessions do not waste LLM calls on near-identical
+        // frames.  Client `Interrupt` frames still preempt the wait.
+        if turn > 0 {
+            let primary_pane = panes.first().map(|t| t.pane_id.clone()).unwrap_or_default();
+            let wait_fut = wait_for_pane_idle(
+                &primary_pane,
+                std::time::Duration::from_secs(IDLE_SECS),
+                poll_interval,
+                std::time::Duration::from_secs(IDLE_POLL_SECS),
+            );
+            tokio::pin!(wait_fut);
+            let interrupted = loop {
+                tokio::select! {
+                    biased;
+                    frame = frame_rx.recv() => {
+                        match frame {
+                            None => {
+                                // Client disconnected.
+                                return Ok(());
+                            }
+                            Some(line) => {
+                                if let Ok(Request::Interrupt { session_id: sid }) =
+                                    serde_json::from_str::<Request>(&line)
+                                {
+                                    if session_id
+                                        .as_deref()
+                                        .is_none_or(|expected| sid == expected)
+                                    {
+                                        break true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ = &mut wait_fut => break false,
+                }
+            };
+            if interrupted {
+                let mut w = writer.lock().await;
+                write_frame(
+                    &mut *w,
+                    &Response::Text {
+                        chunk: "[supervision] interrupted by user\n".into(),
+                    },
+                )
+                .await?;
+                write_frame(&mut *w, &Response::Done).await?;
+                return Ok(());
+            }
+        }
+
+        turn += 1;
+        let elapsed_mins = supervision_start.elapsed().as_secs() / 60;
+
+        // --- Capture pane snapshots (full for LLM, tail for display) ---
+        struct PaneSnapshot {
+            pane_id: String,
+            task_description: String,
+            full_content: String, // sent to LLM
+            tail: String,         // last 8 lines shown to user
+        }
+
+        let mut snapshots: Vec<PaneSnapshot> = Vec::new();
+        for target in &panes {
+            let pid = target.pane_id.clone();
+            let full = tokio::task::spawn_blocking(move || capture_pane_text(&pid))
+                .await
+                .unwrap_or_default();
+            // Last 8 non-empty lines for the user-visible tail.
+            let tail = full
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .rev()
+                .take(8)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<Vec<_>>()
+                .join("\n");
+            snapshots.push(PaneSnapshot {
+                pane_id: target.pane_id.clone(),
+                task_description: target.task_description.clone(),
+                full_content: full,
+                tail,
+            });
+        }
+
+        // Print the check header + pane tails to the user before calling LLM.
+        {
+            let mut header = format!("\n[supervision +{elapsed_mins}m check #{turn}]\n");
+            for snap in &snapshots {
+                header.push_str(&format!(
+                    "  ┌─ pane {} — {}\n",
+                    snap.pane_id, snap.task_description
+                ));
+                for line in snap.tail.lines() {
+                    header.push_str(&format!("  │ {line}\n"));
+                }
+                header.push_str("  └─\n");
+            }
+            let mut w = writer.lock().await;
+            write_frame(&mut *w, &Response::Text { chunk: header }).await?;
+        }
+
+        // Security note: `snap.full_content` is the output of `capture_pane_text`,
+        // which captures only the last 60 visible lines of the pane.  This bounds
+        // the amount of data sent to the LLM, but those lines could still contain
+        // secrets (e.g. env vars printed by a build script).  A future improvement
+        // could add redaction of common secret patterns.
+        let mut pane_snapshots = String::new();
+        for snap in &snapshots {
+            pane_snapshots.push_str(&format!(
+                "=== Pane {} — task: {} ===\n{}\n",
+                snap.pane_id, snap.task_description, snap.full_content
+            ));
+        }
+
+        // Thread the previous verdict into the prompt so the LLM can judge
+        // whether its last STEER landed, whether Claude actually finished
+        // the step it last reported, etc.  First iteration sends "(none)".
+        let prior = last_verdict
+            .as_deref()
+            .unwrap_or("(none yet — this is the first check)");
+        let user_content = format!(
+            "Current pane snapshots (check #{turn}, elapsed {elapsed_mins}m):\n\n\
+             {pane_snapshots}\n\
+             Your previous verdict this session: {prior}"
+        );
+
+        let mut messages = vec![Message::system(system_prompt.clone())];
+        // Inject SOUL.md / AGENTS.md etc. right after the system message
+        // so the supervision LLM has full project context.
+        splice_skill_messages(&mut messages, skill_msgs.clone());
+        messages.push(Message::user(user_content));
+
+        // --- Drain any pending interrupts before invoking the model ---
+        // The model call is short (240 tokens max) so mid-call interrupts
+        // are not critical; they will be handled at the next sleep interval.
+        while let Ok(line) = frame_rx.try_recv() {
+            if let Ok(Request::Interrupt { session_id: isid }) =
+                serde_json::from_str::<Request>(&line)
+            {
+                if session_id
+                    .as_deref()
+                    .is_none_or(|expected| isid == expected)
+                {
+                    let mut w = writer.lock().await;
+                    write_frame(
+                        &mut *w,
+                        &Response::Text {
+                            chunk: "[supervision] interrupted\n".into(),
+                        },
+                    )
+                    .await?;
+                    write_frame(&mut *w, &Response::Done).await?;
+                    return Ok(());
+                }
+            }
+        }
+
+        // --- Invoke model (no tools) ---
+        // Use sink() so the raw LLM tokens are NOT streamed to the client.
+        // We write our own formatted one-line status after parsing the response.
+        let response_text = {
+            let mut sink = tokio::io::sink();
+            match invoke_model(
+                state,
+                &model,
+                &messages,
+                &[],
+                MAX_SUPERVISION_TOKENS,
+                &mut sink,
+            )
+            .await
+            {
+                Ok(r) => r.text,
+                Err(e) => {
+                    let mut w = writer.lock().await;
+                    write_frame(
+                        &mut *w,
+                        &Response::Error {
+                            message: format!("[supervision] model error: {e:#}"),
+                        },
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            }
+        };
+
+        let trimmed = response_text.trim();
+
+        // --- Parse response and act ---
+        let verdict_line = if trimmed.starts_with("DONE:") || trimmed == "DONE" {
+            let summary = trimmed.strip_prefix("DONE:").unwrap_or("").trim();
+            let mut w = writer.lock().await;
+            write_frame(
+                &mut *w,
+                &Response::Text {
+                    chunk: format!("  → DONE\n\n{summary}\n"),
+                },
+            )
+            .await?;
+            write_frame(&mut *w, &Response::Done).await?;
+            return Ok(());
+        } else if let Some(rest) = trimmed.strip_prefix("STEER:") {
+            if let Some((pane_id_raw, message)) = rest.trim().split_once(':') {
+                let pane_id = pane_id_raw.trim().to_owned();
+                let message = message.trim().to_owned();
+                let is_valid_pane = panes.iter().any(|t| t.pane_id == pane_id);
+                if !pane_id.is_empty() && !message.is_empty() && is_valid_pane {
+                    let pid = pane_id.clone();
+                    let msg = message.clone();
+                    tokio::task::spawn_blocking(move || send_pane_keys(&pid, &msg))
+                        .await
+                        .ok();
+                    format!("  → STEER {pane_id}: {message}\n")
+                } else if !pane_id.is_empty() && !message.is_empty() && !is_valid_pane {
+                    format!("  → STEER {pane_id} (unknown pane, ignored)\n")
+                } else {
+                    "  → STEER (malformed response)\n".to_string()
+                }
+            } else {
+                "  → STEER (malformed response)\n".to_string()
+            }
+        } else {
+            // WAIT: <note> or bare WAIT
+            let note = trimmed.strip_prefix("WAIT:").unwrap_or("").trim();
+            if note.is_empty() {
+                "  → WAIT\n".to_string()
+            } else {
+                format!("  → WAIT: {note}\n")
+            }
+        };
+        // Remember this verdict (minus the display prefix) so the next
+        // iteration can pass it back into the user prompt.  `verdict_line`
+        // starts with "  → " and ends with "\n"; strip both for a compact
+        // one-line carry-over.
+        last_verdict = Some(
+            verdict_line
+                .trim_start_matches("  → ")
+                .trim_end_matches('\n')
+                .to_string(),
+        );
+
+        let mut w = writer.lock().await;
+        write_frame(
+            &mut *w,
+            &Response::Text {
+                chunk: verdict_line,
+            },
+        )
+        .await?;
+    }
+}
+
 /// Create a git worktree at `~/.amaebi/worktrees/<repo-name>/<task_id>-<uuid8>`
 /// on a new branch named `<task_id>-<uuid8>`.
 ///
@@ -1140,6 +1682,7 @@ async fn handle_claude_launch(
 fn create_task_worktree(
     task_id: &str,
     client_cwd: Option<&str>,
+    start_branch: Option<&str>,
 ) -> anyhow::Result<std::path::PathBuf> {
     use std::path::PathBuf;
 
@@ -1224,20 +1767,46 @@ fn create_task_worktree(
         .with_context(|| format!("creating worktree parent directory {}", wt_parent.display()))?;
 
     // Create the worktree on a new branch named <task_id>-<uuid8>.
+    // If a start_branch is provided (e.g. the head branch of a PR), the new
+    // branch is forked from that branch rather than from HEAD.  This ensures
+    // Claude starts with the right commits already in place.
     let mut git_cmd = std::process::Command::new("git");
     if let Some(cwd) = client_cwd {
         git_cmd.args(["-C", cwd]);
     }
+    let wt_str = wt_path
+        .to_str()
+        .context("worktree path is not valid UTF-8")?;
+    // If a base branch is provided, fetch it from origin first so the ref
+    // exists locally.  Use `origin/<base>` as the start-point so we don't
+    // require a local tracking branch.  If the fetch fails (e.g. the ref
+    // doesn't exist on the remote), fall back to HEAD (omit the start-point).
+    let fetched_base: Option<String> = start_branch.and_then(|base| {
+        let mut fetch_cmd = std::process::Command::new("git");
+        if let Some(cwd) = client_cwd {
+            fetch_cmd.args(["-C", cwd]);
+        }
+        let fetch_ok = fetch_cmd
+            .args(["fetch", "origin", base])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if fetch_ok {
+            Some(format!("origin/{base}"))
+        } else {
+            tracing::warn!(
+                branch = base,
+                "git fetch origin failed; falling back to HEAD as worktree start-point"
+            );
+            None
+        }
+    });
+    let mut args = vec!["worktree", "add", wt_str, "-b", &unique_name];
+    if let Some(ref start_point) = fetched_base {
+        args.push(start_point);
+    }
     let out = git_cmd
-        .args([
-            "worktree",
-            "add",
-            wt_path
-                .to_str()
-                .context("worktree path is not valid UTF-8")?,
-            "-b",
-            &unique_name,
-        ])
+        .args(&args)
         .output()
         .context("spawning git worktree add")?;
     if !out.status.success() {
@@ -1252,6 +1821,199 @@ fn create_task_worktree(
 /// Escape a string for safe use as a single shell argument (single-quote wrapping).
 fn shell_escape(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+// ---------------------------------------------------------------------------
+// Task context enrichment
+// ---------------------------------------------------------------------------
+
+/// Context gathered from the client's git repository before launching a task.
+struct TaskContext {
+    /// One or two paragraph preamble to prepend to the task description sent
+    /// to Claude so it knows which branch it is on, where to push, and any
+    /// PR-specific information.
+    preamble: String,
+    /// If a PR number was detected in the task description and `gh` resolved
+    /// the PR's head branch, this is the branch name to use as the base for
+    /// the new worktree (instead of HEAD).
+    start_branch: Option<String>,
+}
+
+/// Run a single git command with an optional `-C <cwd>` prefix.
+/// Returns trimmed stdout on success, empty string on failure (best-effort).
+fn git_output(cwd: Option<&str>, args: &[&str]) -> String {
+    let mut cmd = std::process::Command::new("git");
+    if let Some(c) = cwd {
+        cmd.args(["-C", c]);
+    }
+    cmd.args(args)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .unwrap_or_default()
+        .trim()
+        .to_string()
+}
+
+/// Extract the first PR number mentioned in a task description.
+/// Matches patterns like "PR99", "PR #99", "pr 99", "#99".
+fn extract_pr_number(description: &str) -> Option<u32> {
+    // Walk through the string looking for a PR-like pattern.
+    let lower = description.to_lowercase();
+    // "pr" followed by optional space/# and digits.
+    for (i, c) in lower.char_indices() {
+        if c == 'p' {
+            if lower[i..].starts_with("pr") {
+                let after_pr = lower[i + 2..].trim_start_matches([' ', '#']);
+                let digits: String = after_pr
+                    .chars()
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect();
+                if !digits.is_empty() {
+                    if let Ok(n) = digits.parse::<u32>() {
+                        return Some(n);
+                    }
+                }
+            }
+        } else if c == '#' {
+            let after_hash = &lower[i + 1..];
+            let digits: String = after_hash
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
+            if !digits.is_empty() {
+                if let Ok(n) = digits.parse::<u32>() {
+                    return Some(n);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Strip userinfo (credentials/tokens) from a remote URL to avoid leaking secrets
+/// into LLM context.
+///
+/// Handles both standard URLs (`https://token@github.com/...` → `https://***@github.com/...`)
+/// and SCP-style URLs (`token@github.com:org/repo.git` → `***@github.com:org/repo.git`).
+fn sanitize_remote_url(url: &str) -> String {
+    // https://token@github.com/... → https://***@github.com/...
+    if let Some(scheme_end) = url.find("://") {
+        let authority_start = scheme_end + 3;
+        let authority_end = url[authority_start..]
+            .find(['/', '?', '#'])
+            .map(|i| authority_start + i)
+            .unwrap_or(url.len());
+        if let Some(at_rel) = url[authority_start..authority_end].find('@') {
+            let at_pos = authority_start + at_rel;
+            return format!("{}***@{}", &url[..authority_start], &url[at_pos + 1..]);
+        }
+        return url.to_string();
+    }
+    // SCP-style: token@github.com:org/repo.git → ***@github.com:org/repo.git
+    if let Some(at_pos) = url.find('@') {
+        if let Some(colon_rel) = url[at_pos + 1..].find(':') {
+            let colon_pos = at_pos + 1 + colon_rel;
+            let userinfo = &url[..at_pos];
+            let host = &url[at_pos + 1..colon_pos];
+            if !userinfo.is_empty()
+                && !host.is_empty()
+                && !userinfo.contains('/')
+                && !host.contains('/')
+            {
+                return format!("***@{}", &url[at_pos + 1..]);
+            }
+        }
+    }
+    url.to_string()
+}
+
+/// Gather git context from `client_cwd` and return a preamble to prepend to
+/// the task description plus an optional base branch for the worktree.
+///
+/// All subprocess calls are best-effort — failures produce empty strings so
+/// the task is never blocked by unavailable tooling (e.g. no `gh` CLI).
+fn gather_task_context(client_cwd: Option<&str>, description: &str) -> TaskContext {
+    let branch = git_output(client_cwd, &["rev-parse", "--abbrev-ref", "HEAD"]);
+    let remote = git_output(client_cwd, &["remote", "get-url", "origin"]);
+    let log = git_output(client_cwd, &["log", "--oneline", "-5"]);
+
+    let mut lines: Vec<String> = Vec::new();
+    lines.push("=== Repository context (injected by amaebi) ===".into());
+    if !branch.is_empty() {
+        lines.push(format!("Current branch : {branch}"));
+    }
+    if !remote.is_empty() {
+        lines.push(format!("Remote origin  : {}", sanitize_remote_url(&remote)));
+    }
+    if !log.is_empty() {
+        lines.push("Recent commits :".into());
+        for commit_line in log.lines() {
+            lines.push(format!("  {commit_line}"));
+        }
+    }
+
+    // --- PR-specific context ---
+    let mut start_branch: Option<String> = None;
+    if let Some(pr_num) = extract_pr_number(description) {
+        // Try gh pr view to get the head branch and title.
+        let gh_json = std::process::Command::new("gh")
+            .args([
+                "pr",
+                "view",
+                &pr_num.to_string(),
+                "--json",
+                "headRefName,title,baseRefName",
+            ])
+            .current_dir(client_cwd.unwrap_or("."))
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .unwrap_or_default();
+
+        if !gh_json.is_empty() {
+            // Parse the JSON minimally (avoid a heavy dep; fields are simple strings).
+            let head = json_str_field(&gh_json, "headRefName");
+            let base = json_str_field(&gh_json, "baseRefName");
+            let title = json_str_field(&gh_json, "title");
+
+            lines.push(format!("PR #{pr_num}"));
+            if !title.is_empty() {
+                lines.push(format!("  Title      : {title}"));
+            }
+            if !head.is_empty() {
+                lines.push(format!("  Head branch: {head}"));
+                start_branch = Some(head.clone());
+            }
+            if !base.is_empty() {
+                lines.push(format!("  Base branch: {base}"));
+            }
+        }
+    }
+
+    if !branch.is_empty() || start_branch.is_some() {
+        lines.push("When your changes are ready, push with: git push -u origin HEAD".to_string());
+    }
+
+    lines.push("=== End of injected context ===".into());
+    lines.push(String::new()); // blank line before the actual task
+
+    TaskContext {
+        preamble: lines.join("\n"),
+        start_branch,
+    }
+}
+
+/// Extract a string field value from a simple flat JSON object.
+/// Only handles the case where the value is a JSON string (double-quoted).
+/// Returns an empty string on failure.
+fn json_str_field(json: &str, field: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(json)
+        .ok()
+        .and_then(|v| v.get(field)?.as_str().map(str::to_owned))
+        .unwrap_or_default()
 }
 
 /// Handle `Request::ClearMemory`: clear the memory DB and send `Done`.
@@ -2663,6 +3425,12 @@ where
     // turn does not permanently disable compaction for the rest of the
     // session.
     let mut consecutive_compact_failures: u32 = 0;
+    // AMAEBI_TOOL_MODEL: if set, use this cheaper model on turns where the
+    // previous turn finished with tool calls (FinishReason::ToolCalls),
+    // unless the LLM explicitly switched the model via switch_model.
+    let tool_model: Option<String> = std::env::var("AMAEBI_TOOL_MODEL").ok();
+    let mut model_explicitly_switched = false;
+    let mut last_turn_used_tools = false;
 
     // Per-run scratch directory for large tool outputs (unix only).
     // Intentionally not cleaned up on exit — see comment near ScratchDirGuard
@@ -2755,15 +3523,33 @@ where
         // All models route through the Copilot JWT endpoint; invoke_model
         // falls back to the Responses API automatically when needed.
         // Token management and auth-error retry are handled inside invoke_model.
+        //
+        // If AMAEBI_TOOL_MODEL is configured and the LLM has not explicitly
+        // switched the model via switch_model, use the tool model for every
+        // turn after the first to reduce cost on mechanical tool-execution turns.
+        let invoke_with: &str =
+            if last_turn_used_tools && !model_explicitly_switched && tool_model.is_some() {
+                tool_model.as_deref().unwrap()
+            } else {
+                &current_model
+            };
+        if invoke_with != current_model {
+            tracing::debug!(
+                tool_model = invoke_with,
+                main_model = %current_model,
+                "auto-switching to AMAEBI_TOOL_MODEL for tool-execution turn"
+            );
+        }
         let resp = invoke_model(
             state,
-            &current_model,
+            invoke_with,
             &messages,
             &schemas,
-            response_max_tokens(&current_model),
+            response_max_tokens(invoke_with),
             writer,
         )
         .await?;
+        last_turn_used_tools = matches!(resp.finish_reason, FinishReason::ToolCalls);
 
         last_prompt_tokens = resp.prompt_tokens;
 
@@ -3247,6 +4033,9 @@ where
                                 Ok(new_model) => {
                                     let old =
                                         std::mem::replace(&mut current_model, new_model.clone());
+                                    // LLM made an explicit choice — stop auto-switching
+                                    // to AMAEBI_TOOL_MODEL so we respect the LLM's intent.
+                                    model_explicitly_switched = true;
                                     tracing::info!(
                                         old = %old,
                                         new = %current_model,
@@ -4952,5 +5741,121 @@ mod tests {
             None => client_model.clone(),
         };
         assert_eq!(effective, "claude-opus-4.6[1m]");
+    }
+
+    // -----------------------------------------------------------------------
+    // extract_pr_number
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn extract_pr_number_pr99() {
+        assert_eq!(extract_pr_number("fix PR99 copilot review"), Some(99));
+    }
+
+    #[test]
+    fn extract_pr_number_pr_hash_99() {
+        assert_eq!(extract_pr_number("fix PR #99"), Some(99));
+    }
+
+    #[test]
+    fn extract_pr_number_hash_only() {
+        assert_eq!(extract_pr_number("fix #123 issue"), Some(123));
+    }
+
+    #[test]
+    fn extract_pr_number_case_insensitive() {
+        assert_eq!(extract_pr_number("fix pr42"), Some(42));
+    }
+
+    #[test]
+    fn extract_pr_number_chinese_context() {
+        assert_eq!(
+            extract_pr_number("修复sglang的PR99里的copilot review"),
+            Some(99)
+        );
+    }
+
+    #[test]
+    fn extract_pr_number_none_when_absent() {
+        assert_eq!(extract_pr_number("fix the build"), None);
+    }
+
+    #[test]
+    fn extract_pr_number_ignores_non_numeric() {
+        assert_eq!(extract_pr_number("improve PRoductivity"), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // json_str_field
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn json_str_field_extracts_value() {
+        let json = r#"{"headRefName":"feat/paged","title":"Add FMHA"}"#;
+        assert_eq!(json_str_field(json, "headRefName"), "feat/paged");
+        assert_eq!(json_str_field(json, "title"), "Add FMHA");
+    }
+
+    #[test]
+    fn json_str_field_missing_key() {
+        let json = r#"{"headRefName":"feat/paged"}"#;
+        assert_eq!(json_str_field(json, "baseRefName"), "");
+    }
+
+    #[test]
+    fn json_str_field_empty_json() {
+        assert_eq!(json_str_field("", "key"), "");
+    }
+
+    // -----------------------------------------------------------------------
+    // sanitize_remote_url
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn sanitize_remote_url_https_with_token() {
+        assert_eq!(
+            sanitize_remote_url("https://ghp_abc123@github.com/org/repo.git"),
+            "https://***@github.com/org/repo.git"
+        );
+    }
+
+    #[test]
+    fn sanitize_remote_url_https_no_creds() {
+        assert_eq!(
+            sanitize_remote_url("https://github.com/org/repo.git"),
+            "https://github.com/org/repo.git"
+        );
+    }
+
+    #[test]
+    fn sanitize_remote_url_scp_style_with_token() {
+        assert_eq!(
+            sanitize_remote_url("ghp_abc123@github.com:org/repo.git"),
+            "***@github.com:org/repo.git"
+        );
+    }
+
+    #[test]
+    fn sanitize_remote_url_scp_style_git_user() {
+        assert_eq!(
+            sanitize_remote_url("git@github.com:org/repo.git"),
+            "***@github.com:org/repo.git"
+        );
+    }
+
+    #[test]
+    fn sanitize_remote_url_plain_url() {
+        assert_eq!(
+            sanitize_remote_url("https://github.com/org/repo"),
+            "https://github.com/org/repo"
+        );
+    }
+
+    #[test]
+    fn sanitize_remote_url_ssh_scheme() {
+        assert_eq!(
+            sanitize_remote_url("ssh://user@host/path"),
+            "ssh://***@host/path"
+        );
     }
 }

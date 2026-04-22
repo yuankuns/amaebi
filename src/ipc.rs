@@ -18,6 +18,13 @@ pub struct TaskSpec {
     pub auto_enter: bool,
 }
 
+/// A single pane+task pair for supervision.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+pub struct SupervisionTarget {
+    pub pane_id: String,
+    pub task_description: String,
+}
+
 /// A message sent from the client to the daemon over the Unix socket.
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -122,6 +129,13 @@ pub enum Request {
     ClaudeLaunch {
         /// The tasks to launch in parallel.
         tasks: Vec<TaskSpec>,
+    },
+    /// Supervise tmux panes where Claude is executing tasks.
+    /// The daemon runs a Rust polling loop: capture pane → LLM analysis → act.
+    SupervisePanes {
+        panes: Vec<SupervisionTarget>,
+        model: String,
+        session_id: Option<String>,
     },
 }
 
@@ -583,6 +597,38 @@ mod tests {
             panic!("expected ClaudeLaunch");
         };
         assert_eq!(tasks.len(), 2);
+    }
+
+    #[test]
+    fn request_supervise_panes_round_trip() {
+        let req = Request::SupervisePanes {
+            panes: vec![SupervisionTarget {
+                pane_id: "%3".into(),
+                task_description: "implement feature X".into(),
+            }],
+            model: "gpt-4o".into(),
+            session_id: Some("uuid-abc".into()),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["type"], "supervise_panes");
+        assert_eq!(v["panes"][0]["pane_id"], "%3");
+        assert_eq!(v["model"], "gpt-4o");
+        assert_eq!(v["session_id"], "uuid-abc");
+
+        let back: Request = serde_json::from_str(&json).unwrap();
+        let Request::SupervisePanes {
+            panes,
+            model,
+            session_id,
+        } = back
+        else {
+            panic!("expected SupervisePanes");
+        };
+        assert_eq!(panes.len(), 1);
+        assert_eq!(panes[0].pane_id, "%3");
+        assert_eq!(model, "gpt-4o");
+        assert_eq!(session_id.as_deref(), Some("uuid-abc"));
     }
 
     #[test]

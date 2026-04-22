@@ -208,6 +208,13 @@ struct ClaudeTask {
     task_id: String,
     /// Task description / opening prompt.
     description: String,
+    /// Optional absolute worktree path.
+    worktree: Option<String>,
+    /// Whether to auto-send Enter after injecting the command into the pane.
+    auto_enter: bool,
+    /// Override for the client working directory used to locate the git repo
+    /// when auto-creating a worktree.  Maps to TaskSpec::client_cwd.
+    cwd: Option<String>,
 }
 
 /// A parsed slash command from user input.
@@ -250,7 +257,7 @@ fn parse_model(input: &str) -> Option<Option<String>> {
     }
 }
 
-/// Parse `/claude "task" ["task2" ...]`.
+/// Parse `/claude [--worktree <path>] [--cwd <path>] [--no-enter] "task" ["task2" ...]`.
 ///
 /// Task splitting rules:
 /// - All tokens quoted → each quoted string is a separate task
@@ -263,31 +270,114 @@ fn parse_model(input: &str) -> Option<Option<String>> {
 /// - `Some(Ok(tasks))` → one or more tasks
 fn parse_claude(input: &str) -> Option<Result<Vec<ClaudeTask>, String>> {
     // Require "/claude" followed by end-of-string or whitespace to avoid
-    // false positives like "/claudefoo" or "/claude--help".
+    // false positives like "/claudefoo" or "/claude--help".  Whitespace
+    // handling accepts any Unicode whitespace — Chinese IMEs may insert
+    // U+3000 ideographic space.
     let rest = input.strip_prefix("/claude")?;
     if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
         return None;
     }
     let rest = rest.trim_start();
+    let usage = "usage: /claude [--worktree <path>] [--cwd <path>] [--no-enter] \
+                 \"task description\" [\"task2\" ...]";
     if rest.is_empty() {
-        return Some(Err(
-            "usage: /claude \"task description\" [\"task2\" ...]".to_string()
-        ));
+        return Some(Err(usage.to_string()));
     }
 
     let tokens = parse_quoted_args(rest);
     if tokens.is_empty() {
-        return Some(Err(
-            "usage: /claude \"task description\" [\"task2\" ...]".to_string()
-        ));
+        return Some(Err(usage.to_string()));
     }
 
-    // Quoted tokens each become a separate task; unquoted tokens are joined.
-    let all_quoted = tokens.iter().all(|(_, q)| *q);
-    let descriptions: Vec<String> = if all_quoted || tokens.len() == 1 {
-        tokens.into_iter().map(|(s, _)| s).collect()
+    let mut worktree: Option<String> = None;
+    let mut auto_enter = true;
+    let mut cwd: Option<String> = None;
+    // (description, was_quoted) pairs for non-flag tokens.
+    let mut desc_tokens: Vec<(String, bool)> = Vec::new();
+
+    let mut i = 0;
+    while i < tokens.len() {
+        match tokens[i].0.as_str() {
+            "--worktree" => {
+                i += 1;
+                // Require a non-flag value to follow --worktree.
+                if i >= tokens.len() || tokens[i].0.starts_with("--") {
+                    return Some(Err("--worktree requires a path argument".to_string()));
+                }
+                // Canonicalize to an absolute path so worktree uniqueness
+                // checks in the daemon are reliable regardless of how the
+                // path was spelled (relative vs. symlink vs. absolute).
+                // If canonicalize fails (path doesn't exist yet), fall back to
+                // an explicit absolute path rather than leaving it relative.
+                let raw = &tokens[i].0;
+                let raw_path = std::path::PathBuf::from(raw);
+                let abs = std::fs::canonicalize(&raw_path).unwrap_or_else(|_| {
+                    if raw_path.is_absolute() {
+                        raw_path.clone()
+                    } else {
+                        std::env::current_dir()
+                            .map(|cwd| cwd.join(&raw_path))
+                            .unwrap_or(raw_path)
+                    }
+                });
+                worktree = Some(abs.to_string_lossy().into_owned());
+            }
+            "--no-enter" => {
+                auto_enter = false;
+            }
+            "--cwd" => {
+                i += 1;
+                if i >= tokens.len() || tokens[i].0.starts_with("--") {
+                    return Some(Err("--cwd requires a path argument".to_string()));
+                }
+                // Canonicalize so the daemon gets a reliable absolute path.
+                let raw = &tokens[i].0;
+                let raw_path = std::path::PathBuf::from(raw);
+                let abs = std::fs::canonicalize(&raw_path).unwrap_or_else(|_| {
+                    if raw_path.is_absolute() {
+                        raw_path.clone()
+                    } else {
+                        std::env::current_dir()
+                            .map(|d| d.join(&raw_path))
+                            .unwrap_or(raw_path)
+                    }
+                });
+                cwd = Some(abs.to_string_lossy().into_owned());
+            }
+            // `--` marks end of flags; everything after is a description token.
+            "--" => {
+                i += 1;
+                while i < tokens.len() {
+                    desc_tokens.push((tokens[i].0.clone(), tokens[i].1));
+                    i += 1;
+                }
+                break;
+            }
+            tok => {
+                // Only treat unquoted tokens starting with `--` as unknown
+                // flags.  A quoted token like `"--investigate"` is a valid
+                // task description and must not be rejected.
+                if !tokens[i].1 && tok.starts_with("--") {
+                    return Some(Err(format!("unknown flag: {tok}")));
+                }
+                desc_tokens.push((tok.to_string(), tokens[i].1));
+            }
+        }
+        i += 1;
+    }
+
+    if desc_tokens.is_empty() {
+        return Some(Err(usage.to_string()));
+    }
+
+    // Build task list.  Quoted tokens each become a separate task.  Unquoted
+    // tokens are joined as a single task (e.g. `/claude write some code` →
+    // one task "write some code", not three separate tasks).
+    let all_quoted = desc_tokens.iter().all(|(_, q)| *q);
+    let descriptions: Vec<String> = if all_quoted || desc_tokens.len() == 1 {
+        desc_tokens.into_iter().map(|(s, _)| s).collect()
     } else {
-        vec![tokens
+        vec![desc_tokens
             .into_iter()
             .map(|(s, _)| s)
             .collect::<Vec<_>>()
@@ -302,6 +392,9 @@ fn parse_claude(input: &str) -> Option<Result<Vec<ClaudeTask>, String>> {
             ClaudeTask {
                 task_id,
                 description: desc,
+                worktree: worktree.clone(),
+                auto_enter,
+                cwd: cwd.clone(),
             }
         })
         .collect();
@@ -444,9 +537,9 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
                 .map(|t| TaskSpec {
                     task_id: t.task_id,
                     description: t.description,
-                    worktree: None,
-                    client_cwd: Some(cwd_str.clone()),
-                    auto_enter: true,
+                    worktree: t.worktree,
+                    client_cwd: t.cwd.or_else(|| Some(cwd_str.clone())),
+                    auto_enter: t.auto_enter,
                 })
                 .collect(),
         };
@@ -880,21 +973,29 @@ pub async fn run_chat_loop(
                         continue 'session;
                     }
                 };
+                // Save descriptions keyed by task_id for supervision prompt below.
+                let task_descriptions: std::collections::HashMap<String, String> = tasks
+                    .iter()
+                    .map(|t| (t.task_id.clone(), t.description.clone()))
+                    .collect();
                 let req = Request::ClaudeLaunch {
                     tasks: tasks
                         .into_iter()
                         .map(|t| TaskSpec {
                             task_id: t.task_id,
                             description: t.description,
-                            worktree: None,
-                            client_cwd: Some(cwd_str.clone()),
-                            auto_enter: true,
+                            worktree: t.worktree,
+                            client_cwd: t.cwd.or_else(|| Some(cwd_str.clone())),
+                            auto_enter: t.auto_enter,
                         })
                         .collect(),
                 };
                 let mut req_line = serde_json::to_string(&req)?;
                 req_line.push('\n');
                 write_half.write_all(req_line.as_bytes()).await?;
+
+                // Collect (pane_id, task_description) for supervision.
+                let mut launched: Vec<(String, String)> = Vec::new();
 
                 loop {
                     let line = lines.next_line().await.context("reading daemon response")?;
@@ -915,6 +1016,11 @@ pub async fn run_chat_loop(
                         } => {
                             let msg = format!("[pane {pane_id}] {task_id} → session {sid}\n");
                             stdout.write_all(msg.as_bytes()).await?;
+                            let desc = task_descriptions
+                                .get(&task_id)
+                                .cloned()
+                                .unwrap_or_else(|| task_id.clone());
+                            launched.push((pane_id, desc));
                         }
                         Response::CapacityError {
                             requested,
@@ -933,6 +1039,125 @@ pub async fn run_chat_loop(
                     }
                 }
                 stdout.flush().await?;
+
+                // If panes were successfully launched, send a SupervisePanes request
+                // to the daemon so it runs a Rust polling loop instead of asking the
+                // LLM to keep looping via an injected prompt.
+                if !launched.is_empty() {
+                    let supervise_req = Request::SupervisePanes {
+                        panes: launched
+                            .iter()
+                            .map(|(pid, desc)| crate::ipc::SupervisionTarget {
+                                pane_id: pid.clone(),
+                                task_description: desc.clone(),
+                            })
+                            .collect(),
+                        model: model.clone(),
+                        session_id: Some(session_id.clone()),
+                    };
+                    let mut req_line = serde_json::to_string(&supervise_req)?;
+                    req_line.push('\n');
+                    write_half.write_all(req_line.as_bytes()).await?;
+
+                    // Stream supervision output exactly like a Chat response.
+                    // We always arm a timeout so the client never hangs if the
+                    // daemon silently drops. Default: 12 h (slightly above the
+                    // daemon's 10 h default; both are configurable via env vars);
+                    // shortened to 5 s once an interrupt has been sent.
+                    let mut interrupt_sent = false;
+                    let supervision_deadline =
+                        tokio::time::Instant::now() + Duration::from_secs(12 * 60 * 60);
+                    'supervision: loop {
+                        let timeout_at = if interrupt_sent {
+                            // After interrupt, give daemon 5 s to respond with Done.
+                            tokio::time::Instant::now() + Duration::from_secs(5)
+                        } else {
+                            supervision_deadline
+                        };
+                        tokio::select! {
+                            biased;
+
+                            _ = sigint.recv(), if !interrupt_sent => {
+                                let interrupt_req = Request::Interrupt { session_id: session_id.clone() };
+                                if let Ok(mut frame) = serde_json::to_string(&interrupt_req) {
+                                    frame.push('\n');
+                                    let _ = write_half.write_all(frame.as_bytes()).await;
+                                }
+                                interrupt_sent = true;
+                                // Continue looping to drain remaining frames.
+                            }
+
+                            _ = tokio::time::sleep_until(timeout_at) => {
+                                // Timed out: either post-interrupt 5 s drain or the
+                                // supervision hard ceiling.  The daemon may still be
+                                // running its supervision loop, so reusing this socket
+                                // for further Chat requests would desync the protocol.
+                                // Terminate the session cleanly instead.
+                                //
+                                // Flush any partially buffered markdown first so we
+                                // do not lose the last chunk the daemon had streamed
+                                // before we gave up waiting.  `break 'session`
+                                // bypasses the post-supervision-loop flush, so it
+                                // has to happen here.
+                                if let Some(remaining) = md_buf.flush_all() {
+                                    let out = render_markdown(&remaining);
+                                    stdout.write_all(out.as_bytes()).await?;
+                                }
+                                let reason = if interrupt_sent {
+                                    "[supervision] daemon did not stop within 5 s after interrupt; ending session.\n"
+                                } else {
+                                    "[supervision] hard timeout reached; ending session.\n"
+                                };
+                                stdout.write_all(reason.as_bytes()).await?;
+                                stdout.flush().await?;
+                                break 'session;
+                            }
+
+                            line = lines.next_line() => {
+                                let line = line.context("reading supervision response")?;
+                                let Some(line) = line else { break 'session };
+                                let resp: Response = serde_json::from_str(&line)?;
+                                match resp {
+                                    Response::Text { chunk } => {
+                                        md_buf.push(&chunk);
+                                        while let Some(ready) = md_buf.flush_if_ready() {
+                                            let out = render_markdown(&ready);
+                                            stdout.write_all(out.as_bytes()).await?;
+                                            stdout.flush().await?;
+                                        }
+                                    }
+                                    Response::Done => {
+                                        if let Some(remaining) = md_buf.flush_all() {
+                                            let out = render_markdown(&remaining);
+                                            stdout.write_all(out.as_bytes()).await?;
+                                        }
+                                        stdout.write_all(b"\n").await?;
+                                        stdout.flush().await?;
+                                        break 'supervision;
+                                    }
+                                    Response::Error { message } => {
+                                        if let Some(remaining) = md_buf.flush_all() {
+                                            let out = render_markdown(&remaining);
+                                            stdout.write_all(out.as_bytes()).await?;
+                                        }
+                                        stdout.write_all(message.as_bytes()).await?;
+                                        stdout.write_all(b"\n").await?;
+                                        stdout.flush().await?;
+                                        break 'supervision;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                    // Flush any remaining markdown (e.g. timeout break path).
+                    if let Some(remaining) = md_buf.flush_all() {
+                        let out = render_markdown(&remaining);
+                        stdout.write_all(out.as_bytes()).await?;
+                    }
+                    stdout.write_all(b"\n").await?;
+                    stdout.flush().await?;
+                }
                 continue 'session;
             }
             Some(SlashCommand::Model(new_model)) => {
@@ -3505,6 +3730,51 @@ mod tests {
     fn make_task_id_fallback_for_pure_non_ascii() {
         let id = make_task_id("こんにちは", 3);
         assert_eq!(id, "task-3");
+    }
+
+    // -----------------------------------------------------------------------
+    // /claude: Unicode whitespace and --cwd flag
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_claude_unicode_whitespace_ideographic_space() {
+        // Chinese IMEs often produce U+3000 (ideographic space).
+        let input = "/claude\u{3000}\"do something\"";
+        let result = parse_claude(input);
+        let tasks = result.expect("should be Some").expect("should be Ok");
+        assert_eq!(tasks[0].description, "do something");
+    }
+
+    #[test]
+    fn parse_claude_unicode_whitespace_nbsp() {
+        let input = "/claude\u{00A0}\"do something\"";
+        let result = parse_claude(input);
+        let tasks = result.expect("should be Some").expect("should be Ok");
+        assert_eq!(tasks[0].description, "do something");
+    }
+
+    #[test]
+    fn parse_claude_no_whitespace_returns_none() {
+        // "/claudefoo" is not a /claude command.
+        assert!(parse_claude("/claudefoo").is_none());
+    }
+
+    #[test]
+    fn parse_claude_cwd_flag() {
+        let input = r#"/claude --cwd /tmp/myrepo "fix the bug""#;
+        let result = parse_claude(input);
+        let tasks = result.expect("should be Some").expect("should be Ok");
+        assert_eq!(tasks[0].description, "fix the bug");
+        // cwd is canonicalized; /tmp exists so it should resolve.
+        assert!(tasks[0].cwd.is_some());
+    }
+
+    #[test]
+    fn parse_claude_cwd_missing_arg_returns_err() {
+        let input = "/claude --cwd";
+        let result = parse_claude(input);
+        let err = result.expect("should be Some").unwrap_err();
+        assert!(err.contains("--cwd requires a path"));
     }
 
     // -----------------------------------------------------------------------
