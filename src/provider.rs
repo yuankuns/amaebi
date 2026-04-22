@@ -5,6 +5,8 @@
 //!
 //! When no provider prefix is given, the default provider is **Bedrock**.
 
+use std::collections::HashMap;
+
 /// Supported model providers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderKind {
@@ -112,6 +114,20 @@ pub const DEFAULT_MODEL: &str = "claude-sonnet-4.6";
 /// part of the model ID.  This avoids a hard error for forward-compatible
 /// model names that happen to contain a slash.
 pub fn resolve(raw: &str) -> ModelSpec {
+    resolve_with_aliases(raw, &HashMap::new())
+}
+
+/// Parse a raw model string into a [`ModelSpec`], consulting user-defined
+/// aliases from the config file before falling back to the built-in table.
+///
+/// Resolution order when the bare name has no recognised provider prefix:
+/// 1. Built-in `BEDROCK_ALIASES` — wins on name conflict.
+/// 2. `user_aliases` — the value replaces `bare` and re-enters the normal
+///    prefix-parsing path (so aliases may expand to `copilot/...`,
+///    `bedrock/...`, or another bare name).  Alias values are resolved
+///    exactly once; no chain expansion.
+/// 3. Default provider (Bedrock), passing the bare name through unchanged.
+pub fn resolve_with_aliases(raw: &str, user_aliases: &HashMap<String, String>) -> ModelSpec {
     let display_name = raw.to_owned();
 
     // Strip the `[1m]` opt-in suffix before routing and alias resolution.
@@ -121,6 +137,19 @@ pub fn resolve(raw: &str) -> ModelSpec {
         &raw[..raw.len() - "[1m]".len()]
     } else {
         raw
+    };
+
+    // Expand user alias only when `bare` is a plain name (no provider prefix)
+    // AND does not collide with a built-in Bedrock alias.  Built-in wins on
+    // conflict so the LLM-visible `claude-opus-4.6` etc. are stable.
+    let expanded: String;
+    let bare: &str = if bare.contains('/') || BEDROCK_ALIASES.iter().any(|(a, _)| *a == bare) {
+        bare
+    } else if let Some(target) = user_aliases.get(bare) {
+        expanded = target.clone();
+        &expanded
+    } else {
+        bare
     };
 
     if let Some((prefix, model)) = bare.split_once('/') {
@@ -177,6 +206,14 @@ fn resolve_bedrock_alias(name: &str) -> String {
 /// Return the Bedrock alias table for display (e.g. `amaebi models`).
 pub fn bedrock_aliases() -> &'static [(&'static str, &'static str)] {
     BEDROCK_ALIASES
+}
+
+/// Returns `true` when `name` is a key in the built-in Bedrock alias table.
+///
+/// Used by the daemon's user-alias expansion logic so that built-in aliases
+/// always win on name conflicts.
+pub fn is_builtin_bedrock_alias(name: &str) -> bool {
+    BEDROCK_ALIASES.iter().any(|(a, _)| *a == name)
 }
 
 // ---------------------------------------------------------------------------
@@ -336,5 +373,78 @@ mod tests {
     #[test]
     fn bedrock_aliases_not_empty() {
         assert!(!bedrock_aliases().is_empty());
+    }
+
+    // ---- resolve_with_aliases() -------------------------------------------
+
+    #[test]
+    fn resolve_with_aliases_expands_user_alias() {
+        let mut map = HashMap::new();
+        map.insert("opus".into(), "bedrock/claude-opus-4.7".into());
+        let spec = resolve_with_aliases("opus", &map);
+        assert_eq!(spec.provider, ProviderKind::Bedrock);
+        assert_eq!(spec.model_id, "us.anthropic.claude-opus-4-7");
+        // display_name preserves what the user typed.
+        assert_eq!(spec.display_name, "opus");
+    }
+
+    #[test]
+    fn user_alias_does_not_override_builtin() {
+        // Built-in alias `claude-opus-4.6` must win even when the user tries
+        // to point it at something else.
+        let mut map = HashMap::new();
+        map.insert("claude-opus-4.6".into(), "bedrock/claude-sonnet-4.6".into());
+        let spec = resolve_with_aliases("claude-opus-4.6", &map);
+        assert_eq!(spec.model_id, "us.anthropic.claude-opus-4-6-v1");
+    }
+
+    #[test]
+    fn user_alias_preserves_1m_suffix() {
+        let mut map = HashMap::new();
+        map.insert("opus".into(), "bedrock/claude-opus-4.7".into());
+        let spec = resolve_with_aliases("opus[1m]", &map);
+        assert!(spec.use_1m);
+        assert_eq!(spec.model_id, "us.anthropic.claude-opus-4-7");
+        assert_eq!(spec.display_name, "opus[1m]");
+    }
+
+    #[test]
+    fn user_alias_target_is_not_chain_resolved() {
+        // `a -> b`, `b -> bedrock/...`.  Expanding "a" must stop at "b".
+        let mut map = HashMap::new();
+        map.insert("a".into(), "b".into());
+        map.insert("b".into(), "bedrock/claude-opus-4.7".into());
+        let spec = resolve_with_aliases("a", &map);
+        // "b" is not a built-in alias, so it passes through unchanged.
+        assert_eq!(spec.model_id, "b");
+        assert_eq!(spec.provider, ProviderKind::Bedrock);
+    }
+
+    #[test]
+    fn user_alias_can_target_copilot() {
+        let mut map = HashMap::new();
+        map.insert("fast".into(), "copilot/gpt-4o-mini".into());
+        let spec = resolve_with_aliases("fast", &map);
+        assert_eq!(spec.provider, ProviderKind::Copilot);
+        assert_eq!(spec.model_id, "gpt-4o-mini");
+    }
+
+    #[test]
+    fn resolve_wrapper_passes_empty_aliases() {
+        // The zero-config wrapper must behave exactly like the old resolve().
+        let spec = resolve("claude-opus-4.7");
+        assert_eq!(spec.model_id, "us.anthropic.claude-opus-4-7");
+    }
+
+    #[test]
+    fn user_alias_ignored_when_input_has_prefix() {
+        // `bedrock/foo` should never try to expand `bedrock/foo` as a user alias.
+        let mut map = HashMap::new();
+        map.insert(
+            "bedrock/claude-opus-4.7".into(),
+            "bedrock/claude-sonnet-4.6".into(),
+        );
+        let spec = resolve_with_aliases("bedrock/claude-opus-4.7", &map);
+        assert_eq!(spec.model_id, "us.anthropic.claude-opus-4-7");
     }
 }

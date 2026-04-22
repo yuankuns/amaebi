@@ -72,6 +72,27 @@ pub async fn run() -> Result<()> {
             println!("  (could not fetch Copilot models: {e:#})");
         }
     }
+    println!();
+
+    // ── User-defined aliases ──────────────────────────────────────────────
+    println!("User aliases (from ~/.amaebi/config.json):");
+    let user_aliases = crate::config::Config::load().model_aliases;
+    if user_aliases.is_empty() {
+        println!("  (none configured — add a \"model_aliases\" object to the config file)");
+    } else {
+        // Sort alphabetically for stable display.
+        let mut sorted: Vec<(&String, &String)> = user_aliases.iter().collect();
+        sorted.sort_by_key(|(k, _)| k.as_str());
+        let name_width = sorted.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
+        for (name, target) in sorted {
+            let shadowed = if crate::provider::is_builtin_bedrock_alias(name) {
+                "  (shadowed by built-in)"
+            } else {
+                ""
+            };
+            println!("  {name:<name_width$}  → {target}{shadowed}");
+        }
+    }
 
     Ok(())
 }

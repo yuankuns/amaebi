@@ -145,6 +145,10 @@ pub struct DaemonState {
     /// it is already present the request is rejected with a Response::Error so
     /// concurrent clients cannot interleave writes to the same session history.
     pub active_sessions: Arc<Mutex<HashSet<String>>>,
+    /// User-defined model aliases loaded once from `~/.amaebi/config.json` at
+    /// daemon startup.  Consulted by `provider::resolve_with_aliases` on every
+    /// request.  Empty when the config file is missing or has no aliases.
+    pub user_aliases: Arc<std::collections::HashMap<String, String>>,
 }
 
 impl DaemonState {
@@ -166,11 +170,16 @@ impl DaemonState {
 
         let tokens = Arc::new(TokenCache::new());
 
+        // Load user model aliases from the config file.  Never fatal — falls
+        // back to an empty map if the file is missing or malformed.
+        let user_aliases = Arc::new(crate::config::Config::load().model_aliases);
+
         let spawn_ctx = Arc::new(tools::SpawnContext {
             http: http.clone(),
             db: Arc::clone(&db),
             compacting_sessions: Arc::clone(&compacting_sessions),
             tokens: Arc::clone(&tokens),
+            user_aliases: Arc::clone(&user_aliases),
         });
 
         let mut executor = tools::LocalExecutor::new();
@@ -183,6 +192,7 @@ impl DaemonState {
             db,
             compacting_sessions,
             active_sessions,
+            user_aliases,
         })
     }
 }
@@ -328,6 +338,36 @@ fn compaction_threshold_tokens(model: &str) -> usize {
 /// token pre-flight check is required before dispatching the request.
 fn needs_copilot_auth(model: &str) -> bool {
     crate::provider::resolve(model).provider == crate::provider::ProviderKind::Copilot
+}
+
+/// Expand a user-defined alias in `model` using the daemon's loaded alias
+/// table.  Returns the expanded target string, or the original input if no
+/// alias matches.  The `[1m]` suffix is preserved across expansion so
+/// `amaebi chat --model opus[1m]` works when `opus` maps to a Bedrock model.
+///
+/// This is called once on every request-entry so the rest of the daemon can
+/// keep using bare `provider::resolve()` without knowing about user aliases.
+fn expand_user_alias(
+    model: &str,
+    user_aliases: &std::collections::HashMap<String, String>,
+) -> String {
+    // If the caller typed `name[1m]`, strip the suffix, expand the bare name,
+    // then reattach the suffix.  Aliases in config.json should not contain
+    // the `[1m]` suffix themselves.
+    let (bare, suffix) = if let Some(stripped) = model.strip_suffix("[1m]") {
+        (stripped, "[1m]")
+    } else {
+        (model, "")
+    };
+
+    // Built-in aliases win on conflict (same rule as provider::resolve_with_aliases).
+    if bare.contains('/') || crate::provider::is_builtin_bedrock_alias(bare) {
+        return model.to_owned();
+    }
+    match user_aliases.get(bare) {
+        Some(target) => format!("{target}{suffix}"),
+        None => model.to_owned(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -524,6 +564,7 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                 model,
                 session_id,
             } => {
+                let model = expand_user_alias(&model, &state.user_aliases);
                 tracing::info!(model = %model, prompt_len = prompt.len(), "received detach request");
                 if needs_copilot_auth(&model) {
                     if let Err(e) = state.tokens.get(&state.http).await {
@@ -603,6 +644,7 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                 model,
                 session_id,
             } => {
+                let model = expand_user_alias(&model, &state.user_aliases);
                 let mut conn_state = ConnState {
                     frame_rx: &mut frame_rx,
                     pending_unsolicited: &mut pending_unsolicited,
@@ -629,6 +671,7 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                 model,
                 session_id,
             } => {
+                let model = expand_user_alias(&model, &state.user_aliases);
                 let mut conn_state = ConnState {
                     frame_rx: &mut frame_rx,
                     pending_unsolicited: &mut pending_unsolicited,
@@ -662,6 +705,7 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                 model,
                 session_id,
             } => {
+                let model = expand_user_alias(&model, &state.user_aliases);
                 handle_supervision(&writer, &mut frame_rx, panes, model, &state, session_id)
                     .await?;
             }

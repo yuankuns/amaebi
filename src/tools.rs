@@ -24,6 +24,10 @@ pub struct SpawnContext {
     /// Shared Copilot token cache — reused by child agents to avoid redundant
     /// token fetches.
     pub tokens: Arc<crate::auth::TokenCache>,
+    /// User-defined model aliases from `~/.amaebi/config.json`, shared with
+    /// child agents so they can resolve aliases (e.g. `opus`) in spawn_agent
+    /// calls the same way the parent does.
+    pub user_aliases: Arc<HashMap<String, String>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -604,6 +608,8 @@ async fn spawn_agent(args: serde_json::Value, ctx: &SpawnContext) -> Result<Stri
         // Child agents get their own active_sessions set; they are ephemeral
         // and don't share the parent's session-lock namespace.
         active_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+        // Inherit user aliases so spawn_agent's `model` arg can reference them.
+        user_aliases: Arc::clone(&ctx.user_aliases),
     };
 
     let messages = vec![
@@ -1406,6 +1412,7 @@ mod tests {
             db: Arc::new(Mutex::new(rusqlite::Connection::open_in_memory().unwrap())),
             compacting_sessions: Arc::new(Mutex::new(HashSet::new())),
             tokens: Arc::new(crate::auth::TokenCache::new()),
+            user_aliases: Arc::new(HashMap::new()),
         }
     }
 
