@@ -64,7 +64,13 @@ async fn main() -> Result<()> {
         } => {
             if detach {
                 client::run_detach(socket, prompt, model).await
-            } else if let Some(session_uuid) = resume {
+            } else if resume.is_some() {
+                let cwd = std::env::current_dir().context("getting current directory")?;
+                let resumed = session::resolve_resume(&cwd, resume)?;
+                let Some(session_uuid) = resumed else {
+                    eprintln!("Resume cancelled.");
+                    return Ok(());
+                };
                 match client::run_resume(socket, prompt, model, session_uuid).await {
                     Ok(()) => Ok(()),
                     Err(e) if e.is::<client::Interrupted>() => std::process::exit(130),
@@ -89,11 +95,26 @@ async fn main() -> Result<()> {
             prompt,
             socket,
             model,
-        } => match client::run_chat_loop(socket, prompt, model).await {
-            Ok(()) => Ok(()),
-            Err(e) if e.is::<client::Interrupted>() => std::process::exit(130),
-            Err(e) => Err(e),
-        },
+            resume,
+        } => {
+            let resumed = if resume.is_some() {
+                let cwd = std::env::current_dir().context("getting current directory")?;
+                match session::resolve_resume(&cwd, resume)? {
+                    Some(id) => Some(id),
+                    None => {
+                        eprintln!("Resume cancelled.");
+                        return Ok(());
+                    }
+                }
+            } else {
+                None
+            };
+            match client::run_chat_loop(socket, prompt, model, resumed).await {
+                Ok(()) => Ok(()),
+                Err(e) if e.is::<client::Interrupted>() => std::process::exit(130),
+                Err(e) => Err(e),
+            }
+        }
         cli::Command::Acp { model, socket } => agent_server::run(model, socket).await,
         cli::Command::Models => models::run().await,
         cli::Command::Memory { action, socket } => run_memory(action, socket).await,

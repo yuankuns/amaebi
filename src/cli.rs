@@ -37,10 +37,24 @@ pub enum Command {
         /// Cannot be combined with --resume.
         #[arg(long, conflicts_with = "resume")]
         detach: bool,
-        /// Resume a prior session by UUID, loading its full chronological history
+        /// Resume a prior session, loading its full chronological history
         /// instead of the normal sliding-window context (last N turns).
+        ///
+        /// To pass a UUID you must use `=` syntax (`-r=<uuid>` or
+        /// `--resume=<uuid>`) so the value cannot be confused with the
+        /// required `<PROMPT>` positional.  Bare `-r` / `--resume` opens an
+        /// interactive picker of this directory's session history.
+        ///
+        /// Accepts a session UUID (or unique prefix ≥ 4 chars).
         /// Cannot be combined with --detach.
-        #[arg(long, conflicts_with = "detach")]
+        #[arg(
+            short = 'r',
+            long,
+            conflicts_with = "detach",
+            num_args = 0..=1,
+            require_equals = true,
+            default_missing_value = "",
+        )]
         resume: Option<String>,
     },
     /// Start an interactive multi-turn chat session (long connection).
@@ -56,6 +70,22 @@ pub enum Command {
         /// Format: [provider/]model — e.g. bedrock/claude-sonnet-4.6, copilot/gpt-4o.
         #[arg(long)]
         model: Option<String>,
+        /// Resume a prior chat session, loading its full chronological history.
+        ///
+        /// To pass a UUID you must use `=` syntax (`-r=<uuid>` or
+        /// `--resume=<uuid>`) so the value cannot be confused with the
+        /// optional `[PROMPT]` positional.  Bare `-r` / `--resume` opens an
+        /// interactive picker of this directory's session history.
+        ///
+        /// Accepts a session UUID (or unique prefix ≥ 4 chars).
+        #[arg(
+            short = 'r',
+            long,
+            num_args = 0..=1,
+            require_equals = true,
+            default_missing_value = "",
+        )]
+        resume: Option<String>,
     },
     /// Authenticate with GitHub Copilot via the device flow.
     Auth {

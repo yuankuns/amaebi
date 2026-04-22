@@ -335,6 +335,151 @@ pub fn create_fresh(dir: &Path) -> Result<String> {
     Ok(new_id)
 }
 
+/// Interactively resolve a session identifier for the `--resume` flag.
+///
+/// Three cases, driven by the raw value coming off the CLI (which uses
+/// `num_args = 0..=1`, so `--resume` without a value produces `Some("".into())`):
+///
+/// * `arg` is a non-empty string matching an existing record's UUID prefix
+///   uniquely (≥ 4 chars) — completed to the full stored UUID.
+///   Any other non-empty string is treated as an opaque session identifier
+///   and returned unchanged, so callers can resume sessions whose records
+///   have been pruned from `sessions.json` but whose history still exists
+///   in the SQLite memory DB.  No UUID-syntax validation is performed.
+/// * `arg` is `None` or an empty / `"list"` string — a numbered picker is
+///   printed to stderr listing this directory's session history (newest first)
+///   and the user's selection is returned.
+/// * The user enters an empty line at the picker — resolves to `Ok(None)`,
+///   letting the caller fall back to starting a fresh session (or aborting).
+///
+/// Returns `Err` when no sessions exist for the directory but a picker was
+/// requested, or when stderr/stdin is not a TTY (nothing to prompt on).
+pub fn resolve_resume(dir: &Path, arg: Option<String>) -> Result<Option<String>> {
+    let trimmed = arg.as_deref().map(str::trim).unwrap_or("");
+    let want_picker = trimmed.is_empty() || trimmed.eq_ignore_ascii_case("list");
+
+    if !want_picker {
+        // Direct UUID or unique prefix.  `list_for_dir` failures (missing
+        // $HOME, unreadable sessions.json, etc.) are best-effort downgraded
+        // to an empty history so the user can still resume an opaque UUID
+        // when the local index is unavailable.
+        let history = list_for_dir(dir).unwrap_or_default();
+        if let Some(rec) = history.iter().find(|r| r.uuid == trimmed) {
+            return Ok(Some(rec.uuid.clone()));
+        }
+        if trimmed.len() >= 4 {
+            let matches: Vec<&SessionRecord> = history
+                .iter()
+                .filter(|r| r.uuid.starts_with(trimmed))
+                .collect();
+            if matches.len() == 1 {
+                return Ok(Some(matches[0].uuid.clone()));
+            }
+            if matches.len() > 1 {
+                anyhow::bail!(
+                    "ambiguous session prefix {trimmed:?}: {} matches in {}",
+                    matches.len(),
+                    dir.display()
+                );
+            }
+        }
+        // No historical match: treat the argument as an opaque UUID anyway so
+        // callers can resume a session whose record has been pruned from
+        // sessions.json but whose history still exists in the SQLite memory DB.
+        return Ok(Some(trimmed.to_string()));
+    }
+
+    // Picker path.
+    let history = list_for_dir(dir)?;
+    if history.is_empty() {
+        anyhow::bail!(
+            "no previous sessions in {} — start a new one without --resume",
+            dir.display()
+        );
+    }
+    prompt_for_session(&history)
+}
+
+/// Print a numbered list of `history` to stderr and read a choice from stdin.
+///
+/// Accepts: a 1-based index, a UUID, or a unique UUID prefix (≥ 4 chars).
+/// Returns `Ok(None)` on empty input (user cancelled).
+fn prompt_for_session(history: &[SessionRecord]) -> Result<Option<String>> {
+    use std::io::{BufRead, IsTerminal, Write};
+
+    // Both stderr (where we draw the prompt) and stdin (where we read the
+    // choice) must be TTYs.  Otherwise the picker could silently consume
+    // piped input as the selection (e.g. `echo foo | amaebi chat -r`).
+    if !std::io::stderr().is_terminal() || !std::io::stdin().is_terminal() {
+        anyhow::bail!("--resume without a UUID requires an interactive terminal");
+    }
+
+    let stderr = std::io::stderr();
+    let mut e = stderr.lock();
+    writeln!(
+        e,
+        "Select a session to resume ({} available):",
+        history.len()
+    )
+    .context("writing picker header")?;
+    for (i, rec) in history.iter().enumerate() {
+        let marker = if i == 0 { " (current)" } else { "" };
+        writeln!(
+            e,
+            "  {:>2}. {}{}",
+            i + 1,
+            &rec.uuid[..rec.uuid.len().min(8)],
+            marker
+        )?;
+        writeln!(
+            e,
+            "        created {}  accessed {}",
+            rec.created_at, rec.last_accessed
+        )?;
+    }
+    write!(e, "Choice [1-{}] (empty to cancel): ", history.len())?;
+    e.flush().context("flushing picker prompt")?;
+    drop(e);
+
+    let stdin = std::io::stdin();
+    let mut line = String::new();
+    if stdin
+        .lock()
+        .read_line(&mut line)
+        .context("reading choice")?
+        == 0
+    {
+        return Ok(None);
+    }
+    let choice = line.trim();
+    if choice.is_empty() {
+        return Ok(None);
+    }
+
+    if let Ok(n) = choice.parse::<usize>() {
+        if n >= 1 && n <= history.len() {
+            return Ok(Some(history[n - 1].uuid.clone()));
+        }
+        anyhow::bail!("invalid choice {n}: expected 1..={}", history.len());
+    }
+
+    if let Some(rec) = history.iter().find(|r| r.uuid == choice) {
+        return Ok(Some(rec.uuid.clone()));
+    }
+    if choice.len() >= 4 {
+        let matches: Vec<&SessionRecord> = history
+            .iter()
+            .filter(|r| r.uuid.starts_with(choice))
+            .collect();
+        match matches.len() {
+            1 => return Ok(Some(matches[0].uuid.clone())),
+            0 => anyhow::bail!("no session matches prefix {choice:?}"),
+            _ => anyhow::bail!("ambiguous prefix {choice:?}: {} matches", matches.len()),
+        }
+    }
+    anyhow::bail!("could not interpret choice {choice:?}")
+}
+
 /// Return all session records for `dir`, newest first.
 pub fn list_for_dir(dir: &Path) -> Result<Vec<SessionRecord>> {
     let path = sessions_path()?;
@@ -959,6 +1104,64 @@ mod tests {
         assert_eq!(history.len(), 2);
         assert_eq!(history[0].uuid, new_id);
         assert_eq!(history[1].uuid, old_id);
+    }
+
+    #[test]
+    fn resolve_resume_exact_uuid_passes_through() {
+        let _guard = with_temp_home();
+        let dir = tempdir().unwrap();
+        let id = create_fresh(dir.path()).unwrap();
+        let resolved = resolve_resume(dir.path(), Some(id.clone())).unwrap();
+        assert_eq!(resolved, Some(id));
+    }
+
+    #[test]
+    fn resolve_resume_unique_prefix_completes() {
+        let _guard = with_temp_home();
+        let dir = tempdir().unwrap();
+        let id = create_fresh(dir.path()).unwrap();
+        let prefix: String = id.chars().take(8).collect();
+        let resolved = resolve_resume(dir.path(), Some(prefix)).unwrap();
+        assert_eq!(resolved, Some(id));
+    }
+
+    #[test]
+    fn resolve_resume_unknown_uuid_passes_through_verbatim() {
+        // UUIDs not in sessions.json may still exist in the memory DB —
+        // resolve_resume should hand the caller's string back untouched.
+        let _guard = with_temp_home();
+        let dir = tempdir().unwrap();
+        let _ = create_fresh(dir.path()).unwrap();
+        let opaque = "not-a-known-uuid-but-opaque";
+        let resolved = resolve_resume(dir.path(), Some(opaque.to_string())).unwrap();
+        assert_eq!(resolved.as_deref(), Some(opaque));
+    }
+
+    #[test]
+    fn resolve_resume_picker_needs_tty_errors_off_tty() {
+        use std::io::IsTerminal;
+        // Skip this test if both stdin and stderr happen to be TTYs in the
+        // runner (e.g. `cargo test -- --nocapture` on an interactive shell);
+        // otherwise the picker would block forever waiting for a selection.
+        if std::io::stderr().is_terminal() && std::io::stdin().is_terminal() {
+            eprintln!("skipping: stdin+stderr are TTYs; picker would block");
+            return;
+        }
+        let _guard = with_temp_home();
+        let dir = tempdir().unwrap();
+        let _ = create_fresh(dir.path()).unwrap();
+        let err =
+            resolve_resume(dir.path(), Some(String::new())).expect_err("picker off-TTY must fail");
+        assert!(err.to_string().contains("interactive terminal"));
+    }
+
+    #[test]
+    fn resolve_resume_picker_no_sessions_errors() {
+        let _guard = with_temp_home();
+        let dir = tempdir().unwrap();
+        let err =
+            resolve_resume(dir.path(), Some(String::new())).expect_err("empty history must fail");
+        assert!(err.to_string().contains("no previous sessions"));
     }
 
     #[test]
