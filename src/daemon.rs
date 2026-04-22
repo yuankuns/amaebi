@@ -2364,6 +2364,10 @@ async fn flush_pending_unsolicited(
 const MAX_PROMPT_CHARS: usize = 4_000;
 /// Maximum chars stored for an assistant response in session history.
 const MAX_RESPONSE_CHARS: usize = 8_000;
+/// Maximum Unicode scalars kept in the `shell_command` preview returned by
+/// [`summarise_tool_detail`] before appending `…`.  Kept at module scope so
+/// regression tests can reference it without duplicating the `80` literal.
+const SHELL_DETAIL_MAX_CHARS: usize = 80;
 
 /// Truncate `s` to at most `max` Unicode scalar values (including the marker).
 ///
@@ -2411,17 +2415,21 @@ fn should_persist_tool_output(tool_name: &str) -> bool {
 /// when the original was longer; other tools return their primary argument
 /// verbatim.
 fn summarise_tool_detail(tool_name: &str, args: &serde_json::Value) -> String {
-    const SHELL_MAX_CHARS: usize = 80;
     match tool_name {
         "shell_command" => args
             .get("command")
             .and_then(|v| v.as_str())
             .map(|s| {
-                if s.chars().nth(SHELL_MAX_CHARS).is_some() {
-                    let head: String = s.chars().take(SHELL_MAX_CHARS).collect();
-                    format!("{head}…")
-                } else {
-                    s.to_string()
+                // `char_indices().nth(N)` walks the string once and returns
+                // the byte offset of the (N+1)-th Unicode scalar, which is by
+                // construction a char boundary.  Slicing at that byte offset
+                // is safe and avoids the double-iteration / allocation of the
+                // prior `chars().nth` + `chars().take(N).collect()` approach.
+                // `None` means the string has ≤ SHELL_DETAIL_MAX_CHARS chars
+                // and fits verbatim.
+                match s.char_indices().nth(SHELL_DETAIL_MAX_CHARS) {
+                    Some((byte_idx, _)) => format!("{}…", &s[..byte_idx]),
+                    None => s.to_string(),
                 }
             })
             .unwrap_or_default(),
@@ -5887,13 +5895,13 @@ mod tests {
 
     #[test]
     fn summarise_tool_detail_shell_long_ascii_truncates_with_ellipsis() {
-        let cmd: String = "x".repeat(200);
+        let cmd: String = "x".repeat(SHELL_DETAIL_MAX_CHARS * 2);
         let args = serde_json::json!({ "command": cmd });
         let detail = summarise_tool_detail("shell_command", &args);
-        // 80 chars + `…`; total 81 Unicode scalars.
-        assert_eq!(detail.chars().count(), 81);
+        // SHELL_DETAIL_MAX_CHARS chars + `…`.
+        assert_eq!(detail.chars().count(), SHELL_DETAIL_MAX_CHARS + 1);
         assert!(detail.ends_with('…'));
-        assert!(detail.starts_with(&"x".repeat(80)));
+        assert!(detail.starts_with(&"x".repeat(SHELL_DETAIL_MAX_CHARS)));
     }
 
     #[test]
@@ -5907,20 +5915,20 @@ mod tests {
         let args = serde_json::json!({ "command": cmd });
         // Should return Ok without panicking.
         let detail = summarise_tool_detail("shell_command", &args);
-        // If the input has >80 chars, output should end with '…'; in any case
-        // the first 80 chars must be a valid prefix of the input by char count.
-        if cmd.chars().count() > 80 {
+        // If the input has more than SHELL_DETAIL_MAX_CHARS chars, output
+        // should end with '…'; otherwise it's returned verbatim.
+        if cmd.chars().count() > SHELL_DETAIL_MAX_CHARS {
             assert!(detail.ends_with('…'));
-            assert_eq!(detail.chars().count(), 81);
+            assert_eq!(detail.chars().count(), SHELL_DETAIL_MAX_CHARS + 1);
         } else {
             assert_eq!(detail, cmd);
         }
     }
 
     #[test]
-    fn summarise_tool_detail_shell_exactly_80_chars_not_truncated() {
-        // Boundary: exactly 80 Unicode scalars → return as-is, no ellipsis.
-        let cmd: String = "a".repeat(80);
+    fn summarise_tool_detail_shell_exactly_max_chars_not_truncated() {
+        // Boundary: exactly SHELL_DETAIL_MAX_CHARS scalars → return as-is, no ellipsis.
+        let cmd: String = "a".repeat(SHELL_DETAIL_MAX_CHARS);
         let args = serde_json::json!({ "command": cmd.clone() });
         assert_eq!(summarise_tool_detail("shell_command", &args), cmd);
     }
