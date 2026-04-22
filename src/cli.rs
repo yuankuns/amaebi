@@ -28,7 +28,7 @@ pub enum Command {
         /// Path to the Unix socket.
         #[arg(long, default_value = DEFAULT_SOCKET)]
         socket: PathBuf,
-        /// Model to use (overrides AMAEBI_MODEL env var; default: claude-sonnet-4.6).
+        /// Model to use (overrides AMAEBI_MODEL env var; default: claude-sonnet-4.6[1m]).
         /// Format: [provider/]model — e.g. bedrock/claude-sonnet-4.6, copilot/gpt-4o.
         #[arg(long)]
         model: Option<String>,
@@ -66,7 +66,7 @@ pub enum Command {
         prompt: Option<String>,
         #[arg(long, default_value = DEFAULT_SOCKET)]
         socket: PathBuf,
-        /// Model to use (overrides AMAEBI_MODEL env var; default: claude-sonnet-4.6).
+        /// Model to use (overrides AMAEBI_MODEL env var; default: claude-sonnet-4.6[1m]).
         /// Format: [provider/]model — e.g. bedrock/claude-sonnet-4.6, copilot/gpt-4o.
         #[arg(long)]
         model: Option<String>,
@@ -111,7 +111,7 @@ pub enum Command {
     ///
     /// Example: amaebi acp
     Acp {
-        /// Model to use (overrides AMAEBI_MODEL env var; default: claude-sonnet-4.6).
+        /// Model to use (overrides AMAEBI_MODEL env var; default: claude-sonnet-4.6[1m]).
         /// Format: [provider/]model — e.g. bedrock/claude-sonnet-4.6, copilot/gpt-4o.
         #[arg(long)]
         model: Option<String>,

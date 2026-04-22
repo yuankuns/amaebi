@@ -95,7 +95,12 @@ const BEDROCK_ALIASES: &[(&str, &str)] = &[
 ];
 
 /// Default model when no `--model` or `AMAEBI_MODEL` is specified.
-pub const DEFAULT_MODEL: &str = "claude-sonnet-4.6";
+///
+/// Includes the `[1m]` opt-in suffix so long sessions never hit the 200k
+/// context wall by surprise.  The 1M window only changes Bedrock-side
+/// behaviour when the input actually exceeds 200k tokens; small requests
+/// cost the same as plain `claude-sonnet-4.6`.
+pub const DEFAULT_MODEL: &str = "claude-sonnet-4.6[1m]";
 
 // ---------------------------------------------------------------------------
 // Resolution
