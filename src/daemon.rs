@@ -186,6 +186,9 @@ impl DaemonState {
             compacting_sessions: Arc::clone(&compacting_sessions),
             tokens: Arc::clone(&tokens),
             user_aliases: Arc::clone(&user_aliases),
+            // Top-level daemon runs at depth 0; child agents (if ever granted
+            // their own SpawnContext) would start at depth + 1.
+            depth: 0,
         });
 
         let mut executor = tools::LocalExecutor::new();

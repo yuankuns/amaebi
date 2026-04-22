@@ -8,6 +8,45 @@ use tokio::process::Command;
 use crate::sandbox::{docker::DockerSandboxConfig, DockerSandbox, NoopSandbox, Sandbox};
 
 // ---------------------------------------------------------------------------
+// Nested-agent depth limit
+// ---------------------------------------------------------------------------
+
+/// Hard cap on how deep `spawn_agent` nesting is allowed to go.  Top-level
+/// daemon calls run at `depth = 0`; each nested `spawn_agent` increments the
+/// child's depth by one.  The check fires when `ctx.depth >= limit`, so with
+/// the default value of 4 the deepest legal nesting is a depth-3 agent
+/// spawning no further children.
+///
+/// Override at runtime with `AMAEBI_MAX_AGENT_DEPTH`.
+pub const MAX_AGENT_DEPTH: u32 = 4;
+
+/// Resolve the effective depth limit, honouring `AMAEBI_MAX_AGENT_DEPTH` and
+/// falling back to [`MAX_AGENT_DEPTH`] on unset / unparseable values.
+fn max_agent_depth() -> u32 {
+    std::env::var("AMAEBI_MAX_AGENT_DEPTH")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(MAX_AGENT_DEPTH)
+}
+
+/// Fail fast if the given spawn context has already reached the depth limit.
+/// Returns an error whose message is surfaced to the LLM as the tool_result
+/// text so it can adapt (e.g. keep working in the current agent instead of
+/// recursing).
+fn check_depth(ctx: &SpawnContext) -> Result<()> {
+    let limit = max_agent_depth();
+    if ctx.depth >= limit {
+        anyhow::bail!(
+            "spawn_agent blocked: nested agent depth {} exceeds limit {}; \
+             deepen iterative work within the current agent instead of spawning another.",
+            ctx.depth,
+            limit
+        );
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // SpawnContext — shared state injected by the daemon for spawn_agent support
 // ---------------------------------------------------------------------------
 
@@ -32,6 +71,10 @@ pub struct SpawnContext {
     /// children cannot `spawn_agent` themselves, but `switch_model` is
     /// always available.
     pub user_aliases: Arc<HashMap<String, String>>,
+    /// Nesting level of the agent owning this context.  Top-level daemon is
+    /// `0`; each `spawn_agent` call increments its child's depth.  Enforced
+    /// against [`MAX_AGENT_DEPTH`] inside `spawn_agent`.
+    pub depth: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -392,8 +435,11 @@ async fn read_file(args: serde_json::Value) -> Result<String> {
 /// # Recursion prevention
 ///
 /// The child executor is created with `spawn_ctx: None` so it cannot
-/// call `spawn_agent` itself.
-/// TODO: enforce a depth limit for nested agents if needed.
+/// call `spawn_agent` itself.  In addition, [`check_depth`] enforces a
+/// numeric cap of [`MAX_AGENT_DEPTH`] (overridable via
+/// `AMAEBI_MAX_AGENT_DEPTH`) so that even sequential chains of sub-agents
+/// — or future code paths that re-enable recursion — cannot nest beyond
+/// the configured limit.
 /// Resolve the default model for a spawned sub-agent.
 ///
 /// Mirrors the provider-prefix preservation logic in `compact_model` in
@@ -421,6 +467,10 @@ fn subagent_default_model() -> String {
 }
 
 async fn spawn_agent(args: serde_json::Value, ctx: &SpawnContext) -> Result<String> {
+    // Enforce the nested-agent depth cap before doing any work.  The error
+    // message is surfaced to the LLM as the tool_result.
+    check_depth(ctx)?;
+
     let task = args["task"]
         .as_str()
         .context("spawn_agent: missing string argument 'task'")?;
@@ -1419,13 +1469,94 @@ mod tests {
 
     /// Helper: build a minimal SpawnContext suitable for unit tests.
     fn make_spawn_ctx() -> SpawnContext {
+        make_spawn_ctx_at_depth(0)
+    }
+
+    /// Helper: build a SpawnContext at a specific depth (for depth-limit tests).
+    fn make_spawn_ctx_at_depth(depth: u32) -> SpawnContext {
         SpawnContext {
             http: reqwest::Client::new(),
             db: Arc::new(Mutex::new(rusqlite::Connection::open_in_memory().unwrap())),
             compacting_sessions: Arc::new(Mutex::new(HashSet::new())),
             tokens: Arc::new(crate::auth::TokenCache::new()),
             user_aliases: Arc::new(HashMap::new()),
+            depth,
         }
+    }
+
+    // ---- spawn_agent depth limit ----------------------------------------
+
+    #[test]
+    #[serial]
+    fn check_depth_allows_below_limit() {
+        std::env::remove_var("AMAEBI_MAX_AGENT_DEPTH");
+        let ctx = make_spawn_ctx_at_depth(MAX_AGENT_DEPTH - 1);
+        assert!(check_depth(&ctx).is_ok());
+    }
+
+    #[test]
+    #[serial]
+    fn check_depth_rejects_at_limit() {
+        std::env::remove_var("AMAEBI_MAX_AGENT_DEPTH");
+        let ctx = make_spawn_ctx_at_depth(MAX_AGENT_DEPTH);
+        let err = check_depth(&ctx).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("depth"), "error should mention depth: {msg}");
+        assert!(
+            msg.contains(&MAX_AGENT_DEPTH.to_string()),
+            "error should mention the limit {MAX_AGENT_DEPTH}: {msg}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn check_depth_respects_env_override() {
+        std::env::set_var("AMAEBI_MAX_AGENT_DEPTH", "2");
+        // depth=1 is below the override limit of 2.
+        let ok_ctx = make_spawn_ctx_at_depth(1);
+        let ok = check_depth(&ok_ctx);
+        // depth=2 hits the override limit.
+        let blocked_ctx = make_spawn_ctx_at_depth(2);
+        let blocked = check_depth(&blocked_ctx);
+        std::env::remove_var("AMAEBI_MAX_AGENT_DEPTH");
+
+        assert!(ok.is_ok(), "depth=1 should pass with limit=2");
+        let err = blocked.unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("depth"), "error should mention depth: {msg}");
+        assert!(
+            msg.contains(" 2"),
+            "error should mention the overridden limit 2: {msg}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn check_depth_falls_back_on_unparseable_env() {
+        std::env::set_var("AMAEBI_MAX_AGENT_DEPTH", "not-a-number");
+        let ctx = make_spawn_ctx_at_depth(MAX_AGENT_DEPTH);
+        let result = check_depth(&ctx);
+        std::env::remove_var("AMAEBI_MAX_AGENT_DEPTH");
+        // Unparseable env var should fall back to MAX_AGENT_DEPTH, which the
+        // ctx is already at — so the call must still fail.
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn spawn_agent_rejects_when_at_depth_limit() {
+        std::env::remove_var("AMAEBI_MAX_AGENT_DEPTH");
+        let ctx = make_spawn_ctx_at_depth(MAX_AGENT_DEPTH);
+        // Args are well-formed so the only thing that can fail is the depth
+        // check — which runs before any argument parsing or workspace I/O.
+        let result = spawn_agent(serde_json::json!({"task": "t", "workspace": "/tmp"}), &ctx).await;
+        let err = result.expect_err("spawn_agent must reject at depth limit");
+        let msg = format!("{err}");
+        assert!(msg.contains("depth"), "error should mention depth: {msg}");
+        assert!(
+            msg.contains(&MAX_AGENT_DEPTH.to_string()),
+            "error should mention the limit: {msg}"
+        );
     }
 
     // ---- subagent_default_model -----------------------------------------
