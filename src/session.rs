@@ -335,13 +335,17 @@ pub fn create_fresh(dir: &Path) -> Result<String> {
     Ok(new_id)
 }
 
-/// Interactively resolve a session UUID for the `--resume` flag.
+/// Interactively resolve a session identifier for the `--resume` flag.
 ///
 /// Three cases, driven by the raw value coming off the CLI (which uses
 /// `num_args = 0..=1`, so `--resume` without a value produces `Some("".into())`):
 ///
-/// * `arg` is a non-empty, well-formed UUID, or matches an existing record's
-///   UUID prefix uniquely (≥ 4 chars) — returned verbatim / completed.
+/// * `arg` is a non-empty string matching an existing record's UUID prefix
+///   uniquely (≥ 4 chars) — completed to the full stored UUID.
+///   Any other non-empty string is treated as an opaque session identifier
+///   and returned unchanged, so callers can resume sessions whose records
+///   have been pruned from `sessions.json` but whose history still exists
+///   in the SQLite memory DB.  No UUID-syntax validation is performed.
 /// * `arg` is `None` or an empty / `"list"` string — a numbered picker is
 ///   printed to stderr listing this directory's session history (newest first)
 ///   and the user's selection is returned.
@@ -349,7 +353,7 @@ pub fn create_fresh(dir: &Path) -> Result<String> {
 ///   letting the caller fall back to starting a fresh session (or aborting).
 ///
 /// Returns `Err` when no sessions exist for the directory but a picker was
-/// requested, or when stderr is not a TTY (nothing to prompt on).
+/// requested, or when stderr/stdin is not a TTY (nothing to prompt on).
 pub fn resolve_resume(dir: &Path, arg: Option<String>) -> Result<Option<String>> {
     let trimmed = arg.as_deref().map(str::trim).unwrap_or("");
     let want_picker = trimmed.is_empty() || trimmed.eq_ignore_ascii_case("list");
@@ -1135,10 +1139,17 @@ mod tests {
 
     #[test]
     fn resolve_resume_picker_needs_tty_errors_off_tty() {
+        use std::io::IsTerminal;
+        // Skip this test if both stdin and stderr happen to be TTYs in the
+        // runner (e.g. `cargo test -- --nocapture` on an interactive shell);
+        // otherwise the picker would block forever waiting for a selection.
+        if std::io::stderr().is_terminal() && std::io::stdin().is_terminal() {
+            eprintln!("skipping: stdin+stderr are TTYs; picker would block");
+            return;
+        }
         let _guard = with_temp_home();
         let dir = tempdir().unwrap();
         let _ = create_fresh(dir.path()).unwrap();
-        // `cargo test` runs without a stderr TTY, so the picker path must bail.
         let err =
             resolve_resume(dir.path(), Some(String::new())).expect_err("picker off-TTY must fail");
         assert!(err.to_string().contains("interactive terminal"));
