@@ -143,7 +143,7 @@ pub fn resolve_with_aliases(raw: &str, user_aliases: &HashMap<String, String>) -
     // AND does not collide with a built-in Bedrock alias.  Built-in wins on
     // conflict so the LLM-visible `claude-opus-4.6` etc. are stable.
     let expanded: String;
-    let bare: &str = if bare.contains('/') || BEDROCK_ALIASES.iter().any(|(a, _)| *a == bare) {
+    let bare: &str = if bare.contains('/') || is_builtin_bedrock_alias(bare) {
         bare
     } else if let Some(target) = user_aliases.get(bare) {
         expanded = target.clone();

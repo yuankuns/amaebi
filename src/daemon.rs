@@ -146,8 +146,10 @@ pub struct DaemonState {
     /// concurrent clients cannot interleave writes to the same session history.
     pub active_sessions: Arc<Mutex<HashSet<String>>>,
     /// User-defined model aliases loaded once from `~/.amaebi/config.json` at
-    /// daemon startup.  Consulted by `provider::resolve_with_aliases` on every
-    /// request.  Empty when the config file is missing or has no aliases.
+    /// daemon startup.  Expanded by `expand_user_alias` at each request entry
+    /// point so the rest of the pipeline can keep using bare
+    /// `provider::resolve()`.  Empty when the config file is missing or has
+    /// no aliases.
     pub user_aliases: Arc<std::collections::HashMap<String, String>>,
 }
 
@@ -347,7 +349,7 @@ fn needs_copilot_auth(model: &str) -> bool {
 ///
 /// This is called once on every request-entry so the rest of the daemon can
 /// keep using bare `provider::resolve()` without knowing about user aliases.
-fn expand_user_alias(
+pub(crate) fn expand_user_alias(
     model: &str,
     user_aliases: &std::collections::HashMap<String, String>,
 ) -> String {
@@ -5995,5 +5997,61 @@ mod tests {
     fn summarise_tool_detail_unknown_tool_returns_empty() {
         let args = serde_json::json!({ "command": "ignored" });
         assert_eq!(summarise_tool_detail("bogus_tool", &args), "");
+    }
+
+    // ---- expand_user_alias -------------------------------------------------
+
+    fn aliases(pairs: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn expand_user_alias_expands_bare_name() {
+        let map = aliases(&[("opus", "bedrock/claude-opus-4.7")]);
+        assert_eq!(expand_user_alias("opus", &map), "bedrock/claude-opus-4.7");
+    }
+
+    #[test]
+    fn expand_user_alias_preserves_1m_suffix() {
+        // `opus[1m]` must expand the bare name and reattach the suffix.
+        let map = aliases(&[("opus", "bedrock/claude-opus-4.7")]);
+        assert_eq!(
+            expand_user_alias("opus[1m]", &map),
+            "bedrock/claude-opus-4.7[1m]"
+        );
+    }
+
+    #[test]
+    fn expand_user_alias_builtin_shadows_user() {
+        // `claude-opus-4.6` is a built-in; user alias must be ignored.
+        let map = aliases(&[("claude-opus-4.6", "bedrock/claude-sonnet-4.6")]);
+        assert_eq!(
+            expand_user_alias("claude-opus-4.6", &map),
+            "claude-opus-4.6"
+        );
+    }
+
+    #[test]
+    fn expand_user_alias_passes_through_provider_prefix() {
+        // `bedrock/...` already carries a provider prefix and must not be
+        // treated as a bare-name candidate for expansion.
+        let map = aliases(&[("bedrock/foo", "bedrock/bar")]);
+        assert_eq!(expand_user_alias("bedrock/foo", &map), "bedrock/foo");
+    }
+
+    #[test]
+    fn expand_user_alias_unknown_passes_through() {
+        let map = aliases(&[("opus", "bedrock/claude-opus-4.7")]);
+        assert_eq!(expand_user_alias("unknown", &map), "unknown");
+    }
+
+    #[test]
+    fn expand_user_alias_no_chain_resolution() {
+        // `a -> b`, `b -> bedrock/...`.  Expanding "a" must stop at "b".
+        let map = aliases(&[("a", "b"), ("b", "bedrock/claude-opus-4.7")]);
+        assert_eq!(expand_user_alias("a", &map), "b");
     }
 }

@@ -456,6 +456,11 @@ async fn spawn_agent(args: serde_json::Value, ctx: &SpawnContext) -> Result<Stri
         .as_str()
         .map(|s| s.to_string())
         .unwrap_or_else(subagent_default_model);
+    // Expand user-defined aliases here: the downstream run_agentic_loop
+    // resolves the model via provider::resolve() which does not consult
+    // user aliases, so `{"model": "opus"}` from the LLM must be expanded
+    // before the child loop sees it.
+    let model = crate::daemon::expand_user_alias(&model, &ctx.user_aliases);
 
     let extra_mounts = args["extra_mounts"].as_array().cloned().unwrap_or_default();
     let mut ro_paths: Vec<PathBuf> = vec![];
