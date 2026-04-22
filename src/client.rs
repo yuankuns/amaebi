@@ -1093,6 +1093,16 @@ pub async fn run_chat_loop(
                                 // running its supervision loop, so reusing this socket
                                 // for further Chat requests would desync the protocol.
                                 // Terminate the session cleanly instead.
+                                //
+                                // Flush any partially buffered markdown first so we
+                                // do not lose the last chunk the daemon had streamed
+                                // before we gave up waiting.  `break 'session`
+                                // bypasses the post-supervision-loop flush, so it
+                                // has to happen here.
+                                if let Some(remaining) = md_buf.flush_all() {
+                                    let out = render_markdown(&remaining);
+                                    stdout.write_all(out.as_bytes()).await?;
+                                }
                                 let reason = if interrupt_sent {
                                     "[supervision] daemon did not stop within 5 s after interrupt; ending session.\n"
                                 } else {
