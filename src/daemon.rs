@@ -358,8 +358,9 @@ pub(crate) fn expand_user_alias(
     user_aliases: &std::collections::HashMap<String, String>,
 ) -> String {
     // If the caller typed `name[1m]`, strip the suffix, expand the bare name,
-    // then reattach the suffix.  Aliases in config.json should not contain
-    // the `[1m]` suffix themselves.
+    // then reattach the suffix.  Alias targets in config.json may themselves
+    // carry `[1m]` (e.g. `"sonnet": "bedrock/claude-sonnet-4.6[1m]"`) — the
+    // downstream `provider::resolve()` normalizes the suffix either way.
     let (bare, suffix) = if let Some(stripped) = model.strip_suffix("[1m]") {
         (stripped, "[1m]")
     } else {

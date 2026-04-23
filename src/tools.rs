@@ -26,10 +26,11 @@ pub struct SpawnContext {
     pub tokens: Arc<crate::auth::TokenCache>,
     /// User-defined model aliases from `~/.amaebi/config.json`.  Consulted by
     /// `spawn_agent` (parent scope) when expanding the `model` argument
-    /// before launching a child agent.  Children cannot themselves call
-    /// `spawn_agent` (`spawn_ctx: None`, `include_spawn_agent: false`), so
-    /// they do not need this map at runtime; it is still propagated into
-    /// the child `DaemonState` for consistency.
+    /// before launching a child agent.  Also propagated into the child's
+    /// `DaemonState.user_aliases` so the child's `switch_model` tool
+    /// handler can resolve user aliases the same way the parent's does —
+    /// children cannot `spawn_agent` themselves, but `switch_model` is
+    /// always available.
     pub user_aliases: Arc<HashMap<String, String>>,
 }
 
@@ -616,9 +617,10 @@ async fn spawn_agent(args: serde_json::Value, ctx: &SpawnContext) -> Result<Stri
         // Child agents get their own active_sessions set; they are ephemeral
         // and don't share the parent's session-lock namespace.
         active_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
-        // Propagated into the child state for consistency.  Children cannot
-        // themselves spawn further agents, so this map is unused at runtime
-        // today; alias expansion happens in the parent's spawn_agent call.
+        // Children cannot themselves spawn further agents, but the
+        // switch_model tool schema is still available to them.  Propagating
+        // the alias table lets a child's switch_model call resolve user
+        // aliases the same way the parent's does.
         user_aliases: Arc::clone(&ctx.user_aliases),
     };
 

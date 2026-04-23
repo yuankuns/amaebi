@@ -152,6 +152,16 @@ pub fn resolve_with_aliases(raw: &str, user_aliases: &HashMap<String, String>) -
         bare
     };
 
+    // Alias targets in config.json may themselves carry a `[1m]` suffix
+    // (e.g. `"sonnet": "bedrock/claude-sonnet-4.6[1m]"`).  Normalize again
+    // after alias expansion so the suffix is always recorded on `use_1m`
+    // and never left embedded inside the Bedrock model id.
+    let (bare, use_1m) = if let Some(stripped) = bare.strip_suffix("[1m]") {
+        (stripped, true)
+    } else {
+        (bare, use_1m)
+    };
+
     if let Some((prefix, model)) = bare.split_once('/') {
         match prefix {
             "copilot" => {
@@ -406,6 +416,28 @@ mod tests {
         assert!(spec.use_1m);
         assert_eq!(spec.model_id, "us.anthropic.claude-opus-4-7");
         assert_eq!(spec.display_name, "opus[1m]");
+    }
+
+    #[test]
+    fn user_alias_target_can_include_1m_suffix() {
+        // config.json may carry `[1m]` inside the target; it must be parsed
+        // as the opt-in flag, not left embedded in the resolved model id.
+        let mut map = HashMap::new();
+        map.insert("sonnet".into(), "bedrock/claude-sonnet-4.6[1m]".into());
+        let spec = resolve_with_aliases("sonnet", &map);
+        assert!(spec.use_1m);
+        assert_eq!(spec.model_id, "us.anthropic.claude-sonnet-4-6");
+    }
+
+    #[test]
+    fn user_alias_target_1m_and_input_1m_both_enable_use_1m() {
+        // User typed `sonnet[1m]` AND the alias target also has `[1m]` —
+        // resolution stays idempotent.
+        let mut map = HashMap::new();
+        map.insert("sonnet".into(), "bedrock/claude-sonnet-4.6[1m]".into());
+        let spec = resolve_with_aliases("sonnet[1m]", &map);
+        assert!(spec.use_1m);
+        assert_eq!(spec.model_id, "us.anthropic.claude-sonnet-4-6");
     }
 
     #[test]
