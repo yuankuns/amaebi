@@ -893,8 +893,9 @@ pub fn tool_schemas(include_spawn_agent: bool) -> Vec<serde_json::Value> {
                                 The daemon only runs a batch concurrently when EVERY call in \
                                 the batch is `spawn_agent` with `parallel: true`. Mixing any \
                                 other tool (read_file, shell_command, edit_file, …) into the \
-                                same batch silently disables the fast path and the whole batch \
-                                runs sequentially. If you need to read a file or run a shell \
+                                same batch disables the concurrent fast path and the whole \
+                                batch runs sequentially (the daemon also emits a WARN for \
+                                this case). If you need to read a file or run a shell \
                                 command, do it in a SEPARATE turn before or after the \
                                 spawn_agent fan-out, not in the same batch.\n\n\
                                 \"Independent\" means: no data dependency, separate files or \

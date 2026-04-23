@@ -4040,7 +4040,20 @@ where
                             .iter()
                             .map(|tc| tc.name.as_str())
                             .collect();
-                        let msg = if spawn_count == tool_calls_snapshot.len() {
+                        // Distinguish "valid JSON but parallel flag missing"
+                        // from "invalid JSON args" — in the latter case the
+                        // real problem isn't missed parallelism, it's a
+                        // malformed tool call that the executor will also
+                        // reject.
+                        let any_bad_json = tool_calls_snapshot
+                            .iter()
+                            .filter(|tc| tc.name == "spawn_agent")
+                            .any(|tc| tc.parse_args().is_err());
+                        let msg = if any_bad_json {
+                            "spawn_agent batch contains calls with unparseable arguments; \
+                             fix the JSON so each call can be dispatched (parallel fan-out \
+                             requires parallel: true as well)"
+                        } else if spawn_count == tool_calls_snapshot.len() {
                             "sequential spawn_agent batch — set parallel: true on every call \
                              to run them concurrently"
                         } else {
