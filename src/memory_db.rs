@@ -105,10 +105,16 @@ END;
 -- (a) a new session starts in the same folder (cross-session learning), or
 -- (b) the session history grows beyond the sliding-window cap (within-session).
 -- Provides cross-session context without injecting full raw history.
+--
+-- `dir` scopes summaries to the originating working directory so two concurrent
+-- `amaebi chat` sessions in different projects cannot leak each other's
+-- compacted context through `get_recent_summaries`.  Pre-migration rows stay
+-- at `dir = ''` and fall out of any non-empty dir filter.
 CREATE TABLE IF NOT EXISTS session_summaries (
     session_id TEXT PRIMARY KEY,
     summary    TEXT NOT NULL,
-    timestamp  TEXT NOT NULL
+    timestamp  TEXT NOT NULL,
+    dir        TEXT NOT NULL DEFAULT ''
 );
 ";
 
@@ -147,6 +153,24 @@ pub fn init_db(path: &Path) -> Result<Connection> {
 
     conn.execute_batch(SCHEMA)
         .context("applying memory DB schema")?;
+
+    // Additive migration: older databases were created before `dir` existed.
+    // `CREATE TABLE IF NOT EXISTS` will not add the column to an existing
+    // table, so probe PRAGMA table_info and ALTER when missing.  Legacy rows
+    // keep `dir = ''`, which never matches a non-empty dir filter in
+    // `get_recent_summaries` — correctly isolated rather than cross-leaked.
+    let has_dir = conn
+        .prepare("PRAGMA table_info(session_summaries)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .filter_map(Result::ok)
+        .any(|col| col == "dir");
+    if !has_dir {
+        conn.execute(
+            "ALTER TABLE session_summaries ADD COLUMN dir TEXT NOT NULL DEFAULT ''",
+            [],
+        )
+        .context("adding dir column to session_summaries")?;
+    }
 
     Ok(conn)
 }
@@ -347,19 +371,24 @@ pub fn clear(conn: &Connection) -> Result<()> {
 /// Upsert a compacted summary for `session_id`.
 ///
 /// Called by `compact_session` in the daemon.  `timestamp` should be an RFC 3339 UTC string.
+/// `dir` is the canonical working directory the session was created in; it
+/// scopes the summary so `get_recent_summaries` cannot leak it into sessions
+/// from other directories.  Pass `""` when the dir cannot be resolved.
 pub fn store_session_summary(
     conn: &Connection,
     session_id: &str,
     summary: &str,
     timestamp: &str,
+    dir: &str,
 ) -> Result<()> {
     conn.execute(
-        "INSERT INTO session_summaries (session_id, summary, timestamp)
-         VALUES (?1, ?2, ?3)
+        "INSERT INTO session_summaries (session_id, summary, timestamp, dir)
+         VALUES (?1, ?2, ?3, ?4)
          ON CONFLICT(session_id) DO UPDATE SET
              summary   = excluded.summary,
-             timestamp = excluded.timestamp",
-        params![session_id, summary, timestamp],
+             timestamp = excluded.timestamp,
+             dir       = excluded.dir",
+        params![session_id, summary, timestamp, dir],
     )
     .context("storing session summary")?;
     Ok(())
@@ -459,28 +488,33 @@ pub fn get_sessions_without_summary(
     Ok(sessions)
 }
 
-/// Return up to `limit` summaries from sessions other than `exclude_session`,
-/// ordered oldest-first so the caller can inject them chronologically.
+/// Return up to `limit` summaries from sessions other than `exclude_session`
+/// that originate from the same working `dir`, ordered oldest-first so the
+/// caller can inject them chronologically.
 ///
 /// Excludes the current session so the model does not see a stale summary of
-/// the conversation it is actively participating in.
+/// the conversation it is actively participating in.  Filtering by `dir`
+/// prevents cross-project context leakage when two `amaebi chat` sessions
+/// run concurrently in different directories.  An empty `dir` only matches
+/// legacy (pre-migration) rows with `dir = ''`.
 pub fn get_recent_summaries(
     conn: &Connection,
     exclude_session: &str,
+    dir: &str,
     limit: usize,
 ) -> Result<Vec<String>> {
     // Fetch most-recent first, then reverse so injection is chronological.
     let mut stmt = conn
         .prepare(
             "SELECT summary FROM session_summaries
-             WHERE session_id != ?1
+             WHERE session_id != ?1 AND dir = ?2
              ORDER BY timestamp DESC
-             LIMIT ?2",
+             LIMIT ?3",
         )
         .context("preparing get_recent_summaries")?;
 
     let mut summaries = stmt
-        .query_map(params![exclude_session, limit as i64], |row| {
+        .query_map(params![exclude_session, dir, limit as i64], |row| {
             row.get::<_, String>(0)
         })
         .context("executing get_recent_summaries")?
@@ -768,12 +802,26 @@ mod tests {
     fn store_session_summary_upserts() {
         let (conn, _dir) = open_test_db();
 
-        store_session_summary(&conn, "s1", "first summary", "2026-01-01T00:00:00Z").unwrap();
+        store_session_summary(
+            &conn,
+            "s1",
+            "first summary",
+            "2026-01-01T00:00:00Z",
+            "/proj",
+        )
+        .unwrap();
         let s1 = get_session_own_summary(&conn, "s1").unwrap();
         assert_eq!(s1.as_deref(), Some("first summary"));
 
         // Upsert — should update, not create a second row.
-        store_session_summary(&conn, "s1", "updated summary", "2026-01-02T00:00:00Z").unwrap();
+        store_session_summary(
+            &conn,
+            "s1",
+            "updated summary",
+            "2026-01-02T00:00:00Z",
+            "/proj",
+        )
+        .unwrap();
         let s2 = get_session_own_summary(&conn, "s1").unwrap();
         assert_eq!(s2.as_deref(), Some("updated summary"));
 
@@ -800,7 +848,14 @@ mod tests {
         store_memory(&conn, "2026-01-01T00:00:00Z", "s1", "user", "hi", "").unwrap();
         store_memory(&conn, "2026-01-01T00:00:00Z", "s2", "user", "hi", "").unwrap();
         store_memory(&conn, "2026-01-01T00:00:00Z", "s3", "user", "hi", "").unwrap();
-        store_session_summary(&conn, "s2", "summary for s2", "2026-01-01T00:00:00Z").unwrap();
+        store_session_summary(
+            &conn,
+            "s2",
+            "summary for s2",
+            "2026-01-01T00:00:00Z",
+            "/proj",
+        )
+        .unwrap();
 
         // s1 has no summary; s2 has a summary; s3 is the "current" session (excluded).
         let unsummarised = get_sessions_without_summary(&conn, "s3", 10).unwrap();
@@ -810,12 +865,12 @@ mod tests {
     #[test]
     fn get_recent_summaries_excludes_current_and_orders_oldest_first() {
         let (conn, _dir) = open_test_db();
-        store_session_summary(&conn, "s1", "summary A", "2026-01-01T00:00:00Z").unwrap();
-        store_session_summary(&conn, "s2", "summary B", "2026-01-03T00:00:00Z").unwrap();
-        store_session_summary(&conn, "s3", "summary C", "2026-01-02T00:00:00Z").unwrap();
+        store_session_summary(&conn, "s1", "summary A", "2026-01-01T00:00:00Z", "/proj").unwrap();
+        store_session_summary(&conn, "s2", "summary B", "2026-01-03T00:00:00Z", "/proj").unwrap();
+        store_session_summary(&conn, "s3", "summary C", "2026-01-02T00:00:00Z", "/proj").unwrap();
 
         // Exclude s3 (current session); expect oldest-first order.
-        let summaries = get_recent_summaries(&conn, "s3", 10).unwrap();
+        let summaries = get_recent_summaries(&conn, "s3", "/proj", 10).unwrap();
         assert_eq!(summaries, vec!["summary A", "summary B"]);
     }
 
@@ -863,5 +918,87 @@ mod tests {
         // Newest first → s3, s2.
         assert_eq!(rows[0].session_id, "s3");
         assert_eq!(rows[1].session_id, "s2");
+    }
+
+    #[test]
+    fn get_recent_summaries_isolates_by_dir() {
+        let (conn, _dir) = open_test_db();
+        // Two summaries in /proj-a, two in /proj-b.
+        store_session_summary(&conn, "a1", "A1", "2026-01-01T00:00:00Z", "/proj-a").unwrap();
+        store_session_summary(&conn, "a2", "A2", "2026-01-02T00:00:00Z", "/proj-a").unwrap();
+        store_session_summary(&conn, "b1", "B1", "2026-01-03T00:00:00Z", "/proj-b").unwrap();
+        store_session_summary(&conn, "b2", "B2", "2026-01-04T00:00:00Z", "/proj-b").unwrap();
+
+        let a = get_recent_summaries(&conn, "sid-x", "/proj-a", 10).unwrap();
+        assert_eq!(a, vec!["A1", "A2"]);
+
+        let b = get_recent_summaries(&conn, "sid-x", "/proj-b", 10).unwrap();
+        assert_eq!(b, vec!["B1", "B2"]);
+    }
+
+    #[test]
+    fn get_recent_summaries_empty_dir_does_not_match_non_empty_query() {
+        let (conn, _dir) = open_test_db();
+        // Simulate a legacy pre-migration row with dir = ''.
+        store_session_summary(&conn, "legacy", "old summary", "2026-01-01T00:00:00Z", "").unwrap();
+
+        let got = get_recent_summaries(&conn, "sid-x", "/proj-a", 10).unwrap();
+        assert!(
+            got.is_empty(),
+            "legacy dir='' rows must not leak into a non-empty dir query"
+        );
+
+        // But querying for dir='' explicitly *does* return the legacy row.
+        let legacy = get_recent_summaries(&conn, "sid-x", "", 10).unwrap();
+        assert_eq!(legacy, vec!["old summary"]);
+    }
+
+    #[test]
+    fn init_db_migration_is_idempotent() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("memory.db");
+        // First open creates the schema with the `dir` column.
+        {
+            let conn = init_db(&path).unwrap();
+            store_session_summary(&conn, "s1", "A", "2026-01-01T00:00:00Z", "/proj").unwrap();
+        }
+        // Second open must succeed without re-adding the column.
+        let conn = init_db(&path).unwrap();
+        let got = get_recent_summaries(&conn, "sid-x", "/proj", 10).unwrap();
+        assert_eq!(got, vec!["A"]);
+    }
+
+    #[test]
+    fn init_db_backfills_missing_dir_column() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("memory.db");
+        // Create a legacy schema without the `dir` column and insert a raw row.
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE session_summaries (
+                     session_id TEXT PRIMARY KEY,
+                     summary    TEXT NOT NULL,
+                     timestamp  TEXT NOT NULL
+                 );
+                 INSERT INTO session_summaries (session_id, summary, timestamp)
+                 VALUES ('legacy', 'legacy summary', '2026-01-01T00:00:00Z');",
+            )
+            .unwrap();
+        }
+        // Opening via init_db must add the column and default the legacy row to ''.
+        let conn = init_db(&path).unwrap();
+        let dir_val: String = conn
+            .query_row(
+                "SELECT dir FROM session_summaries WHERE session_id = 'legacy'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(dir_val, "");
+
+        // A non-empty dir query must not return the legacy row.
+        let got = get_recent_summaries(&conn, "sid-x", "/proj-a", 10).unwrap();
+        assert!(got.is_empty());
     }
 }

@@ -525,16 +525,24 @@ where
 ///
 /// Returns `(history, summaries, own_summary)`.  On error, logs a warning and
 /// returns empty defaults so the caller can still proceed with a fresh context.
+///
+/// Summaries are scoped to the session's working directory: we look up the
+/// dir for `session_id` in `sessions.json` and pass it to
+/// `get_recent_summaries` so cross-project sessions cannot see each other's
+/// compacted context.  If the lookup fails (session removed, race, etc.) we
+/// fall back to `""` — which only matches legacy pre-migration rows and
+/// never any dir-tagged summary.
 async fn load_session_state(
     state: &Arc<DaemonState>,
     session_id: &str,
 ) -> (Vec<memory_db::DbMemoryEntry>, Vec<String>, Option<String>) {
+    let dir = resolve_session_dir(session_id).await;
     with_db(Arc::clone(&state.db), {
         let sid = session_id.to_owned();
         move |conn| {
             Ok((
                 memory_db::get_session_history(conn, &sid)?,
-                memory_db::get_recent_summaries(conn, &sid, MAX_SUMMARIES)?,
+                memory_db::get_recent_summaries(conn, &sid, &dir, MAX_SUMMARIES)?,
                 memory_db::get_session_own_summary(conn, &sid)?,
             ))
         }
@@ -544,6 +552,29 @@ async fn load_session_state(
         tracing::warn!(error = %e, session_id, "failed to load session state");
         (vec![], vec![], None)
     })
+}
+
+/// Resolve the working directory for `session_id` from `sessions.json`.
+///
+/// Returns the directory path string if found, otherwise `""` — which matches
+/// only legacy pre-migration `session_summaries` rows and never any
+/// dir-tagged summary.  Never errors: a failed lookup (session removed,
+/// lock contention, corrupt JSON) is treated as "unknown dir" so a missing
+/// mapping isolates the session rather than bailing out of compaction.
+async fn resolve_session_dir(session_id: &str) -> String {
+    let sid = session_id.to_owned();
+    tokio::task::spawn_blocking(move || {
+        session::list_all()
+            .ok()
+            .and_then(|map| {
+                map.into_iter()
+                    .find(|(_, rec)| rec.uuid == sid)
+                    .map(|(d, _)| d)
+            })
+            .unwrap_or_default()
+    })
+    .await
+    .unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
@@ -3425,12 +3456,13 @@ async fn compact_session(
             let db = Arc::clone(&state.db);
             let sid = session_id.clone();
             let ts = chrono::Utc::now().to_rfc3339();
+            let dir = resolve_session_dir(&sid).await;
             let result = tokio::task::spawn_blocking(move || {
                 let conn = db.lock().unwrap_or_else(|p| p.into_inner());
                 let tx = conn
                     .unchecked_transaction()
                     .context("compact_session: begin transaction")?;
-                memory_db::store_session_summary(&conn, &sid, &summary, &ts)?;
+                memory_db::store_session_summary(&conn, &sid, &summary, &ts, &dir)?;
                 memory_db::archive_session_turns(&conn, &ids_to_archive)?;
                 tx.commit().context("compact_session: commit transaction")
             })
@@ -3719,6 +3751,7 @@ async fn compact_in_loop(
         let db = Arc::clone(&state.db);
         let sid_owned = sid.to_owned();
         let ts = chrono::Utc::now().to_rfc3339();
+        let dir = resolve_session_dir(sid).await;
         let archive_result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
             let conn = db.lock().unwrap_or_else(|p| p.into_inner());
             // Always persist the summary (even when nothing is archived) so a
@@ -3728,7 +3761,7 @@ async fn compact_in_loop(
             let tx = conn
                 .unchecked_transaction()
                 .context("compact_in_loop: begin transaction")?;
-            memory_db::store_session_summary(&conn, &sid_owned, &summary_text, &ts)?;
+            memory_db::store_session_summary(&conn, &sid_owned, &summary_text, &ts, &dir)?;
             if summarised_row_count > 0 {
                 let rows = memory_db::get_session_oldest(&conn, &sid_owned, summarised_row_count)?;
                 let ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
