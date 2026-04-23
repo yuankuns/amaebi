@@ -4031,15 +4031,15 @@ where
                 // tools (e.g. read_file + read_file) are normal LLM behaviour
                 // and logged at debug so they don't flood the console.
                 if tool_calls_snapshot.len() > 1 && !all_spawn_agent {
-                    let names: Vec<&str> = tool_calls_snapshot
-                        .iter()
-                        .map(|tc| tc.name.as_str())
-                        .collect();
                     let spawn_count = tool_calls_snapshot
                         .iter()
                         .filter(|tc| tc.name == "spawn_agent")
                         .count();
                     if spawn_count >= 1 {
+                        let names: Vec<&str> = tool_calls_snapshot
+                            .iter()
+                            .map(|tc| tc.name.as_str())
+                            .collect();
                         let msg = if spawn_count == tool_calls_snapshot.len() {
                             "sequential spawn_agent batch — consider parallel: true on every call"
                         } else {
@@ -4053,7 +4053,11 @@ where
                             batch_size = tool_calls_snapshot.len(),
                             "{msg}"
                         );
-                    } else {
+                    } else if tracing::enabled!(tracing::Level::DEBUG) {
+                        let names: Vec<&str> = tool_calls_snapshot
+                            .iter()
+                            .map(|tc| tc.name.as_str())
+                            .collect();
                         tracing::debug!(
                             session_id = ?session_id,
                             tools = ?names,
