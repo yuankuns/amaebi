@@ -2785,3 +2785,269 @@ async fn switch_model_persists_to_next_turn() {
         reqs[2].model()
     );
 }
+
+// ---------------------------------------------------------------------------
+// /claude pane reuse end-to-end
+// ---------------------------------------------------------------------------
+//
+// Exercises the full "second /claude task reuses the same tmux pane as the
+// first" workflow that existed in production but was never covered end-to-end:
+//
+//   1. ClaudeLaunch(task A)        → pane P1 assigned, has_claude=true
+//   2. SupervisePanes([P1])        → mock LLM returns "DONE: ..."
+//   3. (fix/supervision-pane-release) releases P1's lease on DONE
+//   4. ClaudeLaunch(task B) same   → must reuse P1, not expand
+//                       worktree
+//
+// The test depends on the parallel fix PR (`fix/supervision-pane-release`) that
+// calls `pane_lease::release_lease` at every supervision exit.  Until that PR
+// lands the lease stays Busy after step 2 and step 4 picks a *new* pane, which
+// is the bug this test is contracting against.
+//
+// `#[ignore]` because:
+//   - `handle_claude_launch` shells out to real `tmux send-keys`, so the test
+//     requires a running tmux server (matches the sibling `docker_sandbox_*`
+//     pattern), and
+//   - even with tmux available the test is a dependency contract for the fix
+//     PR; running it in CI before both land would be a guaranteed red build.
+//
+// To run locally once both PRs land:
+//   cargo test --test integration_tests claude_pane_reuse -- --ignored
+#[tokio::test]
+#[ignore]
+async fn claude_pane_reuse_across_supervision_done() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::UnixStream;
+
+    // Local Request/Response variants that mirror the production IPC enums.
+    // Kept inline in this test (rather than in tests/support/helpers.rs) so
+    // adding ClaudeLaunch/SupervisePanes does not perturb the rest of the
+    // integration suite.
+    #[derive(serde::Serialize)]
+    struct TaskSpec {
+        task_id: String,
+        description: String,
+        worktree: Option<String>,
+        client_cwd: Option<String>,
+        auto_enter: bool,
+    }
+    #[derive(serde::Serialize)]
+    struct SupervisionTarget {
+        pane_id: String,
+        task_description: String,
+    }
+    #[derive(serde::Serialize)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    enum ClaudeReq {
+        ClaudeLaunch {
+            tasks: Vec<TaskSpec>,
+        },
+        SupervisePanes {
+            panes: Vec<SupervisionTarget>,
+            model: String,
+            session_id: Option<String>,
+        },
+    }
+    #[derive(serde::Deserialize, Debug)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    enum ClaudeResp {
+        Text {
+            #[allow(dead_code)]
+            chunk: String,
+        },
+        Done,
+        Error {
+            message: String,
+        },
+        PaneAssigned {
+            #[allow(dead_code)]
+            task_id: String,
+            pane_id: String,
+            #[allow(dead_code)]
+            session_id: String,
+        },
+        CapacityError {
+            #[allow(dead_code)]
+            requested: usize,
+            #[allow(dead_code)]
+            max_panes: usize,
+            #[allow(dead_code)]
+            current_busy: usize,
+        },
+        // Swallow every other variant unchanged — we only assert on the ones above.
+        #[serde(other)]
+        Other,
+    }
+
+    async fn round_trip(
+        socket: &std::path::Path,
+        req: &ClaudeReq,
+        deadline: std::time::Duration,
+    ) -> Vec<ClaudeResp> {
+        let stream = UnixStream::connect(socket).await.expect("connect daemon");
+        let (reader, mut writer) = tokio::io::split(stream);
+        let mut line = serde_json::to_string(req).expect("serialise request");
+        line.push('\n');
+        writer.write_all(line.as_bytes()).await.expect("write req");
+        let mut frames = Vec::new();
+        let mut lines = BufReader::new(reader).lines();
+        tokio::time::timeout(deadline, async {
+            while let Some(l) = lines.next_line().await.expect("read line") {
+                if l.is_empty() {
+                    continue;
+                }
+                let frame: ClaudeResp = serde_json::from_str(&l)
+                    .unwrap_or_else(|e| panic!("parse response {l:?}: {e}"));
+                let done = matches!(frame, ClaudeResp::Done | ClaudeResp::Error { .. });
+                frames.push(frame);
+                if done {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("round_trip timed out");
+        frames
+    }
+
+    // Extract the pane_id from a successful ClaudeLaunch response, panicking
+    // with a descriptive message if the launch returned Error/CapacityError
+    // instead of PaneAssigned.
+    fn pane_id_from_launch(frames: &[ClaudeResp]) -> Option<String> {
+        for f in frames {
+            match f {
+                ClaudeResp::Error { message } => panic!("ClaudeLaunch failed: {message}"),
+                ClaudeResp::CapacityError { .. } => panic!("ClaudeLaunch hit capacity: {f:?}"),
+                ClaudeResp::PaneAssigned { pane_id, .. } => return Some(pane_id.clone()),
+                _ => {}
+            }
+        }
+        None
+    }
+
+    // Skip if the host has no tmux server (would cause step 1 to fail with
+    // Response::Error instead of PaneAssigned).
+    if std::env::var("TMUX").is_err() {
+        eprintln!(
+            "skipping claude_pane_reuse test: $TMUX is not set (run from inside a tmux session)"
+        );
+        return;
+    }
+
+    let server = MockLlmServer::start().await;
+
+    // The daemon's supervision loop calls the LLM once per turn and exits on
+    // "DONE:".  Queue a single DONE verdict so turn 1 terminates immediately.
+    server.enqueue(ScriptedResponse::text_chunks(vec!["DONE: task A finished"]));
+
+    let daemon = start_daemon(&server.url()).await.expect("start_daemon");
+
+    // Both ClaudeLaunch requests use the *same* explicit worktree path so the
+    // tier-1 reuse predicate (`worktree.is_some() && worktree match`) can fire
+    // on the second launch.  Auto-generated worktrees would have unique UUIDs
+    // per call and never match.
+    let shared_wt = daemon.home.join("shared-wt").to_string_lossy().into_owned();
+    std::fs::create_dir_all(&shared_wt).expect("create shared worktree dir");
+
+    // --- Step 1 & 2: launch task A, capture its pane ID ---
+    let req1 = ClaudeReq::ClaudeLaunch {
+        tasks: vec![TaskSpec {
+            task_id: "first".into(),
+            description: "task A".into(),
+            worktree: Some(shared_wt.clone()),
+            client_cwd: Some(daemon.home.to_string_lossy().into_owned()),
+            auto_enter: true,
+        }],
+    };
+    let frames1 = round_trip(&daemon.socket, &req1, std::time::Duration::from_secs(60)).await;
+    let p1 = pane_id_from_launch(&frames1).expect("first launch must yield PaneAssigned");
+
+    // --- Step 3-5: supervise the pane; mock returns DONE → supervision exits ---
+    let req_sup = ClaudeReq::SupervisePanes {
+        panes: vec![SupervisionTarget {
+            pane_id: p1.clone(),
+            task_description: "task A".into(),
+        }],
+        model: "copilot/gpt-4o".into(),
+        session_id: None,
+    };
+    let sup_frames = round_trip(&daemon.socket, &req_sup, std::time::Duration::from_secs(60)).await;
+    assert!(
+        sup_frames.iter().any(|f| matches!(f, ClaudeResp::Done)),
+        "supervision must finish with Done, got: {sup_frames:?}"
+    );
+
+    // --- Step 6: assert pane lease state matches the after-fix expectation ---
+    // The daemon persists lease state at $HOME/.amaebi/tmux-state.json using
+    // the same schema as pane_lease::PaneLease.  Read it directly and verify
+    // the contract the parallel fix PR enforces.
+    #[derive(serde::Deserialize, Debug)]
+    #[serde(rename_all = "snake_case")]
+    enum PaneStatus {
+        Idle,
+        Busy,
+    }
+    #[derive(serde::Deserialize, Debug)]
+    struct PaneLease {
+        status: PaneStatus,
+        task_id: Option<String>,
+        session_id: Option<String>,
+        worktree: Option<String>,
+        #[serde(default)]
+        has_claude: bool,
+    }
+
+    let state_path = daemon.home.join(".amaebi").join("tmux-state.json");
+    let raw = std::fs::read_to_string(&state_path)
+        .unwrap_or_else(|e| panic!("reading {}: {e}", state_path.display()));
+    let state: std::collections::HashMap<String, PaneLease> =
+        serde_json::from_str(&raw).expect("parse tmux-state.json");
+    let lease = state
+        .get(&p1)
+        .unwrap_or_else(|| panic!("pane {p1} missing from lease state: {state:?}"));
+
+    assert!(
+        matches!(lease.status, PaneStatus::Idle),
+        "after supervision DONE the pane must be Idle (requires \
+         fix/supervision-pane-release PR); lease = {lease:?}"
+    );
+    assert!(
+        lease.has_claude,
+        "has_claude must be preserved across release so tier-1 reuse can fire; \
+         lease = {lease:?}"
+    );
+    assert_eq!(
+        lease.worktree.as_deref(),
+        Some(shared_wt.as_str()),
+        "worktree must be preserved across release"
+    );
+    assert!(
+        lease.task_id.is_none(),
+        "task_id must be cleared on release; lease = {lease:?}"
+    );
+    assert!(
+        lease.session_id.is_none(),
+        "session_id must be cleared on release; lease = {lease:?}"
+    );
+
+    // --- Step 7 & 8: launch task B with the same worktree; expect reuse ---
+    // Queue nothing new on the mock — the reuse path sends "/compact" plus the
+    // new description to tmux and does NOT hit the LLM.
+    let req2 = ClaudeReq::ClaudeLaunch {
+        tasks: vec![TaskSpec {
+            task_id: "second".into(),
+            description: "task B".into(),
+            worktree: Some(shared_wt.clone()),
+            client_cwd: Some(daemon.home.to_string_lossy().into_owned()),
+            auto_enter: true,
+        }],
+    };
+    let frames2 = round_trip(&daemon.socket, &req2, std::time::Duration::from_secs(60)).await;
+    let p2 = pane_id_from_launch(&frames2).expect("second launch must yield PaneAssigned");
+
+    assert_eq!(
+        p2, p1,
+        "second /claude task must reuse the same pane as the first (tier-1 \
+         reuse via /compact); got p1={p1}, p2={p2}"
+    );
+}
