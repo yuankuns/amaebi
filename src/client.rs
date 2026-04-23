@@ -2241,12 +2241,22 @@ mod prompt_input {
                 // Move up from end_visual_line to cursor_visual_line, then
                 // jump to the exact column with CHA (1-based).
                 write!(output, "\x1b[{lines_above_end}A")?;
-                // CHA is 1-based.  Use the same pending-wrap adjustment as
-                // visual_line_of: a cursor at an exact column multiple sits at
-                // the last column of the previous line, not column 1 of the
-                // next, so saturating_sub(1) before the modulo is required.
-                let target_col = cursor_col_abs.saturating_sub(1) % term_cols + 1;
-                write!(output, "\x1b[{target_col}G")?;
+                // `cursor_col_abs` counts columns *consumed* by the prompt
+                // plus all chars before the cursor.  The cursor should
+                // therefore land on the cell immediately after that — the
+                // (cursor_col_abs + 1)-th column (1-based).
+                //
+                // Pending-wrap case: when cursor_col_abs is an exact multiple
+                // of term_cols, `visual_line_of` reports the *previous* line
+                // (the "about to wrap" position).  On that line the cursor
+                // rests on the last column, i.e. 1-based column term_cols.
+                let col_on_line = if cursor_col_abs > 0 && cursor_col_abs.is_multiple_of(term_cols)
+                {
+                    term_cols
+                } else {
+                    cursor_col_abs - cursor_visual_line * term_cols + 1
+                };
+                write!(output, "\x1b[{col_on_line}G")?;
             }
         }
 
@@ -3460,6 +3470,266 @@ mod prompt_input {
             // up → "second", up → "first", down → "second", Enter
             let (res, _) = run_with_history(b"\x1b[A\x1b[A\x1b[B\r", &["first", "second"]);
             assert_eq!(res.unwrap(), Some("second".to_string()));
+        }
+
+        // ---- Half-character repro attempts (user report: "deleted half of 基")
+        //      The claim is that backspace / delete in the vicinity of a CJK
+        //      char can leave a stray byte behind.  We reproduce the exact
+        //      operation sequence: Up (recall "基于M"), Left to before '基',
+        //      Backspace, Delete, type "基于", Enter.  If the bug exists,
+        //      the result will NOT equal "基于M".
+
+        #[test]
+        fn halfchar_backspace_before_cjk_then_retype() {
+            // History has "基于M".  Up recalls it (cursor=end=3).
+            // Left ×3 → cursor=0. Delete removes '基' → "于M".
+            // Type "基" → "基于M". Enter.
+            let input = "\x1b[A\x1b[D\x1b[D\x1b[D\x1b[3~基\r".as_bytes();
+            let (res, _) = run_with_history(input, &["基于M"]);
+            assert_eq!(res.unwrap(), Some("基于M".to_string()));
+        }
+
+        #[test]
+        fn halfchar_cursor_on_cjk_backspace_then_delete() {
+            // Position cursor AT '基' (index 0) in "基于".
+            // Backspace at cursor=0 is no-op; Delete removes '基' → "于".
+            // Then retype "基" → "基于".
+            let input = "\x1b[A\x1b[D\x1b[D\x7f\x1b[3~基\r".as_bytes();
+            let (res, _) = run_with_history(input, &["基于"]);
+            assert_eq!(res.unwrap(), Some("基于".to_string()));
+        }
+
+        #[test]
+        fn halfchar_cursor_after_cjk_backspace_then_delete() {
+            // Position cursor AFTER '基' (between 基 and 于), i.e. index 1.
+            // Backspace removes '基' → "于" (cursor=0).
+            // Delete removes '于' → "" (cursor=0).
+            // Retype "基于" → "基于".
+            let input = "\x1b[A\x1b[D\x7f\x1b[3~基于\r".as_bytes();
+            let (res, _) = run_with_history(input, &["基于"]);
+            assert_eq!(res.unwrap(), Some("基于".to_string()));
+        }
+
+        #[test]
+        fn halfchar_matches_user_reported_sequence() {
+            // User's reported sequence on window 12:
+            // 1. Up-arrow → history entry "基于" (cursor at end, index 2)
+            // 2. Left ×2 → cursor at index 0 (before '基')
+            // 3. Backspace → no-op at cursor=0 (code guards `if cursor > 0`)
+            // 4. Delete → removes chars[0]='基'; cursor stays 0; buffer = "于"
+            // 5. Type "基于" → inserts at cursor=0, advancing each char;
+            //    buffer = "基于于" (length 3, all chars intact).
+            // This is the LOGICALLY CORRECT result; the reported "stray m"
+            // cannot come from this path.  Bytes are exact UTF-8 scalar reps.
+            let input = "\x1b[A\x1b[D\x1b[D\x7f\x1b[3~基于\r".as_bytes();
+            let (res, _) = run_with_history(input, &["基于"]);
+            let got = res.unwrap().unwrap();
+            assert_eq!(got, "基于于");
+            // No half-byte corruption: every byte is part of a valid UTF-8
+            // char boundary.
+            assert!(got.is_char_boundary(3) && got.is_char_boundary(6));
+        }
+
+        #[test]
+        fn halfchar_mixed_cjk_ascii_roundtrip() {
+            // "a基b于c" + Left ×3 (cursor between 基 and b) + Backspace (remove '基')
+            // + Delete (remove 'b') → "a于c"
+            let input = "a基b于c\x1b[D\x1b[D\x1b[D\x7f\x1b[3~\r".as_bytes();
+            let (res, _) = run(input);
+            assert_eq!(res.unwrap(), Some("a于c".to_string()));
+        }
+
+        #[test]
+        fn sgr_mouse_report_is_swallowed() {
+            // SGR mouse press: ESC[<0;42;7M — mid-input, around typing "基于".
+            // If the parser mishandles it, stray bytes will leak into the
+            // buffer (e.g. a literal 'M' appearing after "基于").
+            let input = b"\x1b[<0;42;7M\xe5\x9f\xba\xe4\xba\x8e\r";
+            let (res, _) = run(input);
+            assert_eq!(res.unwrap(), Some("基于".to_string()));
+        }
+
+        #[test]
+        fn sgr_mouse_release_is_swallowed() {
+            // SGR mouse release: ESC[<0;42;7m (lowercase m).
+            // Must not appear as stray 'm' character in output.
+            let input = b"\x1b[<0;42;7m\xe5\x9f\xba\xe4\xba\x8e\r";
+            let (res, _) = run(input);
+            assert_eq!(res.unwrap(), Some("基于".to_string()));
+        }
+
+        #[test]
+        fn sgr_mouse_report_mid_buffer() {
+            // Mouse report interleaved mid-word.  Parser must consume it
+            // cleanly without leaking bytes into the surrounding text.
+            let input = b"ab\x1b[<0;10;5Mcd\r";
+            let (res, _) = run(input);
+            assert_eq!(res.unwrap(), Some("abcd".to_string()));
+        }
+
+        // ---- Cursor positioning near CJK boundary (user-reported on
+        //      "> /claude 基于": right-arrow from after the space lands
+        //      "in the middle of 基" instead of at 基's left edge).
+
+        #[test]
+        fn cursor_position_after_right_arrow_over_space_into_cjk() {
+            // Prompt "> ", buffer "/claude 基于", cursor moves from 8 (space)
+            // to 9 (before 基) via Right arrow.  Verify the exact CUB count
+            // emitted by the reposition code.
+            //
+            // Layout (80-col terminal, 1-indexed cols):
+            //   col 1: '>'
+            //   col 2: ' '
+            //   col 3: '/'
+            //   col 4: 'c'
+            //   col 5: 'l'
+            //   col 6: 'a'
+            //   col 7: 'u'
+            //   col 8: 'd'
+            //   col 9: 'e'
+            //   col 10: ' '
+            //   col 11–12: 基
+            //   col 13–14: 于
+            //   col 15: (after end of line; terminal cursor rests here
+            //           immediately after reprinting).
+            //
+            // Expected cursor at char index 8 (right before 基):
+            //   widths[8..] = [2, 2], cols_from_cursor = 4 → ESC[4D.
+            //   Terminal cursor ends at col 15 - 4 = col 11 = LEFT cell of 基.
+            //
+            // This is the correct terminal position for "cursor sits at the
+            // left edge of 基".  In a monospace terminal the cursor always
+            // occupies a cell, so visually this reads as "cursor covering
+            // the first half of 基" — NOT a bug.
+
+            // Drive: type prompt body, then Left×1 (to cursor=9→7? no, to 9→9..
+            // Actually: after typing all 10 chars, cursor=10 (end).
+            //   Left → cursor=9 (before 于)
+            //   Left → cursor=8 (before 基, after space)
+            // Now emit CUB expected to be 4 (widths[8..]=[2,2] sum=4).
+            let input = "/claude 基于\x1b[D\x1b[D\r".as_bytes();
+            let (res, echo) = run(input);
+            assert_eq!(res.unwrap(), Some("/claude 基于".to_string()));
+            // The LAST CUB emitted before the CRLF must be exactly ESC[4D.
+            // Find the last occurrence of ESC[ before the final "\r\n".
+            let echo_str = String::from_utf8_lossy(&echo);
+            // Just assert somewhere in the echo we emitted "\x1b[4D" — the
+            // reposition after the second Left arrow.
+            assert!(
+                echo.windows(4).any(|w| w == b"\x1b[4D"),
+                "expected ESC[4D (back 4 cells = stop at left edge of 基); \
+                 got echo: {echo_str:?}"
+            );
+        }
+
+        #[test]
+        fn cursor_reposition_across_wrapped_line_lands_on_glyph_left_edge() {
+            // Reproduces the user-reported bug on window 12: with prompt "> "
+            // and a long buffer that wraps onto multiple visual lines, when
+            // the cursor is in the middle of an earlier line (so cursor and
+            // end are on DIFFERENT visual lines → CHA branch), the CHA
+            // column must land on the LEFT edge of the target CJK glyph.
+            //
+            // Layout: term_cols=10, prompt="> ", buffer "/claude 基于ABCDEF".
+            //   widths:     1 1 1 1 1 1 1 1 2 2 1 1 1 1 1 1  = 18 cols
+            //   cumulative: 1 2 3 4 5 6 7 8 10 12 13 14 15 16 17 18
+            //   prompt consumes cols 0..1 (1-based 1..2).
+            //   Visual lines (1-based cols):
+            //     line 0: cols 1..10  "> /claude"       (10 cols)
+            //     line 1: cols 11..20 " 基于ABCDEF"      (11 cols — wait)
+            //   Let me recount: after "> " (2) + "/claude" (7) = 9 cols on line 0.
+            //   Next char is ' ' at col 10.  Then '基' is 2 wide:
+            //     visual_line_of(11) = (11-1)/10 = 1, so '基' STARTS line 1
+            //     — but it actually occupies cols 11..12 → line 1 cols 1..2.
+            //   Then '于' at cols 13..14 → line 1 cols 3..4, 'A' at col 15
+            //   → line 1 col 5, etc.  End of buffer at col 20 → line 1 col 10.
+            //
+            // Move cursor with Left ×8 so cursor=10 (between '于' and 'A').
+            // cursor_col_abs = 2 + widths[0..10].sum() = 2 + (1*7 + 1 + 2 + 2) = 14.
+            // visual_line_of(14) = (14-1)/10 = 1; end_col_abs = 20,
+            // end_visual_line = (20-1)/10 = 1.  Same line! Will take CUB.
+            //
+            // To force DIFFERENT visual lines we need cursor on line 0 while
+            // end is on line 1.  Set cursor to index 4 (after "/cla", before 'u'):
+            //   cursor_col_abs = 2 + 4 = 6, visual_line 0.
+            //   end_col_abs = 20, visual_line 1.  Different! → CHA branch.
+            // col_on_line = 6 - 0*10 + 1 = 7 (1-based).
+            // Visual col 7 of line 0 is 'u' of "/claude".  Cursor should
+            // cover 'u'.  Old code: (6-1)%10+1 = 6 → lands on 'a'.  BUG.
+            //
+            // Drive: type full buffer (cursor=16 at end), Left ×12 →
+            // cursor=4.
+            let mut input_bytes: Vec<u8> = Vec::new();
+            input_bytes.extend_from_slice("/claude 基于ABCDEF".as_bytes());
+            for _ in 0..12 {
+                input_bytes.extend_from_slice(b"\x1b[D");
+            }
+            input_bytes.push(b'\r');
+            let (res, echo) = run_with_history_prompt(&input_bytes, &[], "> ", 10);
+            assert_eq!(res.unwrap(), Some("/claude 基于ABCDEF".to_string()));
+            // Collect every CHA (ESC[nG) emitted so we can assert on the
+            // FINAL one, which represents the final cursor landing.
+            let mut chas: Vec<usize> = Vec::new();
+            let mut i = 0;
+            while i < echo.len() {
+                if i + 2 < echo.len() && echo[i] == 0x1b && echo[i + 1] == b'[' {
+                    let mut j = i + 2;
+                    while j < echo.len() && echo[j].is_ascii_digit() {
+                        j += 1;
+                    }
+                    if j < echo.len() && echo[j] == b'G' {
+                        let n: usize = std::str::from_utf8(&echo[i + 2..j])
+                            .unwrap()
+                            .parse()
+                            .unwrap();
+                        chas.push(n);
+                        i = j + 1;
+                        continue;
+                    }
+                }
+                i += 1;
+            }
+            // After the final Left (cursor=4), cursor_col_abs = 2 + 5 = 7.
+            // Correct CHA value: 7 + 1 = 8 (the cursor sits on 'a' of "/claude",
+            // since cursor=4 means "before chars[4]='u', after chars[3]='a'";
+            // the cell that covers this boundary is col 8 of line 0 = 'a').
+            // Wait: cells of line 0 (1-based) are:
+            //   col 1: '>'  col 2: ' '  col 3: '/'  col 4: 'c'  col 5: 'l'
+            //   col 6: 'a'  col 7: 'u'  col 8: 'd'  col 9: 'e'  col 10: ' '
+            // cursor=4 is "before 'u'" → cursor on col 7 ('u').  Hm then CHA
+            // should be 7, not 8.  Let me recount widths:
+            //   chars[0]='/'=1, chars[1]='c'=1, chars[2]='l'=1, chars[3]='a'=1
+            // widths[0..4].sum() = 4.  cursor_col_abs = 2 + 4 = 6.
+            // Expected CHA value: cursor lands on col 6+1 = 7, which is 'u'.
+            // OLD buggy formula `(6-1)%10+1 = 6`, which is 'a' — the bug.
+            assert_eq!(
+                chas.last().copied(),
+                Some(7),
+                "final CHA must be col 7 ('u'), not col 6 ('a'); chas = {chas:?}"
+            );
+        }
+
+        #[test]
+        fn cursor_at_cjk_boundary_is_left_edge_not_mid_glyph() {
+            // Type "a基", then Left (cursor from 2 → 1, sitting before 基).
+            // The reposition must land at col prompt_cols+1 = 1 (0-indexed
+            // "1 cell to the left of start of first char") NOT inside the
+            // second half of 基.
+            //
+            // After reprint: cursor at col prompt_cols + 1 + 2 + 1 = 5
+            //   (prompt="" in run(), 'a' at col 1, '基' at cols 2-3, cursor
+            //   rests at col 4 after print).
+            // cursor=1, widths[1..]=[2], cols_from_cursor=2 → ESC[2D → col 2.
+            // Col 2 is the LEFT cell of 基.  Visually cursor covers 基's
+            // first half; this is the only terminal-representable position
+            // for "cursor between a and 基".
+            let input = "a基\x1b[D\r".as_bytes();
+            let (_, echo) = run(input);
+            assert!(
+                echo.windows(4).any(|w| w == b"\x1b[2D"),
+                "expected ESC[2D emitted by Left over a CJK char; got: {:?}",
+                String::from_utf8_lossy(&echo)
+            );
         }
     }
 }
