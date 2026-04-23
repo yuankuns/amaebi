@@ -379,22 +379,33 @@ pub async fn send_message_with_session(
 }
 
 /// Send a resume request with a specific session_id and model.
+///
+/// Retries briefly on "already in use" — mirrors `send_message_with_session`
+/// so CI timing races, where the daemon hasn't yet released the session
+/// guard from a prior request for the same session_id, don't flake the test.
 pub async fn send_resume(
     client: &ClientHandle,
     prompt: &str,
     session_id: &str,
     model: &str,
 ) -> Result<Vec<Response>> {
-    send_request(
-        client,
-        &Request::Resume {
-            prompt: prompt.to_string(),
-            tmux_pane: None,
-            session_id: session_id.to_string(),
-            model: model.to_string(),
-        },
-    )
-    .await
+    let req = Request::Resume {
+        prompt: prompt.to_string(),
+        tmux_pane: None,
+        session_id: session_id.to_string(),
+        model: model.to_string(),
+    };
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+    loop {
+        let responses = send_request(client, &req).await?;
+        let in_use = responses.iter().any(
+            |r| matches!(r, Response::Error { message } if message.contains("already in use")),
+        );
+        if !in_use || tokio::time::Instant::now() >= deadline {
+            return Ok(responses);
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+    }
 }
 
 /// Send a chat message and collect all response frames until `Done` or `Error`.
