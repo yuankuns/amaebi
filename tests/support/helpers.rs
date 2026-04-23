@@ -381,8 +381,8 @@ pub async fn send_message_with_session(
 /// Send a resume request with a specific session_id and model.
 ///
 /// Retries briefly on "already in use" — mirrors `send_message_with_session`
-/// so CI timing races (chat guard still being released when resume arrives
-/// on the same connection) don't flake the test.
+/// so CI timing races, where the daemon hasn't yet released the session
+/// guard from a prior request for the same session_id, don't flake the test.
 pub async fn send_resume(
     client: &ClientHandle,
     prompt: &str,
