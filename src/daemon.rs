@@ -145,6 +145,16 @@ pub struct DaemonState {
     /// it is already present the request is rejected with a Response::Error so
     /// concurrent clients cannot interleave writes to the same session history.
     pub active_sessions: Arc<Mutex<HashSet<String>>>,
+    /// User-defined model aliases loaded once from `~/.amaebi/config.json` at
+    /// daemon startup.  Expanded by `expand_user_alias` at each request entry
+    /// point (and inside the `switch_model` tool handler) so the rest of the
+    /// pipeline can keep using bare `provider::resolve()`.  Empty when the
+    /// config file is missing or has no aliases.
+    ///
+    /// **Not hot-reloaded**: the daemon snapshots the alias table once at
+    /// startup.  The user must restart the daemon after editing
+    /// `~/.amaebi/config.json` for changes to take effect.
+    pub user_aliases: Arc<std::collections::HashMap<String, String>>,
 }
 
 impl DaemonState {
@@ -166,11 +176,16 @@ impl DaemonState {
 
         let tokens = Arc::new(TokenCache::new());
 
+        // Load user model aliases from the config file.  Never fatal — falls
+        // back to an empty map if the file is missing or malformed.
+        let user_aliases = Arc::new(crate::config::Config::load().model_aliases);
+
         let spawn_ctx = Arc::new(tools::SpawnContext {
             http: http.clone(),
             db: Arc::clone(&db),
             compacting_sessions: Arc::clone(&compacting_sessions),
             tokens: Arc::clone(&tokens),
+            user_aliases: Arc::clone(&user_aliases),
         });
 
         let mut executor = tools::LocalExecutor::new();
@@ -183,6 +198,7 @@ impl DaemonState {
             db,
             compacting_sessions,
             active_sessions,
+            user_aliases,
         })
     }
 }
@@ -328,6 +344,37 @@ fn compaction_threshold_tokens(model: &str) -> usize {
 /// token pre-flight check is required before dispatching the request.
 fn needs_copilot_auth(model: &str) -> bool {
     crate::provider::resolve(model).provider == crate::provider::ProviderKind::Copilot
+}
+
+/// Expand a user-defined alias in `model` using the daemon's loaded alias
+/// table.  Returns the expanded target string, or the original input if no
+/// alias matches.  The `[1m]` suffix is preserved across expansion so
+/// `amaebi chat --model opus[1m]` works when `opus` maps to a Bedrock model.
+///
+/// This is called once on every request-entry so the rest of the daemon can
+/// keep using bare `provider::resolve()` without knowing about user aliases.
+pub(crate) fn expand_user_alias(
+    model: &str,
+    user_aliases: &std::collections::HashMap<String, String>,
+) -> String {
+    // If the caller typed `name[1m]`, strip the suffix, expand the bare name,
+    // then reattach the suffix.  Alias targets in config.json may themselves
+    // carry `[1m]` (e.g. `"sonnet": "bedrock/claude-sonnet-4.6[1m]"`) — the
+    // downstream `provider::resolve()` normalizes the suffix either way.
+    let (bare, suffix) = if let Some(stripped) = model.strip_suffix("[1m]") {
+        (stripped, "[1m]")
+    } else {
+        (model, "")
+    };
+
+    // Built-in aliases win on conflict (same rule as provider::resolve_with_aliases).
+    if bare.contains('/') || crate::provider::is_builtin_bedrock_alias(bare) {
+        return model.to_owned();
+    }
+    match user_aliases.get(bare) {
+        Some(target) => format!("{target}{suffix}"),
+        None => model.to_owned(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -524,6 +571,7 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                 model,
                 session_id,
             } => {
+                let model = expand_user_alias(&model, &state.user_aliases);
                 tracing::info!(model = %model, prompt_len = prompt.len(), "received detach request");
                 if needs_copilot_auth(&model) {
                     if let Err(e) = state.tokens.get(&state.http).await {
@@ -603,6 +651,7 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                 model,
                 session_id,
             } => {
+                let model = expand_user_alias(&model, &state.user_aliases);
                 let mut conn_state = ConnState {
                     frame_rx: &mut frame_rx,
                     pending_unsolicited: &mut pending_unsolicited,
@@ -629,6 +678,7 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                 model,
                 session_id,
             } => {
+                let model = expand_user_alias(&model, &state.user_aliases);
                 let mut conn_state = ConnState {
                     frame_rx: &mut frame_rx,
                     pending_unsolicited: &mut pending_unsolicited,
@@ -662,6 +712,7 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                 model,
                 session_id,
             } => {
+                let model = expand_user_alias(&model, &state.user_aliases);
                 handle_supervision(&writer, &mut frame_rx, panes, model, &state, session_id)
                     .await?;
             }
@@ -4055,6 +4106,11 @@ where
                             let result = match parse_switch_model_arg(args["model"].as_str()) {
                                 Err(e) => e,
                                 Ok(new_model) => {
+                                    // Expand user-defined aliases so the LLM can
+                                    // switch_model with a short alias like "opus"
+                                    // and land on the configured target.
+                                    let new_model =
+                                        expand_user_alias(&new_model, &state.user_aliases);
                                     let old =
                                         std::mem::replace(&mut current_model, new_model.clone());
                                     // LLM made an explicit choice — stop auto-switching
@@ -4461,9 +4517,13 @@ async fn run_cron_job(state: Arc<DaemonState>, job: &cron::CronJob) {
     // Generate a fresh session UUID for this run.
     let session_id = uuid::Uuid::new_v4().to_string();
 
-    // Resolve model from env var (same default as CLI client).
+    // Resolve model from env var (same default as CLI client), then expand
+    // any user-defined alias (e.g. AMAEBI_MODEL=opus) using the daemon's
+    // snapshotted alias table so cron jobs hit the same backend as
+    // interactive requests.
     let model = std::env::var("AMAEBI_MODEL")
         .unwrap_or_else(|_| crate::provider::DEFAULT_MODEL.to_string());
+    let model = expand_user_alias(&model, &state.user_aliases);
 
     let mut messages = build_messages(&job.description, None, &[], &[], None, &model);
     inject_skill_files(&mut messages).await;
@@ -5951,5 +6011,61 @@ mod tests {
     fn summarise_tool_detail_unknown_tool_returns_empty() {
         let args = serde_json::json!({ "command": "ignored" });
         assert_eq!(summarise_tool_detail("bogus_tool", &args), "");
+    }
+
+    // ---- expand_user_alias -------------------------------------------------
+
+    fn aliases(pairs: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn expand_user_alias_expands_bare_name() {
+        let map = aliases(&[("opus", "bedrock/claude-opus-4.7")]);
+        assert_eq!(expand_user_alias("opus", &map), "bedrock/claude-opus-4.7");
+    }
+
+    #[test]
+    fn expand_user_alias_preserves_1m_suffix() {
+        // `opus[1m]` must expand the bare name and reattach the suffix.
+        let map = aliases(&[("opus", "bedrock/claude-opus-4.7")]);
+        assert_eq!(
+            expand_user_alias("opus[1m]", &map),
+            "bedrock/claude-opus-4.7[1m]"
+        );
+    }
+
+    #[test]
+    fn expand_user_alias_builtin_shadows_user() {
+        // `claude-opus-4.6` is a built-in; user alias must be ignored.
+        let map = aliases(&[("claude-opus-4.6", "bedrock/claude-sonnet-4.6")]);
+        assert_eq!(
+            expand_user_alias("claude-opus-4.6", &map),
+            "claude-opus-4.6"
+        );
+    }
+
+    #[test]
+    fn expand_user_alias_passes_through_provider_prefix() {
+        // `bedrock/...` already carries a provider prefix and must not be
+        // treated as a bare-name candidate for expansion.
+        let map = aliases(&[("bedrock/foo", "bedrock/bar")]);
+        assert_eq!(expand_user_alias("bedrock/foo", &map), "bedrock/foo");
+    }
+
+    #[test]
+    fn expand_user_alias_unknown_passes_through() {
+        let map = aliases(&[("opus", "bedrock/claude-opus-4.7")]);
+        assert_eq!(expand_user_alias("unknown", &map), "unknown");
+    }
+
+    #[test]
+    fn expand_user_alias_no_chain_resolution() {
+        // `a -> b`, `b -> bedrock/...`.  Expanding "a" must stop at "b".
+        let map = aliases(&[("a", "b"), ("b", "bedrock/claude-opus-4.7")]);
+        assert_eq!(expand_user_alias("a", &map), "b");
     }
 }

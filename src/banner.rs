@@ -47,11 +47,27 @@ pub fn print(model: &str, session_id: &str, cwd: &Path) {
     };
 
     // Always show the resolved provider/ prefix so users see which backend
-    // will be hit.  Unknown prefixes (e.g. `azure/`) route to Bedrock by
-    // default — reflect that rather than echoing the raw input.
-    let spec = crate::provider::resolve(model);
+    // will be hit.  If the user typed a config-file alias (e.g. `opus`), show
+    // both the alias and its target so there's no ambiguity about what will
+    // actually be sent on the wire.
+    let user_aliases = crate::config::Config::load().model_aliases;
+    let spec = crate::provider::resolve_with_aliases(model, &user_aliases);
     let model_display = if model.starts_with("copilot/") || model.starts_with("bedrock/") {
         model.to_string()
+    } else if let Some(target) = user_aliases
+        .get(model.trim_end_matches("[1m]"))
+        .filter(|_| !crate::provider::is_builtin_bedrock_alias(model.trim_end_matches("[1m]")))
+    {
+        // Alias in effect — show "opus → bedrock/claude-opus-4.7".  If the
+        // user typed `alias[1m]` we append `[1m]` to the target for display
+        // unless it is already there, since the daemon reattaches the suffix
+        // when expanding.
+        let needs_1m = model.ends_with("[1m]") && !target.ends_with("[1m]");
+        if needs_1m {
+            format!("{model} → {target}[1m]")
+        } else {
+            format!("{model} → {target}")
+        }
     } else {
         format!("{}/{}", spec.provider, model)
     };

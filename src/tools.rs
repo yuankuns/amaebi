@@ -24,6 +24,14 @@ pub struct SpawnContext {
     /// Shared Copilot token cache — reused by child agents to avoid redundant
     /// token fetches.
     pub tokens: Arc<crate::auth::TokenCache>,
+    /// User-defined model aliases from `~/.amaebi/config.json`.  Consulted by
+    /// `spawn_agent` (parent scope) when expanding the `model` argument
+    /// before launching a child agent.  Also propagated into the child's
+    /// `DaemonState.user_aliases` so the child's `switch_model` tool
+    /// handler can resolve user aliases the same way the parent's does —
+    /// children cannot `spawn_agent` themselves, but `switch_model` is
+    /// always available.
+    pub user_aliases: Arc<HashMap<String, String>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -452,6 +460,11 @@ async fn spawn_agent(args: serde_json::Value, ctx: &SpawnContext) -> Result<Stri
         .as_str()
         .map(|s| s.to_string())
         .unwrap_or_else(subagent_default_model);
+    // Expand user-defined aliases here: the downstream run_agentic_loop
+    // resolves the model via provider::resolve() which does not consult
+    // user aliases, so `{"model": "opus"}` from the LLM must be expanded
+    // before the child loop sees it.
+    let model = crate::daemon::expand_user_alias(&model, &ctx.user_aliases);
 
     let extra_mounts = args["extra_mounts"].as_array().cloned().unwrap_or_default();
     let mut ro_paths: Vec<PathBuf> = vec![];
@@ -604,6 +617,11 @@ async fn spawn_agent(args: serde_json::Value, ctx: &SpawnContext) -> Result<Stri
         // Child agents get their own active_sessions set; they are ephemeral
         // and don't share the parent's session-lock namespace.
         active_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+        // Children cannot themselves spawn further agents, but the
+        // switch_model tool schema is still available to them.  Propagating
+        // the alias table lets a child's switch_model call resolve user
+        // aliases the same way the parent's does.
+        user_aliases: Arc::clone(&ctx.user_aliases),
     };
 
     let messages = vec![
@@ -1406,6 +1424,7 @@ mod tests {
             db: Arc::new(Mutex::new(rusqlite::Connection::open_in_memory().unwrap())),
             compacting_sessions: Arc::new(Mutex::new(HashSet::new())),
             tokens: Arc::new(crate::auth::TokenCache::new()),
+            user_aliases: Arc::new(HashMap::new()),
         }
     }
 

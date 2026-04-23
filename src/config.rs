@@ -43,6 +43,15 @@ pub struct Config {
     /// 5. built-in 30-minute fallback
     #[serde(default)]
     pub ttl_minutes: HashMap<String, u64>,
+
+    /// User-defined model aliases.  Keys are short names typed on the CLI
+    /// (e.g. `"opus"`), values are full model strings (`"bedrock/claude-opus-4.7"`
+    /// or `"copilot/gpt-4o"`).  Built-in aliases in `provider::BEDROCK_ALIASES`
+    /// take precedence on a name conflict.  Alias values are resolved once
+    /// (no chain resolution): the value must be a final model string or a
+    /// built-in alias name.
+    #[serde(default)]
+    pub model_aliases: HashMap<String, String>,
 }
 
 impl Config {
@@ -233,5 +242,32 @@ mod tests {
         let cfg2: Config = serde_json::from_str(&json).unwrap();
         assert_eq!(cfg2.ttl_minutes.get("default"), Some(&30));
         assert_eq!(cfg2.ttl_minutes.get("/projectX"), Some(&120));
+    }
+
+    #[test]
+    fn model_aliases_default_empty_when_missing() {
+        // Older configs without model_aliases must still load cleanly.
+        let json = r#"{"ttl_minutes":{"default":30}}"#;
+        let cfg: Config = serde_json::from_str(json).unwrap();
+        assert!(cfg.model_aliases.is_empty());
+    }
+
+    #[test]
+    fn model_aliases_roundtrip_serde() {
+        let mut cfg = Config::default();
+        cfg.model_aliases
+            .insert("opus".into(), "bedrock/claude-opus-4.7".into());
+        cfg.model_aliases
+            .insert("haiku".into(), "bedrock/claude-haiku-4.5".into());
+        let json = serde_json::to_string(&cfg).unwrap();
+        let cfg2: Config = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            cfg2.model_aliases.get("opus"),
+            Some(&"bedrock/claude-opus-4.7".to_string())
+        );
+        assert_eq!(
+            cfg2.model_aliases.get("haiku"),
+            Some(&"bedrock/claude-haiku-4.5".to_string())
+        );
     }
 }
