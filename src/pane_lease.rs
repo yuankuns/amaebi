@@ -793,6 +793,31 @@ fn tmux_new_window_sync(window_id: &str) -> Result<(String, String)> {
 }
 
 // ---------------------------------------------------------------------------
+// Test-only helpers (accessible from other modules' tests)
+// ---------------------------------------------------------------------------
+
+/// Seed the pane state file with a single lease.  Test-only.
+///
+/// Exposed so tests outside this module (e.g. supervision-loop tests in
+/// `daemon.rs`) can set up pane state without reaching into the private
+/// `write_state_unlocked` helper.  Must be called inside a `with_temp_home`
+/// scope so the write lands under a temp `$HOME`.
+#[cfg(test)]
+pub(crate) fn seed_state_for_test(lease: PaneLease) -> Result<()> {
+    let lock = open_lock_file()?;
+    lock.lock_exclusive()
+        .context("acquiring flock for seed_state_for_test")?;
+    let result = (|| {
+        let mut state = read_state_unlocked()?;
+        state.insert(lease.pane_id.clone(), lease);
+        write_state_unlocked(&state)
+    })();
+    lock.unlock()
+        .context("releasing flock after seed_state_for_test")?;
+    result
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
