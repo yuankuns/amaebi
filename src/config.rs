@@ -258,7 +258,7 @@ mod tests {
         cfg.model_aliases
             .insert("opus".into(), "bedrock/claude-opus-4.7".into());
         cfg.model_aliases
-            .insert("fast".into(), "bedrock/claude-haiku-4.5".into());
+            .insert("haiku".into(), "bedrock/claude-haiku-4.5".into());
         let json = serde_json::to_string(&cfg).unwrap();
         let cfg2: Config = serde_json::from_str(&json).unwrap();
         assert_eq!(
@@ -266,7 +266,7 @@ mod tests {
             Some(&"bedrock/claude-opus-4.7".to_string())
         );
         assert_eq!(
-            cfg2.model_aliases.get("fast"),
+            cfg2.model_aliases.get("haiku"),
             Some(&"bedrock/claude-haiku-4.5".to_string())
         );
     }

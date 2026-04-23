@@ -423,8 +423,8 @@ mod tests {
     #[test]
     fn user_alias_can_target_copilot() {
         let mut map = HashMap::new();
-        map.insert("fast".into(), "copilot/gpt-4o-mini".into());
-        let spec = resolve_with_aliases("fast", &map);
+        map.insert("mini".into(), "copilot/gpt-4o-mini".into());
+        let spec = resolve_with_aliases("mini", &map);
         assert_eq!(spec.provider, ProviderKind::Copilot);
         assert_eq!(spec.model_id, "gpt-4o-mini");
     }
