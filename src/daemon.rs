@@ -147,9 +147,13 @@ pub struct DaemonState {
     pub active_sessions: Arc<Mutex<HashSet<String>>>,
     /// User-defined model aliases loaded once from `~/.amaebi/config.json` at
     /// daemon startup.  Expanded by `expand_user_alias` at each request entry
-    /// point so the rest of the pipeline can keep using bare
-    /// `provider::resolve()`.  Empty when the config file is missing or has
-    /// no aliases.
+    /// point (and inside the `switch_model` tool handler) so the rest of the
+    /// pipeline can keep using bare `provider::resolve()`.  Empty when the
+    /// config file is missing or has no aliases.
+    ///
+    /// **Not hot-reloaded**: the daemon snapshots the alias table once at
+    /// startup.  The user must restart the daemon after editing
+    /// `~/.amaebi/config.json` for changes to take effect.
     pub user_aliases: Arc<std::collections::HashMap<String, String>>,
 }
 
@@ -4101,6 +4105,11 @@ where
                             let result = match parse_switch_model_arg(args["model"].as_str()) {
                                 Err(e) => e,
                                 Ok(new_model) => {
+                                    // Expand user-defined aliases so the LLM can
+                                    // switch_model with a short alias like "opus"
+                                    // and land on the configured target.
+                                    let new_model =
+                                        expand_user_alias(&new_model, &state.user_aliases);
                                     let old =
                                         std::mem::replace(&mut current_model, new_model.clone());
                                     // LLM made an explicit choice — stop auto-switching
