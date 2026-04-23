@@ -411,18 +411,41 @@ async fn socket_in_use(path: &std::path::Path) -> Result<bool> {
     }
 }
 
-pub async fn run(socket: PathBuf) -> Result<()> {
-    // Probe first — if a live daemon answers, refuse to start.
-    if socket_in_use(&socket).await? {
+/// Try to bind the daemon's Unix socket, safely handling a stale leftover
+/// path.
+///
+/// TOCTOU-safe: if a bare `bind` fails with `AddrInUse`, we probe with
+/// `socket_in_use`.  A live peer means refuse to start; a dead peer means
+/// unlink and retry bind once.  If bind still fails we surface the error.
+///
+/// Racing daemon startups remain safe:
+/// * If peer A bound first and is live, peer B's retry probe reports live
+///   → peer B errors out (desired).
+/// * If peer A crashed and left a stale socket, the probe reports stale →
+///   peer B unlinks and binds.  If peer A's path was already unlinked (or
+///   another process is in the middle of the same retry), the unlink /
+///   bind may fail; we bubble the error up rather than looping forever.
+async fn acquire_socket_listener(socket: &std::path::Path) -> Result<UnixListener> {
+    match UnixListener::bind(socket) {
+        Ok(listener) => return Ok(listener),
+        Err(e) if e.kind() != std::io::ErrorKind::AddrInUse => {
+            return Err(
+                anyhow::Error::new(e).context(format!("binding Unix socket {}", socket.display()))
+            );
+        }
+        Err(_) => { /* AddrInUse — fall through to probe + unlink + retry */ }
+    }
+
+    if socket_in_use(socket).await? {
         anyhow::bail!(
             "daemon already running on {}; refusing to start a second instance",
             socket.display()
         );
     }
-    // Unlink any stale path.  Tolerate NotFound in case the file disappeared
-    // between the probe and this call (another process cleaning up, etc.) —
-    // the subsequent bind() handles missing paths natively.
-    match std::fs::remove_file(&socket) {
+
+    // Probe said stale.  Unlink and retry bind.  Tolerate NotFound in case
+    // another process beat us to the cleanup.
+    match std::fs::remove_file(socket) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => {
@@ -431,8 +454,11 @@ pub async fn run(socket: PathBuf) -> Result<()> {
         }
     }
 
-    let listener = UnixListener::bind(&socket)
-        .with_context(|| format!("binding Unix socket {}", socket.display()))?;
+    UnixListener::bind(socket).with_context(|| format!("binding Unix socket {}", socket.display()))
+}
+
+pub async fn run(socket: PathBuf) -> Result<()> {
+    let listener = acquire_socket_listener(&socket).await?;
 
     tracing::info!(path = %socket.display(), "daemon listening");
 
