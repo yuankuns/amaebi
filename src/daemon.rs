@@ -412,15 +412,23 @@ async fn socket_in_use(path: &std::path::Path) -> Result<bool> {
 }
 
 pub async fn run(socket: PathBuf) -> Result<()> {
-    if socket.exists() {
-        if socket_in_use(&socket).await? {
-            anyhow::bail!(
-                "daemon already running on {}; refusing to start a second instance",
-                socket.display()
-            );
+    // Probe first — if a live daemon answers, refuse to start.
+    if socket_in_use(&socket).await? {
+        anyhow::bail!(
+            "daemon already running on {}; refusing to start a second instance",
+            socket.display()
+        );
+    }
+    // Unlink any stale path.  Tolerate NotFound in case the file disappeared
+    // between the probe and this call (another process cleaning up, etc.) —
+    // the subsequent bind() handles missing paths natively.
+    match std::fs::remove_file(&socket) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(anyhow::Error::new(e)
+                .context(format!("removing stale socket {}", socket.display())));
         }
-        std::fs::remove_file(&socket)
-            .with_context(|| format!("removing stale socket {}", socket.display()))?;
     }
 
     let listener = UnixListener::bind(&socket)
