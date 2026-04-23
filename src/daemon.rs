@@ -4516,9 +4516,13 @@ async fn run_cron_job(state: Arc<DaemonState>, job: &cron::CronJob) {
     // Generate a fresh session UUID for this run.
     let session_id = uuid::Uuid::new_v4().to_string();
 
-    // Resolve model from env var (same default as CLI client).
+    // Resolve model from env var (same default as CLI client), then expand
+    // any user-defined alias (e.g. AMAEBI_MODEL=opus) using the daemon's
+    // snapshotted alias table so cron jobs hit the same backend as
+    // interactive requests.
     let model = std::env::var("AMAEBI_MODEL")
         .unwrap_or_else(|_| crate::provider::DEFAULT_MODEL.to_string());
+    let model = expand_user_alias(&model, &state.user_aliases);
 
     let mut messages = build_messages(&job.description, None, &[], &[], None, &model);
     inject_skill_files(&mut messages).await;

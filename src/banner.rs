@@ -58,8 +58,16 @@ pub fn print(model: &str, session_id: &str, cwd: &Path) {
         .get(model.trim_end_matches("[1m]"))
         .filter(|_| !crate::provider::is_builtin_bedrock_alias(model.trim_end_matches("[1m]")))
     {
-        // Alias in effect — show "opus → bedrock/claude-opus-4.7".
-        format!("{model} → {target}")
+        // Alias in effect — show "opus → bedrock/claude-opus-4.7".  If the
+        // user typed `alias[1m]` we append `[1m]` to the target for display
+        // unless it is already there, since the daemon reattaches the suffix
+        // when expanding.
+        let needs_1m = model.ends_with("[1m]") && !target.ends_with("[1m]");
+        if needs_1m {
+            format!("{model} → {target}[1m]")
+        } else {
+            format!("{model} → {target}")
+        }
     } else {
         format!("{}/{}", spec.provider, model)
     };

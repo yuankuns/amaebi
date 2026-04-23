@@ -373,16 +373,18 @@ impl acp::Agent for AmaebiAgent {
 /// `socket` is the path to a running daemon's Unix socket.  Memory operations
 /// are routed through it so the daemon remains the sole SQLite writer.
 pub async fn run(model: Option<String>, socket: PathBuf) -> Result<()> {
-    let model: Arc<str> = model
-        .or_else(|| std::env::var("AMAEBI_MODEL").ok())
-        .unwrap_or_else(|| crate::provider::DEFAULT_MODEL.to_string())
-        .into();
-
     let state = Arc::new(
         DaemonState::new()
             .await
             .context("initialising daemon state")?,
     );
+
+    // Build state first so we can expand any user-defined alias in the CLI
+    // arg or AMAEBI_MODEL env var using the snapshotted alias table.
+    let raw_model = model
+        .or_else(|| std::env::var("AMAEBI_MODEL").ok())
+        .unwrap_or_else(|| crate::provider::DEFAULT_MODEL.to_string());
+    let model: Arc<str> = crate::daemon::expand_user_alias(&raw_model, &state.user_aliases).into();
 
     let outgoing = tokio::io::stdout().compat_write();
     let incoming = tokio::io::stdin().compat();
