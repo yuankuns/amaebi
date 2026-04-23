@@ -342,11 +342,60 @@ mod tests {
         );
     }
 
-    // TODO: docker_spawn_agent_no_recursion — verify that a child agent
-    // launched inside a DockerSandbox does not have spawn_agent available.
-    // This requires wiring a full agentic loop into the sandbox test, which
-    // is more integration-level than unit-level; covered at the daemon level
-    // by the `spawn_agent_child_cannot_spawn` integration test instead.
+    /// A child agent launched inside a DockerSandbox must not be able to
+    /// recursively call `spawn_agent`.  The recursion-prevention *contract*
+    /// lives in two places that are both exercised here without needing a
+    /// live Docker daemon:
+    ///
+    /// 1. Schema layer: `tool_schemas(false)` — the schema list the child
+    ///    sees — excludes `spawn_agent`.
+    /// 2. Execution layer: a child-shaped `LocalExecutor` (sandbox: Docker,
+    ///    `spawn_ctx: None`) bails when asked to execute `spawn_agent`, so
+    ///    even a model that hallucinates the call cannot re-enter.
+    ///
+    /// Full end-to-end coverage (actually running a child loop inside Docker)
+    /// lives in `tests/integration_tests.rs::spawn_agent_child_cannot_spawn`.
+    #[tokio::test]
+    async fn docker_spawn_agent_no_recursion() {
+        use crate::tools::{tool_schemas, LocalExecutor, ToolExecutor};
+
+        // (1) Schema layer: child agents are built with include_spawn_agent=false
+        // (see `tools::spawn_agent` when constructing `child_state`).
+        let schemas = tool_schemas(false);
+        let has_spawn_agent = schemas
+            .iter()
+            .any(|s| s["function"]["name"].as_str() == Some("spawn_agent"));
+        assert!(
+            !has_spawn_agent,
+            "spawn_agent must be absent from the child tool schema"
+        );
+
+        // (2) Execution layer: build a child-shaped LocalExecutor exactly how
+        // `tools::spawn_agent` builds one for a DockerSandbox child — sandbox
+        // present, spawn_ctx: None — then invoke spawn_agent directly.
+        let dir = TempDir::new().unwrap();
+        let child_executor = LocalExecutor {
+            sandbox: Some(Box::new(test_sandbox(&dir))),
+            spawn_ctx: None,
+            default_cwd: Some(dir.path().to_path_buf()),
+        };
+
+        let err = child_executor
+            .execute(
+                "spawn_agent",
+                serde_json::json!({
+                    "task": "irrelevant",
+                    "workspace": dir.path().to_string_lossy(),
+                }),
+            )
+            .await
+            .expect_err("child executor must reject spawn_agent");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("spawn_agent is not available"),
+            "expected 'spawn_agent is not available' error, got: {msg}"
+        );
+    }
 
     #[tokio::test]
     #[ignore]
