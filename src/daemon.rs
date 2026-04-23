@@ -384,19 +384,22 @@ pub(crate) fn expand_user_alias(
 /// Probe whether a Unix socket at `path` is backed by a live listener.
 ///
 /// Returns `Ok(true)` if a peer accepts our connect (another daemon is alive);
-/// `Ok(false)` if the file is stale (no listener, or missing). Any other
-/// failure (permissions, hung peer, etc.) is bubbled up as an error so we
-/// never silently unlink a socket we can't reason about.
+/// `Ok(false)` if the path is stale — missing, a regular file, or a socket
+/// with no listener.  Any other failure (permissions, hung peer, etc.) is
+/// bubbled up as an error so we never silently unlink something we can't
+/// reason about.
 async fn socket_in_use(path: &std::path::Path) -> Result<bool> {
-    if !path.exists() {
-        return Ok(false);
-    }
     let connect = tokio::net::UnixStream::connect(path);
     match tokio::time::timeout(std::time::Duration::from_millis(500), connect).await {
         Ok(Ok(_stream)) => Ok(true),
         Ok(Err(e)) => {
+            // ENOTSOCK (88 on Linux) surfaces as ErrorKind::Other in current
+            // stable Rust; match on the raw errno so a leftover regular file
+            // at the socket path is still classified as stale.
+            const ENOTSOCK: i32 = 88;
             match e.kind() {
                 std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound => Ok(false),
+                _ if e.raw_os_error() == Some(ENOTSOCK) => Ok(false),
                 _ => Err(anyhow::Error::new(e)
                     .context(format!("probing daemon socket {}", path.display()))),
             }
@@ -6126,11 +6129,24 @@ mod tests {
             "missing socket should be reported as stale"
         );
 
-        // A leftover file with no listener is also stale.
-        std::fs::write(&sock, b"").expect("touch stale socket file");
+        // Re-bind and drop *without unlinking* — leaves a real stale socket
+        // path on disk.  Connect should yield ConnectionRefused, which the
+        // probe classifies as stale.
+        let listener = tokio::net::UnixListener::bind(&sock).expect("rebind");
+        drop(listener);
         assert!(
-            !socket_in_use(&sock).await.expect("probe stale"),
-            "socket file with no listener should be reported as stale"
+            !socket_in_use(&sock).await.expect("probe stale socket path"),
+            "leftover socket path with no listener should be reported as stale"
+        );
+
+        // A leftover *non-socket* regular file at the path must also be
+        // treated as stale (ENOTSOCK → Ok(false)) so the daemon can unlink
+        // random junk left behind by other tools.
+        let _ = std::fs::remove_file(&sock);
+        std::fs::write(&sock, b"").expect("touch non-socket file");
+        assert!(
+            !socket_in_use(&sock).await.expect("probe non-socket file"),
+            "non-socket file at the socket path should be reported as stale"
         );
     }
 }
