@@ -4022,8 +4022,14 @@ where
 
                 // Diagnostic probe: when the LLM emits a multi-call batch that
                 // does not qualify for the concurrent `all_spawn_agent` fast
-                // path, log once so the user can audit missed parallelism.
-                // Behavior is unchanged — this is a pure `tracing::warn!`.
+                // path, log it so the user can audit missed parallelism.
+                // Behavior is unchanged — this is a pure diagnostic log.
+                //
+                // Only WARN when the batch actually contains `spawn_agent`
+                // calls: that's the only case where the fast path applies and
+                // the LLM could have set `parallel: true`.  Batches of other
+                // tools (e.g. read_file + read_file) are normal LLM behaviour
+                // and logged at debug so they don't flood the console.
                 if tool_calls_snapshot.len() > 1 && !all_spawn_agent {
                     let names: Vec<&str> = tool_calls_snapshot
                         .iter()
@@ -4033,13 +4039,28 @@ where
                         .iter()
                         .filter(|tc| tc.name == "spawn_agent")
                         .count();
-                    tracing::warn!(
-                        session_id = ?session_id,
-                        tools = ?names,
-                        spawn_agent_count = spawn_count,
-                        batch_size = tool_calls_snapshot.len(),
-                        "sequential multi-tool batch — consider spawn_agent with parallel: true"
-                    );
+                    if spawn_count >= 1 {
+                        let msg = if spawn_count == tool_calls_snapshot.len() {
+                            "sequential spawn_agent batch — consider parallel: true on every call"
+                        } else {
+                            "mixed-tool batch including spawn_agent — \
+                             consider isolating spawn_agent calls with parallel: true"
+                        };
+                        tracing::warn!(
+                            session_id = ?session_id,
+                            tools = ?names,
+                            spawn_agent_count = spawn_count,
+                            batch_size = tool_calls_snapshot.len(),
+                            "{msg}"
+                        );
+                    } else {
+                        tracing::debug!(
+                            session_id = ?session_id,
+                            tools = ?names,
+                            batch_size = tool_calls_snapshot.len(),
+                            "sequential multi-tool batch (no spawn_agent)"
+                        );
+                    }
                 }
 
                 if all_spawn_agent {
