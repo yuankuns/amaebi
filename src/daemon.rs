@@ -4041,10 +4041,12 @@ where
                             .map(|tc| tc.name.as_str())
                             .collect();
                         let msg = if spawn_count == tool_calls_snapshot.len() {
-                            "sequential spawn_agent batch — consider parallel: true on every call"
+                            "sequential spawn_agent batch — set parallel: true on every call \
+                             to run them concurrently"
                         } else {
                             "mixed-tool batch including spawn_agent — \
-                             consider isolating spawn_agent calls with parallel: true"
+                             concurrency only applies to pure spawn_agent batches; \
+                             isolate spawn_agent calls into their own batch and set parallel: true"
                         };
                         tracing::warn!(
                             session_id = ?session_id,
