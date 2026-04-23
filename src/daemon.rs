@@ -4005,50 +4005,46 @@ where
 
                 let tool_calls_snapshot = &tool_calls;
 
-                // When every call in this batch is spawn_agent AND all of them
-                // opt in with `parallel=true`, run them concurrently.
-                // Default is sequential — the caller must explicitly request
-                // parallel execution for each call in the batch.
-                let all_spawn_agent = tool_calls_snapshot.len() > 1
-                    && tool_calls_snapshot
-                        .iter()
-                        .all(|tc| tc.name == "spawn_agent")
-                    && tool_calls_snapshot.iter().all(|tc| {
-                        tc.parse_args()
-                            .ok()
-                            .and_then(|v| v["parallel"].as_bool())
-                            .unwrap_or(false)
-                    });
+                // Classify the batch in a single pass so we don't re-parse
+                // JSON twice (once for the fast-path decision, once for the
+                // diagnostic probe).
+                let mut spawn_count: usize = 0;
+                let mut all_parallel_true = true;
+                let mut any_bad_json = false;
+                for tc in tool_calls_snapshot.iter() {
+                    if tc.name == "spawn_agent" {
+                        spawn_count += 1;
+                        match tc.parse_args() {
+                            Ok(v) => {
+                                if v["parallel"].as_bool() != Some(true) {
+                                    all_parallel_true = false;
+                                }
+                            }
+                            Err(_) => {
+                                any_bad_json = true;
+                                all_parallel_true = false;
+                            }
+                        }
+                    }
+                }
 
-                // Diagnostic probe: when the LLM emits a multi-call batch that
-                // does not qualify for the concurrent `all_spawn_agent` fast
-                // path, log it so the user can audit missed parallelism.
-                // Behavior is unchanged — this is a pure diagnostic log.
-                //
-                // Only WARN when the batch actually contains `spawn_agent`
-                // calls: that's the only case where the fast path applies and
-                // the LLM could have set `parallel: true`.  Batches of other
-                // tools (e.g. read_file + read_file) are normal LLM behaviour
-                // and logged at debug so they don't flood the console.
+                // Fast-path: every call is spawn_agent AND each one opted in
+                // with `parallel: true`.  Default is sequential.
+                let all_spawn_agent = tool_calls_snapshot.len() > 1
+                    && spawn_count == tool_calls_snapshot.len()
+                    && all_parallel_true;
+
+                // Diagnostic probe: WARN only when the fan-out *could* have
+                // been concurrent but wasn't (>= 2 spawn_agent calls in the
+                // batch without the fast-path).  Mixed batches with a single
+                // spawn_agent never qualify for concurrency, so they are not
+                // a "missed parallelism" case and do not trigger WARN.
                 if tool_calls_snapshot.len() > 1 && !all_spawn_agent {
-                    let spawn_count = tool_calls_snapshot
-                        .iter()
-                        .filter(|tc| tc.name == "spawn_agent")
-                        .count();
-                    if spawn_count >= 1 {
+                    if spawn_count > 1 {
                         let names: Vec<&str> = tool_calls_snapshot
                             .iter()
                             .map(|tc| tc.name.as_str())
                             .collect();
-                        // Distinguish "valid JSON but parallel flag missing"
-                        // from "invalid JSON args" — in the latter case the
-                        // real problem isn't missed parallelism, it's a
-                        // malformed tool call that the executor will also
-                        // reject.
-                        let any_bad_json = tool_calls_snapshot
-                            .iter()
-                            .filter(|tc| tc.name == "spawn_agent")
-                            .any(|tc| tc.parse_args().is_err());
                         let msg = if any_bad_json {
                             "spawn_agent batch contains calls with unparseable arguments; \
                              fix the JSON so each call can be dispatched (parallel fan-out \
@@ -4069,6 +4065,8 @@ where
                             "{msg}"
                         );
                     } else if tracing::enabled!(tracing::Level::DEBUG) {
+                        // spawn_count <= 1: no concurrency possible, log at
+                        // debug for audit without adding default-level noise.
                         let names: Vec<&str> = tool_calls_snapshot
                             .iter()
                             .map(|tc| tc.name.as_str())
@@ -4077,7 +4075,8 @@ where
                             session_id = ?session_id,
                             tools = ?names,
                             batch_size = tool_calls_snapshot.len(),
-                            "sequential multi-tool batch (no spawn_agent)"
+                            spawn_agent_count = spawn_count,
+                            "multi-tool batch with <= 1 spawn_agent (no concurrent fan-out possible)"
                         );
                     }
                 }
