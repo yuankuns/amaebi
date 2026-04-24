@@ -1965,7 +1965,7 @@ struct TaskContext {
 
 /// Run a single git command with an optional `-C <cwd>` prefix.
 /// Returns trimmed stdout on success, empty string on failure (best-effort).
-fn git_output(cwd: Option<&str>, args: &[&str]) -> String {
+pub(crate) fn git_output(cwd: Option<&str>, args: &[&str]) -> String {
     let mut cmd = std::process::Command::new("git");
     if let Some(c) = cwd {
         cmd.args(["-C", c]);

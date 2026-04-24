@@ -159,6 +159,15 @@ pub enum Command {
         #[command(subcommand)]
         action: InboxAction,
     },
+    /// Live TUI dashboard aggregating session, pane, inbox, and cron state.
+    ///
+    /// Full-screen view that auto-refreshes every 2 s.  Shows environment
+    /// context, a task-summary card, and a unified activity stream merged
+    /// from panes (`~/.amaebi/tmux-state.json`), sessions (`memory.db`,
+    /// newest turn per session), inbox arrivals, and cron `last_run` events.
+    ///
+    /// Keys: `q` / Esc / Ctrl-C exits; `r` forces a re-read.
+    Dashboard,
 }
 
 #[derive(clap::Subcommand, Debug)]
