@@ -408,6 +408,21 @@ mod tests {
         assert!(!bedrock_aliases().is_empty());
     }
 
+    // ---- default_model_for_provider ---------------------------------------
+
+    #[test]
+    fn default_model_for_copilot_strips_1m() {
+        assert_eq!(default_model_for_provider("copilot"), DEFAULT_MODEL_BARE);
+        assert!(!default_model_for_provider("copilot").ends_with("[1m]"));
+    }
+
+    #[test]
+    fn default_model_for_bedrock_and_unknown_keep_1m() {
+        assert_eq!(default_model_for_provider("bedrock"), DEFAULT_MODEL);
+        assert_eq!(default_model_for_provider("unknown"), DEFAULT_MODEL);
+        assert!(default_model_for_provider("bedrock").ends_with("[1m]"));
+    }
+
     // ---- resolve_with_aliases() -------------------------------------------
 
     #[test]
