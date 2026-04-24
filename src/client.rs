@@ -2116,11 +2116,18 @@ mod prompt_input {
     pub fn restore_terminal_now() {
         if let Some((fd, termios)) = SAVED_TERMIOS.get() {
             // SAFETY: `fd` is stdin and `termios` is the snapshot we took.
-            // Ignore errors: this is a best-effort cleanup during shutdown.
-            unsafe {
-                libc::tcsetattr(*fd, libc::TCSANOW, termios);
+            // Best-effort cleanup during shutdown: do not propagate errors,
+            // but log the outcome accurately so a broken terminal after
+            // crash can be traced to tcsetattr rather than a no-op path.
+            let rc = unsafe { libc::tcsetattr(*fd, libc::TCSANOW, termios) };
+            if rc == 0 {
+                tracing::debug!("restore_terminal_now(): applied snapshot termios");
+            } else {
+                tracing::debug!(
+                    "restore_terminal_now(): tcsetattr failed: {}",
+                    std::io::Error::last_os_error()
+                );
             }
-            tracing::debug!("restore_terminal_now(): applied snapshot termios");
         }
     }
 
