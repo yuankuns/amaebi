@@ -818,4 +818,50 @@ mod tests {
         let summaries = get_recent_summaries(&conn, "s3", 10).unwrap();
         assert_eq!(summaries, vec!["summary A", "summary B"]);
     }
+
+    #[test]
+    fn get_latest_per_session_returns_one_row_per_session_newest_first() {
+        let (conn, _dir) = open_test_db();
+        // s1: two messages; we expect the later one (id 2).
+        store_memory(&conn, "2026-01-01T00:00:00Z", "s1", "user", "hi s1", "").unwrap();
+        store_memory(
+            &conn,
+            "2026-01-01T00:00:01Z",
+            "s1",
+            "assistant",
+            "s1 reply",
+            "",
+        )
+        .unwrap();
+        // s2: single message (id 3).
+        store_memory(&conn, "2026-01-01T00:00:02Z", "s2", "user", "hi s2", "").unwrap();
+        // s3: single message (id 4) but archive it — must be excluded.
+        store_memory(&conn, "2026-01-01T00:00:03Z", "s3", "user", "archived", "").unwrap();
+        conn.execute(
+            "UPDATE memories SET archived = 1 WHERE session_id = 's3'",
+            [],
+        )
+        .unwrap();
+
+        let rows = get_latest_per_session(&conn, 10).unwrap();
+        // Expect: s2 (id 3) then s1 (id 2). s3 is archived → excluded.
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].session_id, "s2");
+        assert_eq!(rows[0].content, "hi s2");
+        assert_eq!(rows[1].session_id, "s1");
+        assert_eq!(rows[1].content, "s1 reply");
+    }
+
+    #[test]
+    fn get_latest_per_session_respects_limit() {
+        let (conn, _dir) = open_test_db();
+        store_memory(&conn, "2026-01-01T00:00:00Z", "s1", "user", "a", "").unwrap();
+        store_memory(&conn, "2026-01-01T00:00:01Z", "s2", "user", "b", "").unwrap();
+        store_memory(&conn, "2026-01-01T00:00:02Z", "s3", "user", "c", "").unwrap();
+        let rows = get_latest_per_session(&conn, 2).unwrap();
+        assert_eq!(rows.len(), 2);
+        // Newest first → s3, s2.
+        assert_eq!(rows[0].session_id, "s3");
+        assert_eq!(rows[1].session_id, "s2");
+    }
 }

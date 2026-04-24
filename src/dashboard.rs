@@ -97,23 +97,38 @@ impl Snapshot {
         let panes_vec = crate::pane_lease::read_state().unwrap_or_default();
         let panes = count_panes(&panes_vec.values().cloned().collect::<Vec<_>>());
 
-        let inbox_reports = crate::inbox::InboxStore::open()
-            .and_then(|s| s.get_all())
-            .unwrap_or_default();
+        // All three SQLite sources are opened as "best-effort read".  If the
+        // DB file does not exist yet (user hasn't used that feature), skip
+        // the open entirely so the dashboard never creates empty .db/WAL/SHM
+        // files as a side effect of running `amaebi dashboard`.
+        let inbox_reports = if amaebi_file_exists("inbox.db") {
+            crate::inbox::InboxStore::open()
+                .and_then(|s| s.get_all())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         let inbox_unread = inbox_reports.iter().filter(|r| !r.read).count();
 
-        let cron_jobs = crate::cron::load_jobs().unwrap_or_default();
+        let cron_jobs = if amaebi_file_exists("cron.db") {
+            crate::cron::load_jobs().unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         let cron = summarize_cron(&cron_jobs);
 
-        let session_events = collect_session_events().unwrap_or_default();
+        let session_events = if memory_db_exists() {
+            collect_session_events().unwrap_or_default()
+        } else {
+            Vec::new()
+        };
 
         let mut activity = Vec::new();
         activity.extend(collect_pane_events(panes_vec.values()));
         activity.extend(collect_cron_events(&cron_jobs));
         activity.extend(collect_inbox_events(&inbox_reports));
         activity.extend(session_events);
-        activity.sort_by_key(|e| std::cmp::Reverse(e.when));
-        activity.truncate(ACTIVITY_CAP);
+        finalize_activity(&mut activity);
 
         Self {
             env,
@@ -123,6 +138,30 @@ impl Snapshot {
             activity,
         }
     }
+}
+
+/// Sort `events` newest-first and truncate to [`ACTIVITY_CAP`].
+///
+/// Extracted from `Snapshot::collect` so tests can exercise the real
+/// merge/sort/truncate pipeline instead of re-implementing it.
+fn finalize_activity(events: &mut Vec<ActivityEvent>) {
+    events.sort_by_key(|e| std::cmp::Reverse(e.when));
+    events.truncate(ACTIVITY_CAP);
+}
+
+/// True when `~/.amaebi/<name>` exists.  Used to skip opening SQLite
+/// connections for sources the user hasn't initialised yet, so the
+/// dashboard never creates empty DB/WAL/SHM files as a side effect.
+fn amaebi_file_exists(name: &str) -> bool {
+    crate::auth::amaebi_home()
+        .map(|p| p.join(name).exists())
+        .unwrap_or(false)
+}
+
+fn memory_db_exists() -> bool {
+    crate::memory_db::db_path()
+        .map(|p| p.exists())
+        .unwrap_or(false)
 }
 
 fn collect_env() -> Environment {
@@ -159,21 +198,8 @@ fn collect_env() -> Environment {
     }
 }
 
-/// Best-effort git probe; returns empty string on any failure.
-fn git_output(cwd: Option<&str>, args: &[&str]) -> String {
-    let mut cmd = std::process::Command::new("git");
-    if let Some(c) = cwd {
-        cmd.args(["-C", c]);
-    }
-    cmd.args(args)
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .unwrap_or_default()
-        .trim()
-        .to_string()
-}
+// Re-use the daemon's best-effort git helper so the two stay in sync.
+use crate::daemon::git_output;
 
 fn count_panes(panes: &[PaneLease]) -> PaneCounts {
     let mut out = PaneCounts::default();
@@ -467,7 +493,12 @@ struct TerminalGuard;
 impl TerminalGuard {
     fn enter() -> Result<Self> {
         enable_raw_mode().context("enabling raw mode")?;
-        execute!(stdout(), EnterAlternateScreen).context("entering alternate screen")?;
+        // If entering the alt screen fails we need to roll raw mode back;
+        // otherwise the caller's terminal is left in a broken state.
+        if let Err(e) = execute!(stdout(), EnterAlternateScreen) {
+            let _ = disable_raw_mode();
+            return Err(anyhow::Error::new(e).context("entering alternate screen"));
+        }
         Ok(Self)
     }
 }
@@ -655,18 +686,19 @@ mod tests {
 
     #[test]
     fn snapshot_sort_is_descending_and_capped() {
-        // Build events with known timestamps; the merge in Snapshot::collect
-        // sorts descending and truncates to ACTIVITY_CAP.
+        // Build unsorted events and run them through the same helper the
+        // production Snapshot::collect uses, so this test fails if the
+        // merge/sort/truncate logic regresses.
         let now = Utc::now();
         let mut events: Vec<ActivityEvent> = (0..50)
             .map(|i| ActivityEvent {
-                when: now - chrono::Duration::minutes(i),
+                // Interleave so the input is not already sorted.
+                when: now - chrono::Duration::minutes((i * 37) % 50),
                 source: Source::Cron,
                 summary: format!("e{i}"),
             })
             .collect();
-        events.sort_by(|a, b| b.when.cmp(&a.when));
-        events.truncate(ACTIVITY_CAP);
+        finalize_activity(&mut events);
         assert_eq!(events.len(), ACTIVITY_CAP);
         // Newest first.
         for w in events.windows(2) {
