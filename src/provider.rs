@@ -95,7 +95,30 @@ const BEDROCK_ALIASES: &[(&str, &str)] = &[
 ];
 
 /// Default model when no `--model` or `AMAEBI_MODEL` is specified.
-pub const DEFAULT_MODEL: &str = "claude-sonnet-4.6";
+///
+/// Includes the `[1m]` opt-in suffix so Bedrock requests carry the
+/// `context-1m-2025-08-07` beta header, letting sessions grow past the
+/// 200k window.  Small requests cost the same as plain
+/// `claude-sonnet-4.6`.  Copilot does not accept the 1M beta, so callers
+/// targeting Copilot must use [`default_model_for_provider`] (or
+/// otherwise strip the suffix).
+pub const DEFAULT_MODEL: &str = "claude-sonnet-4.6[1m]";
+
+/// The bare default model name, without the `[1m]` suffix.  Used when the
+/// target provider does not support 1M context (currently: Copilot).
+pub const DEFAULT_MODEL_BARE: &str = "claude-sonnet-4.6";
+
+/// Return the appropriate default model string for `provider_prefix`.
+///
+/// `bedrock` (or any unknown prefix routed to Bedrock) gets the `[1m]`
+/// suffix; `copilot` gets the bare name because Copilot does not accept
+/// the Bedrock 1M beta opt-in.
+pub fn default_model_for_provider(provider_prefix: &str) -> &'static str {
+    match provider_prefix {
+        "copilot" => DEFAULT_MODEL_BARE,
+        _ => DEFAULT_MODEL,
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Resolution
@@ -383,6 +406,21 @@ mod tests {
     #[test]
     fn bedrock_aliases_not_empty() {
         assert!(!bedrock_aliases().is_empty());
+    }
+
+    // ---- default_model_for_provider ---------------------------------------
+
+    #[test]
+    fn default_model_for_copilot_strips_1m() {
+        assert_eq!(default_model_for_provider("copilot"), DEFAULT_MODEL_BARE);
+        assert!(!default_model_for_provider("copilot").ends_with("[1m]"));
+    }
+
+    #[test]
+    fn default_model_for_bedrock_and_unknown_keep_1m() {
+        assert_eq!(default_model_for_provider("bedrock"), DEFAULT_MODEL);
+        assert_eq!(default_model_for_provider("unknown"), DEFAULT_MODEL);
+        assert!(default_model_for_provider("bedrock").ends_with("[1m]"));
     }
 
     // ---- resolve_with_aliases() -------------------------------------------

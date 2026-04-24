@@ -85,18 +85,21 @@ fn response_max_tokens(model: &str) -> usize {
 ///
 /// Resolution order:
 ///   1. `AMAEBI_COMPACT_MODEL` env var (used verbatim)
-///   2. Same provider prefix as `main_model` + `DEFAULT_MODEL` (sonnet)
+///   2. Same provider prefix as `main_model` + per-provider default
+///      (`default_model_for_provider`): Bedrock gets `[1m]`, Copilot gets bare
 fn compact_model(main_model: &str) -> String {
     if let Ok(override_model) = std::env::var("AMAEBI_COMPACT_MODEL") {
         return override_model;
     }
     // Preserve the provider prefix so compaction uses the same API backend.
+    // Pick the per-provider default so copilot never gets `[1m]`, which it
+    // does not support.
     let prefix = main_model
         .split_once('/')
         .map(|(p, _)| p)
         .filter(|p| matches!(*p, "copilot" | "bedrock"));
     match prefix {
-        Some(p) => format!("{}/{}", p, crate::provider::DEFAULT_MODEL),
+        Some(p) => format!("{}/{}", p, crate::provider::default_model_for_provider(p)),
         None => crate::provider::DEFAULT_MODEL.to_string(),
     }
 }
@@ -5620,7 +5623,7 @@ mod tests {
         std::env::remove_var("AMAEBI_COMPACT_MODEL");
         assert_eq!(
             compact_model("copilot/claude-opus-4-6"),
-            format!("copilot/{}", crate::provider::DEFAULT_MODEL),
+            format!("copilot/{}", crate::provider::DEFAULT_MODEL_BARE),
         );
     }
 
