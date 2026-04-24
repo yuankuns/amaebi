@@ -698,8 +698,10 @@ pub fn set_task_description(pane_id: &str, description: &str) -> Result<()> {
         let mut state = read_state_unlocked()?;
         if let Some(lease) = state.get_mut(pane_id) {
             lease.task_description = Some(description.to_string());
+            write_state_unlocked(&state)
+        } else {
+            Ok(())
         }
-        write_state_unlocked(&state)
     })();
 
     lock.unlock()

@@ -942,29 +942,54 @@ async fn handle_claude_launch(
         // is always non-empty (parser guards it).
         let resume_prefetched_desc: Option<String> = if let Some(ref rp) = task.resume_pane {
             if task.description.trim().is_empty() {
+                // Distinguish three failure modes so the error message matches
+                // what actually went wrong: state-read I/O failure, unknown
+                // pane id, or pane exists but has no saved description.
+                enum LeaseDescLookup {
+                    Found(String),
+                    PaneMissing,
+                    NoDescription,
+                    ReadFailed(String),
+                }
                 let rp_owned = rp.clone();
-                let lease_desc = tokio::task::spawn_blocking(move || {
-                    pane_lease::read_state()
-                        .ok()
-                        .and_then(|s| s.get(&rp_owned).and_then(|l| l.task_description.clone()))
+                let lookup = tokio::task::spawn_blocking(move || match pane_lease::read_state() {
+                    Err(e) => LeaseDescLookup::ReadFailed(e.to_string()),
+                    Ok(state) => match state.get(&rp_owned) {
+                        None => LeaseDescLookup::PaneMissing,
+                        Some(lease) => match lease
+                            .task_description
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                        {
+                            Some(d) => LeaseDescLookup::Found(d.to_string()),
+                            None => LeaseDescLookup::NoDescription,
+                        },
+                    },
                 })
                 .await
-                .ok()
-                .flatten();
-                match lease_desc {
-                    Some(d) if !d.trim().is_empty() => Some(d),
-                    _ => {
+                .unwrap_or_else(|e| LeaseDescLookup::ReadFailed(e.to_string()));
+
+                match lookup {
+                    LeaseDescLookup::Found(d) => Some(d),
+                    other => {
+                        let message = match other {
+                            LeaseDescLookup::PaneMissing => format!(
+                                "[error] pane {rp} not found in lease state; \
+                                 run `amaebi dashboard` to list active panes"
+                            ),
+                            LeaseDescLookup::NoDescription => format!(
+                                "[error] pane {rp} has no saved task description; \
+                                 pass a description explicitly after --resume-pane"
+                            ),
+                            LeaseDescLookup::ReadFailed(e) => format!(
+                                "[error] failed to read pane lease state while \
+                                 resolving --resume-pane {rp}: {e}"
+                            ),
+                            LeaseDescLookup::Found(_) => unreachable!(),
+                        };
                         let mut w = writer.lock().await;
-                        write_frame(
-                            &mut *w,
-                            &Response::Error {
-                                message: format!(
-                                    "[error] pane {rp} has no saved task description; \
-                                     pass a description explicitly after --resume-pane"
-                                ),
-                            },
-                        )
-                        .await?;
+                        write_frame(&mut *w, &Response::Error { message }).await?;
                         return Ok(());
                     }
                 }
@@ -1367,15 +1392,14 @@ async fn handle_claude_launch(
         // retyping on subsequent rounds.  Uses `raw_desc` (not `description`)
         // to avoid storing the git-context preamble; that gets re-derived on
         // each launch.  Skipped when resume-pane reused the lease's existing
-        // description (no new info to write).
+        // description (no new info to write).  Fire-and-forget — pane
+        // assignment latency should not wait on the state-file write.
         if resume_prefetched_desc.is_none() && !raw_desc.trim().is_empty() {
             let desc_pane = pane_id.clone();
             let desc_text = raw_desc.clone();
             tokio::task::spawn_blocking(move || {
                 let _ = pane_lease::set_task_description(&desc_pane, &desc_text);
-            })
-            .await
-            .ok();
+            });
         }
 
         let mut w = writer.lock().await;
