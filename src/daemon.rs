@@ -1398,23 +1398,84 @@ fn send_pane_keys(pane_id: &str, text: &str) {
     }
 }
 
+/// Release the pane lease for each `SupervisionTarget` in this supervision
+/// request, best-effort.  Iterates `panes` because a single `SupervisePanes`
+/// request can cover multiple panes in parallel; this releases every one.
+///
+/// Called unconditionally at every [`handle_supervision`] exit point — including
+/// timeout, DONE, interrupted, client-disconnect, and model-error paths — so a
+/// pane is never stranded in `Busy` past the end of its supervision loop.
+///
+/// Without this, a pane stays `Busy` until `LEASE_TTL_SECS` (24 h) downgrades
+/// it via [`pane_lease::PaneLease::effective_status`], during which a second
+/// `/claude` invocation cannot reuse it and the scheduler has to spin up a
+/// fresh pane instead of reusing the existing `claude` session via the
+/// tier-1 `/compact` + inject path.
+///
+/// Release failures are logged and swallowed: they must never mask the
+/// supervision loop's `Result`.  Each release runs on a blocking thread since
+/// [`pane_lease::release_lease`] takes an `flock` lock.
+async fn release_supervised_panes(panes: &[crate::ipc::SupervisionTarget]) {
+    for target in panes {
+        let pane_id = target.pane_id.clone();
+        let outcome = tokio::task::spawn_blocking(move || pane_lease::release_lease(&pane_id))
+            .await
+            .map_err(anyhow::Error::from)
+            .and_then(|r| r);
+        if let Err(e) = outcome {
+            tracing::warn!(
+                pane_id = %target.pane_id,
+                error = %e,
+                "failed to release supervision pane lease"
+            );
+        }
+    }
+}
+
 /// Handle `Request::SupervisePanes`: run a Rust polling loop that captures pane
 /// content, calls the LLM for analysis (no tools), and acts on the response.
 ///
-/// The loop iterates with a 60-second sleep between turns (override with
-/// `AMAEBI_SUPERVISION_INTERVAL_SECS`). Each turn the LLM
-/// returns exactly one of:
+/// The loop iterates with a 5-minute ceiling between turns (override with
+/// `AMAEBI_SUPERVISION_INTERVAL_SECS`), but each iteration additionally waits
+/// for the pane to go idle before snapshotting.  Each turn the LLM returns
+/// exactly one of:
 /// - `WAIT` — still working, check again
 /// - `STEER: <pane_id>: <message>` — send a correction to the pane
 /// - `DONE: <summary>` — task is complete; stream the summary and exit
 ///
 /// The loop can also be interrupted by an `Interrupt` frame arriving on
-/// `frame_rx`.  A maximum of 240 completion tokens is requested (sufficient for
-/// the short WAIT/STEER/DONE responses).
+/// `frame_rx`.  A maximum of `MAX_SUPERVISION_TOKENS` completion tokens is
+/// requested per turn (see the constant in `handle_supervision_inner`) —
+/// sufficient for the short WAIT/STEER/DONE responses.
+///
+/// Regardless of which exit point the inner loop takes (timeout, DONE,
+/// interrupted, client disconnect, model error), [`release_supervised_panes`] runs
+/// unconditionally afterward so a pane is never stranded `Busy` — unblocking
+/// the tier-1 reuse path (`/compact` + inject) for the next `/claude` task in
+/// the same worktree.
 async fn handle_supervision(
     writer: &Arc<tokio::sync::Mutex<tokio::net::unix::OwnedWriteHalf>>,
     frame_rx: &mut tokio::sync::mpsc::Receiver<String>,
     panes: Vec<crate::ipc::SupervisionTarget>,
+    model: String,
+    state: &Arc<DaemonState>,
+    session_id: Option<String>,
+) -> Result<()> {
+    let result = handle_supervision_inner(writer, frame_rx, &panes, model, state, session_id).await;
+    // Best-effort cleanup: must run regardless of inner result so panes are
+    // not stranded Busy for up to LEASE_TTL_SECS (24 h).
+    release_supervised_panes(&panes).await;
+    result
+}
+
+/// Inner body of [`handle_supervision`]; see that function's doc for context.
+///
+/// Takes `panes` by reference so the outer wrapper retains ownership and can
+/// pass it to [`release_supervised_panes`] after this returns.
+async fn handle_supervision_inner(
+    writer: &Arc<tokio::sync::Mutex<tokio::net::unix::OwnedWriteHalf>>,
+    frame_rx: &mut tokio::sync::mpsc::Receiver<String>,
+    panes: &[crate::ipc::SupervisionTarget],
     model: String,
     state: &Arc<DaemonState>,
     session_id: Option<String>,
@@ -1588,7 +1649,7 @@ async fn handle_supervision(
         }
 
         let mut snapshots: Vec<PaneSnapshot> = Vec::new();
-        for target in &panes {
+        for target in panes {
             let pid = target.pane_id.clone();
             let full = tokio::task::spawn_blocking(move || capture_pane_text(&pid))
                 .await
@@ -6246,5 +6307,82 @@ mod tests {
             !socket_in_use(&sock).await.expect("probe non-socket file"),
             "non-socket file at the socket path should be reported as stale"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // release_supervised_panes tests
+    // ------------------------------------------------------------------
+
+    /// `release_supervised_panes` must flip a Busy pane to Idle and clear its
+    /// task/session fields while preserving `has_claude` and `worktree` so the
+    /// next `/claude` invocation can reuse the same Claude Code session via
+    /// the tier-1 (`/compact` + inject) path.  Without this call, the pane
+    /// would stay Busy until `LEASE_TTL_SECS` (24 h) and a second `/claude`
+    /// would appear stuck.
+    #[tokio::test]
+    async fn release_supervised_panes_unlocks_pane_and_preserves_reuse_fields() {
+        let _guard = crate::test_utils::with_temp_home();
+
+        let worktree = "/tmp/fake-worktree/task1";
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before UNIX epoch")
+            .as_secs();
+        let seed = pane_lease::PaneLease {
+            pane_id: "%7".to_string(),
+            window_id: "@3".to_string(),
+            status: pane_lease::PaneStatus::Busy,
+            task_id: Some("task-abc".to_string()),
+            session_id: Some("sess-xyz".to_string()),
+            worktree: Some(worktree.to_string()),
+            heartbeat_at: now,
+            has_claude: true,
+        };
+        pane_lease::seed_state_for_test(seed).expect("seed pane state");
+
+        let panes = vec![crate::ipc::SupervisionTarget {
+            pane_id: "%7".to_string(),
+            task_description: "do the thing".to_string(),
+        }];
+        release_supervised_panes(&panes).await;
+
+        let state = pane_lease::read_state().expect("read pane state after release");
+        let lease = state.get("%7").expect("pane %7 still tracked");
+        assert_eq!(
+            lease.status,
+            pane_lease::PaneStatus::Idle,
+            "raw status must be flipped to Idle by release (not just TTL-expired)"
+        );
+        assert_eq!(
+            lease.effective_status(),
+            pane_lease::PaneStatus::Idle,
+            "pane must be Idle after release"
+        );
+        assert!(
+            lease.has_claude,
+            "has_claude must be preserved so tier-1 reuse can match"
+        );
+        assert_eq!(
+            lease.worktree.as_deref(),
+            Some(worktree),
+            "worktree must be preserved so tier-1 reuse can match"
+        );
+        assert!(lease.task_id.is_none(), "task_id must be cleared");
+        assert!(lease.session_id.is_none(), "session_id must be cleared");
+    }
+
+    /// Releasing a target that does not exist in the state must not panic or
+    /// return an error — release is best-effort and must never mask an inner
+    /// supervision result.
+    #[tokio::test]
+    async fn release_supervised_panes_is_noop_for_missing_pane() {
+        let _guard = crate::test_utils::with_temp_home();
+        let panes = vec![crate::ipc::SupervisionTarget {
+            pane_id: "%999".to_string(),
+            task_description: "nonexistent".to_string(),
+        }];
+        release_supervised_panes(&panes).await;
+        let state = pane_lease::read_state().expect("read pane state");
+        assert!(state.get("%999").is_none(), "no pane should be created");
     }
 }
