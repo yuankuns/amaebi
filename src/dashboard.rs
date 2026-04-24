@@ -112,7 +112,7 @@ impl Snapshot {
         activity.extend(collect_cron_events(&cron_jobs));
         activity.extend(collect_inbox_events(&inbox_reports));
         activity.extend(session_events);
-        activity.sort_by(|a, b| b.when.cmp(&a.when));
+        activity.sort_by_key(|e| std::cmp::Reverse(e.when));
         activity.truncate(ACTIVITY_CAP);
 
         Self {
