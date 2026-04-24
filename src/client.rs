@@ -2079,7 +2079,9 @@ mod prompt_input {
                 // `set` fails only if another thread won the init race; in
                 // that case we discard our fresh editor and use theirs.
                 let fresh = rustyline::DefaultEditor::with_config(config).map_err(|e| {
-                    std::io::Error::other(format!("rustyline::DefaultEditor::new: {e}"))
+                    std::io::Error::other(format!(
+                        "rustyline::DefaultEditor::with_config(Behavior::PreferTerm): {e}"
+                    ))
                 })?;
                 let _ = EDITOR.set(Mutex::new(fresh));
                 EDITOR.get().expect("EDITOR set above")
@@ -2125,7 +2127,7 @@ mod prompt_input {
     #[cfg(not(unix))]
     pub fn restore_terminal_now() {}
 
-    /// Strip a trailing `\n` or `\r\n` from a string in place.
+    /// Return `s` with any trailing `\n` or `\r\n` removed.
     fn strip_newline(mut s: String) -> String {
         if s.ends_with('\n') {
             s.pop();
