@@ -529,20 +529,27 @@ where
 /// Summaries are scoped to the session's working directory: we look up the
 /// dir for `session_id` in `sessions.json` and pass it to
 /// `get_recent_summaries` so cross-project sessions cannot see each other's
-/// compacted context.  If the lookup fails (session removed, race, etc.) we
-/// fall back to `""` — which only matches legacy pre-migration rows and
-/// never any dir-tagged summary.
+/// compacted context.  If the lookup fails we skip the summaries query
+/// entirely (returning an empty list) — this avoids reading back rows that
+/// were themselves written with the same sentinel after a previous failed
+/// resolution.
 async fn load_session_state(
     state: &Arc<DaemonState>,
     session_id: &str,
 ) -> (Vec<memory_db::DbMemoryEntry>, Vec<String>, Option<String>) {
     let dir = resolve_session_dir(session_id).await;
+    let dir_for_read = dir.clone();
     with_db(Arc::clone(&state.db), {
         let sid = session_id.to_owned();
         move |conn| {
+            let summaries = if dir_for_read == UNKNOWN_DIR_SENTINEL {
+                Vec::new()
+            } else {
+                memory_db::get_recent_summaries(conn, &sid, &dir_for_read, MAX_SUMMARIES)?
+            };
             Ok((
                 memory_db::get_session_history(conn, &sid)?,
-                memory_db::get_recent_summaries(conn, &sid, &dir, MAX_SUMMARIES)?,
+                summaries,
                 memory_db::get_session_own_summary(conn, &sid)?,
             ))
         }
@@ -555,12 +562,15 @@ async fn load_session_state(
 }
 
 /// Sentinel stored as `session_summaries.dir` when the real directory for
-/// a session cannot be recovered.  Chosen to start with a character that
-/// cannot appear in an absolute path, so a reader querying for a real
-/// directory never returns these rows (strict isolation: a failed
-/// resolve never leaks into another project's summary stream).  Rows
-/// written with this sentinel are effectively orphaned — they are still
-/// stored for forensic debugging but never read back.
+/// a session cannot be recovered.  Canonical session directory keys are
+/// always absolute paths starting with `/` (see `session::canonical_key`),
+/// so this sentinel cannot collide with any legitimate key — a reader
+/// querying for `/some/proj` will never match these rows.
+///
+/// `load_session_state` also explicitly short-circuits when the resolved
+/// dir equals this sentinel, so a row written after one failed resolve is
+/// not read back by the same session on a subsequent failed resolve.
+/// Sentinel rows are therefore quarantined on write AND ignored on read.
 const UNKNOWN_DIR_SENTINEL: &str = "<unknown>";
 
 /// Resolve the working directory for `session_id` from `sessions.json`.
