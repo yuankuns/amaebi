@@ -215,6 +215,9 @@ struct ClaudeTask {
     /// Override for the client working directory used to locate the git repo
     /// when auto-creating a worktree.  Maps to TaskSpec::client_cwd.
     cwd: Option<String>,
+    /// Optional tmux pane id (e.g. `"%41"`) to reuse via `--resume-pane`.
+    /// Mutually exclusive with `worktree`; checked at parse time.
+    resume_pane: Option<String>,
 }
 
 /// A parsed slash command from user input.
@@ -278,8 +281,8 @@ fn parse_claude(input: &str) -> Option<Result<Vec<ClaudeTask>, String>> {
         return None;
     }
     let rest = rest.trim_start();
-    let usage = "usage: /claude [--worktree <path>] [--cwd <path>] [--no-enter] \
-                 \"task description\" [\"task2\" ...]";
+    let usage = "usage: /claude [--worktree <path> | --resume-pane <pane_id>] \
+                 [--cwd <path>] [--no-enter] \"task description\" [\"task2\" ...]";
     if rest.is_empty() {
         return Some(Err(usage.to_string()));
     }
@@ -290,6 +293,7 @@ fn parse_claude(input: &str) -> Option<Result<Vec<ClaudeTask>, String>> {
     }
 
     let mut worktree: Option<String> = None;
+    let mut resume_pane: Option<String> = None;
     let mut auto_enter = true;
     let mut cwd: Option<String> = None;
     // (description, was_quoted) pairs for non-flag tokens.
@@ -298,6 +302,15 @@ fn parse_claude(input: &str) -> Option<Result<Vec<ClaudeTask>, String>> {
     let mut i = 0;
     while i < tokens.len() {
         match tokens[i].0.as_str() {
+            "--resume-pane" => {
+                i += 1;
+                if i >= tokens.len() || tokens[i].0.starts_with("--") {
+                    return Some(Err(
+                        "--resume-pane requires a pane id argument (e.g. `%41`)".to_string(),
+                    ));
+                }
+                resume_pane = Some(tokens[i].0.clone());
+            }
             "--worktree" => {
                 i += 1;
                 // Require a non-flag value to follow --worktree.
@@ -366,7 +379,19 @@ fn parse_claude(input: &str) -> Option<Result<Vec<ClaudeTask>, String>> {
         i += 1;
     }
 
-    if desc_tokens.is_empty() {
+    // --resume-pane and --worktree are mutually exclusive: resume-pane
+    // inherits the target pane's existing worktree and would conflict with
+    // an explicit --worktree.
+    if resume_pane.is_some() && worktree.is_some() {
+        return Some(Err("--resume-pane and --worktree are mutually exclusive; \
+             --resume-pane inherits the target pane's worktree"
+            .to_string()));
+    }
+
+    // Description is required in the normal path, but optional with
+    // --resume-pane: if omitted, the daemon reuses the description
+    // previously persisted on the pane's lease.
+    if desc_tokens.is_empty() && resume_pane.is_none() {
         return Some(Err(usage.to_string()));
     }
 
@@ -374,7 +399,11 @@ fn parse_claude(input: &str) -> Option<Result<Vec<ClaudeTask>, String>> {
     // tokens are joined as a single task (e.g. `/claude write some code` →
     // one task "write some code", not three separate tasks).
     let all_quoted = desc_tokens.iter().all(|(_, q)| *q);
-    let descriptions: Vec<String> = if all_quoted || desc_tokens.len() == 1 {
+    let descriptions: Vec<String> = if desc_tokens.is_empty() {
+        // resume-pane with no description: use an empty-string sentinel so
+        // the daemon will look up the description from the lease.
+        vec![String::new()]
+    } else if all_quoted || desc_tokens.len() == 1 {
         desc_tokens.into_iter().map(|(s, _)| s).collect()
     } else {
         vec![desc_tokens
@@ -383,6 +412,13 @@ fn parse_claude(input: &str) -> Option<Result<Vec<ClaudeTask>, String>> {
             .collect::<Vec<_>>()
             .join(" ")]
     };
+
+    // One pane can only run one task at a time.
+    if resume_pane.is_some() && descriptions.len() > 1 {
+        return Some(Err(
+            "--resume-pane can only be used with a single task".to_string()
+        ));
+    }
 
     let tasks = descriptions
         .into_iter()
@@ -395,6 +431,7 @@ fn parse_claude(input: &str) -> Option<Result<Vec<ClaudeTask>, String>> {
                 worktree: worktree.clone(),
                 auto_enter,
                 cwd: cwd.clone(),
+                resume_pane: resume_pane.clone(),
             }
         })
         .collect();
@@ -540,6 +577,7 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
                     worktree: t.worktree,
                     client_cwd: t.cwd.or_else(|| Some(cwd_str.clone())),
                     auto_enter: t.auto_enter,
+                    resume_pane: t.resume_pane,
                 })
                 .collect(),
         };
@@ -1001,6 +1039,7 @@ pub async fn run_chat_loop(
                             worktree: t.worktree,
                             client_cwd: t.cwd.or_else(|| Some(cwd_str.clone())),
                             auto_enter: t.auto_enter,
+                            resume_pane: t.resume_pane,
                         })
                         .collect(),
                 };
@@ -3920,6 +3959,62 @@ mod tests {
         let result = parse_claude(input);
         let err = result.expect("should be Some").unwrap_err();
         assert!(err.contains("--cwd requires a path"));
+    }
+
+    // -----------------------------------------------------------------------
+    // /claude --resume-pane
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_claude_resume_pane_basic() {
+        let tasks = claude_tasks(r#"/claude --resume-pane %41 "continue fmha4""#);
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].description, "continue fmha4");
+        assert_eq!(tasks[0].resume_pane.as_deref(), Some("%41"));
+        assert!(tasks[0].worktree.is_none());
+    }
+
+    #[test]
+    fn parse_claude_resume_pane_unquoted_description() {
+        let tasks = claude_tasks("/claude --resume-pane %41 继续完成上次的开发");
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].description, "继续完成上次的开发");
+        assert_eq!(tasks[0].resume_pane.as_deref(), Some("%41"));
+    }
+
+    #[test]
+    fn parse_claude_resume_pane_no_value_errors() {
+        let err = claude_err("/claude --resume-pane");
+        assert!(err.contains("--resume-pane requires a pane id"));
+    }
+
+    #[test]
+    fn parse_claude_resume_pane_with_worktree_is_rejected() {
+        let err = claude_err(r#"/claude --resume-pane %41 --worktree /tmp "x""#);
+        assert!(err.contains("mutually exclusive"));
+    }
+
+    #[test]
+    fn parse_claude_resume_pane_multiple_tasks_rejected() {
+        let err = claude_err(r#"/claude --resume-pane %41 "task a" "task b""#);
+        assert!(err.contains("single task"));
+    }
+
+    #[test]
+    fn parse_claude_resume_pane_empty_description_is_ok() {
+        // Valid: daemon will pull the description from the lease.
+        let tasks = claude_tasks("/claude --resume-pane %41");
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].description, "");
+        assert_eq!(tasks[0].resume_pane.as_deref(), Some("%41"));
+    }
+
+    #[test]
+    fn parse_claude_bare_without_resume_pane_still_errors() {
+        // Without --resume-pane, a missing description is still an error
+        // (guards the normal-path invariant).
+        let err = claude_err("/claude");
+        assert!(err.contains("usage"));
     }
 
     // -----------------------------------------------------------------------

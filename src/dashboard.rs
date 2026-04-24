@@ -591,6 +591,7 @@ mod tests {
             worktree: None,
             heartbeat_at: heartbeat,
             has_claude,
+            task_description: None,
         }
     }
 

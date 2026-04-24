@@ -79,6 +79,12 @@ pub struct PaneLease {
     /// the scheduler injects just the prompt rather than launching a new session.
     #[serde(default)]
     pub has_claude: bool,
+    /// Full task description last injected into this pane, persisted so
+    /// `/claude --resume-pane <pid>` can reuse it without the user retyping.
+    /// Preserved by `release_lease` (alongside `worktree` / `has_claude`) so
+    /// the pane remembers what it was working on across supervision exits.
+    #[serde(default)]
+    pub task_description: Option<String>,
 }
 
 impl PaneLease {
@@ -92,6 +98,7 @@ impl PaneLease {
             worktree: None,
             heartbeat_at: now_secs(),
             has_claude: false,
+            task_description: None,
         }
     }
 
@@ -331,8 +338,9 @@ fn acquire_first_idle_locked(
 /// Acquire a lease on a **specific pane** by ID.
 ///
 /// Returns `Err` if the pane is already Busy (and not expired), or if the
-/// `worktree` conflicts with another Busy pane.
-#[allow(dead_code)]
+/// `worktree` conflicts with another Busy pane.  Used by
+/// `/claude --resume-pane <pane_id>` to target a specific pane instead of
+/// letting the scheduler pick one.
 pub fn acquire_lease(
     pane_id: &str,
     task_id: &str,
@@ -400,12 +408,14 @@ pub fn release_lease(pane_id: &str) -> Result<()> {
             lease.status = PaneStatus::Idle;
             lease.task_id = None;
             lease.session_id = None;
-            // Intentionally keep `worktree` and `has_claude`: the pane still
-            // has `claude` running in the same directory.  Preserving these
-            // fields allows the scheduler to reuse the pane for a future task
-            // in the same worktree (tier-1: /compact + inject) without a
-            // full relaunch.  They are only cleared when the pane is destroyed
-            // or explicitly reset to a blank shell.
+            // Intentionally keep `worktree`, `has_claude`, and
+            // `task_description`: the pane still has `claude` running on the
+            // same task in the same directory.  Preserving these fields lets
+            // `/claude --resume-pane <pid>` re-acquire the pane and continue
+            // the same work with `/compact + original description` (tier-1
+            // reuse) without the user retyping the task.  They are cleared
+            // only when the pane is destroyed or explicitly reset to a
+            // blank shell.
             lease.heartbeat_at = now_secs();
         }
         write_state_unlocked(&state)?;
@@ -672,6 +682,31 @@ pub fn ensure_and_acquire_idle(
     result
 }
 
+/// Record the full task description on the pane's lease.
+///
+/// Called by `handle_claude_launch` after successfully injecting the
+/// description, so subsequent `/claude --resume-pane <pid>` calls can
+/// retrieve it without the user retyping.  Best-effort: if the pane is no
+/// longer in the state map (e.g. removed by a concurrent cleanup), the call
+/// is a no-op.
+pub fn set_task_description(pane_id: &str, description: &str) -> Result<()> {
+    let lock = open_lock_file()?;
+    lock.lock_exclusive()
+        .context("acquiring flock for set_task_description")?;
+
+    let result = (|| {
+        let mut state = read_state_unlocked()?;
+        if let Some(lease) = state.get_mut(pane_id) {
+            lease.task_description = Some(description.to_string());
+        }
+        write_state_unlocked(&state)
+    })();
+
+    lock.unlock()
+        .context("releasing flock after set_task_description")?;
+    result
+}
+
 /// Correct the session ID stored in the pane lease after the real
 /// `session::get_or_create` UUID is known.
 ///
@@ -843,6 +878,7 @@ mod tests {
             worktree: worktree.map(str::to_string),
             heartbeat_at: now_secs(),
             has_claude: false,
+            task_description: None,
         }
     }
 
