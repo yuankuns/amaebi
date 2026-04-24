@@ -1981,6 +1981,13 @@ mod prompt_input {
     /// history across calls without any extra plumbing.
     static EDITOR: OnceLock<Mutex<rustyline::DefaultEditor>> = OnceLock::new();
 
+    /// Saved termios from the first TTY entry, used by [`restore_terminal_now`]
+    /// as a belt-and-suspenders path when a detached readline task may have
+    /// left the terminal in raw mode.  Snapshotted before rustyline ever
+    /// touches termios, so restoring it always lands us back in cooked mode.
+    #[cfg(unix)]
+    static SAVED_TERMIOS: OnceLock<(std::os::unix::io::RawFd, libc::termios)> = OnceLock::new();
+
     /// Map a [`rustyline::error::ReadlineError`] into the `io::Result<Option<String>>`
     /// contract callers expect from [`read_line_raw`]:
     ///
@@ -1999,6 +2006,27 @@ mod prompt_input {
             ReadlineError::Eof => Ok(None),
             other => Err(std::io::Error::other(other)),
         }
+    }
+
+    /// Snapshot stdin's termios once so [`restore_terminal_now`] has something
+    /// to restore to even if the rustyline editor is stuck on another thread.
+    /// No-op on non-Unix and after the first successful call.
+    #[cfg(unix)]
+    fn snapshot_termios_once() {
+        use std::os::unix::io::AsRawFd;
+        SAVED_TERMIOS.get_or_init(|| {
+            let fd = std::io::stdin().as_raw_fd();
+            let mut t: libc::termios = unsafe { std::mem::zeroed() };
+            // SAFETY: `t` is a valid termios out-parameter, `fd` is stdin.
+            // A failed ioctl is non-fatal: we return a zeroed struct and
+            // subsequent `restore_terminal_now` calls will see it still
+            // initialised but reapplying zero termios is harmless compared
+            // to the "already broken" state it guards against.
+            unsafe {
+                libc::tcgetattr(fd, &mut t);
+            }
+            (fd, t)
+        });
     }
 
     /// Read one line of input from the user.
@@ -2023,11 +2051,30 @@ mod prompt_input {
             return Ok(Some(strip_newline(line)));
         }
 
-        let editor = EDITOR.get_or_init(|| {
-            Mutex::new(
-                rustyline::DefaultEditor::new().expect("rustyline::DefaultEditor::new failed"),
-            )
-        });
+        #[cfg(unix)]
+        snapshot_termios_once();
+
+        // `Behavior::PreferTerm` makes rustyline open `/dev/tty` directly for
+        // both input and output instead of stdin/stdout.  This preserves the
+        // old hand-written editor's dual-channel UX: streaming response text
+        // on stdout never interleaves with prompt/editing UI, and piping
+        // stdout to a file still leaves editing usable.
+        let config = rustyline::Config::builder()
+            .behavior(rustyline::config::Behavior::PreferTerm)
+            .build();
+
+        let editor = match EDITOR.get() {
+            Some(ed) => ed,
+            None => {
+                // `set` fails only if another thread won the init race; in
+                // that case we discard our fresh editor and use theirs.
+                let fresh = rustyline::DefaultEditor::with_config(config).map_err(|e| {
+                    std::io::Error::other(format!("rustyline::DefaultEditor::new: {e}"))
+                })?;
+                let _ = EDITOR.set(Mutex::new(fresh));
+                EDITOR.get().expect("EDITOR set above")
+            }
+        };
         let mut ed = editor.lock().unwrap_or_else(|p| p.into_inner());
         match ed.readline(PROMPT) {
             Ok(line) => {
@@ -2038,17 +2085,27 @@ mod prompt_input {
         }
     }
 
-    /// Restore the terminal to its pre-raw-mode state.
+    /// Best-effort restore of the terminal to its pre-raw-mode state.
     ///
     /// Rustyline restores termios on every `readline()` return via its own
     /// `Drop` guard, so in the common case this function has nothing to do.
     /// If a `spawn_blocking(read_line_raw)` task is still parked inside
     /// `readline()` when the session exits, its OS thread still owns the
-    /// editor; we cannot forcibly drop another thread's guard, so the best
-    /// we can do is log and let the detached thread unwind on its own.
+    /// rustyline editor and we cannot forcibly drop its guard.  But we CAN
+    /// call `tcsetattr` with the termios we snapshotted before rustyline
+    /// first touched the terminal — that's enough to unstick the user's
+    /// shell from raw mode.  The still-parked readline thread will end up
+    /// reading garbage on its next byte, but the process is exiting anyway.
     #[cfg(unix)]
     pub fn restore_terminal_now() {
-        tracing::debug!("restore_terminal_now(): rustyline manages termios per-readline");
+        if let Some((fd, termios)) = SAVED_TERMIOS.get() {
+            // SAFETY: `fd` is stdin and `termios` is the snapshot we took.
+            // Ignore errors: this is a best-effort cleanup during shutdown.
+            unsafe {
+                libc::tcsetattr(*fd, libc::TCSANOW, termios);
+            }
+        }
+        tracing::debug!("restore_terminal_now(): applied snapshot termios");
     }
 
     #[cfg(not(unix))]
@@ -2101,20 +2158,11 @@ mod prompt_input {
 
         #[test]
         fn restore_terminal_now_idempotent() {
-            // Safe to call in CI (no TTY, no editor initialised).
+            // Safe to call in CI (no TTY, no snapshot taken).  Call twice
+            // to verify idempotence; with no SAVED_TERMIOS populated this
+            // becomes a pure no-op.
             restore_terminal_now();
             restore_terminal_now();
-        }
-
-        #[test]
-        fn editor_is_lazy_uninitialized_before_first_call() {
-            // Note: if another test in the same binary already called
-            // read_line_raw with a TTY, EDITOR may be populated.  In
-            // `cargo test` under CI there is no TTY, so read_line_raw
-            // takes the non-TTY fallback and does not touch EDITOR.
-            // This test documents the contract; don't assert .is_none()
-            // unconditionally because test ordering is nondeterministic.
-            let _ = EDITOR.get();
         }
 
         #[test]
