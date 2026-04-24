@@ -7,7 +7,7 @@
 //! the dashboard must render even on a freshly installed machine.
 //!
 //! Layout is three vertical panels, top to bottom:
-//! * Environment (5 lines) — cwd, git branch, model, sandbox
+//! * Environment (5 lines) — cwd, git branch, sandbox
 //! * Task summary (5 lines) — pane / cron / inbox counts
 //! * Activity (remaining) — unified event stream, tail mode, newest first
 //!
@@ -78,7 +78,6 @@ struct CronSummary {
 struct Environment {
     cwd: String,
     git_branch: String,
-    model: String,
     sandbox: String,
 }
 
@@ -172,11 +171,6 @@ fn collect_env() -> Environment {
     let cwd_for_git = cwd.clone();
     let git_branch = git_output(Some(&cwd_for_git), &["rev-parse", "--abbrev-ref", "HEAD"]);
 
-    let model = std::env::var("AMAEBI_MODEL")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| crate::provider::DEFAULT_MODEL.to_string());
-
     let sandbox = match std::env::var("AMAEBI_SANDBOX").as_deref() {
         Ok("docker") => {
             let image = std::env::var("AMAEBI_SANDBOX_IMAGE")
@@ -193,7 +187,6 @@ fn collect_env() -> Environment {
         } else {
             git_branch
         },
-        model,
         sandbox,
     }
 }
@@ -245,7 +238,15 @@ fn short_uuid(uuid: &str) -> String {
 }
 
 fn truncate_snippet(s: &str, max: usize) -> String {
-    let compact: String = s.chars().map(|c| if c == '\n' { ' ' } else { c }).collect();
+    // Drop C0 control chars (ESC, BEL, bare CR, etc.) so ANSI escape
+    // sequences stored in memory/inbox content cannot escape the ratatui
+    // buffer and mess up the dashboard's rendering.  Keep \n/\t and collapse
+    // whitespace.
+    let compact: String = s
+        .chars()
+        .map(|c| if c == '\n' { ' ' } else { c })
+        .filter(|c| !c.is_control() || *c == '\t')
+        .collect();
     let compact = compact.split_whitespace().collect::<Vec<_>>().join(" ");
     if compact.chars().count() <= max {
         compact
@@ -380,10 +381,6 @@ fn env_lines(env: &Environment) -> Vec<Line<'_>> {
             Span::raw("   "),
             Span::styled("branch: ", Style::default().fg(Color::DarkGray)),
             Span::raw(env.git_branch.clone()),
-        ]),
-        Line::from(vec![
-            Span::styled("model: ", Style::default().fg(Color::DarkGray)),
-            Span::raw(env.model.clone()),
         ]),
         Line::from(vec![
             Span::styled("sandbox: ", Style::default().fg(Color::DarkGray)),
@@ -758,6 +755,19 @@ mod tests {
         assert_eq!(truncate_snippet(s, 20), "abcdefghij");
         // Multi-line collapses.
         assert_eq!(truncate_snippet("a\nb\nc", 20), "a b c");
+    }
+
+    #[test]
+    fn truncate_snippet_strips_control_chars() {
+        // Stripping the leading ESC is enough to neutralise the sequence —
+        // the terminal can no longer interpret `[31m...` as a color code
+        // without the preceding ESC, so the TUI buffer stays intact.  The
+        // residual `[31m` characters are harmless ASCII.
+        let out = truncate_snippet("\x1b[31mred\x1b[0m done", 50);
+        assert!(!out.contains('\x1b'), "ESC must be stripped: {out:?}");
+        assert_eq!(truncate_snippet("before\x07after", 50), "beforeafter");
+        // Tab is preserved (gets collapsed by split_whitespace).
+        assert_eq!(truncate_snippet("a\tb", 50), "a b");
     }
 
     #[test]
