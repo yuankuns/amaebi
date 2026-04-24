@@ -2161,6 +2161,28 @@ mod prompt_input {
         80
     }
 
+    /// Convert an absolute column count ("columns consumed", 0-based boundary)
+    /// into an on-screen `(row, column_1based)` position.
+    ///
+    /// This is the **one** place that knows about ANSI "pending wrap": when
+    /// `col_abs` is an exact positive multiple of `term_cols`, the terminal
+    /// cursor sits on the last cell of the *previous* row, not the first cell
+    /// of the next one.  Everywhere else in the line editor treats `col_abs`
+    /// as plain "columns already consumed by prompt + chars".
+    ///
+    /// Returned column is **1-based** so it can be fed directly to ANSI CHA
+    /// (`ESC[{col}G`).  Returned row is **0-based** (0 = top of prompt).
+    fn screen_pos(col_abs: usize, term_cols: usize) -> (usize, usize) {
+        if col_abs == 0 {
+            (0, 1)
+        } else if col_abs.is_multiple_of(term_cols) {
+            // Pending-wrap: cursor still on the previous row, at its last column.
+            (col_abs / term_cols - 1, term_cols)
+        } else {
+            (col_abs / term_cols, col_abs % term_cols + 1)
+        }
+    }
+
     /// Redraw the current line after any edit or cursor movement.
     ///
     /// Moves up to the first visual line of the prompt, erases to end of
@@ -2179,76 +2201,50 @@ mod prompt_input {
         old_end_line: usize,
     ) -> std::io::Result<()> {
         let prompt_cols: usize = prompt.chars().map(|c| c.width().unwrap_or(1)).sum();
-        let cols_before_cursor: usize = widths[..cursor].iter().sum();
-        let total_char_width: usize = widths.iter().sum();
+        let cursor_col_abs = prompt_cols + widths[..cursor].iter().sum::<usize>();
+        let end_col_abs = prompt_cols + widths.iter().sum::<usize>();
 
-        let cursor_col_abs = prompt_cols + cols_before_cursor;
-        let end_col_abs = prompt_cols + total_char_width;
+        let (cursor_row, cursor_col) = screen_pos(cursor_col_abs, term_cols);
+        let (end_row, _end_col) = screen_pos(end_col_abs, term_cols);
 
-        // ANSI terminals use a "pending wrap" flag: a character printed in the
-        // last column stays on that line until the next printable char.  So a
-        // cursor or end position that is an exact multiple of term_cols is still
-        // on the *previous* visual line, not the next one.
-        let visual_line_of = |col: usize| {
-            if col == 0 {
-                0
-            } else {
-                (col - 1) / term_cols
-            }
-        };
-        let cursor_visual_line = visual_line_of(cursor_col_abs);
-        let end_visual_line = visual_line_of(end_col_abs);
-
-        // Move up to the first visual line of this prompt before clearing.
-        // Use `from_line` (the actual terminal cursor line) rather than the
-        // new cursor's visual line: when the user presses Home the new cursor
-        // is on line 0 but the terminal cursor is still on line 1, so we must
-        // move up by `from_line` lines to reach the top of the prompt.
+        // 1. Move up to the first visual line of this prompt before clearing.
+        //    Use `from_line` (the actual terminal cursor line), not the new
+        //    cursor's row — pressing Home moves `cursor` to 0 but the terminal
+        //    cursor is still wherever it was left by the prior redraw.
         if from_line > 0 {
             write!(output, "\x1b[{from_line}A")?;
         }
 
-        // Erase: use ED (erase to end of display) when the old or new content
-        // spans multiple visual lines.  We need the larger of:
-        //   - end_visual_line: how many lines the new content needs
-        //   - old_end_line:    how many lines the old content occupied
-        //                      (independent of where the cursor was; e.g. the
-        //                      user pressed Home before navigating history, so
-        //                      from_line==0 but old wrapped lines still exist)
-        // EL (\r\x1b[K) suffices only when both old and new fit on one line.
-        if end_visual_line > 0 || old_end_line > 0 {
+        // 2. Erase.  ED (erase to end of display) when the old or new content
+        //    spans multiple visual lines, otherwise EL to end of line.
+        //    `old_end_line` covers the case where new content fits on one line
+        //    but old wrapped lines still live on screen (e.g. history down-
+        //    navigation from a long entry to a short one).
+        if end_row > 0 || old_end_line > 0 {
             output.write_all(b"\r\x1b[J")?;
         } else {
             output.write_all(b"\r\x1b[K")?;
         }
 
-        // Reprint prompt and all characters.
+        // 3. Reprint prompt and all characters.
         output.write_all(prompt.as_bytes())?;
         for ch in chars {
             let mut buf = [0u8; 4];
             output.write_all(ch.encode_utf8(&mut buf).as_bytes())?;
         }
 
-        // Reposition the terminal cursor to `cursor`.
-        // After printing all chars the terminal cursor sits at end_visual_line.
-        let cols_from_cursor: usize = widths[cursor..].iter().sum();
-        if cols_from_cursor > 0 {
-            let lines_above_end = end_visual_line - cursor_visual_line;
-            if lines_above_end == 0 {
-                // Same visual line — simple backward move.
-                write!(output, "\x1b[{cols_from_cursor}D")?;
-            } else {
-                // Move up from end_visual_line to cursor_visual_line, then
-                // jump to the exact column with CHA (1-based).
-                write!(output, "\x1b[{lines_above_end}A")?;
-                // CHA is 1-based.  Use the same pending-wrap adjustment as
-                // visual_line_of: a cursor at an exact column multiple sits at
-                // the last column of the previous line, not column 1 of the
-                // next, so saturating_sub(1) before the modulo is required.
-                let target_col = cursor_col_abs.saturating_sub(1) % term_cols + 1;
-                write!(output, "\x1b[{target_col}G")?;
-            }
+        // 4. Reposition the terminal cursor.  Exactly one code path:
+        //    optional CUU up to the cursor's row, then absolute CHA to the
+        //    target column.  No separate single-line/cross-line branches —
+        //    CHA on the current row is a no-op when the column already
+        //    matches and lands on the correct cell when it doesn't.  All
+        //    pending-wrap logic is folded into `screen_pos` above, so this
+        //    block has no off-by-one hazard.
+        let dy = end_row - cursor_row;
+        if dy > 0 {
+            write!(output, "\x1b[{dy}A")?;
         }
+        write!(output, "\x1b[{cursor_col}G")?;
 
         Ok(())
     }
@@ -2272,8 +2268,6 @@ mod prompt_input {
         term_cols: usize,
     ) -> std::io::Result<Option<String>> {
         let prompt_cols: usize = prompt.chars().map(|c| c.width().unwrap_or(1)).sum();
-        // See redraw() for why (col-1)/term_cols is used instead of col/term_cols.
-        let visual_line_of = |col: usize| if col == 0 { 0 } else { (col - 1) / term_cols };
         let mut chars: Vec<char> = Vec::new();
         // Display width (columns) of each char, matched by index to `chars`.
         let mut widths: Vec<usize> = Vec::new();
@@ -2289,16 +2283,21 @@ mod prompt_input {
 
         loop {
             // Visual line (0-based) where the terminal cursor currently sits.
-            // Every key handler in this iteration leaves the terminal cursor at
-            // `cursor`'s position, so at the top of each iteration `cursor`
-            // reflects the terminal position from the previous iteration.
-            let terminal_line =
-                visual_line_of(prompt_cols + widths[..cursor].iter().sum::<usize>());
-            // Visual line of the last character in the buffer (the full extent
-            // of the old content on screen).  Needed by redraw() so it can
-            // choose ED over EL even when the cursor is at position 0 (e.g.
-            // after Home) but wrapped lines still occupy lines 1+.
-            let terminal_end_line = visual_line_of(prompt_cols + widths.iter().sum::<usize>());
+            // Every key handler in this iteration leaves the terminal cursor
+            // at `cursor`'s position, so at the top of each iteration
+            // `cursor` reflects the terminal position from the previous
+            // iteration.  `screen_pos` owns all pending-wrap arithmetic.
+            let terminal_line = screen_pos(
+                prompt_cols + widths[..cursor].iter().sum::<usize>(),
+                term_cols,
+            )
+            .0;
+            // Visual line of the last character in the buffer (the full
+            // extent of the old content on screen).  Needed by redraw() so
+            // it can choose ED over EL even when the cursor is at position 0
+            // (e.g. after Home) but wrapped lines still occupy lines 1+.
+            let terminal_end_line =
+                screen_pos(prompt_cols + widths.iter().sum::<usize>(), term_cols).0;
 
             let mut byte = [0u8; 1];
             match input.read_exact(&mut byte) {
@@ -2659,7 +2658,7 @@ mod prompt_input {
 
     #[cfg(test)]
     mod tests {
-        use super::{process_input, Arc};
+        use super::{process_input, screen_pos, Arc};
         use std::io::Cursor;
         use unicode_width::UnicodeWidthChar as _;
 
@@ -3460,6 +3459,132 @@ mod prompt_input {
             // up → "second", up → "first", down → "second", Enter
             let (res, _) = run_with_history(b"\x1b[A\x1b[A\x1b[B\r", &["first", "second"]);
             assert_eq!(res.unwrap(), Some("second".to_string()));
+        }
+
+        // ----------------------------------------------------------------- //
+        // screen_pos — coordinate-conversion helper
+        //
+        // Pins the one place that owns pending-wrap arithmetic.  If any of
+        // these regress, the CHA/CUU emitted by redraw() will land in the
+        // wrong cell (as it did prior to the refactor: see the
+        // `cursor_land_at_cjk_boundary_after_cross_line_reposition` test
+        // below, which is a full-redraw regression for the same bug).
+        // ----------------------------------------------------------------- //
+
+        #[test]
+        fn screen_pos_origin() {
+            assert_eq!(screen_pos(0, 80), (0, 1));
+        }
+
+        #[test]
+        fn screen_pos_mid_first_row() {
+            assert_eq!(screen_pos(5, 80), (0, 6));
+        }
+
+        #[test]
+        fn screen_pos_end_of_first_row_not_wrapped() {
+            // 79 columns consumed → cursor on col 80 of row 0.
+            assert_eq!(screen_pos(79, 80), (0, 80));
+        }
+
+        #[test]
+        fn screen_pos_pending_wrap_at_exact_width() {
+            // Exactly term_cols consumed → pending wrap: still on row 0,
+            // last column.  (Not row 1 col 1.)
+            assert_eq!(screen_pos(80, 80), (0, 80));
+        }
+
+        #[test]
+        fn screen_pos_start_of_second_row() {
+            // One column past pending-wrap → row 1 col 2.
+            assert_eq!(screen_pos(81, 80), (1, 2));
+        }
+
+        #[test]
+        fn screen_pos_pending_wrap_at_double_width() {
+            // 2 * 80 consumed → pending wrap on row 1, last column.
+            assert_eq!(screen_pos(160, 80), (1, 80));
+        }
+
+        #[test]
+        fn screen_pos_deep_row() {
+            // 243 = 3 * 80 + 3 → row 3, col 4.
+            assert_eq!(screen_pos(243, 80), (3, 4));
+        }
+
+        #[test]
+        fn screen_pos_narrow_terminal() {
+            // Exercises the exact math the CJK cross-line regression relies
+            // on: 12 columns consumed at term_cols=10 → row 1 col 3, i.e.
+            // the LEFT edge of the CJK glyph starting at that boundary.
+            assert_eq!(screen_pos(12, 10), (1, 3));
+        }
+
+        // ----------------------------------------------------------------- //
+        // Full-redraw regression for the cross-line cursor reposition bug.
+        // Before the refactor, redraw() emitted ESC[12G for this scenario
+        // (0-indexed col 11 = inside the CJK glyph's right half).  After
+        // the refactor, ESC[{cursor_col}G is emitted with `cursor_col`
+        // coming from screen_pos, which lands on the glyph's left edge.
+        // ----------------------------------------------------------------- //
+
+        #[test]
+        fn cursor_land_at_cjk_boundary_after_cross_line_reposition() {
+            // With term_cols=10 and prompt "> ":
+            //   widths: '/'(1) 'c'(1) 'l'(1) 'a'(1) 'u'(1) 'd'(1) 'e'(1)
+            //           ' '(1) '基'(2) '于'(2) 'A'(1) 'B'(1) 'C'(1) 'D'(1)
+            //           'E'(1) 'F'(1)   total = 18
+            // Visual layout (cols 1-based, line 0 is the row the prompt sits on):
+            //   line 0 (cols 1..10):  "> /claude" (consumed cols 1..9 ends at 9;
+            //                          char at col 10 is ' ').  Actually prompt
+            //                          = 2 cols, chars occupy cols 3..14; with
+            //                          term_cols=10 line 0 stops at col 10
+            //                          (end of space, pending-wrap on '基').
+            //   line 1:               "基于ABCDEF" cols 1..10.
+            //
+            // Move cursor to index 4 (between 'a' and 'u'):
+            //   cursor_col_abs = 2 + 4 = 6 → screen_pos(6,10) = (0, 7)
+            //   end_col_abs    = 2 + 18 = 20 → screen_pos(20,10) = (1, 10)
+            // Expected final CHA: ESC[7G (col 7 on line 0 = 'u' cell).
+            // Before refactor (buggy): ESC[6G (col 6 = 'a' cell).
+
+            let mut input: Vec<u8> = Vec::new();
+            input.extend_from_slice("/claude 基于ABCDEF".as_bytes());
+            for _ in 0..12 {
+                input.extend_from_slice(b"\x1b[D");
+            }
+            input.push(b'\r');
+            let (res, echo) = run_with_history_prompt(&input, &[], "> ", 10);
+            assert_eq!(res.unwrap(), Some("/claude 基于ABCDEF".to_string()));
+
+            // Collect every CHA (ESC[nG) emitted so we can assert on the
+            // FINAL one: the cursor's final landing column.
+            let mut chas: Vec<usize> = Vec::new();
+            let mut i = 0;
+            while i < echo.len() {
+                if i + 2 < echo.len() && echo[i] == 0x1b && echo[i + 1] == b'[' {
+                    let mut j = i + 2;
+                    while j < echo.len() && echo[j].is_ascii_digit() {
+                        j += 1;
+                    }
+                    if j < echo.len() && echo[j] == b'G' {
+                        if let Ok(n) = std::str::from_utf8(&echo[i + 2..j])
+                            .unwrap()
+                            .parse::<usize>()
+                        {
+                            chas.push(n);
+                            i = j + 1;
+                            continue;
+                        }
+                    }
+                }
+                i += 1;
+            }
+            assert_eq!(
+                chas.last().copied(),
+                Some(7),
+                "final CHA must be col 7 ('u'), not col 6 ('a'); chas = {chas:?}"
+            );
         }
     }
 }
