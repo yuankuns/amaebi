@@ -1409,7 +1409,7 @@ fn send_pane_keys(pane_id: &str, text: &str) {
 ///
 /// Release failures are logged and swallowed: they must never mask the
 /// supervision loop's `Result`.  Each release runs on a blocking thread since
-/// [`pane_lease::release_lease`] takes an `flock`.
+/// [`pane_lease::release_lease`] takes an `flock` lock.
 async fn release_all_panes(panes: &[crate::ipc::SupervisionTarget]) {
     for target in panes {
         let pane_id = target.pane_id.clone();
@@ -6256,6 +6256,10 @@ mod tests {
         let _guard = crate::test_utils::with_temp_home();
 
         let worktree = "/tmp/fake-worktree/task1";
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before UNIX epoch")
+            .as_secs();
         let seed = pane_lease::PaneLease {
             pane_id: "%7".to_string(),
             window_id: "@3".to_string(),
@@ -6263,7 +6267,7 @@ mod tests {
             task_id: Some("task-abc".to_string()),
             session_id: Some("sess-xyz".to_string()),
             worktree: Some(worktree.to_string()),
-            heartbeat_at: 1_700_000_000,
+            heartbeat_at: now,
             has_claude: true,
         };
         pane_lease::seed_state_for_test(seed).expect("seed pane state");
@@ -6276,6 +6280,11 @@ mod tests {
 
         let state = pane_lease::read_state().expect("read pane state after release");
         let lease = state.get("%7").expect("pane %7 still tracked");
+        assert_eq!(
+            lease.status,
+            pane_lease::PaneStatus::Idle,
+            "raw status must be flipped to Idle by release (not just TTL-expired)"
+        );
         assert_eq!(
             lease.effective_status(),
             pane_lease::PaneStatus::Idle,
