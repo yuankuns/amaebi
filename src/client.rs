@@ -1972,6 +1972,11 @@ mod prompt_input {
     /// called, so the main TTY path does NOT pre-print it.
     pub(super) const PROMPT: &str = "> ";
 
+    /// Max in-memory history entries.  Matches the old hand-written editor's
+    /// 1000-entry VecDeque so Up-arrow depth is preserved across the swap.
+    /// Rustyline's own default is 100, which would be a regression.
+    const HISTORY_CAP: usize = 1000;
+
     /// Process-wide `rustyline` editor.  Lazily initialised on first TTY
     /// readline; CI / piped-input paths never touch it.
     ///
@@ -2010,23 +2015,23 @@ mod prompt_input {
 
     /// Snapshot stdin's termios once so [`restore_terminal_now`] has something
     /// to restore to even if the rustyline editor is stuck on another thread.
-    /// No-op on non-Unix and after the first successful call.
+    /// Only populates `SAVED_TERMIOS` on a successful `tcgetattr`; a failure
+    /// leaves the `OnceLock` unset and future calls will retry.  No-op on
+    /// non-Unix.
     #[cfg(unix)]
     fn snapshot_termios_once() {
         use std::os::unix::io::AsRawFd;
-        SAVED_TERMIOS.get_or_init(|| {
-            let fd = std::io::stdin().as_raw_fd();
-            let mut t: libc::termios = unsafe { std::mem::zeroed() };
-            // SAFETY: `t` is a valid termios out-parameter, `fd` is stdin.
-            // A failed ioctl is non-fatal: we return a zeroed struct and
-            // subsequent `restore_terminal_now` calls will see it still
-            // initialised but reapplying zero termios is harmless compared
-            // to the "already broken" state it guards against.
-            unsafe {
-                libc::tcgetattr(fd, &mut t);
-            }
-            (fd, t)
-        });
+        if SAVED_TERMIOS.get().is_some() {
+            return;
+        }
+        let fd = std::io::stdin().as_raw_fd();
+        let mut t: libc::termios = unsafe { std::mem::zeroed() };
+        // SAFETY: `t` is a valid termios out-parameter, `fd` is stdin.
+        let rc = unsafe { libc::tcgetattr(fd, &mut t) };
+        if rc == 0 {
+            // `set` only fails if another thread won the race — harmless.
+            let _ = SAVED_TERMIOS.set((fd, t));
+        }
     }
 
     /// Read one line of input from the user.
@@ -2059,8 +2064,13 @@ mod prompt_input {
         // old hand-written editor's dual-channel UX: streaming response text
         // on stdout never interleaves with prompt/editing UI, and piping
         // stdout to a file still leaves editing usable.
+        //
+        // `max_history_size(HISTORY_CAP)` matches the old editor's 1000-entry
+        // in-memory cap (rustyline defaults to 100).
         let config = rustyline::Config::builder()
             .behavior(rustyline::config::Behavior::PreferTerm)
+            .max_history_size(HISTORY_CAP)
+            .expect("max_history_size rejects 0; HISTORY_CAP is > 0")
             .build();
 
         let editor = match EDITOR.get() {
@@ -2078,7 +2088,11 @@ mod prompt_input {
         let mut ed = editor.lock().unwrap_or_else(|p| p.into_inner());
         match ed.readline(PROMPT) {
             Ok(line) => {
-                let _ = ed.add_history_entry(line.as_str());
+                // Match the old editor: only non-empty lines join history,
+                // so Up/Down navigation skips accidental bare-Enter presses.
+                if !line.is_empty() {
+                    let _ = ed.add_history_entry(line.as_str());
+                }
                 Ok(Some(line))
             }
             Err(e) => translate_readline_err(e),
