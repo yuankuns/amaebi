@@ -415,7 +415,7 @@ fn subagent_default_model() -> String {
         .map(|(p, _)| p)
         .filter(|p| matches!(*p, "copilot" | "bedrock"));
     match prefix {
-        Some(p) => format!("{}/{}", p, crate::provider::DEFAULT_MODEL),
+        Some(p) => format!("{}/{}", p, crate::provider::default_model_for_provider(p)),
         None => crate::provider::DEFAULT_MODEL.to_string(),
     }
 }
@@ -1453,7 +1453,7 @@ mod tests {
         assert_ne!(result, "copilot/claude-opus-4-6");
         assert_eq!(
             result,
-            format!("copilot/{}", crate::provider::DEFAULT_MODEL)
+            format!("copilot/{}", crate::provider::DEFAULT_MODEL_BARE)
         );
     }
 
@@ -1466,7 +1466,7 @@ mod tests {
         std::env::remove_var("AMAEBI_MODEL");
         assert_eq!(
             result,
-            format!("copilot/{}", crate::provider::DEFAULT_MODEL)
+            format!("copilot/{}", crate::provider::DEFAULT_MODEL_BARE)
         );
     }
 

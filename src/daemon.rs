@@ -91,12 +91,14 @@ fn compact_model(main_model: &str) -> String {
         return override_model;
     }
     // Preserve the provider prefix so compaction uses the same API backend.
+    // Pick the per-provider default so copilot never gets `[1m]`, which it
+    // does not support.
     let prefix = main_model
         .split_once('/')
         .map(|(p, _)| p)
         .filter(|p| matches!(*p, "copilot" | "bedrock"));
     match prefix {
-        Some(p) => format!("{}/{}", p, crate::provider::DEFAULT_MODEL),
+        Some(p) => format!("{}/{}", p, crate::provider::default_model_for_provider(p)),
         None => crate::provider::DEFAULT_MODEL.to_string(),
     }
 }
@@ -5559,7 +5561,7 @@ mod tests {
         std::env::remove_var("AMAEBI_COMPACT_MODEL");
         assert_eq!(
             compact_model("copilot/claude-opus-4-6"),
-            format!("copilot/{}", crate::provider::DEFAULT_MODEL),
+            format!("copilot/{}", crate::provider::DEFAULT_MODEL_BARE),
         );
     }
 
