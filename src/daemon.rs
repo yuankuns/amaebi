@@ -942,9 +942,10 @@ async fn handle_claude_launch(
         // is always non-empty (parser guards it).
         let resume_prefetched_desc: Option<String> = if let Some(ref rp) = task.resume_pane {
             if task.description.trim().is_empty() {
-                // Distinguish three failure modes so the error message matches
+                // Distinguish four failure modes so the error message matches
                 // what actually went wrong: state-read I/O failure, unknown
-                // pane id, or pane exists but has no saved description.
+                // pane id, pane exists but has no saved description, or the
+                // blocking task itself panicked/was cancelled.
                 enum LeaseDescLookup {
                     Found(String),
                     PaneMissing,
@@ -952,23 +953,44 @@ async fn handle_claude_launch(
                     ReadFailed(String),
                 }
                 let rp_owned = rp.clone();
-                let lookup = tokio::task::spawn_blocking(move || match pane_lease::read_state() {
-                    Err(e) => LeaseDescLookup::ReadFailed(e.to_string()),
-                    Ok(state) => match state.get(&rp_owned) {
-                        None => LeaseDescLookup::PaneMissing,
-                        Some(lease) => match lease
-                            .task_description
-                            .as_deref()
-                            .map(str::trim)
-                            .filter(|s| !s.is_empty())
-                        {
-                            Some(d) => LeaseDescLookup::Found(d.to_string()),
-                            None => LeaseDescLookup::NoDescription,
+                let join_res =
+                    tokio::task::spawn_blocking(move || match pane_lease::read_state() {
+                        Err(e) => LeaseDescLookup::ReadFailed(e.to_string()),
+                        Ok(state) => match state.get(&rp_owned) {
+                            None => LeaseDescLookup::PaneMissing,
+                            Some(lease) => match lease
+                                .task_description
+                                .as_deref()
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty())
+                            {
+                                Some(d) => LeaseDescLookup::Found(d.to_string()),
+                                None => LeaseDescLookup::NoDescription,
+                            },
                         },
-                    },
-                })
-                .await
-                .unwrap_or_else(|e| LeaseDescLookup::ReadFailed(e.to_string()));
+                    })
+                    .await;
+
+                let lookup = match join_res {
+                    Ok(l) => l,
+                    Err(join_err) => {
+                        // Blocking task panicked or was cancelled — surface
+                        // that distinctly instead of claiming a disk-read
+                        // failure we did not actually observe.
+                        let mut w = writer.lock().await;
+                        write_frame(
+                            &mut *w,
+                            &Response::Error {
+                                message: format!(
+                                    "[error] resume-pane lookup task panicked \
+                                     while resolving --resume-pane {rp}: {join_err}"
+                                ),
+                            },
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                };
 
                 match lookup {
                     LeaseDescLookup::Found(d) => Some(d),
@@ -1078,7 +1100,7 @@ async fn handle_claude_launch(
                     write_frame(
                         &mut *w,
                         &Response::Error {
-                            message: format!("[error] {e}"),
+                            message: format!("[error] {e:#}"),
                         },
                     )
                     .await?;
@@ -1392,14 +1414,37 @@ async fn handle_claude_launch(
         // retyping on subsequent rounds.  Uses `raw_desc` (not `description`)
         // to avoid storing the git-context preamble; that gets re-derived on
         // each launch.  Skipped when resume-pane reused the lease's existing
-        // description (no new info to write).  Fire-and-forget — pane
-        // assignment latency should not wait on the state-file write.
+        // description (no new info to write).  Awaited (not fire-and-forget)
+        // so an immediate follow-up `/claude --resume-pane <pid>` is
+        // guaranteed to observe the persisted description instead of racing
+        // a background write.  Failures are logged but do not block pane
+        // assignment — the user still gets a working pane; resume-pane just
+        // won't auto-recover the description.
         if resume_prefetched_desc.is_none() && !raw_desc.trim().is_empty() {
             let desc_pane = pane_id.clone();
             let desc_text = raw_desc.clone();
-            tokio::task::spawn_blocking(move || {
-                let _ = pane_lease::set_task_description(&desc_pane, &desc_text);
-            });
+            let persist_pane = pane_id.clone();
+            match tokio::task::spawn_blocking(move || {
+                pane_lease::set_task_description(&desc_pane, &desc_text)
+            })
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    tracing::warn!(
+                        pane_id = %persist_pane,
+                        error = %e,
+                        "failed to persist task description on lease"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        pane_id = %persist_pane,
+                        error = %e,
+                        "task-description persistence task panicked"
+                    );
+                }
+            }
         }
 
         let mut w = writer.lock().await;

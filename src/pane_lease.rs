@@ -1273,4 +1273,47 @@ mod tests {
             result.expect("should succeed without calling tmux");
         }
     }
+
+    #[test]
+    fn set_task_description_persists_to_disk_for_existing_pane() {
+        let _guard = crate::test_utils::with_temp_home();
+        let mut state: PaneState = HashMap::new();
+        let mut lease = make_idle("%7", "@0");
+        lease.task_description = None;
+        state.insert("%7".to_string(), lease);
+        write_state_unlocked(&state).expect("seed state");
+
+        set_task_description("%7", "resume this exact task").expect("persist");
+
+        let s = read_state_unlocked().expect("read back");
+        assert_eq!(
+            s["%7"].task_description.as_deref(),
+            Some("resume this exact task"),
+            "description must be persisted on the existing lease"
+        );
+    }
+
+    #[test]
+    fn set_task_description_is_noop_for_missing_pane() {
+        let _guard = crate::test_utils::with_temp_home();
+        let mut state: PaneState = HashMap::new();
+        let mut lease = make_idle("%7", "@0");
+        lease.task_description = Some("keep me".to_string());
+        state.insert("%7".to_string(), lease);
+        write_state_unlocked(&state).expect("seed state");
+
+        set_task_description("%999", "should not be written").expect("noop");
+
+        let s = read_state_unlocked().expect("read back");
+        assert_eq!(s.len(), 1, "no new entries must be added");
+        assert!(
+            !s.contains_key("%999"),
+            "missing pane must not be auto-inserted"
+        );
+        assert_eq!(
+            s["%7"].task_description.as_deref(),
+            Some("keep me"),
+            "existing pane's description must be left untouched"
+        );
+    }
 }
