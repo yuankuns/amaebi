@@ -2062,12 +2062,12 @@ mod prompt_input {
         let editor = match EDITOR.get() {
             Some(ed) => ed,
             None => {
-                // `Behavior::PreferTerm` makes rustyline open `/dev/tty`
-                // directly for both input and output instead of stdin/stdout.
-                // This preserves the old hand-written editor's dual-channel
-                // UX: streaming response text on stdout never interleaves
-                // with prompt/editing UI, and piping stdout to a file still
-                // leaves editing usable.
+                // `Behavior::PreferTerm` makes rustyline prefer `/dev/tty`
+                // for interactive input/output instead of stdin/stdout when
+                // a controlling terminal is available.  This preserves the
+                // old hand-written editor's usability when stdin or stdout
+                // are piped/redirected: prompting and line editing still
+                // work via the terminal.
                 //
                 // `max_history_size(HISTORY_CAP)` matches the old editor's
                 // 1000-entry in-memory cap (rustyline defaults to 100).
