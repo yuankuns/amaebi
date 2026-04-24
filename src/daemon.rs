@@ -1430,16 +1430,18 @@ async fn release_all_panes(panes: &[crate::ipc::SupervisionTarget]) {
 /// Handle `Request::SupervisePanes`: run a Rust polling loop that captures pane
 /// content, calls the LLM for analysis (no tools), and acts on the response.
 ///
-/// The loop iterates with a 60-second sleep between turns (override with
-/// `AMAEBI_SUPERVISION_INTERVAL_SECS`). Each turn the LLM
-/// returns exactly one of:
+/// The loop iterates with a 5-minute ceiling between turns (override with
+/// `AMAEBI_SUPERVISION_INTERVAL_SECS`), but each iteration additionally waits
+/// for the pane to go idle before snapshotting.  Each turn the LLM returns
+/// exactly one of:
 /// - `WAIT` — still working, check again
 /// - `STEER: <pane_id>: <message>` — send a correction to the pane
 /// - `DONE: <summary>` — task is complete; stream the summary and exit
 ///
 /// The loop can also be interrupted by an `Interrupt` frame arriving on
-/// `frame_rx`.  A maximum of 240 completion tokens is requested (sufficient for
-/// the short WAIT/STEER/DONE responses).
+/// `frame_rx`.  A maximum of `MAX_SUPERVISION_TOKENS` completion tokens is
+/// requested per turn (see the constant in `handle_supervision_inner`) —
+/// sufficient for the short WAIT/STEER/DONE responses.
 ///
 /// Regardless of which exit point the inner loop takes (timeout, DONE,
 /// interrupted, client disconnect, model error), [`release_all_panes`] runs

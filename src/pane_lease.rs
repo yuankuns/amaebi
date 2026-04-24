@@ -796,7 +796,11 @@ fn tmux_new_window_sync(window_id: &str) -> Result<(String, String)> {
 // Test-only helpers (accessible from other modules' tests)
 // ---------------------------------------------------------------------------
 
-/// Seed the pane state file with a single lease.  Test-only.
+/// Insert or overwrite a single lease in the pane state file.  Test-only.
+///
+/// Reads the current state, upserts `lease` keyed by `pane_id` (other entries
+/// are preserved), then writes the result back — so callers can build up
+/// multi-pane fixtures with repeated calls.
 ///
 /// Exposed so tests outside this module (e.g. supervision-loop tests in
 /// `daemon.rs`) can set up pane state without reaching into the private
