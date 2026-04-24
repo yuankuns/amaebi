@@ -539,6 +539,31 @@ pub fn current_record(dir: &Path) -> Result<Option<SessionRecord>> {
     Ok(result)
 }
 
+/// Look up the directory that owns `uuid` by scanning every record in
+/// `sessions.json` (current and historical).  Unlike [`list_all`], this
+/// also finds UUIDs the user has since rotated past (e.g. resuming an
+/// older session).
+///
+/// Returns `Ok(None)` when the UUID is not present anywhere in the file,
+/// `Err` on I/O or parse failure.
+pub fn dir_for_uuid(uuid: &str) -> Result<Option<String>> {
+    let path = sessions_path()?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    let lock_file = open_lock_file()?;
+    lock_file.lock_shared().context("acquiring sessions lock")?;
+    let map = load_map(&path)?;
+    lock_file.unlock().context("releasing sessions lock")?;
+
+    for (dir, recs) in map {
+        if recs.iter().any(|r| r.uuid == uuid) {
+            return Ok(Some(dir));
+        }
+    }
+    Ok(None)
+}
+
 /// Return all session records (directory → most-recent SessionRecord).
 ///
 /// Returns one record per directory (the most recent / current one).
@@ -872,6 +897,29 @@ mod tests {
         let _ = get_or_create(d2.path()).unwrap();
         let all = list_all().unwrap();
         assert_eq!(all.len(), 2);
+    }
+
+    #[test]
+    fn dir_for_uuid_finds_current_and_historical() {
+        let _guard = with_temp_home();
+        let dir = tempdir().unwrap();
+        let old_uuid = get_or_create(dir.path()).unwrap();
+        // Rotate: create_fresh appends without overwriting old_uuid.
+        let new_uuid = create_fresh(dir.path()).unwrap();
+        assert_ne!(old_uuid, new_uuid);
+
+        // Current UUID resolves.
+        assert_eq!(
+            dir_for_uuid(&new_uuid).unwrap().as_deref(),
+            Some(canonical_key(dir.path()).as_str())
+        );
+        // Historical UUID still resolves (list_all would miss this).
+        assert_eq!(
+            dir_for_uuid(&old_uuid).unwrap().as_deref(),
+            Some(canonical_key(dir.path()).as_str())
+        );
+        // Unknown UUID → None.
+        assert_eq!(dir_for_uuid("not-in-sessions").unwrap(), None);
     }
 
     #[test]

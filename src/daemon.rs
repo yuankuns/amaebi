@@ -554,27 +554,36 @@ async fn load_session_state(
     })
 }
 
+/// Sentinel stored as `session_summaries.dir` when the real directory for
+/// a session cannot be recovered.  Chosen to start with a character that
+/// cannot appear in an absolute path, so a reader querying for a real
+/// directory never returns these rows (strict isolation: a failed
+/// resolve never leaks into another project's summary stream).  Rows
+/// written with this sentinel are effectively orphaned — they are still
+/// stored for forensic debugging but never read back.
+const UNKNOWN_DIR_SENTINEL: &str = "<unknown>";
+
 /// Resolve the working directory for `session_id` from `sessions.json`.
 ///
-/// Returns the directory path string if found, otherwise `""` — which matches
-/// only legacy pre-migration `session_summaries` rows and never any
-/// dir-tagged summary.  Never errors: a failed lookup (session removed,
-/// lock contention, corrupt JSON) is treated as "unknown dir" so a missing
-/// mapping isolates the session rather than bailing out of compaction.
+/// Scans the full per-directory history so resumed sessions (UUIDs that
+/// have been rotated past) still resolve correctly.  On any failure the
+/// sentinel [`UNKNOWN_DIR_SENTINEL`] is returned, which matches no real
+/// directory and so quarantines the summary rather than leaking it into
+/// another project.
+///
+/// Note: the underlying `session::dir_for_uuid` takes a blocking shared
+/// flock, so under heavy contention this will block the `spawn_blocking`
+/// thread briefly before returning.
 async fn resolve_session_dir(session_id: &str) -> String {
     let sid = session_id.to_owned();
     tokio::task::spawn_blocking(move || {
-        session::list_all()
+        session::dir_for_uuid(&sid)
             .ok()
-            .and_then(|map| {
-                map.into_iter()
-                    .find(|(_, rec)| rec.uuid == sid)
-                    .map(|(d, _)| d)
-            })
-            .unwrap_or_default()
+            .flatten()
+            .unwrap_or_else(|| UNKNOWN_DIR_SENTINEL.to_string())
     })
     .await
-    .unwrap_or_default()
+    .unwrap_or_else(|_| UNKNOWN_DIR_SENTINEL.to_string())
 }
 
 // ---------------------------------------------------------------------------

@@ -373,7 +373,9 @@ pub fn clear(conn: &Connection) -> Result<()> {
 /// Called by `compact_session` in the daemon.  `timestamp` should be an RFC 3339 UTC string.
 /// `dir` is the canonical working directory the session was created in; it
 /// scopes the summary so `get_recent_summaries` cannot leak it into sessions
-/// from other directories.  Pass `""` when the dir cannot be resolved.
+/// from other directories.  When the dir cannot be resolved, callers should
+/// pass a sentinel that cannot match any real path (e.g. `"<unknown>"`) so
+/// the row is effectively quarantined.  Pre-migration rows retain `""`.
 pub fn store_session_summary(
     conn: &Connection,
     session_id: &str,
