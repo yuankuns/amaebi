@@ -2059,23 +2059,23 @@ mod prompt_input {
         #[cfg(unix)]
         snapshot_termios_once();
 
-        // `Behavior::PreferTerm` makes rustyline open `/dev/tty` directly for
-        // both input and output instead of stdin/stdout.  This preserves the
-        // old hand-written editor's dual-channel UX: streaming response text
-        // on stdout never interleaves with prompt/editing UI, and piping
-        // stdout to a file still leaves editing usable.
-        //
-        // `max_history_size(HISTORY_CAP)` matches the old editor's 1000-entry
-        // in-memory cap (rustyline defaults to 100).
-        let config = rustyline::Config::builder()
-            .behavior(rustyline::config::Behavior::PreferTerm)
-            .max_history_size(HISTORY_CAP)
-            .expect("max_history_size rejects 0; HISTORY_CAP is > 0")
-            .build();
-
         let editor = match EDITOR.get() {
             Some(ed) => ed,
             None => {
+                // `Behavior::PreferTerm` makes rustyline open `/dev/tty`
+                // directly for both input and output instead of stdin/stdout.
+                // This preserves the old hand-written editor's dual-channel
+                // UX: streaming response text on stdout never interleaves
+                // with prompt/editing UI, and piping stdout to a file still
+                // leaves editing usable.
+                //
+                // `max_history_size(HISTORY_CAP)` matches the old editor's
+                // 1000-entry in-memory cap (rustyline defaults to 100).
+                let config = rustyline::Config::builder()
+                    .behavior(rustyline::config::Behavior::PreferTerm)
+                    .max_history_size(HISTORY_CAP)
+                    .expect("max_history_size rejects 0; HISTORY_CAP is > 0")
+                    .build();
                 // `set` fails only if another thread won the init race; in
                 // that case we discard our fresh editor and use theirs.
                 let fresh = rustyline::DefaultEditor::with_config(config).map_err(|e| {
@@ -2118,8 +2118,8 @@ mod prompt_input {
             unsafe {
                 libc::tcsetattr(*fd, libc::TCSANOW, termios);
             }
+            tracing::debug!("restore_terminal_now(): applied snapshot termios");
         }
-        tracing::debug!("restore_terminal_now(): applied snapshot termios");
     }
 
     #[cfg(not(unix))]
