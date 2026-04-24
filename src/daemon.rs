@@ -85,7 +85,8 @@ fn response_max_tokens(model: &str) -> usize {
 ///
 /// Resolution order:
 ///   1. `AMAEBI_COMPACT_MODEL` env var (used verbatim)
-///   2. Same provider prefix as `main_model` + `DEFAULT_MODEL` (sonnet)
+///   2. Same provider prefix as `main_model` + per-provider default
+///      (`default_model_for_provider`): Bedrock gets `[1m]`, Copilot gets bare
 fn compact_model(main_model: &str) -> String {
     if let Ok(override_model) = std::env::var("AMAEBI_COMPACT_MODEL") {
         return override_model;

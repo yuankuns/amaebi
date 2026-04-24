@@ -403,8 +403,9 @@ async fn read_file(args: serde_json::Value) -> Result<String> {
 ///
 /// Resolution order:
 ///   1. `AMAEBI_SUBAGENT_MODEL` env var (used verbatim)
-///   2. Provider prefix from `AMAEBI_MODEL` + `DEFAULT_MODEL`
-///   3. Bare `DEFAULT_MODEL`
+///   2. Provider prefix from `AMAEBI_MODEL` + per-provider default
+///      (`default_model_for_provider`): Bedrock gets `[1m]`, Copilot gets bare
+///   3. Bare `DEFAULT_MODEL` (Bedrock, with `[1m]`)
 fn subagent_default_model() -> String {
     if let Ok(m) = std::env::var("AMAEBI_SUBAGENT_MODEL") {
         return m;
@@ -1449,7 +1450,8 @@ mod tests {
         std::env::remove_var("AMAEBI_SUBAGENT_MODEL");
         let result = subagent_default_model();
         std::env::remove_var("AMAEBI_MODEL");
-        // Must NOT be the parent model — just the prefix + DEFAULT_MODEL.
+        // Must NOT be the parent model — just the copilot prefix + the
+        // Copilot-safe default (no `[1m]` suffix).
         assert_ne!(result, "copilot/claude-opus-4-6");
         assert_eq!(
             result,
