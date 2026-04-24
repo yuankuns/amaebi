@@ -409,13 +409,15 @@ pub fn release_lease(pane_id: &str) -> Result<()> {
             lease.task_id = None;
             lease.session_id = None;
             // Intentionally keep `worktree`, `has_claude`, and
-            // `task_description`: the pane still has `claude` running on the
-            // same task in the same directory.  Preserving these fields lets
-            // `/claude --resume-pane <pid>` re-acquire the pane and continue
-            // the same work with `/compact + original description` (tier-1
-            // reuse) without the user retyping the task.  They are cleared
-            // only when the pane is destroyed or explicitly reset to a
-            // blank shell.
+            // `task_description` so `/claude --resume-pane <pid>` can re-acquire
+            // the pane and continue the same work with `/compact + original
+            // description` (tier-1 reuse) when those fields still describe the
+            // current pane state.  Depending on why the lease was released
+            // (e.g. early startup or tmux injection failures), these fields may
+            // be absent or stale rather than proving that `claude` is still
+            // running on the same task — callers of resume-pane must treat
+            // them as hints and validate before reuse.  They are cleared only
+            // when the pane is destroyed or explicitly reset to a blank shell.
             lease.heartbeat_at = now_secs();
         }
         write_state_unlocked(&state)?;

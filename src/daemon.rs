@@ -1052,7 +1052,7 @@ async fn handle_claude_launch(
                     })?;
                     if !lease.has_claude {
                         anyhow::bail!(
-                            "pane {rp_owned} has no `claude` process running; drop --resume-pane and let the scheduler pick or start a new pane"
+                            "pane {rp_owned} is not marked in lease state as having `claude` started; drop --resume-pane and let the scheduler pick or start a new pane"
                         );
                     }
                     let wt = lease.worktree.clone().ok_or_else(|| {
@@ -6523,5 +6523,137 @@ mod tests {
         release_supervised_panes(&panes).await;
         let state = pane_lease::read_state().expect("read pane state");
         assert!(state.get("%999").is_none(), "no pane should be created");
+    }
+
+    // ------------------------------------------------------------------
+    // handle_claude_launch --resume-pane error-path tests
+    //
+    // These tests cover the "description omitted" resume-pane lookup:
+    // the daemon must read the lease, surface the specific failure mode
+    // to the user, and return WITHOUT touching tmux.  The happy path
+    // spawns `tmux send-keys` so is not exercised here (kept for
+    // integration tests).
+    // ------------------------------------------------------------------
+
+    /// Collect every frame the daemon writes on a connected pair until EOF,
+    /// parsing each newline-delimited JSON blob back into `Response`.
+    async fn collect_responses(
+        mut reader: tokio::net::unix::OwnedReadHalf,
+    ) -> Vec<crate::ipc::Response> {
+        use tokio::io::AsyncReadExt;
+        let mut buf = Vec::new();
+        reader
+            .read_to_end(&mut buf)
+            .await
+            .expect("read daemon responses");
+        let text = String::from_utf8(buf).expect("utf-8 daemon responses");
+        text.lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| {
+                serde_json::from_str::<crate::ipc::Response>(l)
+                    .unwrap_or_else(|e| panic!("parse response `{l}`: {e}"))
+            })
+            .collect()
+    }
+
+    /// When `--resume-pane` points at a pane that isn't in the lease state and
+    /// the task description is empty, the daemon must reply with a "not found"
+    /// error (distinct from the missing-description and read-failure cases).
+    #[tokio::test]
+    async fn resume_pane_missing_pane_returns_not_found_error() {
+        let _guard = crate::test_utils::with_temp_home();
+        let (client, server) = tokio::net::UnixStream::pair().expect("unix pair");
+        // `handle_claude_launch` writes to the daemon-side `writer`; the test
+        // reads those frames from the client-side reader.  `pair()` gives us
+        // a duplex socket, so server.writer -> client.reader is the right
+        // direction.  Drop the unused halves so EOF propagates cleanly.
+        let (server_reader_unused, server_writer) = server.into_split();
+        let (client_reader, client_writer_unused) = client.into_split();
+        drop(server_reader_unused);
+        drop(client_writer_unused);
+        let writer = Arc::new(tokio::sync::Mutex::new(server_writer));
+
+        let task = crate::ipc::TaskSpec {
+            task_id: "task-missing".to_string(),
+            description: String::new(),
+            worktree: None,
+            client_cwd: None,
+            auto_enter: true,
+            resume_pane: Some("%999".to_string()),
+        };
+        handle_claude_launch(&writer, vec![task])
+            .await
+            .expect("launch returns ok even on per-task error");
+        drop(writer);
+
+        let responses = collect_responses(client_reader).await;
+        assert!(
+            responses.iter().any(|r| matches!(
+                r,
+                crate::ipc::Response::Error { message }
+                    if message.contains("%999")
+                        && message.contains("not found in lease state")
+            )),
+            "expected not-found error for %999, got {responses:?}"
+        );
+    }
+
+    /// When `--resume-pane` points at a real lease that has no persisted
+    /// `task_description` and the user omitted one, the daemon must reply with
+    /// the "no saved task description" error rather than the not-found error.
+    #[tokio::test]
+    async fn resume_pane_existing_pane_without_description_errors() {
+        let _guard = crate::test_utils::with_temp_home();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before UNIX epoch")
+            .as_secs();
+        let seed = pane_lease::PaneLease {
+            pane_id: "%42".to_string(),
+            window_id: "@1".to_string(),
+            status: pane_lease::PaneStatus::Idle,
+            task_id: None,
+            session_id: None,
+            worktree: Some("/tmp/fake-worktree/resume".to_string()),
+            heartbeat_at: now,
+            has_claude: true,
+            task_description: None,
+        };
+        pane_lease::seed_state_for_test(seed).expect("seed pane state");
+
+        let (client, server) = tokio::net::UnixStream::pair().expect("unix pair");
+        // `handle_claude_launch` writes to the daemon-side `writer`; the test
+        // reads those frames from the client-side reader.  `pair()` gives us
+        // a duplex socket, so server.writer -> client.reader is the right
+        // direction.  Drop the unused halves so EOF propagates cleanly.
+        let (server_reader_unused, server_writer) = server.into_split();
+        let (client_reader, client_writer_unused) = client.into_split();
+        drop(server_reader_unused);
+        drop(client_writer_unused);
+        let writer = Arc::new(tokio::sync::Mutex::new(server_writer));
+
+        let task = crate::ipc::TaskSpec {
+            task_id: "task-nodesc".to_string(),
+            description: String::new(),
+            worktree: None,
+            client_cwd: None,
+            auto_enter: true,
+            resume_pane: Some("%42".to_string()),
+        };
+        handle_claude_launch(&writer, vec![task])
+            .await
+            .expect("launch returns ok even on per-task error");
+        drop(writer);
+
+        let responses = collect_responses(client_reader).await;
+        assert!(
+            responses.iter().any(|r| matches!(
+                r,
+                crate::ipc::Response::Error { message }
+                    if message.contains("%42")
+                        && message.contains("has no saved task description")
+            )),
+            "expected missing-description error for %42, got {responses:?}"
+        );
     }
 }
