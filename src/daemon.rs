@@ -935,123 +935,206 @@ async fn handle_claude_launch(
         // the task description mentions a PR number.  The context is prepended
         // to the description so Claude knows where to start, what branch it is
         // on, and how to push when done.
+        // For the resume-pane path we may need to pull the description from
+        // the lease first (when the user typed `/claude --resume-pane %N`
+        // with no description).  So resolve `raw_description` BEFORE running
+        // the git-context prefix step.  In the normal path `task.description`
+        // is always non-empty (parser guards it).
+        let resume_prefetched_desc: Option<String> = if let Some(ref rp) = task.resume_pane {
+            if task.description.trim().is_empty() {
+                // Distinguish four failure modes so the error message matches
+                // what actually went wrong: state-read I/O failure, unknown
+                // pane id, pane exists but has no saved description, or the
+                // blocking task itself panicked/was cancelled.
+                enum LeaseDescLookup {
+                    Found(String),
+                    PaneMissing,
+                    NoDescription,
+                    ReadFailed(String),
+                }
+                let rp_owned = rp.clone();
+                let join_res =
+                    tokio::task::spawn_blocking(move || match pane_lease::read_state() {
+                        Err(e) => LeaseDescLookup::ReadFailed(e.to_string()),
+                        Ok(state) => match state.get(&rp_owned) {
+                            None => LeaseDescLookup::PaneMissing,
+                            Some(lease) => match lease
+                                .task_description
+                                .as_deref()
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty())
+                            {
+                                Some(d) => LeaseDescLookup::Found(d.to_string()),
+                                None => LeaseDescLookup::NoDescription,
+                            },
+                        },
+                    })
+                    .await;
+
+                let lookup = match join_res {
+                    Ok(l) => l,
+                    Err(join_err) => {
+                        // Blocking task panicked or was cancelled — surface
+                        // that distinctly instead of claiming a disk-read
+                        // failure we did not actually observe.
+                        let mut w = writer.lock().await;
+                        write_frame(
+                            &mut *w,
+                            &Response::Error {
+                                message: format!(
+                                    "[error] resume-pane lookup task panicked \
+                                     while resolving --resume-pane {rp}: {join_err}"
+                                ),
+                            },
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                };
+
+                match lookup {
+                    LeaseDescLookup::Found(d) => Some(d),
+                    other => {
+                        let message = match other {
+                            LeaseDescLookup::PaneMissing => format!(
+                                "[error] pane {rp} not found in lease state; \
+                                 run `amaebi dashboard` to list active panes"
+                            ),
+                            LeaseDescLookup::NoDescription => format!(
+                                "[error] pane {rp} has no saved task description; \
+                                 pass a description explicitly after --resume-pane"
+                            ),
+                            LeaseDescLookup::ReadFailed(e) => format!(
+                                "[error] failed to read pane lease state while \
+                                 resolving --resume-pane {rp}: {e}"
+                            ),
+                            LeaseDescLookup::Found(_) => unreachable!(),
+                        };
+                        let mut w = writer.lock().await;
+                        write_frame(&mut *w, &Response::Error { message }).await?;
+                        return Ok(());
+                    }
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let raw_desc = resume_prefetched_desc
+            .clone()
+            .unwrap_or_else(|| task.description.clone());
+
         let (description, ctx_start_branch) = {
-            let raw_desc = task.description.clone();
+            let raw = raw_desc.clone();
             let cwd = task.client_cwd.clone();
             tokio::task::spawn_blocking(move || {
-                let ctx = gather_task_context(cwd.as_deref(), &raw_desc);
-                let enriched = format!("{}\n{}", ctx.preamble, raw_desc);
+                let ctx = gather_task_context(cwd.as_deref(), &raw);
+                let enriched = format!("{}\n{}", ctx.preamble, raw);
                 (enriched, ctx.start_branch)
             })
             .await
-            .unwrap_or_else(|_| (task.description.clone(), None))
+            .unwrap_or_else(|_| (raw_desc.clone(), None))
         };
 
-        // Each parallel Claude session must work in its own git worktree so
-        // concurrent tasks cannot trample each other's in-progress file edits.
-        // Auto-create a worktree when the caller did not supply one explicitly.
-        // Track whether the worktree was auto-created so we can clean it up
-        // if pane acquisition subsequently fails (avoiding orphaned branches).
-        let was_explicit_worktree = task.worktree.is_some();
-        let worktree: Option<String> = match task.worktree {
-            Some(wt) => Some(wt),
-            None => {
-                let tid = task_id.clone();
-                let cwd = task.client_cwd.clone();
-                let base = ctx_start_branch.clone();
-                match tokio::task::spawn_blocking(move || {
-                    create_task_worktree(&tid, cwd.as_deref(), base.as_deref())
+        // Determine worktree + acquire pane.  Two paths:
+        //
+        // 1. `--resume-pane <pid>` path: reuse a specific pane whose lease
+        //    already records a worktree and `has_claude = true`.  The CLI
+        //    parser rejects `--resume-pane` combined with `--worktree`, so
+        //    `task.worktree` is always None here.  We read the lease, inherit
+        //    its worktree, and acquire THAT pane specifically via
+        //    `pane_lease::acquire_lease`.  `had_claude` is forced true so
+        //    `handle_claude_launch` runs the `/compact + inject` tier-1
+        //    reuse path instead of launching a fresh `claude` process.
+        //
+        // 2. Normal path: auto-create a worktree if the caller didn't pass
+        //    `--worktree`, then let `ensure_and_acquire_idle` pick a pane.
+        //
+        // `was_explicit_worktree` gates cleanup of auto-created worktrees on
+        // pane-acquisition failure.  The resume-pane path never auto-creates
+        // anything, so no cleanup is needed there.
+        let was_explicit_worktree = task.worktree.is_some() || task.resume_pane.is_some();
+        let sid_placeholder = uuid::Uuid::new_v4().to_string();
+
+        let (pane_id, had_claude, worktree): (String, bool, Option<String>) = if let Some(ref rp) =
+            task.resume_pane
+        {
+            // --- resume-pane path ---
+            let rp_owned = rp.clone();
+            let tid_for_lease = task_id.clone();
+            let sid_for_lease = sid_placeholder.clone();
+            let probe = tokio::task::spawn_blocking(move || {
+                    let state = pane_lease::read_state()?;
+                    let lease = state.get(&rp_owned).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "pane {rp_owned} not found in lease state; run `amaebi dashboard` to list active panes"
+                        )
+                    })?;
+                    if !lease.has_claude {
+                        anyhow::bail!(
+                            "pane {rp_owned} is not marked in lease state as having `claude` started; drop --resume-pane and let the scheduler pick or start a new pane"
+                        );
+                    }
+                    let wt = lease.worktree.clone().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "pane {rp_owned} has no associated worktree; cannot resume"
+                        )
+                    })?;
+                    // The lease's `has_claude` flag is persisted state and can
+                    // go stale (e.g. user `Ctrl-C`'d claude without the daemon
+                    // noticing).  Cross-check at the tmux layer so we don't
+                    // inject `/compact` + a task prompt into a bare shell.
+                    let tmux_probe = std::process::Command::new("tmux")
+                        .args([
+                            "display-message",
+                            "-p",
+                            "-t",
+                            &rp_owned,
+                            "#{pane_current_command}",
+                        ])
+                        .output()
+                        .with_context(|| {
+                            format!(
+                                "failed to inspect tmux pane {rp_owned}; cannot verify that `claude` is running"
+                            )
+                        })?;
+                    if !tmux_probe.status.success() {
+                        let stderr =
+                            String::from_utf8_lossy(&tmux_probe.stderr).trim().to_string();
+                        if stderr.is_empty() {
+                            anyhow::bail!(
+                                "failed to inspect tmux pane {rp_owned}; cannot verify that `claude` is running"
+                            );
+                        } else {
+                            anyhow::bail!(
+                                "failed to inspect tmux pane {rp_owned}; cannot verify that `claude` is running: {stderr}"
+                            );
+                        }
+                    }
+                    let pane_current_command =
+                        String::from_utf8_lossy(&tmux_probe.stdout).trim().to_string();
+                    if pane_current_command != "claude" {
+                        anyhow::bail!(
+                            "pane {rp_owned} is not currently running `claude` (tmux reports `{pane_current_command}`); drop --resume-pane and let the scheduler pick or start a new pane"
+                        );
+                    }
+                    pane_lease::acquire_lease(
+                        &rp_owned,
+                        &tid_for_lease,
+                        &sid_for_lease,
+                        Some(&wt),
+                    )?;
+                    Ok::<(String, bool, Option<String>), anyhow::Error>((rp_owned, true, Some(wt)))
                 })
                 .await
-                .context("create_task_worktree panicked")?
-                {
-                    Ok(path) => Some(path.to_string_lossy().into_owned()),
-                    Err(e) => {
-                        tracing::warn!(
-                            task_id = %task_id,
-                            error = %e,
-                            "auto-worktree creation failed; launching claude without worktree isolation"
-                        );
-                        None
-                    }
-                }
-            }
-        };
+                .context("resume-pane probe task panicked")?;
 
-        let tid_for_lease = task_id.clone();
-        let wt_for_lease = worktree.clone();
-
-        // Acquire a pane lease *before* creating session state so that a
-        // capacity failure does not leave orphan session entries on disk.
-        // A placeholder session_id is stored now; it is corrected to the real
-        // UUID via `update_session_id` after `session::get_or_create` returns.
-        let sid_placeholder = uuid::Uuid::new_v4().to_string();
-        let sid_for_lease = sid_placeholder.clone();
-        let pane_result = tokio::task::spawn_blocking(move || {
-            pane_lease::ensure_and_acquire_idle(
-                &tid_for_lease,
-                &sid_for_lease,
-                wt_for_lease.as_deref(),
-            )
-        })
-        .await
-        .context("ensure_and_acquire_idle task panicked")?;
-
-        let (pane_id, had_claude) = match pane_result {
-            Ok(p) => p,
-            Err(e) => {
-                // If the worktree was auto-created, remove it and its branch
-                // to avoid orphaned state after a capacity error.
-                // Use client_cwd with -C so git targets the right repo
-                // regardless of where the daemon was started.
-                // The branch name equals the worktree directory's basename
-                // (both set to unique_name = "<task_id>-<uuid8>").
-                if !was_explicit_worktree {
-                    if let Some(ref wt) = worktree {
-                        let wt_path = wt.clone();
-                        let cleanup_cwd = task.client_cwd.clone();
-                        tokio::task::spawn_blocking(move || {
-                            let branch = std::path::Path::new(&wt_path)
-                                .file_name()
-                                .and_then(|n| n.to_str())
-                                .map(str::to_string);
-                            let mut rm_cmd = std::process::Command::new("git");
-                            if let Some(ref cwd) = cleanup_cwd {
-                                rm_cmd.args(["-C", cwd.as_str()]);
-                            }
-                            let removed = rm_cmd
-                                .args(["worktree", "remove", "--force", &wt_path])
-                                .output()
-                                .map(|o| o.status.success())
-                                .unwrap_or(false);
-                            if removed {
-                                if let (Some(ref cwd), Some(ref br)) = (&cleanup_cwd, &branch) {
-                                    let _ = std::process::Command::new("git")
-                                        .args(["-C", cwd.as_str(), "branch", "-D", br.as_str()])
-                                        .output();
-                                }
-                            }
-                        })
-                        .await
-                        .ok();
-                    }
-                }
-                // Surface CapacityError as a typed terminal response.
-                // Report tasks still unassigned (including this one) so the
-                // caller sees the real demand that exceeded capacity.
-                let remaining = total_tasks - task_idx;
-                let mut w = writer.lock().await;
-                if let Some(cap) = e.downcast_ref::<pane_lease::CapacityError>() {
-                    write_frame(
-                        &mut *w,
-                        &Response::CapacityError {
-                            requested: remaining,
-                            max_panes: cap.max_panes,
-                            current_busy: cap.current_busy,
-                        },
-                    )
-                    .await?;
-                } else {
+            match probe {
+                Ok(triple) => triple,
+                Err(e) => {
+                    let mut w = writer.lock().await;
                     write_frame(
                         &mut *w,
                         &Response::Error {
@@ -1059,10 +1142,110 @@ async fn handle_claude_launch(
                         },
                     )
                     .await?;
+                    return Ok(());
                 }
-                // Both Error and CapacityError are terminal: the client
-                // breaks its read loop on either, so return immediately.
-                return Ok(());
+            }
+        } else {
+            // --- normal path: auto-worktree + scheduler-picked pane ---
+            let wt_val: Option<String> = match task.worktree.clone() {
+                Some(wt) => Some(wt),
+                None => {
+                    let tid = task_id.clone();
+                    let cwd = task.client_cwd.clone();
+                    let base = ctx_start_branch.clone();
+                    match tokio::task::spawn_blocking(move || {
+                        create_task_worktree(&tid, cwd.as_deref(), base.as_deref())
+                    })
+                    .await
+                    .context("create_task_worktree panicked")?
+                    {
+                        Ok(path) => Some(path.to_string_lossy().into_owned()),
+                        Err(e) => {
+                            tracing::warn!(
+                                task_id = %task_id,
+                                error = %e,
+                                "auto-worktree creation failed; launching claude without worktree isolation"
+                            );
+                            None
+                        }
+                    }
+                }
+            };
+
+            let tid_for_lease = task_id.clone();
+            let wt_for_lease = wt_val.clone();
+            let sid_for_lease = sid_placeholder.clone();
+            let pane_result = tokio::task::spawn_blocking(move || {
+                pane_lease::ensure_and_acquire_idle(
+                    &tid_for_lease,
+                    &sid_for_lease,
+                    wt_for_lease.as_deref(),
+                )
+            })
+            .await
+            .context("ensure_and_acquire_idle task panicked")?;
+
+            match pane_result {
+                Ok((pid, hc)) => (pid, hc, wt_val),
+                Err(e) => {
+                    // If the worktree was auto-created, remove it and its
+                    // branch to avoid orphaned state after a capacity
+                    // error.  Skipped for --worktree (user-supplied) and
+                    // --resume-pane (pre-existing worktree on another
+                    // pane).
+                    if !was_explicit_worktree {
+                        if let Some(ref wt) = wt_val {
+                            let wt_path = wt.clone();
+                            let cleanup_cwd = task.client_cwd.clone();
+                            tokio::task::spawn_blocking(move || {
+                                let branch = std::path::Path::new(&wt_path)
+                                    .file_name()
+                                    .and_then(|n| n.to_str())
+                                    .map(str::to_string);
+                                let mut rm_cmd = std::process::Command::new("git");
+                                if let Some(ref cwd) = cleanup_cwd {
+                                    rm_cmd.args(["-C", cwd.as_str()]);
+                                }
+                                let removed = rm_cmd
+                                    .args(["worktree", "remove", "--force", &wt_path])
+                                    .output()
+                                    .map(|o| o.status.success())
+                                    .unwrap_or(false);
+                                if removed {
+                                    if let (Some(ref cwd), Some(ref br)) = (&cleanup_cwd, &branch) {
+                                        let _ = std::process::Command::new("git")
+                                            .args(["-C", cwd.as_str(), "branch", "-D", br.as_str()])
+                                            .output();
+                                    }
+                                }
+                            })
+                            .await
+                            .ok();
+                        }
+                    }
+                    let remaining = total_tasks - task_idx;
+                    let mut w = writer.lock().await;
+                    if let Some(cap) = e.downcast_ref::<pane_lease::CapacityError>() {
+                        write_frame(
+                            &mut *w,
+                            &Response::CapacityError {
+                                requested: remaining,
+                                max_panes: cap.max_panes,
+                                current_busy: cap.current_busy,
+                            },
+                        )
+                        .await?;
+                    } else {
+                        write_frame(
+                            &mut *w,
+                            &Response::Error {
+                                message: format!("[error] {e:#}"),
+                            },
+                        )
+                        .await?;
+                    }
+                    return Ok(());
+                }
             }
         };
 
@@ -1262,6 +1445,44 @@ async fn handle_claude_launch(
             })
             .await
             .ok();
+        }
+
+        // Persist the raw (user-typed) task description on the lease so that
+        // `/claude --resume-pane <pid>` can reuse it without the user
+        // retyping on subsequent rounds.  Uses `raw_desc` (not `description`)
+        // to avoid storing the git-context preamble; that gets re-derived on
+        // each launch.  Skipped when resume-pane reused the lease's existing
+        // description (no new info to write).  Awaited (not fire-and-forget)
+        // so an immediate follow-up `/claude --resume-pane <pid>` is
+        // guaranteed to observe the persisted description instead of racing
+        // a background write.  Failures are logged but do not block pane
+        // assignment — the user still gets a working pane; resume-pane just
+        // won't auto-recover the description.
+        if resume_prefetched_desc.is_none() && !raw_desc.trim().is_empty() {
+            let desc_pane = pane_id.clone();
+            let desc_text = raw_desc.clone();
+            let persist_pane = pane_id.clone();
+            match tokio::task::spawn_blocking(move || {
+                pane_lease::set_task_description(&desc_pane, &desc_text)
+            })
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    tracing::warn!(
+                        pane_id = %persist_pane,
+                        error = %e,
+                        "failed to persist task description on lease"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        pane_id = %persist_pane,
+                        error = %e,
+                        "task-description persistence task panicked"
+                    );
+                }
+            }
         }
 
         let mut w = writer.lock().await;
@@ -6337,6 +6558,7 @@ mod tests {
             worktree: Some(worktree.to_string()),
             heartbeat_at: now,
             has_claude: true,
+            task_description: None,
         };
         pane_lease::seed_state_for_test(seed).expect("seed pane state");
 
@@ -6384,5 +6606,216 @@ mod tests {
         release_supervised_panes(&panes).await;
         let state = pane_lease::read_state().expect("read pane state");
         assert!(state.get("%999").is_none(), "no pane should be created");
+    }
+
+    // ------------------------------------------------------------------
+    // handle_claude_launch --resume-pane error-path tests
+    //
+    // These tests cover the "description omitted" resume-pane lookup:
+    // the daemon must read the lease, surface the specific failure mode
+    // to the user, and return WITHOUT touching tmux.  The happy path
+    // spawns `tmux send-keys` so is not exercised here (kept for
+    // integration tests).
+    // ------------------------------------------------------------------
+
+    /// Collect every frame the daemon writes on a connected pair until EOF,
+    /// parsing each newline-delimited JSON blob back into `Response`.
+    async fn collect_responses(
+        mut reader: tokio::net::unix::OwnedReadHalf,
+    ) -> Vec<crate::ipc::Response> {
+        use tokio::io::AsyncReadExt;
+        let mut buf = Vec::new();
+        reader
+            .read_to_end(&mut buf)
+            .await
+            .expect("read daemon responses");
+        let text = String::from_utf8(buf).expect("utf-8 daemon responses");
+        text.lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| {
+                serde_json::from_str::<crate::ipc::Response>(l)
+                    .unwrap_or_else(|e| panic!("parse response `{l}`: {e}"))
+            })
+            .collect()
+    }
+
+    /// When `--resume-pane` points at a pane that isn't in the lease state and
+    /// the task description is empty, the daemon must reply with a "not found"
+    /// error (distinct from the missing-description and read-failure cases).
+    #[tokio::test]
+    async fn resume_pane_missing_pane_returns_not_found_error() {
+        let _guard = crate::test_utils::with_temp_home();
+        let (client, server) = tokio::net::UnixStream::pair().expect("unix pair");
+        // `handle_claude_launch` writes to the daemon-side `writer`; the test
+        // reads those frames from the client-side reader.  `pair()` gives us
+        // a duplex socket, so server.writer -> client.reader is the right
+        // direction.  Drop the unused halves so EOF propagates cleanly.
+        let (server_reader_unused, server_writer) = server.into_split();
+        let (client_reader, client_writer_unused) = client.into_split();
+        drop(server_reader_unused);
+        drop(client_writer_unused);
+        let writer = Arc::new(tokio::sync::Mutex::new(server_writer));
+
+        let task = crate::ipc::TaskSpec {
+            task_id: "task-missing".to_string(),
+            description: String::new(),
+            worktree: None,
+            client_cwd: None,
+            auto_enter: true,
+            resume_pane: Some("%999".to_string()),
+        };
+        handle_claude_launch(&writer, vec![task])
+            .await
+            .expect("launch returns ok even on per-task error");
+        drop(writer);
+
+        let responses = collect_responses(client_reader).await;
+        assert!(
+            responses.iter().any(|r| matches!(
+                r,
+                crate::ipc::Response::Error { message }
+                    if message.contains("%999")
+                        && message.contains("not found in lease state")
+            )),
+            "expected not-found error for %999, got {responses:?}"
+        );
+    }
+
+    /// When `--resume-pane` points at a real lease that has no persisted
+    /// `task_description` and the user omitted one, the daemon must reply with
+    /// the "no saved task description" error rather than the not-found error.
+    #[tokio::test]
+    async fn resume_pane_existing_pane_without_description_errors() {
+        let _guard = crate::test_utils::with_temp_home();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before UNIX epoch")
+            .as_secs();
+        let seed = pane_lease::PaneLease {
+            pane_id: "%42".to_string(),
+            window_id: "@1".to_string(),
+            status: pane_lease::PaneStatus::Idle,
+            task_id: None,
+            session_id: None,
+            worktree: Some("/tmp/fake-worktree/resume".to_string()),
+            heartbeat_at: now,
+            has_claude: true,
+            task_description: None,
+        };
+        pane_lease::seed_state_for_test(seed).expect("seed pane state");
+
+        let (client, server) = tokio::net::UnixStream::pair().expect("unix pair");
+        // `handle_claude_launch` writes to the daemon-side `writer`; the test
+        // reads those frames from the client-side reader.  `pair()` gives us
+        // a duplex socket, so server.writer -> client.reader is the right
+        // direction.  Drop the unused halves so EOF propagates cleanly.
+        let (server_reader_unused, server_writer) = server.into_split();
+        let (client_reader, client_writer_unused) = client.into_split();
+        drop(server_reader_unused);
+        drop(client_writer_unused);
+        let writer = Arc::new(tokio::sync::Mutex::new(server_writer));
+
+        let task = crate::ipc::TaskSpec {
+            task_id: "task-nodesc".to_string(),
+            description: String::new(),
+            worktree: None,
+            client_cwd: None,
+            auto_enter: true,
+            resume_pane: Some("%42".to_string()),
+        };
+        handle_claude_launch(&writer, vec![task])
+            .await
+            .expect("launch returns ok even on per-task error");
+        drop(writer);
+
+        let responses = collect_responses(client_reader).await;
+        assert!(
+            responses.iter().any(|r| matches!(
+                r,
+                crate::ipc::Response::Error { message }
+                    if message.contains("%42")
+                        && message.contains("has no saved task description")
+            )),
+            "expected missing-description error for %42, got {responses:?}"
+        );
+    }
+
+    /// When `--resume-pane` points at a lease that claims `has_claude=true`
+    /// but the target tmux pane does not actually exist (or isn't running
+    /// `claude`), the daemon must reject the request at the tmux probe step
+    /// rather than injecting `/compact` into whatever is there.  The task
+    /// description is non-empty here so the lease-description prefetch is
+    /// skipped and the probe runs.
+    #[tokio::test]
+    async fn resume_pane_tmux_probe_rejects_nonexistent_pane() {
+        let _guard = crate::test_utils::with_temp_home();
+        // Use a tmux pane id that does not exist in any tmux session.  The
+        // `tmux display-message -t %9999999` call will fail with a non-zero
+        // exit and an "unknown pane" / "can't find pane" stderr, which our
+        // probe surfaces as a tmux-inspection failure.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before UNIX epoch")
+            .as_secs();
+        let seed = pane_lease::PaneLease {
+            pane_id: "%9999999".to_string(),
+            window_id: "@1".to_string(),
+            status: pane_lease::PaneStatus::Idle,
+            task_id: None,
+            session_id: None,
+            worktree: Some("/tmp/fake-worktree/resume-probe".to_string()),
+            heartbeat_at: now,
+            has_claude: true,
+            task_description: Some("old task".to_string()),
+        };
+        pane_lease::seed_state_for_test(seed).expect("seed pane state");
+
+        let (client, server) = tokio::net::UnixStream::pair().expect("unix pair");
+        let (server_reader_unused, server_writer) = server.into_split();
+        let (client_reader, client_writer_unused) = client.into_split();
+        drop(server_reader_unused);
+        drop(client_writer_unused);
+        let writer = Arc::new(tokio::sync::Mutex::new(server_writer));
+
+        let task = crate::ipc::TaskSpec {
+            task_id: "task-probe".to_string(),
+            // Non-empty description: skips the lease-description prefetch
+            // early-return and forces execution into the tmux probe branch.
+            description: "run this task".to_string(),
+            worktree: None,
+            client_cwd: None,
+            auto_enter: true,
+            resume_pane: Some("%9999999".to_string()),
+        };
+        handle_claude_launch(&writer, vec![task])
+            .await
+            .expect("launch returns ok even on per-task error");
+        drop(writer);
+
+        let responses = collect_responses(client_reader).await;
+        let err_texts: Vec<&str> = responses
+            .iter()
+            .filter_map(|r| match r {
+                crate::ipc::Response::Error { message } => Some(message.as_str()),
+                _ => None,
+            })
+            .collect();
+        // When running under a live tmux server (CI and local dev both have
+        // one), `tmux display-message -t %9999999` exits 0 with empty stdout
+        // because tmux silently falls back to a nearby pane's formatting
+        // context — so our probe sees `pane_current_command == ""`, which
+        // trips the "not currently running `claude`" branch.  When there is
+        // no tmux at all, the probe fails on `.output()` and surfaces the
+        // "failed to inspect tmux pane" branch.  Either is acceptable; both
+        // are preferable to silently injecting `/compact` into the wrong
+        // thing.
+        assert!(
+            err_texts.iter().any(|m| {
+                m.contains("%9999999")
+                    && (m.contains("failed to inspect tmux pane")
+                        || m.contains("is not currently running `claude`"))
+            }),
+            "expected tmux-probe failure for %9999999, got errors: {err_texts:?}"
+        );
     }
 }

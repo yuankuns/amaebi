@@ -16,6 +16,15 @@ pub struct TaskSpec {
     /// If `false`, the command is injected into the pane without a trailing
     /// Enter key (useful for commands the user wants to review first).
     pub auto_enter: bool,
+    /// Optional tmux pane id (e.g. `"%41"`) to reuse instead of allocating a
+    /// new one.  When `Some`, the daemon validates the pane exists and has
+    /// `has_claude=true` in the lease map, acquires THAT pane specifically
+    /// (not a scheduler-picked one), inherits its existing worktree, and
+    /// injects `/compact + description` (tier-1 reuse path).  Mutually
+    /// exclusive with `worktree` at the CLI parser; the daemon treats a
+    /// `Some(resume_pane)` as authoritative and ignores any stray `worktree`.
+    #[serde(default)]
+    pub resume_pane: Option<String>,
 }
 
 /// A single pane+task pair for supervision.
@@ -557,6 +566,7 @@ mod tests {
             worktree: Some("/home/user/repo-wt/feat-x".into()),
             client_cwd: Some("/home/user/repo".into()),
             auto_enter: true,
+            resume_pane: None,
         };
         let json = serde_json::to_string(&spec).unwrap();
         let back: TaskSpec = serde_json::from_str(&json).unwrap();
@@ -564,6 +574,32 @@ mod tests {
         assert_eq!(back.description, "implement feature X");
         assert_eq!(back.worktree.as_deref(), Some("/home/user/repo-wt/feat-x"));
         assert!(back.auto_enter);
+        assert!(back.resume_pane.is_none());
+    }
+
+    #[test]
+    fn task_spec_resume_pane_round_trip() {
+        // With resume_pane set.
+        let spec = TaskSpec {
+            task_id: "t1".into(),
+            description: "continue".into(),
+            worktree: None,
+            client_cwd: None,
+            auto_enter: true,
+            resume_pane: Some("%41".into()),
+        };
+        let json = serde_json::to_string(&spec).unwrap();
+        let back: TaskSpec = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.resume_pane.as_deref(), Some("%41"));
+    }
+
+    #[test]
+    fn task_spec_resume_pane_absent_field_deserializes_as_none() {
+        // Older clients on master still encode without `resume_pane`; the
+        // daemon must accept that payload and default the field to None.
+        let legacy = r#"{"task_id":"x","description":"d","worktree":null,"client_cwd":null,"auto_enter":true}"#;
+        let back: TaskSpec = serde_json::from_str(legacy).unwrap();
+        assert!(back.resume_pane.is_none());
     }
 
     #[test]
@@ -576,6 +612,7 @@ mod tests {
                     worktree: None,
                     client_cwd: Some("/home/user/repo".into()),
                     auto_enter: true,
+                    resume_pane: None,
                 },
                 TaskSpec {
                     task_id: "t2".into(),
@@ -583,6 +620,7 @@ mod tests {
                     worktree: Some("/wt/b".into()),
                     client_cwd: None,
                     auto_enter: false,
+                    resume_pane: None,
                 },
             ],
         };
