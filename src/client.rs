@@ -2519,6 +2519,31 @@ mod tests {
     }
 
     #[test]
+    fn parse_claude_resource_specs_map_to_correct_request_variants() {
+        // Regression: guards the handoff between the CLI parser (strings) and
+        // `ResourceRequest::parse` (typed variant).  A future rename on either
+        // side (`class:` prefix or the enum shape) would fail here before it
+        // reaches the daemon and silently routes every request as Named.
+        use crate::resource_lease::ResourceRequest;
+        let tasks = claude_tasks(
+            "/claude --resource sim-9900 --resource class:simulator --resource any:gpu \"run\"",
+        );
+        let requests: Vec<ResourceRequest> = tasks[0]
+            .resources
+            .iter()
+            .map(|s| ResourceRequest::parse(s))
+            .collect();
+        assert_eq!(
+            requests,
+            vec![
+                ResourceRequest::Named("sim-9900".into()),
+                ResourceRequest::Class("simulator".into()),
+                ResourceRequest::Class("gpu".into()),
+            ]
+        );
+    }
+
+    #[test]
     fn parse_claude_resource_timeout_rejects_non_integer() {
         let result = parse_claude("/claude --resource-timeout abc \"t\"");
         let err = match result {

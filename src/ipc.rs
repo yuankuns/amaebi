@@ -620,6 +620,50 @@ mod tests {
     }
 
     #[test]
+    fn task_spec_resources_absent_fields_deserialize_as_defaults() {
+        // Regression for mixed-version deployments: a client built at
+        // PR #124 (with `resume_pane` but no `resources` / `resource_timeout_secs`)
+        // must still deserialize against the new daemon.  Without
+        // `#[serde(default)]` on the new fields this would fail and break
+        // every existing `/claude` call after the daemon upgrade.
+        let pr124_payload = r#"{"task_id":"x","description":"d","worktree":null,"client_cwd":null,"auto_enter":true,"resume_pane":"%41"}"#;
+        let back: TaskSpec = serde_json::from_str(pr124_payload).expect("legacy must parse");
+        assert_eq!(back.resume_pane.as_deref(), Some("%41"));
+        assert!(back.resources.is_empty(), "resources must default to empty");
+        assert!(
+            back.resource_timeout_secs.is_none(),
+            "timeout must default to None"
+        );
+    }
+
+    #[test]
+    fn task_spec_resources_round_trip_with_values() {
+        // Opposite direction: a task built with resources and timeout must
+        // survive a JSON round-trip preserving spec order and the numeric
+        // timeout.  Protects the wire-format from accidental renames.
+        let spec = TaskSpec {
+            task_id: "kernel-debug".into(),
+            description: "run this kernel".into(),
+            worktree: None,
+            client_cwd: None,
+            auto_enter: true,
+            resume_pane: None,
+            resources: vec!["sim-9900".into(), "class:gpu".into()],
+            resource_timeout_secs: Some(300),
+        };
+        let json = serde_json::to_string(&spec).unwrap();
+        // Assert the wire field names so a silent serde rename is caught here,
+        // not by a runtime "unknown field" error in the daemon.
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["resources"], serde_json::json!(["sim-9900", "class:gpu"]));
+        assert_eq!(v["resource_timeout_secs"], serde_json::json!(300));
+
+        let back: TaskSpec = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.resources, vec!["sim-9900", "class:gpu"]);
+        assert_eq!(back.resource_timeout_secs, Some(300));
+    }
+
+    #[test]
     fn request_claude_launch_round_trip() {
         let req = Request::ClaudeLaunch {
             tasks: vec![

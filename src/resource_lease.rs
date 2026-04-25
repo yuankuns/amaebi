@@ -1112,4 +1112,201 @@ mod tests {
         let hint = render_prompt_hint(&leases, &[a, b]);
         assert_eq!(hint, "A=sim-9900\nB=gpu-0");
     }
+
+    // ── Functional regression tests ────────────────────────────────────────
+
+    /// Two `class:gpu` requests in one call must acquire two **different**
+    /// GPUs — otherwise both panes end up pointing at the same device and
+    /// the whole feature is pointless.  This is the user's core scenario
+    /// (5 simulator containers, 6 panes).
+    #[tokio::test(flavor = "current_thread")]
+    async fn acquire_multiple_class_requests_pick_distinct_resources() {
+        let _guard = crate::test_utils::with_temp_home();
+        seed_pool_file(&[
+            def("gpu-0", "gpu"),
+            def("gpu-1", "gpu"),
+            def("gpu-2", "gpu"),
+        ])
+        .expect("seed");
+
+        let leases = acquire_all(
+            &[
+                ResourceRequest::Class("gpu".into()),
+                ResourceRequest::Class("gpu".into()),
+            ],
+            holder("%7"),
+            WaitPolicy::Nowait,
+        )
+        .await
+        .expect("two gpus");
+
+        assert_eq!(leases.len(), 2);
+        assert_ne!(
+            leases[0].name, leases[1].name,
+            "two Class requests in one acquire must pick different resources"
+        );
+    }
+
+    /// `release_all_for_pane("%A")` must leave panes `%B`'s leases untouched.
+    /// A bug here (e.g. matching the wrong field) would mass-release every
+    /// lease on any supervision exit.
+    #[tokio::test(flavor = "current_thread")]
+    async fn release_by_pane_is_scoped_to_that_pane() {
+        let _guard = crate::test_utils::with_temp_home();
+        seed_pool_file(&[def("r-a", "x"), def("r-b", "x")]).expect("seed");
+
+        acquire_all(
+            &[ResourceRequest::Named("r-a".into())],
+            holder("%A"),
+            WaitPolicy::Nowait,
+        )
+        .await
+        .expect("a");
+        acquire_all(
+            &[ResourceRequest::Named("r-b".into())],
+            holder("%B"),
+            WaitPolicy::Nowait,
+        )
+        .await
+        .expect("b");
+
+        let released = release_all_for_pane("%A").await.expect("release A");
+        assert_eq!(released, vec!["r-a".to_string()]);
+
+        let state = read_state().expect("read");
+        assert_eq!(state["r-a"].effective_status(), ResourceStatus::Idle);
+        assert_eq!(
+            state["r-b"].effective_status(),
+            ResourceStatus::Busy,
+            "r-b must still be held by %B after releasing %A"
+        );
+        assert_eq!(state["r-b"].pane_id.as_deref(), Some("%B"));
+    }
+
+    /// A lease held past `LEASE_TTL_SECS` must be reclaimable — otherwise a
+    /// crashed holder pins the resource for 24 h with no recovery path.
+    /// This verifies the TTL downgrade is wired into the acquisition check,
+    /// not just the `effective_status` accessor.
+    #[tokio::test(flavor = "current_thread")]
+    async fn expired_busy_lease_is_reclaimable_by_next_acquirer() {
+        let _guard = crate::test_utils::with_temp_home();
+        seed_pool_file(&[def("sim-9900", "simulator")]).expect("seed");
+
+        // Seed a Busy lease with an expired heartbeat directly into state,
+        // simulating a dead holder that never got to release.
+        let lock = open_lock_file().expect("lock");
+        lock.lock_exclusive().expect("flock");
+        let mut state = read_state_unlocked().expect("read");
+        state.insert(
+            "sim-9900".into(),
+            ResourceLease {
+                name: "sim-9900".into(),
+                class: "simulator".into(),
+                status: ResourceStatus::Busy,
+                pane_id: Some("%ghost".into()),
+                task_id: Some("dead".into()),
+                session_id: Some("dead".into()),
+                heartbeat_at: now_secs().saturating_sub(LEASE_TTL_SECS + 1),
+            },
+        );
+        write_state_unlocked(&state).expect("write");
+        lock.unlock().expect("unlock");
+
+        let leases = acquire_all(
+            &[ResourceRequest::Named("sim-9900".into())],
+            holder("%new"),
+            WaitPolicy::Nowait,
+        )
+        .await
+        .expect("reclaim must succeed past TTL");
+        assert_eq!(leases[0].pane_id.as_deref(), Some("%new"));
+    }
+
+    /// End-to-end pipeline: a TOML pool with the user's simulator shape
+    /// (`{port}` metadata → `$SIM_PORT` env + prompt_hint), followed by a
+    /// realistic `parse`-based request list, renders env/hint correctly
+    /// and releases everything on pane exit.  This is the one test that
+    /// exercises every seam between module boundaries.
+    #[tokio::test(flavor = "current_thread")]
+    async fn end_to_end_simulator_scenario() {
+        let _guard = crate::test_utils::with_temp_home();
+        let mut sim0 = def("sim-9900", "simulator");
+        sim0.metadata.insert("port".into(), "9900".into());
+        sim0.env.insert("SIM_PORT".into(), "{port}".into());
+        sim0.prompt_hint = Some("use port {port} only".into());
+        let mut sim1 = def("sim-9901", "simulator");
+        sim1.metadata.insert("port".into(), "9901".into());
+        sim1.env.insert("SIM_PORT".into(), "{port}".into());
+        sim1.prompt_hint = Some("use port {port} only".into());
+        seed_pool_file(&[sim0, sim1]).expect("seed");
+
+        // Specs as they would arrive from `parse_claude` (strings).
+        let specs = ["class:simulator"];
+        let requests: Vec<ResourceRequest> =
+            specs.iter().map(|s| ResourceRequest::parse(s)).collect();
+        assert_eq!(requests, vec![ResourceRequest::Class("simulator".into())]);
+
+        let leases = acquire_all(&requests, holder("%42"), WaitPolicy::Nowait)
+            .await
+            .expect("acquire");
+        assert_eq!(leases.len(), 1);
+        let picked_name = leases[0].name.clone();
+        assert!(picked_name.starts_with("sim-"), "got {picked_name}");
+
+        // Env + prompt_hint must render the *picked* resource's values.
+        let pool = load_pool().expect("reload pool");
+        let env = render_env(&leases, &pool);
+        assert_eq!(env.len(), 1);
+        assert_eq!(env[0].0, "SIM_PORT");
+        assert!(
+            env[0].1 == "9900" || env[0].1 == "9901",
+            "SIM_PORT should be the picked port, got {:?}",
+            env[0].1
+        );
+        let hint = render_prompt_hint(&leases, &pool);
+        assert!(hint.contains(&env[0].1), "hint must mention the port");
+        assert!(hint.contains("use port"));
+
+        // Release by pane — full lifecycle closes.
+        let released = release_all_for_pane("%42").await.expect("release");
+        assert_eq!(released, vec![picked_name.clone()]);
+        let state = read_state().expect("read");
+        assert_eq!(
+            state[&picked_name].effective_status(),
+            ResourceStatus::Idle,
+            "resource must be available for the next caller"
+        );
+    }
+
+    /// Adding a resource to the TOML while the daemon is running must make
+    /// it available on the next acquisition attempt (reconciliation under
+    /// flock).  Regression: a caching bug here would force a daemon
+    /// restart after every `resources.toml` edit.
+    #[tokio::test(flavor = "current_thread")]
+    async fn new_pool_entry_becomes_available_after_toml_edit() {
+        let _guard = crate::test_utils::with_temp_home();
+        seed_pool_file(&[def("r-a", "x")]).expect("initial seed");
+
+        // Baseline: only r-a exists, r-b is unknown.
+        let err = acquire_all(
+            &[ResourceRequest::Named("r-b".into())],
+            holder("%1"),
+            WaitPolicy::Nowait,
+        )
+        .await
+        .expect_err("r-b unknown");
+        assert!(matches!(err, AcquireError::UnknownName(_)));
+
+        // Edit the pool: add r-b.  Simulates the user editing resources.toml.
+        seed_pool_file(&[def("r-a", "x"), def("r-b", "x")]).expect("re-seed");
+
+        let leases = acquire_all(
+            &[ResourceRequest::Named("r-b".into())],
+            holder("%1"),
+            WaitPolicy::Nowait,
+        )
+        .await
+        .expect("r-b available after pool edit");
+        assert_eq!(leases[0].name, "r-b");
+    }
 }
