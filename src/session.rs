@@ -539,6 +539,48 @@ pub fn current_record(dir: &Path) -> Result<Option<SessionRecord>> {
     Ok(result)
 }
 
+/// Look up the directory that owns `uuid` by scanning every record in
+/// `sessions.json` (current and historical).  Unlike [`list_all`], this
+/// also finds UUIDs the user has since rotated past (e.g. resuming an
+/// older session).
+///
+/// # Return values
+///
+/// - `Ok(Some(dir))` — UUID found; `dir` is the canonical directory key.
+/// - `Ok(None)` — `sessions.json` does not exist, is empty, is corrupted
+///   (see below), or does not contain the requested UUID.
+/// - `Err(_)` — filesystem I/O failure (read permission denied, disk
+///   error, or lock acquisition failure).
+///
+/// # Corruption handling
+///
+/// JSON parse failures are intentionally treated as an empty map rather
+/// than propagated as `Err` — mirrors [`load_map`]'s "sessions.json is
+/// corrupted; resetting to empty" policy, tested by
+/// `corrupted_sessions_json_recovers`.  This keeps the daemon operable
+/// against a manually-edited or partially-written JSON file; the
+/// trade-off is that callers cannot distinguish "UUID not found" from
+/// "file is corrupt".  `resolve_session_dir` in `daemon.rs` handles
+/// both uniformly by falling back to `UNKNOWN_DIR_SENTINEL`, so the
+/// distinction would be informational only.
+pub fn dir_for_uuid(uuid: &str) -> Result<Option<String>> {
+    let path = sessions_path()?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    let lock_file = open_lock_file()?;
+    lock_file.lock_shared().context("acquiring sessions lock")?;
+    let map = load_map(&path)?;
+    lock_file.unlock().context("releasing sessions lock")?;
+
+    for (dir, recs) in map {
+        if recs.iter().any(|r| r.uuid == uuid) {
+            return Ok(Some(dir));
+        }
+    }
+    Ok(None)
+}
+
 /// Return all session records (directory → most-recent SessionRecord).
 ///
 /// Returns one record per directory (the most recent / current one).
@@ -872,6 +914,29 @@ mod tests {
         let _ = get_or_create(d2.path()).unwrap();
         let all = list_all().unwrap();
         assert_eq!(all.len(), 2);
+    }
+
+    #[test]
+    fn dir_for_uuid_finds_current_and_historical() {
+        let _guard = with_temp_home();
+        let dir = tempdir().unwrap();
+        let old_uuid = get_or_create(dir.path()).unwrap();
+        // Rotate: create_fresh appends without overwriting old_uuid.
+        let new_uuid = create_fresh(dir.path()).unwrap();
+        assert_ne!(old_uuid, new_uuid);
+
+        // Current UUID resolves.
+        assert_eq!(
+            dir_for_uuid(&new_uuid).unwrap().as_deref(),
+            Some(canonical_key(dir.path()).as_str())
+        );
+        // Historical UUID still resolves (list_all would miss this).
+        assert_eq!(
+            dir_for_uuid(&old_uuid).unwrap().as_deref(),
+            Some(canonical_key(dir.path()).as_str())
+        );
+        // Unknown UUID → None.
+        assert_eq!(dir_for_uuid("not-in-sessions").unwrap(), None);
     }
 
     #[test]

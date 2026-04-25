@@ -525,16 +525,33 @@ where
 ///
 /// Returns `(history, summaries, own_summary)`.  On error, logs a warning and
 /// returns empty defaults so the caller can still proceed with a fresh context.
+///
+/// Summaries are scoped to the session's working directory: we look up the
+/// dir for `session_id` in `sessions.json` and pass it to
+/// `get_recent_summaries` so cross-project sessions cannot see each other's
+/// compacted context.  When `resolve_session_dir` falls back to
+/// [`UNKNOWN_DIR_SENTINEL`] (unknown UUID, I/O error, lock failure, etc.)
+/// we short-circuit and return no summaries at all — this avoids reading
+/// back rows that were themselves written with the same sentinel after a
+/// previous failed resolution, and it never reads legacy `dir = ''` rows
+/// either.
 async fn load_session_state(
     state: &Arc<DaemonState>,
     session_id: &str,
 ) -> (Vec<memory_db::DbMemoryEntry>, Vec<String>, Option<String>) {
+    let dir = resolve_session_dir(session_id).await;
+    let dir_for_read = dir.clone();
     with_db(Arc::clone(&state.db), {
         let sid = session_id.to_owned();
         move |conn| {
+            let summaries = if dir_for_read == UNKNOWN_DIR_SENTINEL {
+                Vec::new()
+            } else {
+                memory_db::get_recent_summaries(conn, &sid, &dir_for_read, MAX_SUMMARIES)?
+            };
             Ok((
                 memory_db::get_session_history(conn, &sid)?,
-                memory_db::get_recent_summaries(conn, &sid, MAX_SUMMARIES)?,
+                summaries,
                 memory_db::get_session_own_summary(conn, &sid)?,
             ))
         }
@@ -543,6 +560,76 @@ async fn load_session_state(
     .unwrap_or_else(|e| {
         tracing::warn!(error = %e, session_id, "failed to load session state");
         (vec![], vec![], None)
+    })
+}
+
+/// Sentinel stored as `session_summaries.dir` when the real directory for
+/// a session cannot be recovered.
+///
+/// Collision reasoning: `session::canonical_key` prefers the result of
+/// `std::fs::canonicalize`, which on Unix always produces an absolute path
+/// (`/…`).  It only falls back to the raw input path when `canonicalize`
+/// fails (dir deleted/inaccessible), so a relative path key is possible in
+/// degenerate cases.  The sentinel is therefore chosen to not match any
+/// typical path component: it starts with `<` and ends with `>`, a
+/// combination no sane working directory would produce, and it is compared
+/// as an exact whole string — not a prefix — so `/tmp/<unknown>/…` would
+/// not collide.  If a real dir ever did happen to equal the sentinel
+/// verbatim, the only consequence is that its sessions' summaries get
+/// lumped into the quarantine set, which is strictly safer than leaking
+/// across unrelated projects.
+///
+/// Defense-in-depth: `load_session_state` also explicitly short-circuits
+/// when the resolved dir equals this sentinel, so a row written after one
+/// failed resolve is not read back by the same session on a subsequent
+/// failed resolve.  Sentinel rows are therefore quarantined on write AND
+/// ignored on read.
+const UNKNOWN_DIR_SENTINEL: &str = "<unknown>";
+
+/// Resolve the working directory for `session_id` from `sessions.json`.
+///
+/// Scans the full per-directory history so resumed sessions (UUIDs that
+/// have been rotated past) still resolve correctly.  On any failure —
+/// I/O error, parse error, lock acquisition failure, unknown UUID, or a
+/// panic in the spawned blocking thread — the sentinel
+/// [`UNKNOWN_DIR_SENTINEL`] is returned so the caller's summary gets
+/// quarantined instead of being written/read as an empty-dir row that
+/// could match legacy pre-migration entries.
+///
+/// Blocking behavior: the underlying `session::dir_for_uuid` takes a
+/// `lock_shared()` on the sessions lock file, which is a genuinely
+/// blocking call — under contention this waits rather than failing
+/// fast.  It runs on `spawn_blocking`, so the daemon's async runtime is
+/// not stalled; only the blocking pool thread is held.
+///
+/// Real I/O / lock failures are logged at debug level so silent masking
+/// of persistent problems can still be traced in logs.
+async fn resolve_session_dir(session_id: &str) -> String {
+    let sid = session_id.to_owned();
+    tokio::task::spawn_blocking(move || match session::dir_for_uuid(&sid) {
+        Ok(Some(dir)) => dir,
+        Ok(None) => {
+            // Unknown UUID — expected for brand-new or purged sessions;
+            // quarantine silently without a log.
+            UNKNOWN_DIR_SENTINEL.to_string()
+        }
+        Err(e) => {
+            tracing::debug!(
+                session_id = %sid,
+                error = %e,
+                "resolve_session_dir: dir_for_uuid failed; falling back to sentinel"
+            );
+            UNKNOWN_DIR_SENTINEL.to_string()
+        }
+    })
+    .await
+    .unwrap_or_else(|e| {
+        tracing::debug!(
+            session_id,
+            error = %e,
+            "resolve_session_dir: blocking task panicked; falling back to sentinel"
+        );
+        UNKNOWN_DIR_SENTINEL.to_string()
     })
 }
 
@@ -3425,12 +3512,13 @@ async fn compact_session(
             let db = Arc::clone(&state.db);
             let sid = session_id.clone();
             let ts = chrono::Utc::now().to_rfc3339();
+            let dir = resolve_session_dir(&sid).await;
             let result = tokio::task::spawn_blocking(move || {
                 let conn = db.lock().unwrap_or_else(|p| p.into_inner());
                 let tx = conn
                     .unchecked_transaction()
                     .context("compact_session: begin transaction")?;
-                memory_db::store_session_summary(&conn, &sid, &summary, &ts)?;
+                memory_db::store_session_summary(&conn, &sid, &summary, &ts, &dir)?;
                 memory_db::archive_session_turns(&conn, &ids_to_archive)?;
                 tx.commit().context("compact_session: commit transaction")
             })
@@ -3719,6 +3807,7 @@ async fn compact_in_loop(
         let db = Arc::clone(&state.db);
         let sid_owned = sid.to_owned();
         let ts = chrono::Utc::now().to_rfc3339();
+        let dir = resolve_session_dir(sid).await;
         let archive_result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
             let conn = db.lock().unwrap_or_else(|p| p.into_inner());
             // Always persist the summary (even when nothing is archived) so a
@@ -3728,7 +3817,7 @@ async fn compact_in_loop(
             let tx = conn
                 .unchecked_transaction()
                 .context("compact_in_loop: begin transaction")?;
-            memory_db::store_session_summary(&conn, &sid_owned, &summary_text, &ts)?;
+            memory_db::store_session_summary(&conn, &sid_owned, &summary_text, &ts, &dir)?;
             if summarised_row_count > 0 {
                 let rows = memory_db::get_session_oldest(&conn, &sid_owned, summarised_row_count)?;
                 let ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
@@ -7011,6 +7100,115 @@ mod tests {
                         || m.contains("is not currently running `claude`"))
             }),
             "expected tmux-probe failure for %9999999, got errors: {err_texts:?}"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // resolve_session_dir + load_session_state dir-scoping regression
+    //
+    // These guard the core behaviour of PR #121: summaries must be scoped
+    // by working directory, and the sentinel fallback must never read
+    // back rows tagged with it (otherwise cross-project leakage returns).
+    // ------------------------------------------------------------------
+
+    /// A resumable (rotated) session UUID must resolve back to its owning
+    /// directory, even after a newer UUID has been issued for the same dir.
+    /// This is the regression test for the `list_all()` → `dir_for_uuid`
+    /// switch (Copilot review comment on `resolve_session_dir`): `list_all()`
+    /// only returns the most-recent record per dir and would miss the old UUID.
+    #[tokio::test]
+    async fn resolve_session_dir_finds_rotated_uuid() {
+        let _guard = crate::test_utils::with_temp_home();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let old_uuid = crate::session::get_or_create(dir.path()).expect("create first");
+        let new_uuid = crate::session::create_fresh(dir.path()).expect("rotate");
+        assert_ne!(old_uuid, new_uuid);
+
+        let canonical = std::fs::canonicalize(dir.path())
+            .expect("canonicalize")
+            .to_string_lossy()
+            .into_owned();
+
+        assert_eq!(
+            resolve_session_dir(&new_uuid).await,
+            canonical,
+            "current UUID must resolve to its canonical directory"
+        );
+        assert_eq!(
+            resolve_session_dir(&old_uuid).await,
+            canonical,
+            "rotated/historical UUID must still resolve (list_all would miss this)"
+        );
+    }
+
+    /// An unknown UUID must fall back to the sentinel, not to `""`.  Falling
+    /// back to `""` would match legacy pre-migration rows (`dir = ''`) and
+    /// re-introduce the cross-project leak this PR fixes.
+    #[tokio::test]
+    async fn resolve_session_dir_unknown_uuid_returns_sentinel() {
+        let _guard = crate::test_utils::with_temp_home();
+        // No sessions.json entries at all.
+        assert_eq!(
+            resolve_session_dir("not-in-sessions").await,
+            UNKNOWN_DIR_SENTINEL,
+            "unknown UUID must quarantine via sentinel, not leak via empty-string"
+        );
+    }
+
+    /// `load_session_state` must short-circuit the summaries query when the
+    /// resolved dir is the sentinel, so rows previously written with the
+    /// sentinel (after a failed resolve) cannot be read back.  Exercises
+    /// the integration between `resolve_session_dir` (returns sentinel for
+    /// unknown UUID) and `load_session_state` (short-circuits on sentinel).
+    #[tokio::test]
+    async fn load_session_state_sentinel_skips_summaries_query() {
+        let _guard = crate::test_utils::with_temp_home();
+
+        // File-backed DB under the temp HOME so `init_db` runs the full
+        // schema + migration path exactly as the daemon would.
+        let db_dir = tempfile::tempdir().expect("tempdir for db");
+        let db_path = db_dir.path().join("memory.db");
+        let conn = memory_db::init_db(&db_path).expect("init memory db");
+
+        // Seed a summary row tagged with the sentinel — simulates what
+        // `compact_session` would have written for an unresolvable session.
+        memory_db::store_session_summary(
+            &conn,
+            "sid-quarantined",
+            "quarantined summary text",
+            "2026-01-01T00:00:00Z",
+            UNKNOWN_DIR_SENTINEL,
+        )
+        .expect("seed sentinel row");
+
+        // Sanity: the raw query at the DB layer CAN read the row back if
+        // asked directly with the sentinel — proves the short-circuit at
+        // the daemon layer is load-bearing, not a trivial no-op.
+        let raw = memory_db::get_recent_summaries(&conn, "other-sid", UNKNOWN_DIR_SENTINEL, 10)
+            .expect("raw summaries read");
+        assert_eq!(
+            raw,
+            vec!["quarantined summary text"],
+            "sentinel rows are reachable at the memory_db layer — daemon must short-circuit"
+        );
+
+        let state = Arc::new(DaemonState {
+            http: reqwest::Client::new(),
+            tokens: Arc::new(TokenCache::new()),
+            executor: Box::new(tools::LocalExecutor::new()),
+            db: Arc::new(Mutex::new(conn)),
+            compacting_sessions: Arc::new(Mutex::new(HashSet::new())),
+            active_sessions: Arc::new(Mutex::new(HashSet::new())),
+            user_aliases: Arc::new(std::collections::HashMap::new()),
+        });
+
+        // "sid-quarantined" has no entry in the empty sessions.json under
+        // the temp $HOME, so resolve_session_dir returns the sentinel and
+        // load_session_state MUST skip the query.
+        let (_hist, summaries, _own) = load_session_state(&state, "sid-quarantined").await;
+        assert!(
+            summaries.is_empty(),
+            "load_session_state must not read sentinel rows back; got {summaries:?}"
         );
     }
 }
