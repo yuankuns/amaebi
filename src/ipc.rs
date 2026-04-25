@@ -27,11 +27,14 @@ pub struct TaskSpec {
     pub resume_pane: Option<String>,
     /// Resource specs to acquire before the pane starts running `claude`.
     ///
-    /// Each spec is either a resource name (looked up in
-    /// `~/.amaebi/resources.toml`) or `class:<name>` / `any:<name>` / a
-    /// bare class name when the entry matches a declared class with no
-    /// literal resource of that name.  Held for the supervision lifetime of
-    /// the pane and released when supervision exits.
+    /// Each spec is parsed by [`crate::resource_lease::ResourceRequest::parse`]:
+    /// the `class:<name>` or `any:<name>` prefix selects any idle resource of
+    /// that class; any other string is treated as a specific resource name
+    /// looked up in `~/.amaebi/resources.toml`.  Bare class names (without
+    /// the prefix) are always treated as Named and will error if no resource
+    /// by that literal name exists — the explicit prefix is required for
+    /// class-based selection.  Held for the supervision lifetime of the pane
+    /// and released when supervision exits.
     #[serde(default)]
     pub resources: Vec<String>,
     /// Seconds to wait for resources to free up before failing.  `None` or

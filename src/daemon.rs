@@ -1345,11 +1345,37 @@ async fn handle_claude_launch(
             };
             match resource_lease::acquire_all(&requests, holder, wait).await {
                 Ok(leases) => {
-                    let pool = tokio::task::spawn_blocking(resource_lease::load_pool)
-                        .await
-                        .ok()
-                        .and_then(|r| r.ok())
-                        .unwrap_or_default();
+                    // Reload the pool for env/prompt-hint rendering.  If the
+                    // TOML was edited into an invalid state between
+                    // acquisition and this call, fall back to an empty pool
+                    // — which means `render_env` / `render_prompt_hint`
+                    // return nothing for leases whose pool entries are
+                    // unrecoverable, logged inside `render_env`.  Logged
+                    // loudly here so an operator can correlate a pane
+                    // launching without expected env vars with a failed
+                    // pool reload, rather than wondering why the LLM was
+                    // never told about its resource.
+                    let pool = match tokio::task::spawn_blocking(resource_lease::load_pool).await {
+                        Ok(Ok(p)) => p,
+                        Ok(Err(e)) => {
+                            tracing::error!(
+                                pane_id = %pane_id,
+                                error = %e,
+                                "failed to reload ~/.amaebi/resources.toml after acquisition; \
+                                 env vars and prompt_hint will NOT be injected into this pane"
+                            );
+                            Vec::new()
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                pane_id = %pane_id,
+                                error = %e,
+                                "load_pool task panicked after acquisition; \
+                                 env vars and prompt_hint will NOT be injected into this pane"
+                            );
+                            Vec::new()
+                        }
+                    };
                     (leases, pool)
                 }
                 Err(e) => {

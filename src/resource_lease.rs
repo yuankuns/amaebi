@@ -293,7 +293,39 @@ fn read_state_unlocked() -> Result<ResourceState> {
     if contents.trim().is_empty() {
         return Ok(ResourceState::new());
     }
-    Ok(serde_json::from_str(&contents).unwrap_or_default())
+    match serde_json::from_str(&contents) {
+        Ok(state) => Ok(state),
+        Err(e) => {
+            // Corrupt state is dangerous for resource leases: treating it as
+            // empty would drop every Busy lease and allow the next acquirer
+            // to grab a resource another pane still holds in memory (double
+            // allocation of single-holder hardware).  Quarantine the file
+            // instead so the next write starts clean, and log loudly so
+            // operators see it in the daemon log.  Acquisitions continue
+            // against an empty state — correct when the corruption predates
+            // any in-flight leases, and the quarantined file preserves
+            // evidence for post-mortem review.
+            let quarantine = path.with_extension("json.corrupt");
+            match std::fs::rename(&path, &quarantine) {
+                Ok(()) => tracing::error!(
+                    state_file = %path.display(),
+                    quarantined = %quarantine.display(),
+                    error = %e,
+                    "resource-state.json is corrupt; quarantined and resetting to empty state. \
+                     Review the quarantined file and reconcile with `amaebi resource list` \
+                     to confirm no leases were lost."
+                ),
+                Err(rename_err) => tracing::error!(
+                    state_file = %path.display(),
+                    error = %e,
+                    rename_error = %rename_err,
+                    "resource-state.json is corrupt AND could not be quarantined; \
+                     continuing with empty in-memory state"
+                ),
+            }
+            Ok(ResourceState::new())
+        }
+    }
 }
 
 fn write_state_unlocked(state: &ResourceState) -> Result<()> {
@@ -561,15 +593,30 @@ pub async fn acquire_all(
                         )));
                     }
                     let remaining = d - now;
+                    // Poll tick bounds the wait even when no explicit release
+                    // happens — e.g. the holder crashed without running the
+                    // supervision-exit release path.  In that case the only
+                    // path back to Idle is `effective_status`'s TTL check,
+                    // which is observed only when `try_acquire_locked` runs.
+                    // Without this tick, such leases stay blocked until
+                    // `timeout` elapses even if TTL already expired minutes
+                    // into the wait.  5 s keeps CPU noise negligible while
+                    // cutting TTL-recovery latency from hours to seconds.
+                    let tick = remaining.min(std::time::Duration::from_secs(5));
                     tokio::select! {
                         _ = notified.as_mut() => {
                             // A lease was released somewhere — retry.
                             continue;
                         }
-                        _ = tokio::time::sleep(remaining) => {
-                            return Err(AcquireError::Unavailable(format!(
-                                "{which} (waited up to timeout)"
-                            )));
+                        _ = tokio::time::sleep(tick) => {
+                            if tokio::time::Instant::now() >= d {
+                                return Err(AcquireError::Unavailable(format!(
+                                    "{which} (waited up to timeout)"
+                                )));
+                            }
+                            // Tick fired short of the deadline — retry in case
+                            // a TTL expiry made a resource reclaimable.
+                            continue;
                         }
                     }
                 }
@@ -669,11 +716,31 @@ pub fn render_placeholders(template: &str, def: &ResourceDef) -> String {
     out
 }
 
+/// True iff `name` is a valid POSIX-style environment variable identifier
+/// (`[A-Za-z_][A-Za-z0-9_]*`).  Keys that don't match are rejected by
+/// [`render_env`] rather than injected into the shell command — injecting
+/// names containing spaces, `;`, `&`, or `$(...)` would let a malformed
+/// `resources.toml` entry break pane launch or, worse, run arbitrary shell
+/// code via the `export KEY=VALUE && ...` prefix the daemon builds.
+fn is_valid_env_key(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
 /// Render env-var assignments for a collection of leased resources.
 /// Returns `(KEY, VALUE)` pairs suitable for `KEY=VALUE` shell prefixes.
 /// Resources with no `env` map contribute nothing; variables missing from
 /// the pool (i.e. the lease references a resource removed after
-/// acquisition) are skipped with a warning.
+/// acquisition) are skipped with a warning.  Keys that aren't valid POSIX
+/// env-var identifiers are rejected with an error log and dropped — the
+/// rendered value is shell-interpolated by the daemon, so letting a bad
+/// key through would break pane launch or open an injection vector.
 pub fn render_env(leases: &[ResourceLease], pool: &[ResourceDef]) -> Vec<(String, String)> {
     let mut out = Vec::new();
     for lease in leases {
@@ -685,6 +752,15 @@ pub fn render_env(leases: &[ResourceLease], pool: &[ResourceDef]) -> Vec<(String
             continue;
         };
         for (k, v) in &def.env {
+            if !is_valid_env_key(k) {
+                tracing::error!(
+                    resource = %lease.name,
+                    key = %k,
+                    "invalid env var name in resources.toml (must match [A-Za-z_][A-Za-z0-9_]*); \
+                     skipping this entry to avoid breaking the pane launch command"
+                );
+                continue;
+            }
             out.push((k.clone(), render_placeholders(v, def)));
         }
     }
@@ -1058,6 +1134,31 @@ mod tests {
     }
 
     #[test]
+    fn render_env_rejects_invalid_env_keys() {
+        // Guards against a `resources.toml` entry that would break the
+        // pane launch command or inject shell code via the `export K=V &&`
+        // prefix (e.g. a key with `;` or spaces).  Invalid keys must be
+        // dropped rather than propagated.
+        let mut d = def("sim", "simulator");
+        d.env.insert("GOOD_NAME".into(), "ok".into());
+        d.env.insert("BAD NAME".into(), "nope".into());
+        d.env.insert("also;bad".into(), "nope".into());
+        d.env.insert("".into(), "nope".into());
+        d.env.insert("1STARTS_WITH_DIGIT".into(), "nope".into());
+        let lease = ResourceLease {
+            name: "sim".into(),
+            class: "simulator".into(),
+            status: ResourceStatus::Busy,
+            pane_id: Some("%3".into()),
+            task_id: None,
+            session_id: None,
+            heartbeat_at: 0,
+        };
+        let pairs = render_env(&[lease], &[d]);
+        assert_eq!(pairs, vec![("GOOD_NAME".to_string(), "ok".to_string())]);
+    }
+
+    #[test]
     fn render_env_produces_expanded_pairs() {
         let mut d = def("sim-9900", "simulator");
         d.metadata.insert("port".into(), "9900".into());
@@ -1275,6 +1376,96 @@ mod tests {
             state[&picked_name].effective_status(),
             ResourceStatus::Idle,
             "resource must be available for the next caller"
+        );
+    }
+
+    /// `Wait` must observe TTL-based recoveries even when no explicit
+    /// `release_all_for_pane` fires — regression for the "holder crashed
+    /// without releasing" case.  We seed an already-expired Busy lease
+    /// and kick off a waiter with a timeout longer than the poll tick;
+    /// without the periodic re-check the waiter would only notice at the
+    /// deadline.
+    #[tokio::test(flavor = "current_thread")]
+    async fn wait_observes_ttl_expiry_without_explicit_release() {
+        let _guard = crate::test_utils::with_temp_home();
+        seed_pool_file(&[def("sim-9900", "simulator")]).expect("seed");
+
+        // Seed an expired Busy lease directly so no one will ever release
+        // it explicitly — the only way the waiter can succeed is by
+        // observing that `effective_status` has downgraded it to Idle.
+        let lock = open_lock_file().expect("lock");
+        lock.lock_exclusive().expect("flock");
+        let mut state = read_state_unlocked().expect("read");
+        state.insert(
+            "sim-9900".into(),
+            ResourceLease {
+                name: "sim-9900".into(),
+                class: "simulator".into(),
+                status: ResourceStatus::Busy,
+                pane_id: Some("%ghost".into()),
+                task_id: Some("dead".into()),
+                session_id: Some("dead".into()),
+                heartbeat_at: now_secs().saturating_sub(LEASE_TTL_SECS + 1),
+            },
+        );
+        write_state_unlocked(&state).expect("write");
+        lock.unlock().expect("unlock");
+
+        // The waiter's timeout (30 s) is much longer than the poll tick
+        // (5 s), so if the tick works we succeed within a few seconds.
+        // Wrap in an outer watchdog so a broken tick doesn't hang CI.
+        // Keep `requests` in a let-binding so its lifetime covers the
+        // tokio::time::timeout await below.
+        let requests = vec![ResourceRequest::Named("sim-9900".into())];
+        let acquire_fut = acquire_all(
+            &requests,
+            holder("%new"),
+            WaitPolicy::Wait {
+                timeout: Duration::from_secs(30),
+            },
+        );
+        let leases = tokio::time::timeout(Duration::from_secs(10), acquire_fut)
+            .await
+            .expect("TTL tick must fire before outer watchdog")
+            .expect("acquire must reclaim expired lease");
+        assert_eq!(leases[0].pane_id.as_deref(), Some("%new"));
+    }
+
+    /// Corrupt `resource-state.json` must be quarantined (not silently
+    /// reset) so double-allocation cannot happen and operators retain
+    /// evidence for post-mortem.  Subsequent acquisitions continue against
+    /// a fresh empty state.
+    #[tokio::test(flavor = "current_thread")]
+    async fn corrupt_state_file_is_quarantined_not_silently_dropped() {
+        let _guard = crate::test_utils::with_temp_home();
+        seed_pool_file(&[def("sim-9900", "simulator")]).expect("seed pool");
+
+        // Write garbage to the state file where valid JSON is expected.
+        let state = state_path().expect("path");
+        std::fs::create_dir_all(state.parent().unwrap()).expect("dir");
+        std::fs::write(&state, b"{not json at all").expect("write garbage");
+
+        // Acquisition must succeed (reading corrupt state returns empty).
+        let leases = acquire_all(
+            &[ResourceRequest::Named("sim-9900".into())],
+            holder("%1"),
+            WaitPolicy::Nowait,
+        )
+        .await
+        .expect("acquire succeeds against reset state");
+        assert_eq!(leases[0].name, "sim-9900");
+
+        // The corrupt file must have been renamed to `.corrupt` — so an
+        // operator can inspect it — and the live state must be fresh JSON.
+        let quarantine = state.with_extension("json.corrupt");
+        assert!(
+            quarantine.exists(),
+            "corrupt file must be quarantined for post-mortem"
+        );
+        let live = std::fs::read_to_string(&state).expect("read live state");
+        assert!(
+            live.contains("sim-9900"),
+            "live state must be rewritten with the new lease, got: {live}"
         );
     }
 
