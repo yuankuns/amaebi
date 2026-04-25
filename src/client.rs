@@ -283,7 +283,8 @@ fn parse_claude(input: &str) -> Option<Result<Vec<ClaudeTask>, String>> {
     let rest = rest.trim_start();
     let usage = "usage: /claude [--worktree <path> | --resume-pane <pane_id>] \
                  [--cwd <path>] [--no-enter] [\"task description\" [\"task2\" ...]] \
-                 (task description optional with --resume-pane)";
+                 (--resume-pane supports at most one optional task description; \
+                 omitting the task description is only valid with --resume-pane)";
     if rest.is_empty() {
         return Some(Err(usage.to_string()));
     }

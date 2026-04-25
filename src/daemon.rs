@@ -1082,6 +1082,44 @@ async fn handle_claude_launch(
                             "pane {rp_owned} has no associated worktree; cannot resume"
                         )
                     })?;
+                    // The lease's `has_claude` flag is persisted state and can
+                    // go stale (e.g. user `Ctrl-C`'d claude without the daemon
+                    // noticing).  Cross-check at the tmux layer so we don't
+                    // inject `/compact` + a task prompt into a bare shell.
+                    let tmux_probe = std::process::Command::new("tmux")
+                        .args([
+                            "display-message",
+                            "-p",
+                            "-t",
+                            &rp_owned,
+                            "#{pane_current_command}",
+                        ])
+                        .output()
+                        .with_context(|| {
+                            format!(
+                                "failed to inspect tmux pane {rp_owned}; cannot verify that `claude` is running"
+                            )
+                        })?;
+                    if !tmux_probe.status.success() {
+                        let stderr =
+                            String::from_utf8_lossy(&tmux_probe.stderr).trim().to_string();
+                        if stderr.is_empty() {
+                            anyhow::bail!(
+                                "failed to inspect tmux pane {rp_owned}; cannot verify that `claude` is running"
+                            );
+                        } else {
+                            anyhow::bail!(
+                                "failed to inspect tmux pane {rp_owned}; cannot verify that `claude` is running: {stderr}"
+                            );
+                        }
+                    }
+                    let pane_current_command =
+                        String::from_utf8_lossy(&tmux_probe.stdout).trim().to_string();
+                    if pane_current_command != "claude" {
+                        anyhow::bail!(
+                            "pane {rp_owned} is not currently running `claude` (tmux reports `{pane_current_command}`); drop --resume-pane and let the scheduler pick or start a new pane"
+                        );
+                    }
                     pane_lease::acquire_lease(
                         &rp_owned,
                         &tid_for_lease,
