@@ -159,12 +159,16 @@ pub fn init_db(path: &Path) -> Result<Connection> {
     // table, so probe PRAGMA table_info and ALTER when missing.  Legacy rows
     // keep `dir = ''`, which never matches a non-empty dir filter in
     // `get_recent_summaries` — correctly isolated rather than cross-leaked.
-    let has_dir = conn
+    //
+    // Propagate row-decode errors so schema introspection surprises (e.g.
+    // unexpected PRAGMA shape) fail loudly instead of being silently
+    // treated as "column absent" and triggering a spurious ALTER.
+    let columns: Vec<String> = conn
         .prepare("PRAGMA table_info(session_summaries)")?
         .query_map([], |row| row.get::<_, String>(1))?
-        .filter_map(Result::ok)
-        .any(|col| col == "dir");
-    if !has_dir {
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .context("reading PRAGMA table_info(session_summaries)")?;
+    if !columns.iter().any(|col| col == "dir") {
         conn.execute(
             "ALTER TABLE session_summaries ADD COLUMN dir TEXT NOT NULL DEFAULT ''",
             [],
@@ -497,8 +501,14 @@ pub fn get_sessions_without_summary(
 /// Excludes the current session so the model does not see a stale summary of
 /// the conversation it is actively participating in.  Filtering by `dir`
 /// prevents cross-project context leakage when two `amaebi chat` sessions
-/// run concurrently in different directories.  An empty `dir` only matches
-/// legacy (pre-migration) rows with `dir = ''`.
+/// run concurrently in different directories.
+///
+/// Never pass `dir = ""` here in production code.  Empty-string matches
+/// every legacy pre-migration row *and* any row written when the dir
+/// lookup failed without a sentinel — exactly the cross-project leak this
+/// PR fixes.  Callers that cannot resolve a real canonical path should pass
+/// a sentinel value (see `UNKNOWN_DIR_SENTINEL` in `daemon.rs`) and
+/// additionally short-circuit the read so sentinel rows are never matched.
 pub fn get_recent_summaries(
     conn: &Connection,
     exclude_session: &str,

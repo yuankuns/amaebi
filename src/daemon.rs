@@ -529,10 +529,12 @@ where
 /// Summaries are scoped to the session's working directory: we look up the
 /// dir for `session_id` in `sessions.json` and pass it to
 /// `get_recent_summaries` so cross-project sessions cannot see each other's
-/// compacted context.  If the lookup fails we skip the summaries query
-/// entirely (returning an empty list) — this avoids reading back rows that
-/// were themselves written with the same sentinel after a previous failed
-/// resolution.
+/// compacted context.  When `resolve_session_dir` falls back to
+/// [`UNKNOWN_DIR_SENTINEL`] (unknown UUID, I/O error, lock failure, etc.)
+/// we short-circuit and return no summaries at all — this avoids reading
+/// back rows that were themselves written with the same sentinel after a
+/// previous failed resolution, and it never reads legacy `dir = ''` rows
+/// either.
 async fn load_session_state(
     state: &Arc<DaemonState>,
     session_id: &str,
@@ -562,38 +564,73 @@ async fn load_session_state(
 }
 
 /// Sentinel stored as `session_summaries.dir` when the real directory for
-/// a session cannot be recovered.  Canonical session directory keys are
-/// always absolute paths starting with `/` (see `session::canonical_key`),
-/// so this sentinel cannot collide with any legitimate key — a reader
-/// querying for `/some/proj` will never match these rows.
+/// a session cannot be recovered.
 ///
-/// `load_session_state` also explicitly short-circuits when the resolved
-/// dir equals this sentinel, so a row written after one failed resolve is
-/// not read back by the same session on a subsequent failed resolve.
-/// Sentinel rows are therefore quarantined on write AND ignored on read.
+/// Collision reasoning: `session::canonical_key` prefers the result of
+/// `std::fs::canonicalize`, which on Unix always produces an absolute path
+/// (`/…`).  It only falls back to the raw input path when `canonicalize`
+/// fails (dir deleted/inaccessible), so a relative path key is possible in
+/// degenerate cases.  The sentinel is therefore chosen to not match any
+/// typical path component: it starts with `<` and ends with `>`, a
+/// combination no sane working directory would produce, and it is compared
+/// as an exact whole string — not a prefix — so `/tmp/<unknown>/…` would
+/// not collide.  If a real dir ever did happen to equal the sentinel
+/// verbatim, the only consequence is that its sessions' summaries get
+/// lumped into the quarantine set, which is strictly safer than leaking
+/// across unrelated projects.
+///
+/// Defense-in-depth: `load_session_state` also explicitly short-circuits
+/// when the resolved dir equals this sentinel, so a row written after one
+/// failed resolve is not read back by the same session on a subsequent
+/// failed resolve.  Sentinel rows are therefore quarantined on write AND
+/// ignored on read.
 const UNKNOWN_DIR_SENTINEL: &str = "<unknown>";
 
 /// Resolve the working directory for `session_id` from `sessions.json`.
 ///
 /// Scans the full per-directory history so resumed sessions (UUIDs that
-/// have been rotated past) still resolve correctly.  On any failure the
-/// sentinel [`UNKNOWN_DIR_SENTINEL`] is returned, which matches no real
-/// directory and so quarantines the summary rather than leaking it into
-/// another project.
+/// have been rotated past) still resolve correctly.  On any failure —
+/// I/O error, parse error, lock acquisition failure, unknown UUID, or a
+/// panic in the spawned blocking thread — the sentinel
+/// [`UNKNOWN_DIR_SENTINEL`] is returned so the caller's summary gets
+/// quarantined instead of being written/read as an empty-dir row that
+/// could match legacy pre-migration entries.
 ///
-/// Note: the underlying `session::dir_for_uuid` takes a blocking shared
-/// flock, so under heavy contention this will block the `spawn_blocking`
-/// thread briefly before returning.
+/// Blocking behavior: the underlying `session::dir_for_uuid` takes a
+/// `lock_shared()` on the sessions lock file, which is a genuinely
+/// blocking call — under contention this waits rather than failing
+/// fast.  It runs on `spawn_blocking`, so the daemon's async runtime is
+/// not stalled; only the blocking pool thread is held.
+///
+/// Real I/O / lock failures are logged at debug level so silent masking
+/// of persistent problems can still be traced in logs.
 async fn resolve_session_dir(session_id: &str) -> String {
     let sid = session_id.to_owned();
-    tokio::task::spawn_blocking(move || {
-        session::dir_for_uuid(&sid)
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| UNKNOWN_DIR_SENTINEL.to_string())
+    tokio::task::spawn_blocking(move || match session::dir_for_uuid(&sid) {
+        Ok(Some(dir)) => dir,
+        Ok(None) => {
+            // Unknown UUID — expected for brand-new or purged sessions;
+            // quarantine silently without a log.
+            UNKNOWN_DIR_SENTINEL.to_string()
+        }
+        Err(e) => {
+            tracing::debug!(
+                session_id = %sid,
+                error = %e,
+                "resolve_session_dir: dir_for_uuid failed; falling back to sentinel"
+            );
+            UNKNOWN_DIR_SENTINEL.to_string()
+        }
     })
     .await
-    .unwrap_or_else(|_| UNKNOWN_DIR_SENTINEL.to_string())
+    .unwrap_or_else(|e| {
+        tracing::debug!(
+            session_id,
+            error = %e,
+            "resolve_session_dir: blocking task panicked; falling back to sentinel"
+        );
+        UNKNOWN_DIR_SENTINEL.to_string()
+    })
 }
 
 // ---------------------------------------------------------------------------
