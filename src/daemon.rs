@@ -6739,4 +6739,83 @@ mod tests {
             "expected missing-description error for %42, got {responses:?}"
         );
     }
+
+    /// When `--resume-pane` points at a lease that claims `has_claude=true`
+    /// but the target tmux pane does not actually exist (or isn't running
+    /// `claude`), the daemon must reject the request at the tmux probe step
+    /// rather than injecting `/compact` into whatever is there.  The task
+    /// description is non-empty here so the lease-description prefetch is
+    /// skipped and the probe runs.
+    #[tokio::test]
+    async fn resume_pane_tmux_probe_rejects_nonexistent_pane() {
+        let _guard = crate::test_utils::with_temp_home();
+        // Use a tmux pane id that does not exist in any tmux session.  The
+        // `tmux display-message -t %9999999` call will fail with a non-zero
+        // exit and an "unknown pane" / "can't find pane" stderr, which our
+        // probe surfaces as a tmux-inspection failure.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before UNIX epoch")
+            .as_secs();
+        let seed = pane_lease::PaneLease {
+            pane_id: "%9999999".to_string(),
+            window_id: "@1".to_string(),
+            status: pane_lease::PaneStatus::Idle,
+            task_id: None,
+            session_id: None,
+            worktree: Some("/tmp/fake-worktree/resume-probe".to_string()),
+            heartbeat_at: now,
+            has_claude: true,
+            task_description: Some("old task".to_string()),
+        };
+        pane_lease::seed_state_for_test(seed).expect("seed pane state");
+
+        let (client, server) = tokio::net::UnixStream::pair().expect("unix pair");
+        let (server_reader_unused, server_writer) = server.into_split();
+        let (client_reader, client_writer_unused) = client.into_split();
+        drop(server_reader_unused);
+        drop(client_writer_unused);
+        let writer = Arc::new(tokio::sync::Mutex::new(server_writer));
+
+        let task = crate::ipc::TaskSpec {
+            task_id: "task-probe".to_string(),
+            // Non-empty description: skips the lease-description prefetch
+            // early-return and forces execution into the tmux probe branch.
+            description: "run this task".to_string(),
+            worktree: None,
+            client_cwd: None,
+            auto_enter: true,
+            resume_pane: Some("%9999999".to_string()),
+        };
+        handle_claude_launch(&writer, vec![task])
+            .await
+            .expect("launch returns ok even on per-task error");
+        drop(writer);
+
+        let responses = collect_responses(client_reader).await;
+        let err_texts: Vec<&str> = responses
+            .iter()
+            .filter_map(|r| match r {
+                crate::ipc::Response::Error { message } => Some(message.as_str()),
+                _ => None,
+            })
+            .collect();
+        // When running under a live tmux server (CI and local dev both have
+        // one), `tmux display-message -t %9999999` exits 0 with empty stdout
+        // because tmux silently falls back to a nearby pane's formatting
+        // context — so our probe sees `pane_current_command == ""`, which
+        // trips the "not currently running `claude`" branch.  When there is
+        // no tmux at all, the probe fails on `.output()` and surfaces the
+        // "failed to inspect tmux pane" branch.  Either is acceptable; both
+        // are preferable to silently injecting `/compact` into the wrong
+        // thing.
+        assert!(
+            err_texts.iter().any(|m| {
+                m.contains("%9999999")
+                    && (m.contains("failed to inspect tmux pane")
+                        || m.contains("is not currently running `claude`"))
+            }),
+            "expected tmux-probe failure for %9999999, got errors: {err_texts:?}"
+        );
+    }
 }
