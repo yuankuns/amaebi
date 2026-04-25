@@ -551,10 +551,15 @@ pub async fn acquire_all(
         let notified = notifier.notified();
         tokio::pin!(notified);
 
-        let pool = load_pool().map_err(AcquireError::Io)?;
         let holder_clone = holder.clone();
         let canonical_clone = canonical.clone();
 
+        // All filesystem I/O + TOML parse + JSON parse + flock happens
+        // inside one spawn_blocking so the async executor thread never
+        // stalls on disk.  `load_pool` is called here (under the flock)
+        // so it also picks up TOML edits made between retries — matches
+        // the reconcile-on-every-attempt contract documented on
+        // `reconcile_pool_locked`.
         let attempt = tokio::task::spawn_blocking(
             move || -> std::result::Result<Vec<ResourceLease>, AcquireError> {
                 let lock = open_lock_file().map_err(AcquireError::Io)?;
@@ -563,6 +568,7 @@ pub async fn acquire_all(
                     .map_err(AcquireError::Io)?;
 
                 let result = (|| -> std::result::Result<Vec<ResourceLease>, AcquireError> {
+                    let pool = load_pool().map_err(AcquireError::Io)?;
                     let mut state = read_state_unlocked().map_err(AcquireError::Io)?;
                     let acquired_names =
                         try_acquire_locked(&pool, &canonical_clone, &holder_clone, &mut state)?;

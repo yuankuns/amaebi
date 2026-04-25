@@ -426,6 +426,23 @@ fn parse_claude(input: &str) -> Option<Result<Vec<ClaudeTask>, String>> {
             .to_string()));
     }
 
+    // --resume-pane and --resource are mutually exclusive: on the reuse
+    // path `claude` is already running in the pane and can no longer
+    // receive new env vars (every keystroke is intercepted by the Claude
+    // Code TUI as chat input), so `export SIM_PORT=...` cannot be applied.
+    // Rejecting at parse time gives a clear error instead of silently
+    // dropping env injection — the user's scripts would otherwise see
+    // `$SIM_PORT` unset and fail mysteriously.
+    if resume_pane.is_some() && !resources.is_empty() {
+        return Some(Err(
+            "--resume-pane and --resource are mutually exclusive: env var injection \
+             requires a fresh `claude` launch.  Either drop --resume-pane (the scheduler \
+             will start a new pane and apply env vars), or drop --resource (the reused \
+             pane will inherit whatever env was in effect at its original launch)."
+                .to_string(),
+        ));
+    }
+
     // Description is required in the normal path, but optional with
     // --resume-pane: if omitted, the daemon reuses the description
     // previously persisted on the pane's lease.
@@ -2518,6 +2535,22 @@ mod tests {
     fn parse_claude_resource_requires_value() {
         let result = parse_claude("/claude --resource");
         assert!(matches!(result, Some(Err(_))));
+    }
+
+    #[test]
+    fn parse_claude_resume_pane_and_resource_are_mutually_exclusive() {
+        // Regression: env-var injection requires a fresh claude launch, so
+        // combining --resume-pane (reuse path) with --resource is
+        // meaningless and must be rejected at parse time rather than
+        // silently dropping the env injection.
+        let err = match parse_claude("/claude --resume-pane %41 --resource sim-9900") {
+            Some(Err(msg)) => msg,
+            other => panic!("expected Err, got {other:?}"),
+        };
+        assert!(
+            err.contains("--resume-pane") && err.contains("--resource"),
+            "error must mention both flags, got: {err}"
+        );
     }
 
     #[test]

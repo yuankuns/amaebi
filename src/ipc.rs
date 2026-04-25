@@ -25,7 +25,7 @@ pub struct TaskSpec {
     /// `Some(resume_pane)` as authoritative and ignores any stray `worktree`.
     #[serde(default)]
     pub resume_pane: Option<String>,
-    /// Resource specs to acquire before the pane starts running `claude`.
+    /// Resource specs to acquire for this task.
     ///
     /// Each spec is parsed by [`crate::resource_lease::ResourceRequest::parse`]:
     /// the `class:<name>` or `any:<name>` prefix selects any idle resource of
@@ -35,6 +35,19 @@ pub struct TaskSpec {
     /// by that literal name exists — the explicit prefix is required for
     /// class-based selection.  Held for the supervision lifetime of the pane
     /// and released when supervision exits.
+    ///
+    /// # Sequencing and limitations
+    ///
+    /// Resources are acquired by the daemon **after** the pane lease but
+    /// **before** the task description is injected into the pane.  On the
+    /// fresh-pane path (no `--resume-pane`), `env` values render into an
+    /// `export KEY=VAL && ...` prefix on the `claude` launch command, so
+    /// shell scripts inside the pane inherit them.  On the `--resume-pane`
+    /// reuse path `claude` is already running and cannot receive new env
+    /// vars, so the daemon rejects `resources` combined with `--resume-pane`
+    /// outright rather than silently dropping the env injection.
+    /// `prompt_hint` is always prepended to the description regardless of
+    /// path.
     #[serde(default)]
     pub resources: Vec<String>,
     /// Seconds to wait for resources to free up before failing.  `None` or

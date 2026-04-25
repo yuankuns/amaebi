@@ -3001,3 +3001,68 @@ async fn claude_launch_legacy_payload_without_resources_still_dispatches() {
 
     let _ = child.kill().await;
 }
+
+/// Defense in depth for Copilot review (round 2, comment 8): a custom
+/// client that bypasses `parse_claude` by sending a `ClaudeLaunch` with
+/// both `resume_pane` and `resources` must still be rejected by the
+/// daemon with a clear error — the reuse path cannot apply env vars,
+/// and silently dropping them would mean scripts run in the pane
+/// without the hardware binding the caller thought they'd get.
+#[tokio::test]
+async fn claude_launch_resume_pane_with_resources_is_rejected_by_daemon() {
+    let server = MockLlmServer::start().await;
+    let home = setup_home().expect("setup_home");
+    // Pre-seed a plausible lease for the resume_pane target so the
+    // rejection comes from the resume+resource mutual-exclusion guard,
+    // not from a missing-lease error earlier in the pipeline.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    std::fs::write(
+        home.path().join(".amaebi/tmux-state.json"),
+        format!(
+            r#"{{"%41":{{"pane_id":"%41","window_id":"@0","status":"idle","task_id":null,"session_id":null,"worktree":"/tmp/fake","heartbeat_at":{now},"has_claude":true,"task_description":"old"}}}}"#
+        ),
+    )
+    .expect("seed tmux-state");
+
+    let (socket, mut child, _sd) = start_daemon_at_home_with_env(home.path(), &server.url(), &[])
+        .await
+        .expect("start_daemon_at_home_with_env");
+
+    let req = Request::ClaudeLaunch {
+        tasks: vec![ClaudeLaunchTaskSpec {
+            task_id: "bad-combo".to_string(),
+            description: "".to_string(),
+            auto_enter: true,
+            resume_pane: Some("%41".to_string()),
+            resources: vec!["sim-9900".to_string()],
+            ..Default::default()
+        }],
+    };
+    let json = serde_json::to_string(&req).expect("serialise");
+    let responses = send_claude_launch_raw(&socket, &json).await;
+
+    let saw_rejection = responses.iter().any(|r| {
+        matches!(
+            r,
+            Response::Error { message }
+                if message.contains("--resume-pane") && message.contains("--resource")
+        )
+    });
+    let saw_pane_assigned = responses
+        .iter()
+        .any(|r| matches!(r, Response::PaneAssigned { .. }));
+
+    assert!(
+        saw_rejection,
+        "daemon must reject resume_pane + resources combo; got {responses:?}"
+    );
+    assert!(
+        !saw_pane_assigned,
+        "no pane must be assigned when the daemon rejects the combo; got {responses:?}"
+    );
+
+    let _ = child.kill().await;
+}

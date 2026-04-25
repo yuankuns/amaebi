@@ -931,6 +931,26 @@ async fn handle_claude_launch(
         let task_id = task.task_id.clone();
         let auto_enter = task.auto_enter;
 
+        // Defense in depth against a stale / custom client that bypasses
+        // the CLI parser: the reuse path cannot apply env vars (claude is
+        // already intercepting keystrokes), so rejecting up front avoids
+        // silently dropping the env injection the caller asked for.
+        if task.resume_pane.is_some() && !task.resources.is_empty() {
+            let mut w = writer.lock().await;
+            write_frame(
+                &mut *w,
+                &Response::Error {
+                    message: format!(
+                        "[error] task {:?}: --resume-pane is incompatible with --resource; \
+                         env injection requires a fresh `claude` launch",
+                        task_id
+                    ),
+                },
+            )
+            .await?;
+            return Ok(());
+        }
+
         // Gather git context from the client's working directory: current
         // branch, remote URL, recent commits, and PR-specific information if
         // the task description mentions a PR number.  The context is prepended
@@ -1189,41 +1209,7 @@ async fn handle_claude_launch(
             match pane_result {
                 Ok((pid, hc)) => (pid, hc, wt_val),
                 Err(e) => {
-                    // If the worktree was auto-created, remove it and its
-                    // branch to avoid orphaned state after a capacity
-                    // error.  Skipped for --worktree (user-supplied) and
-                    // --resume-pane (pre-existing worktree on another
-                    // pane).
-                    if !was_explicit_worktree {
-                        if let Some(ref wt) = wt_val {
-                            let wt_path = wt.clone();
-                            let cleanup_cwd = task.client_cwd.clone();
-                            tokio::task::spawn_blocking(move || {
-                                let branch = std::path::Path::new(&wt_path)
-                                    .file_name()
-                                    .and_then(|n| n.to_str())
-                                    .map(str::to_string);
-                                let mut rm_cmd = std::process::Command::new("git");
-                                if let Some(ref cwd) = cleanup_cwd {
-                                    rm_cmd.args(["-C", cwd.as_str()]);
-                                }
-                                let removed = rm_cmd
-                                    .args(["worktree", "remove", "--force", &wt_path])
-                                    .output()
-                                    .map(|o| o.status.success())
-                                    .unwrap_or(false);
-                                if removed {
-                                    if let (Some(ref cwd), Some(ref br)) = (&cleanup_cwd, &branch) {
-                                        let _ = std::process::Command::new("git")
-                                            .args(["-C", cwd.as_str(), "branch", "-D", br.as_str()])
-                                            .output();
-                                    }
-                                }
-                            })
-                            .await
-                            .ok();
-                        }
-                    }
+                    cleanup_auto_worktree(was_explicit_worktree, &wt_val, &task.client_cwd).await;
                     let remaining = total_tasks - task_idx;
                     let mut w = writer.lock().await;
                     if let Some(cap) = e.downcast_ref::<pane_lease::CapacityError>() {
@@ -1385,6 +1371,11 @@ async fn handle_claude_launch(
                     })
                     .await
                     .ok();
+                    // Same cleanup as the pane-CapacityError path: if the
+                    // worktree was auto-created for this task, remove it
+                    // so a failed resource acquisition doesn't leak
+                    // branches and worktree dirs on disk.
+                    cleanup_auto_worktree(was_explicit_worktree, &worktree, &task.client_cwd).await;
                     let mut w = writer.lock().await;
                     write_frame(
                         &mut *w,
@@ -2375,6 +2366,56 @@ fn create_task_worktree(
 /// Escape a string for safe use as a single shell argument (single-quote wrapping).
 fn shell_escape(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Remove an auto-created git worktree and its branch on task-setup failure.
+///
+/// Centralises the rollback logic used by every error path that fires
+/// after `create_task_worktree` has succeeded but before the pane is
+/// actually populated — pane-acquisition failure, resource-acquisition
+/// failure, session-ID failure, etc.  Skipped when the worktree was
+/// user-supplied (`was_explicit_worktree = true`) so we never touch a
+/// worktree the caller owns.
+///
+/// Best-effort: git failures are swallowed; the caller has already
+/// surfaced the primary error and any leftover worktree can be removed
+/// manually with `git worktree remove --force`.
+async fn cleanup_auto_worktree(
+    was_explicit_worktree: bool,
+    worktree: &Option<String>,
+    client_cwd: &Option<String>,
+) {
+    if was_explicit_worktree {
+        return;
+    }
+    let Some(wt) = worktree.clone() else {
+        return;
+    };
+    let cleanup_cwd = client_cwd.clone();
+    tokio::task::spawn_blocking(move || {
+        let branch = std::path::Path::new(&wt)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(str::to_string);
+        let mut rm_cmd = std::process::Command::new("git");
+        if let Some(ref cwd) = cleanup_cwd {
+            rm_cmd.args(["-C", cwd.as_str()]);
+        }
+        let removed = rm_cmd
+            .args(["worktree", "remove", "--force", &wt])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if removed {
+            if let (Some(ref cwd), Some(ref br)) = (&cleanup_cwd, &branch) {
+                let _ = std::process::Command::new("git")
+                    .args(["-C", cwd.as_str(), "branch", "-D", br.as_str()])
+                    .output();
+            }
+        }
+    })
+    .await
+    .ok();
 }
 
 // ---------------------------------------------------------------------------
