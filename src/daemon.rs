@@ -7102,4 +7102,113 @@ mod tests {
             "expected tmux-probe failure for %9999999, got errors: {err_texts:?}"
         );
     }
+
+    // ------------------------------------------------------------------
+    // resolve_session_dir + load_session_state dir-scoping regression
+    //
+    // These guard the core behaviour of PR #121: summaries must be scoped
+    // by working directory, and the sentinel fallback must never read
+    // back rows tagged with it (otherwise cross-project leakage returns).
+    // ------------------------------------------------------------------
+
+    /// A resumable (rotated) session UUID must resolve back to its owning
+    /// directory, even after a newer UUID has been issued for the same dir.
+    /// This is the regression test for the `list_all()` → `dir_for_uuid`
+    /// switch (Copilot review comment on `resolve_session_dir`): `list_all()`
+    /// only returns the most-recent record per dir and would miss the old UUID.
+    #[tokio::test]
+    async fn resolve_session_dir_finds_rotated_uuid() {
+        let _guard = crate::test_utils::with_temp_home();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let old_uuid = crate::session::get_or_create(dir.path()).expect("create first");
+        let new_uuid = crate::session::create_fresh(dir.path()).expect("rotate");
+        assert_ne!(old_uuid, new_uuid);
+
+        let canonical = std::fs::canonicalize(dir.path())
+            .expect("canonicalize")
+            .to_string_lossy()
+            .into_owned();
+
+        assert_eq!(
+            resolve_session_dir(&new_uuid).await,
+            canonical,
+            "current UUID must resolve to its canonical directory"
+        );
+        assert_eq!(
+            resolve_session_dir(&old_uuid).await,
+            canonical,
+            "rotated/historical UUID must still resolve (list_all would miss this)"
+        );
+    }
+
+    /// An unknown UUID must fall back to the sentinel, not to `""`.  Falling
+    /// back to `""` would match legacy pre-migration rows (`dir = ''`) and
+    /// re-introduce the cross-project leak this PR fixes.
+    #[tokio::test]
+    async fn resolve_session_dir_unknown_uuid_returns_sentinel() {
+        let _guard = crate::test_utils::with_temp_home();
+        // No sessions.json entries at all.
+        assert_eq!(
+            resolve_session_dir("not-in-sessions").await,
+            UNKNOWN_DIR_SENTINEL,
+            "unknown UUID must quarantine via sentinel, not leak via empty-string"
+        );
+    }
+
+    /// `load_session_state` must short-circuit the summaries query when the
+    /// resolved dir is the sentinel, so rows previously written with the
+    /// sentinel (after a failed resolve) cannot be read back.  Exercises
+    /// the integration between `resolve_session_dir` (returns sentinel for
+    /// unknown UUID) and `load_session_state` (short-circuits on sentinel).
+    #[tokio::test]
+    async fn load_session_state_sentinel_skips_summaries_query() {
+        let _guard = crate::test_utils::with_temp_home();
+
+        // File-backed DB under the temp HOME so `init_db` runs the full
+        // schema + migration path exactly as the daemon would.
+        let db_dir = tempfile::tempdir().expect("tempdir for db");
+        let db_path = db_dir.path().join("memory.db");
+        let conn = memory_db::init_db(&db_path).expect("init memory db");
+
+        // Seed a summary row tagged with the sentinel — simulates what
+        // `compact_session` would have written for an unresolvable session.
+        memory_db::store_session_summary(
+            &conn,
+            "sid-quarantined",
+            "quarantined summary text",
+            "2026-01-01T00:00:00Z",
+            UNKNOWN_DIR_SENTINEL,
+        )
+        .expect("seed sentinel row");
+
+        // Sanity: the raw query at the DB layer CAN read the row back if
+        // asked directly with the sentinel — proves the short-circuit at
+        // the daemon layer is load-bearing, not a trivial no-op.
+        let raw = memory_db::get_recent_summaries(&conn, "other-sid", UNKNOWN_DIR_SENTINEL, 10)
+            .expect("raw summaries read");
+        assert_eq!(
+            raw,
+            vec!["quarantined summary text"],
+            "sentinel rows are reachable at the memory_db layer — daemon must short-circuit"
+        );
+
+        let state = Arc::new(DaemonState {
+            http: reqwest::Client::new(),
+            tokens: Arc::new(TokenCache::new()),
+            executor: Box::new(tools::LocalExecutor::new()),
+            db: Arc::new(Mutex::new(conn)),
+            compacting_sessions: Arc::new(Mutex::new(HashSet::new())),
+            active_sessions: Arc::new(Mutex::new(HashSet::new())),
+            user_aliases: Arc::new(std::collections::HashMap::new()),
+        });
+
+        // "sid-quarantined" has no entry in the empty sessions.json under
+        // the temp $HOME, so resolve_session_dir returns the sentinel and
+        // load_session_state MUST skip the query.
+        let (_hist, summaries, _own) = load_session_state(&state, "sid-quarantined").await;
+        assert!(
+            summaries.is_empty(),
+            "load_session_state must not read sentinel rows back; got {summaries:?}"
+        );
+    }
 }
