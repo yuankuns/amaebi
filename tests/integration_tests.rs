@@ -27,7 +27,7 @@ use support::{
     helpers::{
         collect_text, connect_client, seed_cron_job, send_message, send_message_with_session,
         send_resume, setup_home, start_daemon, start_daemon_at_home_with_env,
-        start_daemon_with_env, LongChatConnection, Request, Response,
+        start_daemon_with_env, ClaudeLaunchTaskSpec, LongChatConnection, Request, Response,
     },
     mock_llm::{MockLlmServer, ScriptedResponse},
 };
@@ -2784,4 +2784,220 @@ async fn switch_model_persists_to_next_turn() {
         "IPC turn 2 must use the switched model, got: {:?}",
         reqs[2].model()
     );
+}
+
+// ---------------------------------------------------------------------------
+// /claude resource-lease IPC (daemon-over-socket level)
+// ---------------------------------------------------------------------------
+//
+// These tests exercise the full request round-trip through the real daemon
+// binary over its Unix socket, not the in-process mocks that unit tests use.
+// The goal is to catch drift between the test mirror of `TaskSpec` and the
+// real `crate::ipc::TaskSpec`: field renames, serde-default regressions, or
+// an accidental rejection of payloads with / without the new `resources`
+// fields would fail here but not in any unit test.
+//
+// They deliberately force the daemon down the `CapacityError` branch by
+// pre-filling `tmux-state.json` with `MAX_PANES` (16) Busy entries.  That
+// path fails BEFORE any tmux interaction or resource acquisition — so the
+// tests run in non-tmux CI environments while still proving that:
+//   * the daemon accepts a ClaudeLaunch payload with/without `resources`
+//   * it dispatches through `handle_claude_launch`
+//   * the `CapacityError` response frame is emitted verbatim (new frame
+//     type mirror exercised)
+
+/// Seed `~/.amaebi/tmux-state.json` with N Busy panes so the next
+/// `ensure_and_acquire_idle` hits `CapacityError` without any tmux call.
+/// Returns the number of seeded panes.
+fn seed_full_pane_pool(home: &std::path::Path, count: usize) -> usize {
+    // Timestamp far enough in the future that the 24-hour TTL won't
+    // downgrade these to Idle during the test — expressed as "now" which
+    // is close enough for a test lasting < 10 s.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let mut map = serde_json::Map::new();
+    for i in 0..count {
+        let pid = format!("%{i}");
+        map.insert(
+            pid.clone(),
+            serde_json::json!({
+                "pane_id": pid,
+                "window_id": "@0",
+                "status": "busy",
+                "task_id": "prefill",
+                "session_id": "prefill",
+                "worktree": null,
+                "heartbeat_at": now,
+                "has_claude": false,
+                "task_description": null,
+            }),
+        );
+    }
+    let state = serde_json::Value::Object(map);
+    std::fs::write(
+        home.join(".amaebi/tmux-state.json"),
+        serde_json::to_string_pretty(&state).unwrap(),
+    )
+    .expect("write tmux-state.json");
+    count
+}
+
+/// Send a raw JSON line to the daemon and collect response frames until
+/// the daemon emits a terminal frame for a ClaudeLaunch.  Unlike
+/// `send_raw_request`, which expects `Done | Error` to close the turn,
+/// `handle_claude_launch` returns without a `Done` after `CapacityError`
+/// (the connection stays open for further requests) — so the test-side
+/// read loop has to recognise `CapacityError` as terminal itself.
+async fn send_claude_launch_raw(socket: &std::path::Path, req_json: &str) -> Vec<Response> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::UnixStream;
+
+    let stream = UnixStream::connect(socket)
+        .await
+        .expect("connect to daemon socket");
+    let (reader, mut writer) = tokio::io::split(stream);
+
+    let mut line = req_json.trim_end().to_string();
+    line.push('\n');
+    writer
+        .write_all(line.as_bytes())
+        .await
+        .expect("write request");
+
+    let mut responses: Vec<Response> = Vec::new();
+    let mut lines = BufReader::new(reader).lines();
+    let result = tokio::time::timeout(Duration::from_secs(15), async {
+        while let Some(l) = lines
+            .next_line()
+            .await
+            .expect("reading response line from daemon")
+        {
+            if l.is_empty() {
+                continue;
+            }
+            let frame: Response =
+                serde_json::from_str(&l).unwrap_or_else(|e| panic!("parsing response {l:?}: {e}"));
+            let terminal = matches!(
+                frame,
+                Response::Done | Response::Error { .. } | Response::CapacityError { .. }
+            );
+            responses.push(frame);
+            if terminal {
+                break;
+            }
+        }
+    })
+    .await;
+    assert!(
+        result.is_ok(),
+        "send_claude_launch_raw timed out without a terminal frame: got {responses:?}"
+    );
+    responses
+}
+
+/// Payloads carrying `resources: [...]` must round-trip through the real
+/// daemon without deserialization errors.  Forces the daemon into the
+/// pre-tmux `CapacityError` branch via a pre-seeded pane pool so this
+/// test can run anywhere (no tmux required), while still exercising the
+/// real IPC + daemon dispatch path end to end.
+#[tokio::test]
+async fn claude_launch_with_resources_dispatches_and_returns_capacity_error() {
+    let server = MockLlmServer::start().await;
+    let home = setup_home().expect("setup_home");
+    seed_full_pane_pool(home.path(), 16);
+
+    let (socket, mut child, _sd) = start_daemon_at_home_with_env(home.path(), &server.url(), &[])
+        .await
+        .expect("start_daemon_at_home_with_env");
+
+    // Build the payload via the mirror struct and serialise ourselves so
+    // the test actually exercises the wire-level `resources` field
+    // rather than a hypothetical-but-never-transmitted route.
+    let req = Request::ClaudeLaunch {
+        tasks: vec![ClaudeLaunchTaskSpec {
+            task_id: "ipc-res-1".to_string(),
+            description: "a task that would want resources".to_string(),
+            auto_enter: true,
+            resources: vec!["sim-9900".to_string(), "class:gpu".to_string()],
+            resource_timeout_secs: Some(5),
+            ..Default::default()
+        }],
+    };
+    let json = serde_json::to_string(&req).expect("serialise ClaudeLaunch");
+    // Sanity-check the wire-level shape before sending — guards the test
+    // itself from silently passing if `#[serde(skip_serializing_if)]` on
+    // the mirror ever drops the new fields.
+    assert!(
+        json.contains("\"resources\":[\"sim-9900\",\"class:gpu\"]"),
+        "resources field missing from wire payload: {json}"
+    );
+    assert!(
+        json.contains("\"resource_timeout_secs\":5"),
+        "resource_timeout_secs field missing from wire payload: {json}"
+    );
+
+    let responses = send_claude_launch_raw(&socket, &json).await;
+
+    let saw_capacity_error = responses.iter().any(|r| {
+        matches!(
+            r,
+            Response::CapacityError { max_panes, .. } if *max_panes == 16
+        )
+    });
+    let saw_pane_assigned = responses
+        .iter()
+        .any(|r| matches!(r, Response::PaneAssigned { .. }));
+
+    assert!(
+        saw_capacity_error,
+        "expected CapacityError (pool pre-filled to 16 Busy); got {responses:?}"
+    );
+    assert!(
+        !saw_pane_assigned,
+        "must NOT allocate a pane when the pool is full; got {responses:?}"
+    );
+
+    let _ = child.kill().await;
+}
+
+/// Payloads from a PR#124-era client that OMIT the `resources` and
+/// `resource_timeout_secs` fields must still deserialize against the new
+/// daemon (mixed-version deployment safety).  Without `#[serde(default)]`
+/// on the new fields the daemon would reject the payload with a JSON
+/// parse error at the IPC layer, silently breaking every pre-existing
+/// `/claude` client.
+#[tokio::test]
+async fn claude_launch_legacy_payload_without_resources_still_dispatches() {
+    let server = MockLlmServer::start().await;
+    let home = setup_home().expect("setup_home");
+    seed_full_pane_pool(home.path(), 16);
+
+    let (socket, mut child, _sd) = start_daemon_at_home_with_env(home.path(), &server.url(), &[])
+        .await
+        .expect("start_daemon_at_home_with_env");
+
+    // Raw JSON mirrors exactly what a PR#124 client would emit: no
+    // `resources` or `resource_timeout_secs` fields at all.
+    let legacy_payload = r#"{"type":"claude_launch","tasks":[{"task_id":"ipc-legacy","description":"legacy client task","worktree":null,"client_cwd":null,"auto_enter":true}]}"#;
+    let responses = send_claude_launch_raw(&socket, legacy_payload).await;
+
+    let saw_capacity_error = responses
+        .iter()
+        .any(|r| matches!(r, Response::CapacityError { .. }));
+    let saw_hard_error = responses
+        .iter()
+        .any(|r| matches!(r, Response::Error { message } if message.contains("missing field")));
+
+    assert!(
+        saw_capacity_error,
+        "legacy payload must reach handle_claude_launch and hit CapacityError; got {responses:?}"
+    );
+    assert!(
+        !saw_hard_error,
+        "legacy payload must NOT trigger a serde missing-field error; got {responses:?}"
+    );
+
+    let _ = child.kill().await;
 }

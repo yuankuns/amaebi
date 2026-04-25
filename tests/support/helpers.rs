@@ -33,22 +33,76 @@ pub enum Request {
         session_id: String,
         model: String,
     },
+    /// Mirror of `crate::ipc::Request::ClaudeLaunch` so integration tests can
+    /// send `/claude` dispatch frames and observe how the real daemon
+    /// deserialises them.  The inner `TaskSpec` intentionally matches the
+    /// wire shape of the production struct — keep in sync if fields change.
+    ClaudeLaunch {
+        tasks: Vec<ClaudeLaunchTaskSpec>,
+    },
+}
+
+/// Mirror of `crate::ipc::TaskSpec` for integration tests.  Optional fields
+/// are `Option`/`Vec` so a test can omit them to simulate a legacy client.
+#[derive(Serialize, Deserialize, Debug, Default)]
+pub struct ClaudeLaunchTaskSpec {
+    pub task_id: String,
+    pub description: String,
+    pub worktree: Option<String>,
+    pub client_cwd: Option<String>,
+    pub auto_enter: bool,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub resume_pane: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub resources: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub resource_timeout_secs: Option<u64>,
 }
 
 /// A single frame streamed from the daemon back to the client.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Response {
-    Text { chunk: String },
+    Text {
+        chunk: String,
+    },
     Done,
-    Error { message: String },
-    ToolUse { name: String, detail: String },
+    Error {
+        message: String,
+    },
+    ToolUse {
+        name: String,
+        detail: String,
+    },
     SteerAck,
-    DetachAccepted { session_id: String },
-    MemoryEntry { role: String, content: String },
+    DetachAccepted {
+        session_id: String,
+    },
+    MemoryEntry {
+        role: String,
+        content: String,
+    },
     Compacting,
-    WaitingForInput { prompt: String },
-    ModelSwitched { model: String },
+    WaitingForInput {
+        prompt: String,
+    },
+    ModelSwitched {
+        model: String,
+    },
+    /// Success frame for a single `/claude` task launched via ClaudeLaunch.
+    PaneAssigned {
+        task_id: String,
+        pane_id: String,
+        session_id: String,
+    },
+    /// Failure frame when the pane pool is full and the daemon cannot
+    /// allocate more.  Surfaces BEFORE any tmux interaction so this path
+    /// is observable in a non-tmux CI environment.
+    CapacityError {
+        requested: usize,
+        max_panes: usize,
+        current_busy: usize,
+    },
 }
 
 // ---------------------------------------------------------------------------
