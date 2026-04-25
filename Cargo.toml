@@ -30,6 +30,7 @@ termimad = "0.34"
 ratatui = "0.30"
 crossterm = "0.29"
 rustyline = "14"
+toml = "0.8"
 
 [dev-dependencies]
 tempfile = "3"

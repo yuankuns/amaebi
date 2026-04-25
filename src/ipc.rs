@@ -25,6 +25,35 @@ pub struct TaskSpec {
     /// `Some(resume_pane)` as authoritative and ignores any stray `worktree`.
     #[serde(default)]
     pub resume_pane: Option<String>,
+    /// Resource specs to acquire for this task.
+    ///
+    /// Each spec is parsed by [`crate::resource_lease::ResourceRequest::parse`]:
+    /// the `class:<name>` or `any:<name>` prefix selects any idle resource of
+    /// that class; any other string is treated as a specific resource name
+    /// looked up in `~/.amaebi/resources.toml`.  Bare class names (without
+    /// the prefix) are always treated as Named and will error if no resource
+    /// by that literal name exists — the explicit prefix is required for
+    /// class-based selection.  Held for the supervision lifetime of the pane
+    /// and released when supervision exits.
+    ///
+    /// # Sequencing and limitations
+    ///
+    /// Resources are acquired by the daemon **after** the pane lease but
+    /// **before** the task description is injected into the pane.  On the
+    /// fresh-pane path (no `--resume-pane`), `env` values render into an
+    /// `export KEY=VAL && ...` prefix on the `claude` launch command, so
+    /// shell scripts inside the pane inherit them.  On the `--resume-pane`
+    /// reuse path `claude` is already running and cannot receive new env
+    /// vars, so the daemon rejects `resources` combined with `--resume-pane`
+    /// outright rather than silently dropping the env injection.
+    /// `prompt_hint` is always prepended to the description regardless of
+    /// path.
+    #[serde(default)]
+    pub resources: Vec<String>,
+    /// Seconds to wait for resources to free up before failing.  `None` or
+    /// `0` means don't wait (fail immediately if any resource is busy).
+    #[serde(default)]
+    pub resource_timeout_secs: Option<u64>,
 }
 
 /// A single pane+task pair for supervision.
@@ -567,6 +596,8 @@ mod tests {
             client_cwd: Some("/home/user/repo".into()),
             auto_enter: true,
             resume_pane: None,
+            resources: Vec::new(),
+            resource_timeout_secs: None,
         };
         let json = serde_json::to_string(&spec).unwrap();
         let back: TaskSpec = serde_json::from_str(&json).unwrap();
@@ -587,6 +618,8 @@ mod tests {
             client_cwd: None,
             auto_enter: true,
             resume_pane: Some("%41".into()),
+            resources: Vec::new(),
+            resource_timeout_secs: None,
         };
         let json = serde_json::to_string(&spec).unwrap();
         let back: TaskSpec = serde_json::from_str(&json).unwrap();
@@ -603,6 +636,50 @@ mod tests {
     }
 
     #[test]
+    fn task_spec_resources_absent_fields_deserialize_as_defaults() {
+        // Regression for mixed-version deployments: a client built at
+        // PR #124 (with `resume_pane` but no `resources` / `resource_timeout_secs`)
+        // must still deserialize against the new daemon.  Without
+        // `#[serde(default)]` on the new fields this would fail and break
+        // every existing `/claude` call after the daemon upgrade.
+        let pr124_payload = r#"{"task_id":"x","description":"d","worktree":null,"client_cwd":null,"auto_enter":true,"resume_pane":"%41"}"#;
+        let back: TaskSpec = serde_json::from_str(pr124_payload).expect("legacy must parse");
+        assert_eq!(back.resume_pane.as_deref(), Some("%41"));
+        assert!(back.resources.is_empty(), "resources must default to empty");
+        assert!(
+            back.resource_timeout_secs.is_none(),
+            "timeout must default to None"
+        );
+    }
+
+    #[test]
+    fn task_spec_resources_round_trip_with_values() {
+        // Opposite direction: a task built with resources and timeout must
+        // survive a JSON round-trip preserving spec order and the numeric
+        // timeout.  Protects the wire-format from accidental renames.
+        let spec = TaskSpec {
+            task_id: "kernel-debug".into(),
+            description: "run this kernel".into(),
+            worktree: None,
+            client_cwd: None,
+            auto_enter: true,
+            resume_pane: None,
+            resources: vec!["sim-9900".into(), "class:gpu".into()],
+            resource_timeout_secs: Some(300),
+        };
+        let json = serde_json::to_string(&spec).unwrap();
+        // Assert the wire field names so a silent serde rename is caught here,
+        // not by a runtime "unknown field" error in the daemon.
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["resources"], serde_json::json!(["sim-9900", "class:gpu"]));
+        assert_eq!(v["resource_timeout_secs"], serde_json::json!(300));
+
+        let back: TaskSpec = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.resources, vec!["sim-9900", "class:gpu"]);
+        assert_eq!(back.resource_timeout_secs, Some(300));
+    }
+
+    #[test]
     fn request_claude_launch_round_trip() {
         let req = Request::ClaudeLaunch {
             tasks: vec![
@@ -613,6 +690,8 @@ mod tests {
                     client_cwd: Some("/home/user/repo".into()),
                     auto_enter: true,
                     resume_pane: None,
+                    resources: Vec::new(),
+                    resource_timeout_secs: None,
                 },
                 TaskSpec {
                     task_id: "t2".into(),
@@ -621,6 +700,8 @@ mod tests {
                     client_cwd: None,
                     auto_enter: false,
                     resume_pane: None,
+                    resources: Vec::new(),
+                    resource_timeout_secs: None,
                 },
             ],
         };

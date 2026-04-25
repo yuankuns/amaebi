@@ -19,6 +19,7 @@ mod memory_db;
 mod models;
 mod pane_lease;
 mod provider;
+mod resource_lease;
 mod responses;
 mod retry;
 mod sandbox;
@@ -123,6 +124,7 @@ async fn main() -> Result<()> {
         cli::Command::Cache { action } => run_cache(action),
         cli::Command::Inbox { action } => run_inbox(action),
         cli::Command::Cron { action } => run_cron(action),
+        cli::Command::Resource { action } => run_resource(action),
         cli::Command::Dashboard => dashboard::run().await,
     }
 }
@@ -507,6 +509,82 @@ fn format_bytes(bytes: u64) -> String {
         format!("{:.1} KB", bytes as f64 / 1024.0)
     } else {
         format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    }
+}
+
+fn run_resource(action: cli::ResourceAction) -> Result<()> {
+    match action {
+        cli::ResourceAction::List => {
+            let pool = resource_lease::load_pool().context("loading resource pool")?;
+            let state = resource_lease::read_state().context("reading resource state")?;
+
+            if pool.is_empty() && state.is_empty() {
+                println!(
+                    "No resources defined.  Create ~/.amaebi/resources.toml \
+                     with one or more [[resource]] entries."
+                );
+                return Ok(());
+            }
+
+            for def in &pool {
+                let lease = state.get(&def.name);
+                let (status, holder) = match lease {
+                    Some(l) if l.effective_status() == resource_lease::ResourceStatus::Busy => (
+                        "BUSY",
+                        format!(
+                            "pane={} task={} session={}",
+                            l.pane_id.as_deref().unwrap_or("?"),
+                            l.task_id.as_deref().unwrap_or("?"),
+                            l.session_id.as_deref().unwrap_or("?"),
+                        ),
+                    ),
+                    _ => ("idle", String::from("-")),
+                };
+                println!(
+                    "{name:<20} class={class:<15} {status}  {holder}",
+                    name = def.name,
+                    class = def.class,
+                );
+            }
+
+            // Surface leases whose resource entry is no longer in the pool
+            // (resources.toml was edited to remove/rename them).  Without
+            // this, a BUSY lease could be invisibly pinning hardware until
+            // TTL expiry — debugging "resource X is stuck" means nothing
+            // if X isn't even shown.  Operators can reconcile by either
+            // restoring the TOML entry or waiting for TTL / calling
+            // release from the holder pane.
+            let pool_names: std::collections::HashSet<&str> =
+                pool.iter().map(|d| d.name.as_str()).collect();
+            let mut orphans: Vec<&resource_lease::ResourceLease> = state
+                .values()
+                .filter(|l| !pool_names.contains(l.name.as_str()))
+                .collect();
+            orphans.sort_by(|a, b| a.name.cmp(&b.name));
+            for l in orphans {
+                let status = if l.effective_status() == resource_lease::ResourceStatus::Busy {
+                    "BUSY"
+                } else {
+                    "idle"
+                };
+                let holder = if l.effective_status() == resource_lease::ResourceStatus::Busy {
+                    format!(
+                        "pane={} task={} session={}",
+                        l.pane_id.as_deref().unwrap_or("?"),
+                        l.task_id.as_deref().unwrap_or("?"),
+                        l.session_id.as_deref().unwrap_or("?"),
+                    )
+                } else {
+                    String::from("-")
+                };
+                println!(
+                    "{name:<20} class={class:<15} {status}  {holder}  (orphaned: not in resources.toml)",
+                    name = l.name,
+                    class = l.class,
+                );
+            }
+            Ok(())
+        }
     }
 }
 

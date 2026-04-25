@@ -159,6 +159,18 @@ pub enum Command {
         #[command(subcommand)]
         action: InboxAction,
     },
+    /// Inspect the resource pool and current lease state.
+    ///
+    /// Reads `~/.amaebi/resources.toml` (the pool definition) and
+    /// `~/.amaebi/resource-state.json` (the runtime lease table) and prints
+    /// one line per resource showing its class, status, and current holder.
+    ///
+    /// Only `list` is available for now; `register` / `unregister` will be
+    /// added when dynamic registration is needed.
+    Resource {
+        #[command(subcommand)]
+        action: ResourceAction,
+    },
     /// Live TUI dashboard aggregating session, pane, inbox, and cron state.
     ///
     /// Full-screen view that auto-refreshes every 2 s.  Shows environment
@@ -168,6 +180,12 @@ pub enum Command {
     ///
     /// Keys: `q` / Esc / Ctrl-C exits; `r` forces a re-read.
     Dashboard,
+}
+
+#[derive(clap::Subcommand, Debug)]
+pub enum ResourceAction {
+    /// List all resources in the pool with their status and current holder.
+    List,
 }
 
 #[derive(clap::Subcommand, Debug)]

@@ -12,6 +12,7 @@ use crate::inbox::InboxStore;
 use crate::ipc::{write_frame, Request, Response};
 use crate::memory_db;
 use crate::pane_lease;
+use crate::resource_lease;
 use crate::session;
 use crate::tools::{self, ToolExecutor};
 
@@ -930,6 +931,26 @@ async fn handle_claude_launch(
         let task_id = task.task_id.clone();
         let auto_enter = task.auto_enter;
 
+        // Defense in depth against a stale / custom client that bypasses
+        // the CLI parser: the reuse path cannot apply env vars (claude is
+        // already intercepting keystrokes), so rejecting up front avoids
+        // silently dropping the env injection the caller asked for.
+        if task.resume_pane.is_some() && !task.resources.is_empty() {
+            let mut w = writer.lock().await;
+            write_frame(
+                &mut *w,
+                &Response::Error {
+                    message: format!(
+                        "[error] task {:?}: --resume-pane is incompatible with --resource; \
+                         env injection requires a fresh `claude` launch",
+                        task_id
+                    ),
+                },
+            )
+            .await?;
+            return Ok(());
+        }
+
         // Gather git context from the client's working directory: current
         // branch, remote URL, recent commits, and PR-specific information if
         // the task description mentions a PR number.  The context is prepended
@@ -1188,41 +1209,7 @@ async fn handle_claude_launch(
             match pane_result {
                 Ok((pid, hc)) => (pid, hc, wt_val),
                 Err(e) => {
-                    // If the worktree was auto-created, remove it and its
-                    // branch to avoid orphaned state after a capacity
-                    // error.  Skipped for --worktree (user-supplied) and
-                    // --resume-pane (pre-existing worktree on another
-                    // pane).
-                    if !was_explicit_worktree {
-                        if let Some(ref wt) = wt_val {
-                            let wt_path = wt.clone();
-                            let cleanup_cwd = task.client_cwd.clone();
-                            tokio::task::spawn_blocking(move || {
-                                let branch = std::path::Path::new(&wt_path)
-                                    .file_name()
-                                    .and_then(|n| n.to_str())
-                                    .map(str::to_string);
-                                let mut rm_cmd = std::process::Command::new("git");
-                                if let Some(ref cwd) = cleanup_cwd {
-                                    rm_cmd.args(["-C", cwd.as_str()]);
-                                }
-                                let removed = rm_cmd
-                                    .args(["worktree", "remove", "--force", &wt_path])
-                                    .output()
-                                    .map(|o| o.status.success())
-                                    .unwrap_or(false);
-                                if removed {
-                                    if let (Some(ref cwd), Some(ref br)) = (&cleanup_cwd, &branch) {
-                                        let _ = std::process::Command::new("git")
-                                            .args(["-C", cwd.as_str(), "branch", "-D", br.as_str()])
-                                            .output();
-                                    }
-                                }
-                            })
-                            .await
-                            .ok();
-                        }
-                    }
+                    cleanup_auto_worktree(was_explicit_worktree, &wt_val, &task.client_cwd).await;
                     let remaining = total_tasks - task_idx;
                     let mut w = writer.lock().await;
                     if let Some(cap) = e.downcast_ref::<pane_lease::CapacityError>() {
@@ -1271,11 +1258,16 @@ async fn handle_claude_launch(
             Ok(id) => id,
             Err(e) => {
                 let failed_pane = pane_id.clone();
+                let resource_pane = failed_pane.clone();
                 tokio::task::spawn_blocking(move || {
                     let _ = pane_lease::release_lease(&failed_pane);
                 })
                 .await
                 .ok();
+                // No resources have been acquired yet at this point (session
+                // resolution runs before resource acquisition), but release
+                // defensively so a future reordering can't strand resources.
+                let _ = resource_lease::release_all_for_pane(&resource_pane).await;
                 let mut w = writer.lock().await;
                 write_frame(
                     &mut *w,
@@ -1311,6 +1303,114 @@ async fn handle_claude_launch(
         .await
         .ok();
 
+        // Resource acquisition.  Held for the pane's supervision lifetime and
+        // released from `release_supervised_panes`.  Failures here roll back
+        // the pane lease so it doesn't stay Busy until TTL: a task that can't
+        // get its hardware should free the pane for someone else.
+        let (resource_leases, resource_pool): (
+            Vec<resource_lease::ResourceLease>,
+            Vec<resource_lease::ResourceDef>,
+        ) = if task.resources.is_empty() {
+            (Vec::new(), Vec::new())
+        } else {
+            let requests: Vec<resource_lease::ResourceRequest> = task
+                .resources
+                .iter()
+                .map(|s| resource_lease::ResourceRequest::parse(s))
+                .collect();
+            let holder = resource_lease::Holder {
+                pane_id: pane_id.clone(),
+                task_id: task_id.clone(),
+                session_id: session_id.clone(),
+            };
+            let wait = match task.resource_timeout_secs {
+                Some(secs) if secs > 0 => resource_lease::WaitPolicy::Wait {
+                    timeout: std::time::Duration::from_secs(secs),
+                },
+                _ => resource_lease::WaitPolicy::Nowait,
+            };
+            match resource_lease::acquire_all(&requests, holder, wait).await {
+                Ok(leases) => {
+                    // Reload the pool for env/prompt-hint rendering.  If the
+                    // TOML was edited into an invalid state between
+                    // acquisition and this call, fall back to an empty pool
+                    // — which means `render_env` / `render_prompt_hint`
+                    // return nothing for leases whose pool entries are
+                    // unrecoverable, logged inside `render_env`.  Logged
+                    // loudly here so an operator can correlate a pane
+                    // launching without expected env vars with a failed
+                    // pool reload, rather than wondering why the LLM was
+                    // never told about its resource.
+                    let pool = match tokio::task::spawn_blocking(resource_lease::load_pool).await {
+                        Ok(Ok(p)) => p,
+                        Ok(Err(e)) => {
+                            tracing::error!(
+                                pane_id = %pane_id,
+                                error = %e,
+                                "failed to reload ~/.amaebi/resources.toml after acquisition; \
+                                 env vars and prompt_hint will NOT be injected into this pane"
+                            );
+                            Vec::new()
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                pane_id = %pane_id,
+                                error = %e,
+                                "load_pool task panicked after acquisition; \
+                                 env vars and prompt_hint will NOT be injected into this pane"
+                            );
+                            Vec::new()
+                        }
+                    };
+                    (leases, pool)
+                }
+                Err(e) => {
+                    let failed_pane = pane_id.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let _ = pane_lease::release_lease(&failed_pane);
+                    })
+                    .await
+                    .ok();
+                    // Same cleanup as the pane-CapacityError path: if the
+                    // worktree was auto-created for this task, remove it
+                    // so a failed resource acquisition doesn't leak
+                    // branches and worktree dirs on disk.
+                    cleanup_auto_worktree(was_explicit_worktree, &worktree, &task.client_cwd).await;
+                    let mut w = writer.lock().await;
+                    write_frame(
+                        &mut *w,
+                        &Response::Error {
+                            message: format!(
+                                "[error] resource acquisition failed: {e}; \
+                                 check `amaebi resource list` and \
+                                 ~/.amaebi/resources.toml"
+                            ),
+                        },
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            }
+        };
+
+        // Render resource env/prompt-hint for injection.  Both are empty
+        // vectors/strings when no resources were requested — the normal
+        // launch path is unchanged for callers that don't use /resource.
+        let resource_env: Vec<(String, String)> =
+            resource_lease::render_env(&resource_leases, &resource_pool);
+        let resource_prompt_hint: String =
+            resource_lease::render_prompt_hint(&resource_leases, &resource_pool);
+
+        // Prepend the resource prompt hint to the LLM-facing description so
+        // the first turn knows what hardware it has and how to use it.
+        // Kept separate from the git preamble (added earlier) so an operator
+        // reading the pane output can tell the two apart.
+        let description = if resource_prompt_hint.is_empty() {
+            description
+        } else {
+            format!("{resource_prompt_hint}\n\n{description}")
+        };
+
         // Build the key sequences to inject into the pane.
         //
         // Priority:
@@ -1333,13 +1433,27 @@ async fn handle_claude_launch(
             // Fresh pane: launch claude with --dangerously-skip-permissions so
             // the autonomous session never blocks on an interactive approval
             // prompt, then inject the description as the opening message.
+            // Resource env vars go on an `export` line ahead of the cd/claude
+            // command — keeping them shell-level so both any `cd` into the
+            // worktree and Claude itself inherit them.  (Injecting them after
+            // claude starts is impossible: claude intercepts all keystrokes
+            // and would treat `export FOO=bar` as a chat message.)
+            let env_prefix = if resource_env.is_empty() {
+                String::new()
+            } else {
+                let exports: Vec<String> = resource_env
+                    .iter()
+                    .map(|(k, v)| format!("export {}={}", k, shell_escape(v)))
+                    .collect();
+                format!("{} && ", exports.join(" && "))
+            };
             let launch_cmd = if let Some(ref wt) = worktree {
                 format!(
-                    "cd {} && claude --dangerously-skip-permissions",
+                    "{env_prefix}cd {} && claude --dangerously-skip-permissions",
                     shell_escape(wt)
                 )
             } else {
-                "claude --dangerously-skip-permissions".to_string()
+                format!("{env_prefix}claude --dangerously-skip-permissions")
             };
             vec![(launch_cmd, true), (description.clone(), auto_enter)]
         };
@@ -1414,6 +1528,7 @@ async fn handle_claude_launch(
             let is_stale = err_msg.contains("unknown pane")
                 || err_msg.contains("can't find pane")
                 || err_msg.contains("no server running");
+            let pane_for_resources = failed_pane.clone();
             tokio::task::spawn_blocking(move || {
                 if is_stale {
                     let _ = pane_lease::remove_pane(&failed_pane);
@@ -1423,6 +1538,9 @@ async fn handle_claude_launch(
             })
             .await
             .ok();
+            // Always release resources, regardless of whether the pane was
+            // removed or just freed — the holder pane is gone either way.
+            let _ = resource_lease::release_all_for_pane(&pane_for_resources).await;
             let mut w = writer.lock().await;
             write_frame(
                 &mut *w,
@@ -1649,6 +1767,27 @@ async fn release_supervised_panes(panes: &[crate::ipc::SupervisionTarget]) {
                 error = %e,
                 "failed to release supervision pane lease"
             );
+        }
+        // Release any external resources (GPUs, simulators) that were
+        // acquired alongside this pane.  Matched by pane_id on the resource
+        // lease, so this is safe whether or not the caller actually
+        // requested resources.
+        match resource_lease::release_all_for_pane(&target.pane_id).await {
+            Ok(names) if !names.is_empty() => {
+                tracing::debug!(
+                    pane_id = %target.pane_id,
+                    released = ?names,
+                    "released resource leases on supervision exit"
+                );
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(
+                    pane_id = %target.pane_id,
+                    error = %e,
+                    "failed to release resource leases on supervision exit"
+                );
+            }
         }
     }
 }
@@ -2227,6 +2366,56 @@ fn create_task_worktree(
 /// Escape a string for safe use as a single shell argument (single-quote wrapping).
 fn shell_escape(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Remove an auto-created git worktree and its branch on task-setup failure.
+///
+/// Centralises the rollback logic used by every error path that fires
+/// after `create_task_worktree` has succeeded but before the pane is
+/// actually populated — pane-acquisition failure, resource-acquisition
+/// failure, session-ID failure, etc.  Skipped when the worktree was
+/// user-supplied (`was_explicit_worktree = true`) so we never touch a
+/// worktree the caller owns.
+///
+/// Best-effort: git failures are swallowed; the caller has already
+/// surfaced the primary error and any leftover worktree can be removed
+/// manually with `git worktree remove --force`.
+async fn cleanup_auto_worktree(
+    was_explicit_worktree: bool,
+    worktree: &Option<String>,
+    client_cwd: &Option<String>,
+) {
+    if was_explicit_worktree {
+        return;
+    }
+    let Some(wt) = worktree.clone() else {
+        return;
+    };
+    let cleanup_cwd = client_cwd.clone();
+    tokio::task::spawn_blocking(move || {
+        let branch = std::path::Path::new(&wt)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(str::to_string);
+        let mut rm_cmd = std::process::Command::new("git");
+        if let Some(ref cwd) = cleanup_cwd {
+            rm_cmd.args(["-C", cwd.as_str()]);
+        }
+        let removed = rm_cmd
+            .args(["worktree", "remove", "--force", &wt])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if removed {
+            if let (Some(ref cwd), Some(ref br)) = (&cleanup_cwd, &branch) {
+                let _ = std::process::Command::new("git")
+                    .args(["-C", cwd.as_str(), "branch", "-D", br.as_str()])
+                    .output();
+            }
+        }
+    })
+    .await
+    .ok();
 }
 
 // ---------------------------------------------------------------------------
@@ -6663,6 +6852,8 @@ mod tests {
             client_cwd: None,
             auto_enter: true,
             resume_pane: Some("%999".to_string()),
+            resources: Vec::new(),
+            resource_timeout_secs: None,
         };
         handle_claude_launch(&writer, vec![task])
             .await
@@ -6722,6 +6913,8 @@ mod tests {
             client_cwd: None,
             auto_enter: true,
             resume_pane: Some("%42".to_string()),
+            resources: Vec::new(),
+            resource_timeout_secs: None,
         };
         handle_claude_launch(&writer, vec![task])
             .await
@@ -6786,6 +6979,8 @@ mod tests {
             client_cwd: None,
             auto_enter: true,
             resume_pane: Some("%9999999".to_string()),
+            resources: Vec::new(),
+            resource_timeout_secs: None,
         };
         handle_claude_launch(&writer, vec![task])
             .await
