@@ -218,6 +218,12 @@ struct ClaudeTask {
     /// Optional tmux pane id (e.g. `"%41"`) to reuse via `--resume-pane`.
     /// Mutually exclusive with `worktree`; checked at parse time.
     resume_pane: Option<String>,
+    /// One or more resource specs passed via `--resource`.  Each string is
+    /// either a resource name (e.g. `sim-9900`) or `class:<name>` /
+    /// `any:<name>` for any-idle-of-class selection.  Parsed by the daemon.
+    resources: Vec<String>,
+    /// Seconds to wait for busy resources.  `None` / `0` → fail fast.
+    resource_timeout_secs: Option<u64>,
 }
 
 /// A parsed slash command from user input.
@@ -298,6 +304,8 @@ fn parse_claude(input: &str) -> Option<Result<Vec<ClaudeTask>, String>> {
     let mut resume_pane: Option<String> = None;
     let mut auto_enter = true;
     let mut cwd: Option<String> = None;
+    let mut resources: Vec<String> = Vec::new();
+    let mut resource_timeout_secs: Option<u64> = None;
     // (description, was_quoted) pairs for non-flag tokens.
     let mut desc_tokens: Vec<(String, bool)> = Vec::new();
 
@@ -339,6 +347,32 @@ fn parse_claude(input: &str) -> Option<Result<Vec<ClaudeTask>, String>> {
             }
             "--no-enter" => {
                 auto_enter = false;
+            }
+            "--resource" => {
+                i += 1;
+                if i >= tokens.len() || tokens[i].0.starts_with("--") {
+                    return Some(Err(
+                        "--resource requires a spec (resource name or `class:<name>`)".to_string(),
+                    ));
+                }
+                resources.push(tokens[i].0.clone());
+            }
+            "--resource-timeout" => {
+                i += 1;
+                if i >= tokens.len() || tokens[i].0.starts_with("--") {
+                    return Some(Err(
+                        "--resource-timeout requires a number of seconds".to_string()
+                    ));
+                }
+                match tokens[i].0.parse::<u64>() {
+                    Ok(n) => resource_timeout_secs = Some(n),
+                    Err(_) => {
+                        return Some(Err(format!(
+                            "--resource-timeout expects a non-negative integer, got {:?}",
+                            tokens[i].0
+                        )));
+                    }
+                }
             }
             "--cwd" => {
                 i += 1;
@@ -434,6 +468,8 @@ fn parse_claude(input: &str) -> Option<Result<Vec<ClaudeTask>, String>> {
                 auto_enter,
                 cwd: cwd.clone(),
                 resume_pane: resume_pane.clone(),
+                resources: resources.clone(),
+                resource_timeout_secs,
             }
         })
         .collect();
@@ -580,6 +616,8 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
                     client_cwd: t.cwd.or_else(|| Some(cwd_str.clone())),
                     auto_enter: t.auto_enter,
                     resume_pane: t.resume_pane,
+                    resources: t.resources,
+                    resource_timeout_secs: t.resource_timeout_secs,
                 })
                 .collect(),
         };
@@ -1035,6 +1073,8 @@ pub async fn run_chat_loop(
                             client_cwd: t.cwd.or_else(|| Some(cwd_str.clone())),
                             auto_enter: t.auto_enter,
                             resume_pane: t.resume_pane,
+                            resources: t.resources,
+                            resource_timeout_secs: t.resource_timeout_secs,
                         })
                         .collect(),
                 };
@@ -2453,6 +2493,42 @@ mod tests {
         let long = format!("/claude \"{}\"", "a".repeat(100));
         let tasks = claude_tasks(&long);
         assert!(tasks[0].task_id.len() <= 32);
+    }
+
+    #[test]
+    fn parse_claude_resource_flag_collects_specs() {
+        let tasks = claude_tasks("/claude --resource sim-9900 --resource class:gpu \"run kernel\"");
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].resources, vec!["sim-9900", "class:gpu"]);
+        assert!(
+            tasks[0].resource_timeout_secs.is_none(),
+            "timeout defaults to None (Nowait)"
+        );
+    }
+
+    #[test]
+    fn parse_claude_resource_timeout_parses_seconds() {
+        let tasks = claude_tasks("/claude --resource class:gpu --resource-timeout 300 \"task\"");
+        assert_eq!(tasks[0].resource_timeout_secs, Some(300));
+    }
+
+    #[test]
+    fn parse_claude_resource_requires_value() {
+        let result = parse_claude("/claude --resource");
+        assert!(matches!(result, Some(Err(_))));
+    }
+
+    #[test]
+    fn parse_claude_resource_timeout_rejects_non_integer() {
+        let result = parse_claude("/claude --resource-timeout abc \"t\"");
+        let err = match result {
+            Some(Err(s)) => s,
+            other => panic!("expected Err, got {other:?}"),
+        };
+        assert!(
+            err.contains("non-negative integer"),
+            "msg should explain the format: {err}"
+        );
     }
 
     #[test]

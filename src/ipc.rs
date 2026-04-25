@@ -25,6 +25,19 @@ pub struct TaskSpec {
     /// `Some(resume_pane)` as authoritative and ignores any stray `worktree`.
     #[serde(default)]
     pub resume_pane: Option<String>,
+    /// Resource specs to acquire before the pane starts running `claude`.
+    ///
+    /// Each spec is either a resource name (looked up in
+    /// `~/.amaebi/resources.toml`) or `class:<name>` / `any:<name>` / a
+    /// bare class name when the entry matches a declared class with no
+    /// literal resource of that name.  Held for the supervision lifetime of
+    /// the pane and released when supervision exits.
+    #[serde(default)]
+    pub resources: Vec<String>,
+    /// Seconds to wait for resources to free up before failing.  `None` or
+    /// `0` means don't wait (fail immediately if any resource is busy).
+    #[serde(default)]
+    pub resource_timeout_secs: Option<u64>,
 }
 
 /// A single pane+task pair for supervision.
@@ -567,6 +580,8 @@ mod tests {
             client_cwd: Some("/home/user/repo".into()),
             auto_enter: true,
             resume_pane: None,
+            resources: Vec::new(),
+            resource_timeout_secs: None,
         };
         let json = serde_json::to_string(&spec).unwrap();
         let back: TaskSpec = serde_json::from_str(&json).unwrap();
@@ -587,6 +602,8 @@ mod tests {
             client_cwd: None,
             auto_enter: true,
             resume_pane: Some("%41".into()),
+            resources: Vec::new(),
+            resource_timeout_secs: None,
         };
         let json = serde_json::to_string(&spec).unwrap();
         let back: TaskSpec = serde_json::from_str(&json).unwrap();
@@ -613,6 +630,8 @@ mod tests {
                     client_cwd: Some("/home/user/repo".into()),
                     auto_enter: true,
                     resume_pane: None,
+                    resources: Vec::new(),
+                    resource_timeout_secs: None,
                 },
                 TaskSpec {
                     task_id: "t2".into(),
@@ -621,6 +640,8 @@ mod tests {
                     client_cwd: None,
                     auto_enter: false,
                     resume_pane: None,
+                    resources: Vec::new(),
+                    resource_timeout_secs: None,
                 },
             ],
         };
