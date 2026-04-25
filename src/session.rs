@@ -544,8 +544,25 @@ pub fn current_record(dir: &Path) -> Result<Option<SessionRecord>> {
 /// also finds UUIDs the user has since rotated past (e.g. resuming an
 /// older session).
 ///
-/// Returns `Ok(None)` when the UUID is not present anywhere in the file,
-/// `Err` on I/O or parse failure.
+/// # Return values
+///
+/// - `Ok(Some(dir))` — UUID found; `dir` is the canonical directory key.
+/// - `Ok(None)` — `sessions.json` does not exist, is empty, is corrupted
+///   (see below), or does not contain the requested UUID.
+/// - `Err(_)` — filesystem I/O failure (read permission denied, disk
+///   error, or lock acquisition failure).
+///
+/// # Corruption handling
+///
+/// JSON parse failures are intentionally treated as an empty map rather
+/// than propagated as `Err` — mirrors [`load_map`]'s "sessions.json is
+/// corrupted; resetting to empty" policy, tested by
+/// `corrupted_sessions_json_recovers`.  This keeps the daemon operable
+/// against a manually-edited or partially-written JSON file; the
+/// trade-off is that callers cannot distinguish "UUID not found" from
+/// "file is corrupt".  `resolve_session_dir` in `daemon.rs` handles
+/// both uniformly by falling back to `UNKNOWN_DIR_SENTINEL`, so the
+/// distinction would be informational only.
 pub fn dir_for_uuid(uuid: &str) -> Result<Option<String>> {
     let path = sessions_path()?;
     if !path.exists() {
