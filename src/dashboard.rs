@@ -2,18 +2,23 @@
 //!
 //! Read-only observer: does not touch the daemon via IPC and does not modify
 //! any on-disk state. Every tick re-reads the existing files (sessions.json,
-//! tmux-state.json, inbox.db, cron.db, memory.db) and rebuilds a fresh
-//! `Snapshot`. Sources that are missing or fail to open are treated as empty —
-//! the dashboard must render even on a freshly installed machine.
+//! tmux-state.json, resources.toml, resource-state.json, inbox.db, cron.db,
+//! memory.db) and rebuilds a fresh `Snapshot`. Sources that are missing or
+//! fail to open are treated as empty — the dashboard must render even on a
+//! freshly installed machine.
 //!
 //! Layout is three vertical panels, top to bottom:
 //! * Environment (5 lines) — cwd, git branch, sandbox
-//! * Task summary (5 lines) — pane / cron / inbox counts
+//! * Task summary + Resources (side-by-side) — pane / cron / inbox counts and
+//!   resource-lease state.  Resources are derived from both the pool
+//!   definition (`~/.amaebi/resources.toml`) and the live lease record
+//!   (`~/.amaebi/resource-state.json`); without the TOML the panel is empty.
 //! * Activity (remaining) — unified event stream, tail mode, newest first
 //!
 //! Keys: `q` / Esc / Ctrl-C exit; `r` forces an immediate re-read. Auto-refresh
 //! ticks every [`REFRESH`].
 
+use std::collections::{HashMap, HashSet};
 use std::io::{stdout, Stdout};
 use std::time::{Duration, Instant};
 
@@ -35,6 +40,7 @@ use crate::cron::CronJob;
 use crate::inbox::InboxReport;
 use crate::memory_db;
 use crate::pane_lease::{PaneLease, PaneStatus};
+use crate::resource_lease::{self, ResourceLease, ResourceStatus as LeaseStatus};
 
 const REFRESH: Duration = Duration::from_secs(2);
 const ACTIVITY_CAP: usize = 20;
@@ -81,6 +87,29 @@ struct Environment {
     sandbox: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ResourceStatus {
+    Idle,
+    Busy {
+        pane_id: String,
+        task_id: Option<String>,
+    },
+    /// Holder pane is no longer in `tmux-state.json` — lease stranded on a
+    /// dead pane.  Surfaced separately so the UI can demand operator attention.
+    Orphaned {
+        last_pane_id: String,
+    },
+}
+
+#[derive(Clone, Debug)]
+struct ResourceSnapshot {
+    name: String,
+    class: String,
+    status: ResourceStatus,
+    /// Seconds since last heartbeat; 0 for `Idle` (nothing to measure).
+    age_secs: u64,
+}
+
 #[derive(Clone, Debug)]
 struct Snapshot {
     env: Environment,
@@ -88,6 +117,7 @@ struct Snapshot {
     cron: CronSummary,
     inbox_unread: usize,
     activity: Vec<ActivityEvent>,
+    resources: Vec<ResourceSnapshot>,
 }
 
 impl Snapshot {
@@ -122,6 +152,9 @@ impl Snapshot {
             Vec::new()
         };
 
+        let live_panes: HashSet<String> = panes_vec.keys().cloned().collect();
+        let resources = collect_resources(&live_panes);
+
         let mut activity = Vec::new();
         activity.extend(collect_pane_events(panes_vec.values()));
         activity.extend(collect_cron_events(&cron_jobs));
@@ -135,8 +168,95 @@ impl Snapshot {
             cron,
             inbox_unread,
             activity,
+            resources,
         }
     }
+}
+
+/// Merge pool definitions with on-disk lease state and classify each resource
+/// relative to the live pane set.  Pool-file errors fall back to an empty
+/// Vec so one malformed TOML line never kills the whole dashboard.
+fn collect_resources(live_panes: &HashSet<String>) -> Vec<ResourceSnapshot> {
+    let pool = match resource_lease::load_pool() {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(error = %e, "dashboard: failed to load resource pool");
+            return Vec::new();
+        }
+    };
+    if pool.is_empty() {
+        return Vec::new();
+    }
+    let state = resource_lease::read_state().unwrap_or_default();
+    let now = now_secs();
+
+    let mut out: Vec<ResourceSnapshot> = pool
+        .iter()
+        .map(|def| {
+            let record = state.get(&def.name);
+            let status = classify_resource(record, live_panes);
+            let age_secs = match (&status, record) {
+                (ResourceStatus::Idle, _) => 0,
+                (_, Some(r)) => now.saturating_sub(r.heartbeat_at),
+                (_, None) => 0,
+            };
+            ResourceSnapshot {
+                name: def.name.clone(),
+                class: def.class.clone(),
+                status,
+                age_secs,
+            }
+        })
+        .collect();
+
+    // Orphaned first (red, needs attention), then Busy, then Idle; ties
+    // broken by name for a stable display order.
+    out.sort_by(|a, b| {
+        fn rank(s: &ResourceStatus) -> u8 {
+            match s {
+                ResourceStatus::Orphaned { .. } => 0,
+                ResourceStatus::Busy { .. } => 1,
+                ResourceStatus::Idle => 2,
+            }
+        }
+        rank(&a.status)
+            .cmp(&rank(&b.status))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    out
+}
+
+fn classify_resource(
+    record: Option<&ResourceLease>,
+    live_panes: &HashSet<String>,
+) -> ResourceStatus {
+    let Some(lease) = record else {
+        return ResourceStatus::Idle;
+    };
+    // `effective_status` already downgrades stale Busy leases to Idle via the
+    // TTL check, so the TTL path can't surface as Orphaned here.
+    if lease.effective_status() != LeaseStatus::Busy {
+        return ResourceStatus::Idle;
+    }
+    match &lease.pane_id {
+        Some(pid) if live_panes.contains(pid) => ResourceStatus::Busy {
+            pane_id: pid.clone(),
+            task_id: lease.tag.clone(),
+        },
+        Some(pid) => ResourceStatus::Orphaned {
+            last_pane_id: pid.clone(),
+        },
+        // Busy without a pane_id is a malformed record; treat as Idle rather
+        // than faking an orphan entry with no identifier to display.
+        None => ResourceStatus::Idle,
+    }
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// Sort `events` newest-first and truncate to [`ACTIVITY_CAP`].
@@ -343,6 +463,18 @@ fn collect_session_events() -> Result<Vec<ActivityEvent>> {
 // Rendering
 // ---------------------------------------------------------------------------
 
+fn format_age(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h", secs / 3600)
+    } else {
+        format!("{}d", secs / 86_400)
+    }
+}
+
 fn relative_time(when: DateTime<Utc>, now: DateTime<Utc>) -> String {
     let delta = now.signed_duration_since(when);
     let secs = delta.num_seconds();
@@ -414,7 +546,11 @@ fn summary_lines(snap: &Snapshot, now: DateTime<Utc>) -> Vec<Line<'_>> {
     ]
 }
 
-fn activity_lines(events: &[ActivityEvent], now: DateTime<Utc>) -> Vec<Line<'_>> {
+fn activity_lines<'a>(
+    events: &'a [ActivityEvent],
+    now: DateTime<Utc>,
+    pane_resources: &HashMap<String, Vec<String>>,
+) -> Vec<Line<'a>> {
     if events.is_empty() {
         return vec![Line::from(Span::styled(
             "(no activity yet — start a chat, spawn a pane, or wait for cron)",
@@ -426,11 +562,94 @@ fn activity_lines(events: &[ActivityEvent], now: DateTime<Utc>) -> Vec<Line<'_>>
         .map(|e| {
             let time = relative_time(e.when, now);
             let src = format_source(&e.source);
-            Line::from(vec![
+            let mut spans = vec![
                 Span::styled(format!("{time:>8}  "), Style::default().fg(Color::DarkGray)),
                 Span::styled(format!("{src:<18} "), Style::default().fg(Color::Cyan)),
                 Span::raw(e.summary.clone()),
-            ])
+            ];
+            if let Source::Pane(pid) = &e.source {
+                if let Some(names) = pane_resources.get(pid) {
+                    if !names.is_empty() {
+                        spans.push(Span::raw(" "));
+                        spans.push(Span::styled(
+                            format!("[{}]", names.join(", ")),
+                            Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM),
+                        ));
+                    }
+                }
+            }
+            Line::from(spans)
+        })
+        .collect()
+}
+
+/// Build `pane_id → [resource names]` for O(1) lookup while rendering the
+/// activity panel.  Only Busy and Orphaned leases contribute; Idle resources
+/// have no holder to attach to.
+fn pane_resource_map(resources: &[ResourceSnapshot]) -> HashMap<String, Vec<String>> {
+    let mut map: HashMap<String, Vec<String>> = HashMap::new();
+    for r in resources {
+        let pid = match &r.status {
+            ResourceStatus::Busy { pane_id, .. } => Some(pane_id.clone()),
+            ResourceStatus::Orphaned { last_pane_id } => Some(last_pane_id.clone()),
+            ResourceStatus::Idle => None,
+        };
+        if let Some(pid) = pid {
+            map.entry(pid).or_default().push(r.name.clone());
+        }
+    }
+    for names in map.values_mut() {
+        names.sort();
+    }
+    map
+}
+
+fn resource_lines(resources: &[ResourceSnapshot]) -> Vec<Line<'_>> {
+    if resources.is_empty() {
+        return vec![Line::from(Span::styled(
+            "(no pool configured)",
+            Style::default().fg(Color::DarkGray),
+        ))];
+    }
+    resources
+        .iter()
+        .map(|r| match &r.status {
+            ResourceStatus::Idle => Line::from(vec![
+                Span::raw(r.name.clone()),
+                Span::styled(
+                    format!("  ({})", r.class),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]),
+            ResourceStatus::Busy { pane_id, task_id } => {
+                let mut spans = vec![
+                    Span::styled(r.name.clone(), Style::default().fg(Color::Yellow)),
+                    Span::raw("  "),
+                    Span::styled(pane_id.clone(), Style::default().fg(Color::Cyan)),
+                ];
+                if let Some(t) = task_id.as_deref() {
+                    spans.push(Span::raw("  "));
+                    spans.push(Span::raw(truncate_snippet(t, 24)));
+                }
+                spans.push(Span::styled(
+                    format!("  {}", format_age(r.age_secs)),
+                    Style::default().fg(Color::DarkGray),
+                ));
+                Line::from(spans)
+            }
+            ResourceStatus::Orphaned { last_pane_id } => Line::from(vec![
+                Span::styled(
+                    r.name.clone(),
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!(
+                        "  orphaned  (pane {last_pane_id} gone, {})",
+                        format_age(r.age_secs)
+                    ),
+                    Style::default().fg(Color::Red),
+                ),
+            ]),
         })
         .collect()
 }
@@ -440,13 +659,19 @@ fn draw(
     snap: &Snapshot,
     now: DateTime<Utc>,
 ) -> Result<()> {
+    // Resources panel grows with the pool — 2 chrome rows + 1 body row per
+    // entry, with a floor so the middle band keeps the task summary readable
+    // and a ceiling so a giant pool can't push the activity panel off screen.
+    let resource_rows = snap.resources.len().max(1);
+    let middle_height: u16 = (2 + resource_rows as u16).clamp(5, 12);
+
     terminal
         .draw(|f| {
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
                     Constraint::Length(5),
-                    Constraint::Length(5),
+                    Constraint::Length(middle_height),
                     Constraint::Min(5),
                 ])
                 .split(f.area());
@@ -458,23 +683,34 @@ fn draw(
             );
             f.render_widget(env_block, chunks[0]);
 
+            let middle = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .split(chunks[1]);
+
             let summary_block = Paragraph::new(summary_lines(snap, now)).block(
                 Block::default()
                     .borders(Borders::ALL)
                     .title(" Task summary "),
             );
-            f.render_widget(summary_block, chunks[1]);
+            f.render_widget(summary_block, middle[0]);
 
+            let resource_block = Paragraph::new(resource_lines(&snap.resources))
+                .block(Block::default().borders(Borders::ALL).title(" Resources "));
+            f.render_widget(resource_block, middle[1]);
+
+            let pane_resources = pane_resource_map(&snap.resources);
             let activity_title = format!(
                 " Activity (last {}, newest first — q quit, r refresh) ",
                 snap.activity.len()
             );
-            let activity_block = Paragraph::new(activity_lines(&snap.activity, now)).block(
-                Block::default().borders(Borders::ALL).title(Span::styled(
-                    activity_title,
-                    Style::default().add_modifier(Modifier::BOLD),
-                )),
-            );
+            let activity_block =
+                Paragraph::new(activity_lines(&snap.activity, now, &pane_resources)).block(
+                    Block::default().borders(Borders::ALL).title(Span::styled(
+                        activity_title,
+                        Style::default().add_modifier(Modifier::BOLD),
+                    )),
+                );
             f.render_widget(activity_block, chunks[2]);
         })
         .context("drawing dashboard frame")?;
@@ -593,13 +829,6 @@ mod tests {
             has_claude,
             task_description: None,
         }
-    }
-
-    fn now_secs() -> u64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs()
     }
 
     #[test]
@@ -787,6 +1016,199 @@ mod tests {
         assert_eq!(
             format_source(&Source::Session("abc".into())),
             "[session abc]"
+        );
+    }
+
+    // ── Resources panel ────────────────────────────────────────────────────
+
+    /// Seed `~/.amaebi/resources.toml` with the given (name, class) entries.
+    fn seed_pool(entries: &[(&str, &str)]) {
+        let dir = crate::auth::amaebi_home().expect("home");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let mut toml = String::new();
+        for (name, class) in entries {
+            toml.push_str(&format!(
+                "[[resource]]\nname = {name:?}\nclass = {class:?}\n\n"
+            ));
+        }
+        std::fs::write(dir.join("resources.toml"), toml).expect("write pool");
+    }
+
+    /// Serialize a `ResourceLease` map via serde so tests can't drift from
+    /// the real on-disk schema — construct typed structs, not JSON literals.
+    fn seed_resource_state(records: Vec<(&str, &str, LeaseStatus, Option<&str>, Option<&str>)>) {
+        let dir = crate::auth::amaebi_home().expect("home");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let now = now_secs();
+        let map: HashMap<String, ResourceLease> = records
+            .into_iter()
+            .map(|(name, class, status, pane_id, tag)| {
+                (
+                    name.to_string(),
+                    ResourceLease {
+                        name: name.to_string(),
+                        class: class.to_string(),
+                        status,
+                        pane_id: pane_id.map(String::from),
+                        tag: tag.map(String::from),
+                        session_id: None,
+                        heartbeat_at: now,
+                    },
+                )
+            })
+            .collect();
+        let s = serde_json::to_string_pretty(&map).expect("json");
+        std::fs::write(dir.join("resource-state.json"), s).expect("write state");
+    }
+
+    /// Seed `tmux-state.json` with Idle `PaneLease` entries.  Goes through
+    /// `PaneLease`'s serde impl so the schema stays coupled to production.
+    fn seed_tmux_state(pane_ids: &[&str]) {
+        let dir = crate::auth::amaebi_home().expect("home");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let now = now_secs();
+        let map: HashMap<String, PaneLease> = pane_ids
+            .iter()
+            .map(|pid| {
+                let mut lease = PaneLease::new_idle((*pid).to_string(), "@0".to_string());
+                lease.heartbeat_at = now;
+                ((*pid).to_string(), lease)
+            })
+            .collect();
+        let s = serde_json::to_string_pretty(&map).expect("json");
+        std::fs::write(dir.join("tmux-state.json"), s).expect("write tmux");
+    }
+
+    #[test]
+    fn collect_resources_all_idle() {
+        let _guard = with_temp_home();
+        seed_pool(&[
+            ("sim-9900", "simulator"),
+            ("sim-9901", "simulator"),
+            ("sim-9902", "simulator"),
+        ]);
+        seed_resource_state(vec![
+            ("sim-9900", "simulator", LeaseStatus::Idle, None, None),
+            ("sim-9901", "simulator", LeaseStatus::Idle, None, None),
+            ("sim-9902", "simulator", LeaseStatus::Idle, None, None),
+        ]);
+        seed_tmux_state(&[]);
+
+        let snap = Snapshot::collect();
+        assert_eq!(snap.resources.len(), 3);
+        assert!(snap
+            .resources
+            .iter()
+            .all(|r| matches!(r.status, ResourceStatus::Idle)));
+    }
+
+    #[test]
+    fn collect_resources_busy_pane_live() {
+        let _guard = with_temp_home();
+        seed_pool(&[("sim-9900", "simulator")]);
+        seed_resource_state(vec![(
+            "sim-9900",
+            "simulator",
+            LeaseStatus::Busy,
+            Some("%42"),
+            Some("pr-1"),
+        )]);
+        seed_tmux_state(&["%42"]);
+
+        let snap = Snapshot::collect();
+        assert_eq!(snap.resources.len(), 1);
+        match &snap.resources[0].status {
+            ResourceStatus::Busy { pane_id, task_id } => {
+                assert_eq!(pane_id, "%42");
+                assert_eq!(task_id.as_deref(), Some("pr-1"));
+            }
+            other => panic!("expected Busy, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn collect_resources_busy_pane_orphaned() {
+        let _guard = with_temp_home();
+        seed_pool(&[("sim-9900", "simulator")]);
+        seed_resource_state(vec![(
+            "sim-9900",
+            "simulator",
+            LeaseStatus::Busy,
+            Some("%99"),
+            Some("dead-task"),
+        )]);
+        // %99 deliberately absent from tmux-state.
+        seed_tmux_state(&["%1"]);
+
+        let snap = Snapshot::collect();
+        assert_eq!(snap.resources.len(), 1);
+        match &snap.resources[0].status {
+            ResourceStatus::Orphaned { last_pane_id } => {
+                assert_eq!(last_pane_id, "%99");
+            }
+            other => panic!("expected Orphaned, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn collect_resources_empty_pool() {
+        let _guard = with_temp_home();
+        // No resources.toml written at all.
+        let snap = Snapshot::collect();
+        assert!(snap.resources.is_empty());
+    }
+
+    #[test]
+    fn activity_line_for_pane_includes_resource_suffix() {
+        // Given one activity event from pane %42 and a Busy lease on sim-9900
+        // held by %42, the rendered line must end with the `[sim-9900]`
+        // suffix.  Idle leases (no holder) must not appear anywhere.
+        let now = Utc::now();
+        let events = vec![ActivityEvent {
+            when: now - chrono::Duration::seconds(30),
+            source: Source::Pane("%42".into()),
+            summary: "compiling crate X".into(),
+        }];
+        let resources = vec![
+            ResourceSnapshot {
+                name: "sim-9900".into(),
+                class: "simulator".into(),
+                status: ResourceStatus::Busy {
+                    pane_id: "%42".into(),
+                    task_id: Some("pr-1".into()),
+                },
+                age_secs: 5,
+            },
+            ResourceSnapshot {
+                name: "sim-9901".into(),
+                class: "simulator".into(),
+                status: ResourceStatus::Idle,
+                age_secs: 0,
+            },
+        ];
+        let pane_res = pane_resource_map(&resources);
+        assert_eq!(
+            pane_res.get("%42").map(|v| v.as_slice()),
+            Some(["sim-9900".to_string()].as_slice()),
+            "pane_resource_map must bucket Busy leases by holder pane id"
+        );
+        assert!(
+            !pane_res.contains_key("%idle-holder"),
+            "Idle leases must not contribute to the map"
+        );
+
+        let lines = activity_lines(&events, now, &pane_res);
+        assert_eq!(lines.len(), 1);
+        // Concatenate all spans to a plain string so we can assert on the
+        // visible output without asserting on Ratatui Style internals.
+        let rendered: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            rendered.contains("compiling crate X"),
+            "summary missing: {rendered:?}"
+        );
+        assert!(
+            rendered.ends_with("[sim-9900]"),
+            "suffix missing or misplaced: {rendered:?}"
         );
     }
 }
