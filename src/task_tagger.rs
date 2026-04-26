@@ -1,6 +1,6 @@
 //! LLM-based tag generator for the task notebook.
 //!
-//! When the user doesn't pass `--task <tag>`, the daemon asks Haiku
+//! When the user doesn't pass `--tag <tag>`, the daemon asks Haiku
 //! for a short ASCII hyphen-separated tag derived from the task
 //! description.  Haiku is used unconditionally here — tagging is a
 //! short, cheap call that doesn't need Opus/Sonnet, and isolating it

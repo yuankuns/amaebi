@@ -2826,7 +2826,7 @@ fn seed_full_pane_pool(home: &std::path::Path, count: usize) -> usize {
                 "pane_id": pid,
                 "window_id": "@0",
                 "status": "busy",
-                "task_id": "prefill",
+                "tag": "prefill",
                 "session_id": "prefill",
                 "worktree": null,
                 "heartbeat_at": now,
@@ -2917,7 +2917,7 @@ async fn claude_launch_with_resources_dispatches_and_returns_capacity_error() {
     // rather than a hypothetical-but-never-transmitted route.
     let req = Request::ClaudeLaunch {
         tasks: vec![ClaudeLaunchTaskSpec {
-            task_id: "ipc-res-1".to_string(),
+            tag: "ipc-res-1".to_string(),
             description: "a task that would want resources".to_string(),
             auto_enter: true,
             resources: vec!["sim-9900".to_string(), "class:gpu".to_string()],
@@ -2980,7 +2980,7 @@ async fn claude_launch_legacy_payload_without_resources_still_dispatches() {
 
     // Raw JSON mirrors exactly what a PR#124 client would emit: no
     // `resources` or `resource_timeout_secs` fields at all.
-    let legacy_payload = r#"{"type":"claude_launch","tasks":[{"task_id":"ipc-legacy","description":"legacy client task","worktree":null,"client_cwd":null,"auto_enter":true}]}"#;
+    let legacy_payload = r#"{"type":"claude_launch","tasks":[{"tag":"ipc-legacy","description":"legacy client task","worktree":null,"client_cwd":null,"auto_enter":true}]}"#;
     let responses = send_claude_launch_raw(&socket, legacy_payload).await;
 
     let saw_capacity_error = responses
@@ -3022,7 +3022,7 @@ async fn claude_launch_resume_pane_with_resources_is_rejected_by_daemon() {
     std::fs::write(
         home.path().join(".amaebi/tmux-state.json"),
         format!(
-            r#"{{"%41":{{"pane_id":"%41","window_id":"@0","status":"idle","task_id":null,"session_id":null,"worktree":"/tmp/fake","heartbeat_at":{now},"has_claude":true,"task_description":"old"}}}}"#
+            r#"{{"%41":{{"pane_id":"%41","window_id":"@0","status":"idle","tag":null,"session_id":null,"worktree":"/tmp/fake","heartbeat_at":{now},"has_claude":true,"task_description":"old"}}}}"#
         ),
     )
     .expect("seed tmux-state");
@@ -3033,7 +3033,7 @@ async fn claude_launch_resume_pane_with_resources_is_rejected_by_daemon() {
 
     let req = Request::ClaudeLaunch {
         tasks: vec![ClaudeLaunchTaskSpec {
-            task_id: "bad-combo".to_string(),
+            tag: "bad-combo".to_string(),
             description: "".to_string(),
             auto_enter: true,
             resume_pane: Some("%41".to_string()),

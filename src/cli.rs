@@ -177,9 +177,9 @@ pub enum Command {
     /// pairs currently hold a live 24 h lease.  `release` force-clears
     /// a stuck lease without waiting out the TTL, e.g. when the
     /// supervision process died without releasing.
-    Task {
+    Tag {
         #[command(subcommand)]
-        action: TaskAction,
+        action: TagAction,
     },
     /// Live TUI dashboard aggregating session, pane, inbox, and cron state.
     ///
@@ -199,7 +199,7 @@ pub enum ResourceAction {
 }
 
 #[derive(clap::Subcommand, Debug)]
-pub enum TaskAction {
+pub enum TagAction {
     /// List every live task notebook lease (repo_dir, tag, holder, age).
     List,
     /// Force-release the live lease for a tag in the current directory,

@@ -128,7 +128,7 @@ async fn main() -> Result<()> {
         cli::Command::Inbox { action } => run_inbox(action),
         cli::Command::Cron { action } => run_cron(action),
         cli::Command::Resource { action } => run_resource(action),
-        cli::Command::Task { action } => run_task(action),
+        cli::Command::Tag { action } => run_tag(action),
         cli::Command::Dashboard => dashboard::run().await,
     }
 }
@@ -538,7 +538,7 @@ fn run_resource(action: cli::ResourceAction) -> Result<()> {
                         format!(
                             "pane={} task={} session={}",
                             l.pane_id.as_deref().unwrap_or("?"),
-                            l.task_id.as_deref().unwrap_or("?"),
+                            l.tag.as_deref().unwrap_or("?"),
                             l.session_id.as_deref().unwrap_or("?"),
                         ),
                     ),
@@ -575,7 +575,7 @@ fn run_resource(action: cli::ResourceAction) -> Result<()> {
                     format!(
                         "pane={} task={} session={}",
                         l.pane_id.as_deref().unwrap_or("?"),
-                        l.task_id.as_deref().unwrap_or("?"),
+                        l.tag.as_deref().unwrap_or("?"),
                         l.session_id.as_deref().unwrap_or("?"),
                     )
                 } else {
@@ -592,12 +592,12 @@ fn run_resource(action: cli::ResourceAction) -> Result<()> {
     }
 }
 
-fn run_task(action: cli::TaskAction) -> Result<()> {
+fn run_tag(action: cli::TagAction) -> Result<()> {
     match action {
-        cli::TaskAction::List => {
+        cli::TagAction::List => {
             let path = tasks::db_path().context("resolving tasks DB path")?;
             if !path.exists() {
-                println!("No task notebook yet (no `/claude --task` has ever run).");
+                println!("No task notebook yet (no `/claude --tag` has ever run).");
                 return Ok(());
             }
             let conn = tasks::init_db(&path).context("opening tasks DB")?;
@@ -618,7 +618,7 @@ fn run_task(action: cli::TaskAction) -> Result<()> {
             }
             Ok(())
         }
-        cli::TaskAction::Release { tag } => {
+        cli::TagAction::Release { tag } => {
             let path = tasks::db_path().context("resolving tasks DB path")?;
             if !path.exists() {
                 println!("No task notebook exists — nothing to release.");

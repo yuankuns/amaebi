@@ -274,7 +274,7 @@ where
             PaneStatus::Busy => "starting",
             PaneStatus::Idle => "idle",
         };
-        let task = p.task_id.as_deref().unwrap_or("(idle)");
+        let task = p.tag.as_deref().unwrap_or("(idle)");
         let summary = format!("{status} — {task}");
         events.push(ActivityEvent {
             when,
@@ -586,7 +586,7 @@ mod tests {
             pane_id: id.to_string(),
             window_id: "@0".to_string(),
             status,
-            task_id: task.map(String::from),
+            tag: task.map(String::from),
             session_id: None,
             worktree: None,
             heartbeat_at: heartbeat,

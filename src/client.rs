@@ -205,7 +205,7 @@ fn render_markdown(text: &str) -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ClaudeTask {
     /// Short task label derived from the description.
-    task_id: String,
+    tag: String,
     /// Task description / opening prompt.
     description: String,
     /// Optional absolute worktree path.
@@ -224,10 +224,6 @@ struct ClaudeTask {
     resources: Vec<String>,
     /// Seconds to wait for busy resources.  `None` / `0` → fail fast.
     resource_timeout_secs: Option<u64>,
-    /// Optional task notebook tag passed via `--task`.  Enables
-    /// supervision persistence at `~/.amaebi/tasks.db` keyed by
-    /// `(client_cwd, task_name)`.
-    task_name: Option<String>,
 }
 
 /// A parsed slash command from user input.
@@ -310,7 +306,7 @@ fn parse_claude(input: &str) -> Option<Result<Vec<ClaudeTask>, String>> {
     let mut resume_pane: Option<String> = None;
     let mut auto_enter = true;
     let mut cwd: Option<String> = None;
-    let mut task_name: Option<String> = None;
+    let mut tag: Option<String> = None;
     let mut resources: Vec<String> = Vec::new();
     let mut resource_timeout_secs: Option<u64> = None;
     // (description, was_quoted) pairs for non-flag tokens.
@@ -355,14 +351,14 @@ fn parse_claude(input: &str) -> Option<Result<Vec<ClaudeTask>, String>> {
             "--no-enter" => {
                 auto_enter = false;
             }
-            "--task" => {
+            "--tag" => {
                 i += 1;
                 if i >= tokens.len() || tokens[i].0.starts_with("--") {
                     return Some(Err(
-                        "--task requires a tag (short identifier for the notebook)".to_string(),
+                        "--tag requires a tag (short identifier for the notebook)".to_string(),
                     ));
                 }
-                task_name = Some(tokens[i].0.clone());
+                tag = Some(tokens[i].0.clone());
             }
             "--resource" => {
                 i += 1;
@@ -489,77 +485,25 @@ fn parse_claude(input: &str) -> Option<Result<Vec<ClaudeTask>, String>> {
         ));
     }
 
+    // Tag is filled later: the client does a GenerateTag round-trip
+    // per task (or uses `--tag <override>` verbatim) before sending
+    // ClaudeLaunch.  Parser emits ClaudeTask with a placeholder tag
+    // the later code is responsible for replacing.
     let tasks = descriptions
         .into_iter()
-        .enumerate()
-        .map(|(idx, desc)| {
-            let task_id = make_task_id(&desc, idx);
-            // task_name stays as the CLI override (if any) — the daemon
-            // resolves `None` via its LLM tagger to an auto-generated
-            // tag.  No client-side slug fallback because CJK descs
-            // yield uninformative `task-N` slugs that would collide
-            // across invocations.
-            ClaudeTask {
-                task_id,
-                description: desc,
-                worktree: worktree.clone(),
-                auto_enter,
-                cwd: cwd.clone(),
-                resume_pane: resume_pane.clone(),
-                resources: resources.clone(),
-                resource_timeout_secs,
-                task_name: task_name.clone(),
-            }
+        .map(|desc| ClaudeTask {
+            tag: tag.clone().unwrap_or_default(),
+            description: desc,
+            worktree: worktree.clone(),
+            auto_enter,
+            cwd: cwd.clone(),
+            resume_pane: resume_pane.clone(),
+            resources: resources.clone(),
+            resource_timeout_secs,
         })
         .collect();
 
     Some(Ok(tasks))
-}
-
-/// Derive a short task label from a description + index.
-fn make_task_id(description: &str, idx: usize) -> String {
-    let lower = description.to_lowercase();
-    let slug: String = lower
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .collect();
-
-    // Collapse runs of dashes.
-    let mut result = String::new();
-    let mut prev_dash = false;
-    for c in slug.chars() {
-        if c == '-' {
-            if !prev_dash {
-                result.push('-');
-            }
-            prev_dash = true;
-        } else {
-            result.push(c);
-            prev_dash = false;
-        }
-    }
-    let trimmed = result.trim_matches('-');
-
-    // For non-ASCII-only descriptions that produce an empty slug, use
-    // "task-{idx}" which already encodes the index — no suffix needed.
-    if trimmed.is_empty() {
-        return format!("task-{idx}");
-    }
-
-    let base = if trimmed.len() > 32 {
-        trimmed[..32].trim_end_matches('-').to_string()
-    } else {
-        trimmed.to_string()
-    };
-
-    // Append the index for tasks beyond the first so that duplicate
-    // descriptions within a single /claude invocation get distinct task_ids
-    // (and therefore distinct auto-worktree paths / branch names).
-    if idx > 0 {
-        format!("{base}-{idx}")
-    } else {
-        base
-    }
 }
 
 /// Parse shell-style arguments, supporting both quoted and unquoted tokens.
@@ -635,7 +579,7 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
     // Intercept slash commands before session::get_or_create to avoid
     // unnecessary disk I/O for commands that don't use the chat session.
     if let Some(SlashCommand::Claude(parse_result)) = parse_slash_command(&prompt) {
-        let tasks = match parse_result {
+        let mut tasks = match parse_result {
             Ok(t) => t,
             Err(msg) => {
                 let mut stdout = tokio::io::stdout();
@@ -645,11 +589,16 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
                 return Ok(());
             }
         };
+        // For each task with no explicit `--tag`, ask the daemon for
+        // one via GenerateTag (Haiku under the hood).  Must happen
+        // before ClaudeLaunch so pane/worktree/notebook all use the
+        // resolved tag from the start.
+        resolve_missing_tags(&socket, &mut tasks, &cwd_str).await?;
         let req = Request::ClaudeLaunch {
             tasks: tasks
                 .into_iter()
                 .map(|t| TaskSpec {
-                    task_id: t.task_id,
+                    tag: t.tag,
                     description: t.description,
                     worktree: t.worktree,
                     client_cwd: t.cwd.or_else(|| Some(cwd_str.clone())),
@@ -657,7 +606,6 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
                     resume_pane: t.resume_pane,
                     resources: t.resources,
                     resource_timeout_secs: t.resource_timeout_secs,
-                    task_name: t.task_name,
                 })
                 .collect(),
         };
@@ -682,16 +630,11 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
                     break;
                 }
                 Response::PaneAssigned {
-                    task_id,
+                    tag,
                     pane_id,
                     session_id: sid,
-                    task_name,
                 } => {
-                    let tag_hint = task_name
-                        .as_deref()
-                        .map(|t| format!(" tag={t}"))
-                        .unwrap_or_default();
-                    let msg = format!("[pane {pane_id}] {task_id} → session {sid}{tag_hint}\n");
+                    let msg = format!("[pane {pane_id}] tag={tag} → session {sid}\n");
                     stdout.write_all(msg.as_bytes()).await?;
                 }
                 Response::CapacityError {
@@ -938,9 +881,11 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
                             let _ = tokio::io::stderr().flush().await;
                         }
                     }
-                    Response::PaneAssigned { .. } | Response::CapacityError { .. } => {
+                    Response::PaneAssigned { .. }
+                    | Response::CapacityError { .. }
+                    | Response::TagGenerated { .. } => {
                         // Not expected in a normal Chat response stream.
-                        tracing::debug!("unexpected pane scheduler response in chat loop");
+                        tracing::debug!("unexpected pane/tag scheduler response in chat loop");
                     }
                     Response::ModelSwitched { .. } => {
                         // ask mode has no persistent model variable to update.
@@ -1094,7 +1039,7 @@ pub async fn run_chat_loop(
         // Dispatch slash commands before sending to daemon.
         match parse_slash_command(&prompt) {
             Some(SlashCommand::Claude(parse_result)) => {
-                let tasks = match parse_result {
+                let mut tasks = match parse_result {
                     Ok(t) => t,
                     Err(msg) => {
                         stdout.write_all(msg.as_bytes()).await?;
@@ -1103,22 +1048,26 @@ pub async fn run_chat_loop(
                         continue 'session;
                     }
                 };
-                // Save descriptions + per-task tags keyed by task_id so the
-                // supervision request built after this loop can look each
-                // pane's tag up individually.  Parser always fills a tag
-                // (auto-derived from task_id unless `--task` overrode it),
-                // so every pane participates in the notebook by default.
+                // Resolve any empty tags via the daemon's tagger before
+                // building TaskSpec.  Skipped for tasks that arrived
+                // with `--tag <override>` already set.
+                if let Err(e) = resolve_missing_tags(&socket, &mut tasks, &cwd_str).await {
+                    let msg = format!("[error] tag generation failed: {e:#}\n");
+                    stdout.write_all(msg.as_bytes()).await?;
+                    stdout.flush().await?;
+                    continue 'session;
+                }
+                // Keyed by tag — used to look up the original description
+                // when daemon replies with PaneAssigned.  Tag is resolved
+                // (Haiku or `--tag` override) before tasks land here, so
+                // it's a stable id for the supervision handoff.
                 let task_descriptions: std::collections::HashMap<String, String> = tasks
                     .iter()
-                    .map(|t| (t.task_id.clone(), t.description.clone()))
-                    .collect();
-                let task_tags: std::collections::HashMap<String, Option<String>> = tasks
-                    .iter()
-                    .map(|t| (t.task_id.clone(), t.task_name.clone()))
+                    .map(|t| (t.tag.clone(), t.description.clone()))
                     .collect();
                 // Canonicalise the effective client cwd — honour `--cwd` when
                 // set so `repo_dir` matches the path sent as `client_cwd` on
-                // each TaskSpec.  Without this, `/claude --cwd /other --task foo`
+                // each TaskSpec.  Without this, `/claude --cwd /other --tag foo`
                 // would key the notebook against the chat process's cwd instead
                 // of the requested directory, breaking resume and lease.
                 let invocation_repo_dir: Option<String> = Some({
@@ -1132,7 +1081,7 @@ pub async fn run_chat_loop(
                     tasks: tasks
                         .into_iter()
                         .map(|t| TaskSpec {
-                            task_id: t.task_id,
+                            tag: t.tag,
                             description: t.description,
                             worktree: t.worktree,
                             client_cwd: t.cwd.or_else(|| Some(cwd_str.clone())),
@@ -1140,7 +1089,6 @@ pub async fn run_chat_loop(
                             resume_pane: t.resume_pane,
                             resources: t.resources,
                             resource_timeout_secs: t.resource_timeout_secs,
-                            task_name: t.task_name,
                         })
                         .collect(),
                 };
@@ -1149,8 +1097,9 @@ pub async fn run_chat_loop(
                 write_half.write_all(req_line.as_bytes()).await?;
 
                 // Collect (pane_id, task_description) for supervision.
-                // (pane_id, description, task_name_tag) per launched pane.
-                let mut launched: Vec<(String, String, Option<String>)> = Vec::new();
+                // (pane_id, description, tag_tag) per launched pane.
+                // (pane_id, description, tag) per launched pane.
+                let mut launched: Vec<(String, String, String)> = Vec::new();
 
                 loop {
                     let line = lines.next_line().await.context("reading daemon response")?;
@@ -1165,29 +1114,16 @@ pub async fn run_chat_loop(
                             break;
                         }
                         Response::PaneAssigned {
-                            task_id,
+                            tag,
                             pane_id,
                             session_id: sid,
-                            task_name,
                         } => {
-                            let tag_hint = task_name
-                                .as_deref()
-                                .map(|t| format!(" tag={t}"))
-                                .unwrap_or_default();
-                            let msg =
-                                format!("[pane {pane_id}] {task_id} → session {sid}{tag_hint}\n");
+                            let msg = format!("[pane {pane_id}] tag={tag} → session {sid}\n");
                             stdout.write_all(msg.as_bytes()).await?;
                             let desc = task_descriptions
-                                .get(&task_id)
+                                .get(&tag)
                                 .cloned()
-                                .unwrap_or_else(|| task_id.clone());
-                            // Prefer the daemon-resolved tag (may have been
-                            // auto-generated by the LLM tagger).  Fall back
-                            // to whatever the parser recorded, which is the
-                            // `--task` override when present.
-                            let tag = task_name
-                                .clone()
-                                .or_else(|| task_tags.get(&task_id).cloned().unwrap_or(None));
+                                .unwrap_or_else(|| tag.clone());
                             launched.push((pane_id, desc, tag));
                         }
                         Response::CapacityError {
@@ -1218,7 +1154,7 @@ pub async fn run_chat_loop(
                             .map(|(pid, desc, tag)| crate::ipc::SupervisionTarget {
                                 pane_id: pid.clone(),
                                 task_description: desc.clone(),
-                                task_name: tag.clone(),
+                                tag: Some(tag.clone()),
                                 repo_dir: invocation_repo_dir.clone(),
                             })
                             .collect(),
@@ -1845,8 +1781,10 @@ pub async fn run_resume(
                             let _ = tokio::io::stderr().flush().await;
                         }
                     }
-                    Response::PaneAssigned { .. } | Response::CapacityError { .. } => {
-                        tracing::debug!("unexpected pane scheduler response in resume loop");
+                    Response::PaneAssigned { .. }
+                    | Response::CapacityError { .. }
+                    | Response::TagGenerated { .. } => {
+                        tracing::debug!("unexpected pane/tag scheduler response in resume loop");
                     }
                     Response::ModelSwitched { .. } => {
                         // resume mode has no persistent model variable to update.
@@ -2070,6 +2008,61 @@ async fn flush_steer_buffer(
 /// is not already running.
 ///
 /// On the first failed connection attempt the daemon binary is spawned with
+/// Fill in `tasks[*].tag` when empty, asking the daemon to generate a
+/// tag via its Haiku tagger.  One dedicated short-lived connection per
+/// task — keeps the dispatcher on the main connection cleanly focused
+/// on ClaudeLaunch / SupervisePanes frames.  On any IPC failure the
+/// tag is left empty and the caller can decide what to do (typically
+/// fall back to a local slug).
+async fn resolve_missing_tags(
+    socket: &std::path::Path,
+    tasks: &mut [ClaudeTask],
+    client_cwd: &str,
+) -> Result<()> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    for t in tasks.iter_mut() {
+        if !t.tag.is_empty() {
+            continue;
+        }
+        let repo_dir = crate::session::canonical_key(std::path::Path::new(
+            t.cwd.as_deref().unwrap_or(client_cwd),
+        ));
+        let stream = UnixStream::connect(socket)
+            .await
+            .context("connecting to daemon for GenerateTag")?;
+        let (reader, mut writer) = tokio::io::split(stream);
+        let req = Request::GenerateTag {
+            description: t.description.clone(),
+            repo_dir,
+        };
+        let mut line = serde_json::to_string(&req).context("serialising GenerateTag")?;
+        line.push('\n');
+        writer
+            .write_all(line.as_bytes())
+            .await
+            .context("sending GenerateTag")?;
+        let mut lines = BufReader::new(reader).lines();
+        let reply = lines
+            .next_line()
+            .await
+            .context("reading GenerateTag response")?
+            .context("daemon closed before GenerateTag reply")?;
+        let frame: Response = serde_json::from_str(&reply).context("parsing GenerateTag reply")?;
+        match frame {
+            Response::TagGenerated { tag } => {
+                t.tag = tag;
+            }
+            Response::Error { message } => {
+                anyhow::bail!("daemon rejected GenerateTag: {message}");
+            }
+            other => {
+                anyhow::bail!("unexpected daemon frame for GenerateTag: {other:?}");
+            }
+        }
+    }
+    Ok(())
+}
+
 /// `stdin`/`stdout`/`stderr` all redirected to `/dev/null`.  Connection is
 /// then retried with exponential back-off up to ~5 seconds before giving up.
 async fn connect_or_start_daemon(socket: &std::path::Path) -> Result<UnixStream> {
@@ -2565,19 +2558,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_claude_task_id_derived_from_description() {
-        let tasks = claude_tasks(r#"/claude "Implement Cron Scheduling""#);
-        assert_eq!(tasks[0].task_id, "implement-cron-scheduling");
-    }
-
-    #[test]
-    fn parse_claude_task_id_truncated() {
-        let long = format!("/claude \"{}\"", "a".repeat(100));
-        let tasks = claude_tasks(&long);
-        assert!(tasks[0].task_id.len() <= 32);
-    }
-
-    #[test]
     fn parse_claude_resource_flag_collects_specs() {
         let tasks = claude_tasks("/claude --resource sim-9900 --resource class:gpu \"run kernel\"");
         assert_eq!(tasks.len(), 1);
@@ -2655,25 +2635,25 @@ mod tests {
     }
 
     #[test]
-    fn parse_claude_task_tag_is_collected() {
-        let tasks = claude_tasks("/claude --task kernel-opt \"run this\"");
-        assert_eq!(tasks[0].task_name.as_deref(), Some("kernel-opt"));
+    fn parse_claude_tag_override_is_collected() {
+        let tasks = claude_tasks("/claude --tag kernel-opt \"run this\"");
+        assert_eq!(tasks[0].tag, "kernel-opt");
         assert_eq!(tasks[0].description, "run this");
     }
 
     #[test]
-    fn parse_claude_task_without_value_errors() {
-        let result = parse_claude("/claude --task");
+    fn parse_claude_tag_without_value_errors() {
+        let result = parse_claude("/claude --tag");
         assert!(matches!(result, Some(Err(_))));
     }
 
     #[test]
-    fn parse_claude_without_task_flag_leaves_name_none() {
-        // Parser doesn't pre-fill task_name — the daemon resolves `None`
-        // via its LLM tagger.  This lets non-ASCII descriptions (Chinese,
-        // Japanese, etc.) get a meaningful tag rather than `task-N`.
+    fn parse_claude_without_tag_flag_leaves_empty() {
+        // Parser leaves tag empty when `--tag` isn't passed.  The
+        // client will run an IPC GenerateTag round-trip against the
+        // daemon (Haiku or fallback slug) before sending ClaudeLaunch.
         let tasks = claude_tasks("/claude \"just run\"");
-        assert!(tasks[0].task_name.is_none());
+        assert_eq!(tasks[0].tag, "");
     }
 
     #[test]
@@ -2724,25 +2704,6 @@ mod tests {
     fn parse_model_false_positive_rejected() {
         assert!(parse_slash_command("/modelx").is_none());
         assert!(parse_slash_command("/model--help").is_none());
-    }
-
-    #[test]
-    fn make_task_id_simple() {
-        assert_eq!(
-            make_task_id("implement something", 0),
-            "implement-something"
-        );
-    }
-
-    #[test]
-    fn make_task_id_collapses_dashes() {
-        assert_eq!(make_task_id("hello   world", 0), "hello-world");
-    }
-
-    #[test]
-    fn make_task_id_fallback_for_pure_non_ascii() {
-        let id = make_task_id("こんにちは", 3);
-        assert_eq!(id, "task-3");
     }
 
     // -----------------------------------------------------------------------

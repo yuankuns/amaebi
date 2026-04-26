@@ -67,7 +67,7 @@ pub struct PaneLease {
     pub window_id: String,
     pub status: PaneStatus,
     /// User-supplied task label (e.g. `"pr-123"`).
-    pub task_id: Option<String>,
+    pub tag: Option<String>,
     /// amaebi session UUID assigned when the lease was acquired.
     pub session_id: Option<String>,
     /// Absolute path to the git worktree for this task (uniqueness key).
@@ -93,7 +93,7 @@ impl PaneLease {
             pane_id,
             window_id,
             status: PaneStatus::Idle,
-            task_id: None,
+            tag: None,
             session_id: None,
             worktree: None,
             heartbeat_at: now_secs(),
@@ -244,7 +244,7 @@ pub fn read_state() -> Result<PaneState> {
 /// [`ensure_and_acquire_idle`] for production use to avoid TOCTOU races.
 #[allow(dead_code)]
 pub fn acquire_first_idle(
-    task_id: &str,
+    tag: &str,
     session_id: &str,
     worktree: Option<&str>,
 ) -> Result<(String, bool)> {
@@ -252,7 +252,7 @@ pub fn acquire_first_idle(
     lock.lock_exclusive()
         .context("acquiring flock for acquire_first_idle")?;
 
-    let result = acquire_first_idle_locked(task_id, session_id, worktree);
+    let result = acquire_first_idle_locked(tag, session_id, worktree);
 
     lock.unlock()
         .context("releasing flock after acquire_first_idle")?;
@@ -267,7 +267,7 @@ pub fn acquire_first_idle(
 /// Priority: idle panes with `has_claude = true` are preferred so that
 /// existing Claude sessions absorb new tasks before blank panes are used.
 fn acquire_first_idle_locked(
-    task_id: &str,
+    tag: &str,
     session_id: &str,
     worktree: Option<&str>,
 ) -> Result<(String, bool)> {
@@ -280,7 +280,7 @@ fn acquire_first_idle_locked(
                 anyhow::bail!(
                     "worktree {} already held by task {:?} on pane {}",
                     wt,
-                    l.task_id,
+                    l.tag,
                     pid
                 );
             }
@@ -326,7 +326,7 @@ fn acquire_first_idle_locked(
     let had_claude =
         lease.has_claude && worktree.is_some() && lease.worktree.as_deref() == worktree;
     lease.status = PaneStatus::Busy;
-    lease.task_id = Some(task_id.to_string());
+    lease.tag = Some(tag.to_string());
     lease.session_id = Some(session_id.to_string());
     lease.worktree = worktree.map(str::to_string);
     lease.heartbeat_at = now_secs();
@@ -343,7 +343,7 @@ fn acquire_first_idle_locked(
 /// letting the scheduler pick one.
 pub fn acquire_lease(
     pane_id: &str,
-    task_id: &str,
+    tag: &str,
     session_id: &str,
     worktree: Option<&str>,
 ) -> Result<()> {
@@ -359,7 +359,7 @@ pub fn acquire_lease(
             .ok_or_else(|| anyhow::anyhow!("pane {pane_id} not found in state"))?;
 
         if lease.effective_status() == PaneStatus::Busy {
-            anyhow::bail!("pane {} is busy (task: {:?})", pane_id, lease.task_id);
+            anyhow::bail!("pane {} is busy (task: {:?})", pane_id, lease.tag);
         }
 
         // Worktree uniqueness check.
@@ -372,7 +372,7 @@ pub fn acquire_lease(
                     anyhow::bail!(
                         "worktree {} already held by task {:?} on pane {}",
                         wt,
-                        l.task_id,
+                        l.tag,
                         pid
                     );
                 }
@@ -381,7 +381,7 @@ pub fn acquire_lease(
 
         let lease = state.get_mut(pane_id).unwrap();
         lease.status = PaneStatus::Busy;
-        lease.task_id = Some(task_id.to_string());
+        lease.tag = Some(tag.to_string());
         lease.session_id = Some(session_id.to_string());
         lease.worktree = worktree.map(str::to_string);
         lease.heartbeat_at = now_secs();
@@ -406,7 +406,7 @@ pub fn release_lease(pane_id: &str) -> Result<()> {
         let mut state = read_state_unlocked()?;
         if let Some(lease) = state.get_mut(pane_id) {
             lease.status = PaneStatus::Idle;
-            lease.task_id = None;
+            lease.tag = None;
             lease.session_id = None;
             // Intentionally keep `worktree`, `has_claude`, and
             // `task_description` so `/claude --resume-pane <pid>` can re-acquire
@@ -636,7 +636,7 @@ fn ensure_idle_panes_locked(needed: usize) -> Result<()> {
 /// `acquire_first_idle` when multiple `ClaudeLaunch` requests arrive
 /// concurrently.
 pub fn ensure_and_acquire_idle(
-    task_id: &str,
+    tag: &str,
     session_id: &str,
     worktree: Option<&str>,
 ) -> Result<(String, bool)> {
@@ -676,7 +676,7 @@ pub fn ensure_and_acquire_idle(
             ensure_idle_panes_locked(total_idle + 1)?;
         }
         // Acquire the first usable idle pane.
-        acquire_first_idle_locked(task_id, session_id, worktree)
+        acquire_first_idle_locked(tag, session_id, worktree)
     })();
 
     lock.unlock()
@@ -877,7 +877,7 @@ mod tests {
             pane_id: pane_id.to_string(),
             window_id: window_id.to_string(),
             status: PaneStatus::Busy,
-            task_id: Some("task-1".to_string()),
+            tag: Some("task-1".to_string()),
             session_id: Some("sess-1".to_string()),
             worktree: worktree.map(str::to_string),
             heartbeat_at: now_secs(),
@@ -974,7 +974,7 @@ mod tests {
 
             let s = read_state_unlocked().expect("read back");
             assert_eq!(s["%0"].effective_status(), PaneStatus::Busy);
-            assert_eq!(s["%0"].task_id.as_deref(), Some("task-x"));
+            assert_eq!(s["%0"].tag.as_deref(), Some("task-x"));
         }
     }
 
@@ -1004,7 +1004,7 @@ mod tests {
             acquire_lease("%0", "task-new", "sess-new", None).expect("should succeed after expiry");
 
             let s = read_state_unlocked().expect("read back");
-            assert_eq!(s["%0"].task_id.as_deref(), Some("task-new"));
+            assert_eq!(s["%0"].tag.as_deref(), Some("task-new"));
         }
     }
 
@@ -1179,7 +1179,7 @@ mod tests {
 
             let s = read_state_unlocked().expect("read back");
             assert_eq!(s["%0"].effective_status(), PaneStatus::Idle);
-            assert!(s["%0"].task_id.is_none());
+            assert!(s["%0"].tag.is_none());
         }
     }
 

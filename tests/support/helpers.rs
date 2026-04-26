@@ -46,7 +46,7 @@ pub enum Request {
 /// are `Option`/`Vec` so a test can omit them to simulate a legacy client.
 #[derive(Serialize, Deserialize, Debug, Default)]
 pub struct ClaudeLaunchTaskSpec {
-    pub task_id: String,
+    pub tag: String,
     pub description: String,
     pub worktree: Option<String>,
     pub client_cwd: Option<String>,
@@ -91,11 +91,9 @@ pub enum Response {
     },
     /// Success frame for a single `/claude` task launched via ClaudeLaunch.
     PaneAssigned {
-        task_id: String,
+        tag: String,
         pane_id: String,
         session_id: String,
-        #[serde(default)]
-        task_name: Option<String>,
     },
     /// Failure frame when the pane pool is full and the daemon cannot
     /// allocate more.  Surfaces BEFORE any tmux interaction so this path

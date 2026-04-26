@@ -1,8 +1,13 @@
 /// A single task specification for [`Request::ClaudeLaunch`].
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct TaskSpec {
-    /// User-supplied label, e.g. `"pr-123"` or `"issue-76"`.
-    pub task_id: String,
+    /// Notebook tag for this task.  Resolved by the client before
+    /// sending: either the user's `--tag <name>` verbatim, or the
+    /// result of an earlier [`Request::GenerateTag`] round-trip.  The
+    /// tag is used as the pane lease holder id, the worktree directory
+    /// name (`<tag>-<uuid8>`), the tmux window title (`cc-<tag>`), and
+    /// the notebook key in `~/.amaebi/tasks.db`.
+    pub tag: String,
     /// Description sent to the Claude session as the opening prompt.
     pub description: String,
     /// Optional absolute path to a git worktree for this task.
@@ -54,12 +59,6 @@ pub struct TaskSpec {
     /// `0` means don't wait (fail immediately if any resource is busy).
     #[serde(default)]
     pub resource_timeout_secs: Option<u64>,
-    /// Optional task tag for supervision notebook persistence.  When
-    /// present, the supervision loop acquires a 24 h lease on
-    /// `(client_cwd, task_name)` and reads/writes
-    /// `~/.amaebi/tasks.db`.  When absent, notebook is bypassed.
-    #[serde(default)]
-    pub task_name: Option<String>,
 }
 
 /// A single pane+task pair for supervision.
@@ -67,13 +66,12 @@ pub struct TaskSpec {
 pub struct SupervisionTarget {
     pub pane_id: String,
     pub task_description: String,
-    /// Task notebook tag — carried from [`TaskSpec::task_name`] so the
-    /// supervision loop can read/write `~/.amaebi/tasks.db`.  `None`
-    /// disables the notebook path for this pane.
+    /// Notebook tag — carried from [`TaskSpec::tag`].  `None` disables
+    /// the notebook path for this pane (e.g. legacy client).
     #[serde(default)]
-    pub task_name: Option<String>,
+    pub tag: Option<String>,
     /// Canonicalized `client_cwd` at the time the task was launched.
-    /// Used together with `task_name` as the notebook lookup key.
+    /// Used together with `tag` as the notebook lookup key.
     #[serde(default)]
     pub repo_dir: Option<String>,
 }
@@ -183,6 +181,18 @@ pub enum Request {
         /// The tasks to launch in parallel.
         tasks: Vec<TaskSpec>,
     },
+    /// Ask the daemon to generate a notebook tag for a task description.
+    ///
+    /// The client sends this before [`Request::ClaudeLaunch`] when the
+    /// user didn't pass `--tag`.  The daemon calls Haiku, or falls back
+    /// to a slug/date heuristic, and returns [`Response::TagGenerated`].
+    /// Blocks the client until a tag is ready — the whole pane launch
+    /// flow depends on the tag being known up front (worktree
+    /// directory, tmux window title, notebook key all use it).
+    GenerateTag {
+        description: String,
+        repo_dir: String,
+    },
     /// Supervise tmux panes where Claude is executing tasks.
     /// The daemon runs a Rust polling loop: capture pane → LLM analysis → act.
     SupervisePanes {
@@ -249,18 +259,13 @@ pub enum Response {
     /// The client receives one frame per task, in submission order, before the
     /// final [`Response::Done`].
     PaneAssigned {
-        /// The task label supplied in [`TaskSpec::task_id`].
-        task_id: String,
+        /// Notebook tag that owns this pane (the `TaskSpec::tag`
+        /// resolved upstream by [`Request::GenerateTag`] or `--tag`).
+        tag: String,
         /// tmux pane ID, e.g. `"%3"`.
         pane_id: String,
         /// amaebi session UUID for the new chat session running in the pane.
         session_id: String,
-        /// Resolved notebook tag for this task.  Either the user-supplied
-        /// `--task <tag>` verbatim, or an auto-generated tag from the
-        /// daemon's LLM tagger (via haiku).  `None` only when tagging was
-        /// skipped (e.g. tagger disabled in a future config).
-        #[serde(default)]
-        task_name: Option<String>,
     },
     /// The LLM called the `switch_model` tool and the active model changed.
     ///
@@ -274,6 +279,8 @@ pub enum Response {
         /// unchanged in the next [`Request::Chat`].
         model: String,
     },
+    /// Reply to [`Request::GenerateTag`] carrying the resolved tag.
+    TagGenerated { tag: String },
     /// The [`Request::ClaudeLaunch`] was rejected because adding the requested
     /// panes would exceed the configured maximum.
     CapacityError {
@@ -582,7 +589,7 @@ mod tests {
             r#"{"type":"memory_entry","role":"user","content":"hi"}"#,
             r#"{"type":"waiting_for_input","prompt":"Which language?"}"#,
             r#"{"type":"compacting"}"#,
-            r#"{"type":"pane_assigned","task_id":"pr-1","pane_id":"%3","session_id":"uuid-abc"}"#,
+            r#"{"type":"pane_assigned","tag":"pr-1","pane_id":"%3","session_id":"uuid-abc"}"#,
             r#"{"type":"capacity_error","requested":3,"max_panes":16,"current_busy":14}"#,
             r#"{"type":"model_switched","model":"bedrock/claude-opus-4.7"}"#,
         ];
@@ -611,7 +618,7 @@ mod tests {
     #[test]
     fn task_spec_round_trip() {
         let spec = TaskSpec {
-            task_id: "pr-123".into(),
+            tag: "pr-123".into(),
             description: "implement feature X".into(),
             worktree: Some("/home/user/repo-wt/feat-x".into()),
             client_cwd: Some("/home/user/repo".into()),
@@ -619,11 +626,10 @@ mod tests {
             resume_pane: None,
             resources: Vec::new(),
             resource_timeout_secs: None,
-            task_name: None,
         };
         let json = serde_json::to_string(&spec).unwrap();
         let back: TaskSpec = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.task_id, "pr-123");
+        assert_eq!(back.tag, "pr-123");
         assert_eq!(back.description, "implement feature X");
         assert_eq!(back.worktree.as_deref(), Some("/home/user/repo-wt/feat-x"));
         assert!(back.auto_enter);
@@ -634,7 +640,7 @@ mod tests {
     fn task_spec_resume_pane_round_trip() {
         // With resume_pane set.
         let spec = TaskSpec {
-            task_id: "t1".into(),
+            tag: "t1".into(),
             description: "continue".into(),
             worktree: None,
             client_cwd: None,
@@ -642,7 +648,6 @@ mod tests {
             resume_pane: Some("%41".into()),
             resources: Vec::new(),
             resource_timeout_secs: None,
-            task_name: None,
         };
         let json = serde_json::to_string(&spec).unwrap();
         let back: TaskSpec = serde_json::from_str(&json).unwrap();
@@ -653,7 +658,8 @@ mod tests {
     fn task_spec_resume_pane_absent_field_deserializes_as_none() {
         // Older clients on master still encode without `resume_pane`; the
         // daemon must accept that payload and default the field to None.
-        let legacy = r#"{"task_id":"x","description":"d","worktree":null,"client_cwd":null,"auto_enter":true}"#;
+        let legacy =
+            r#"{"tag":"x","description":"d","worktree":null,"client_cwd":null,"auto_enter":true}"#;
         let back: TaskSpec = serde_json::from_str(legacy).unwrap();
         assert!(back.resume_pane.is_none());
     }
@@ -665,7 +671,7 @@ mod tests {
         // must still deserialize against the new daemon.  Without
         // `#[serde(default)]` on the new fields this would fail and break
         // every existing `/claude` call after the daemon upgrade.
-        let pr124_payload = r#"{"task_id":"x","description":"d","worktree":null,"client_cwd":null,"auto_enter":true,"resume_pane":"%41"}"#;
+        let pr124_payload = r#"{"tag":"x","description":"d","worktree":null,"client_cwd":null,"auto_enter":true,"resume_pane":"%41"}"#;
         let back: TaskSpec = serde_json::from_str(pr124_payload).expect("legacy must parse");
         assert_eq!(back.resume_pane.as_deref(), Some("%41"));
         assert!(back.resources.is_empty(), "resources must default to empty");
@@ -681,7 +687,7 @@ mod tests {
         // survive a JSON round-trip preserving spec order and the numeric
         // timeout.  Protects the wire-format from accidental renames.
         let spec = TaskSpec {
-            task_id: "kernel-debug".into(),
+            tag: "kernel-debug".into(),
             description: "run this kernel".into(),
             worktree: None,
             client_cwd: None,
@@ -689,7 +695,6 @@ mod tests {
             resume_pane: None,
             resources: vec!["sim-9900".into(), "class:gpu".into()],
             resource_timeout_secs: Some(300),
-            task_name: None,
         };
         let json = serde_json::to_string(&spec).unwrap();
         // Assert the wire field names so a silent serde rename is caught here,
@@ -704,14 +709,14 @@ mod tests {
     }
 
     #[test]
-    fn task_spec_task_name_absent_field_deserializes_as_none() {
-        // A PR #126/#127-era client (with resources, no task_name) must
-        // still deserialise against the new daemon.  Without
-        // `#[serde(default)]` on task_name, mixed-version deployments
-        // would fail every `/claude` call.
-        let legacy = r#"{"task_id":"x","description":"d","worktree":null,"client_cwd":null,"auto_enter":true,"resume_pane":null,"resources":[],"resource_timeout_secs":null}"#;
-        let back: TaskSpec = serde_json::from_str(legacy).expect("legacy must parse");
-        assert!(back.task_name.is_none());
+    fn task_spec_tag_is_mandatory() {
+        // `tag` is a required field (resolved upstream via
+        // Request::GenerateTag or `--tag`).  Payloads missing it must
+        // fail to deserialise — better an early error than a silent
+        // empty-tag row in the notebook.
+        let missing = r#"{"description":"d","worktree":null,"client_cwd":null,"auto_enter":true,"resume_pane":null,"resources":[],"resource_timeout_secs":null}"#;
+        let back: Result<TaskSpec, _> = serde_json::from_str(missing);
+        assert!(back.is_err(), "missing tag should reject");
     }
 
     #[test]
@@ -720,7 +725,7 @@ mod tests {
         // Legacy payloads (pre-task-notebook PR) must still deserialise.
         let legacy = r#"{"pane_id":"%3","task_description":"old task"}"#;
         let back: SupervisionTarget = serde_json::from_str(legacy).expect("legacy must parse");
-        assert!(back.task_name.is_none());
+        assert!(back.tag.is_none());
         assert!(back.repo_dir.is_none());
     }
 
@@ -729,17 +734,17 @@ mod tests {
         let t = SupervisionTarget {
             pane_id: "%3".into(),
             task_description: "do the thing".into(),
-            task_name: Some("kernel-opt".into()),
+            tag: Some("kernel-opt".into()),
             repo_dir: Some("/home/me/proj".into()),
         };
         let json = serde_json::to_string(&t).unwrap();
         // Pin the wire field names.
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(v["task_name"], "kernel-opt");
+        assert_eq!(v["tag"], "kernel-opt");
         assert_eq!(v["repo_dir"], "/home/me/proj");
 
         let back: SupervisionTarget = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.task_name.as_deref(), Some("kernel-opt"));
+        assert_eq!(back.tag.as_deref(), Some("kernel-opt"));
         assert_eq!(back.repo_dir.as_deref(), Some("/home/me/proj"));
     }
 
@@ -748,7 +753,7 @@ mod tests {
         let req = Request::ClaudeLaunch {
             tasks: vec![
                 TaskSpec {
-                    task_id: "t1".into(),
+                    tag: "t1".into(),
                     description: "do A".into(),
                     worktree: None,
                     client_cwd: Some("/home/user/repo".into()),
@@ -756,10 +761,9 @@ mod tests {
                     resume_pane: None,
                     resources: Vec::new(),
                     resource_timeout_secs: None,
-                    task_name: None,
                 },
                 TaskSpec {
-                    task_id: "t2".into(),
+                    tag: "t2".into(),
                     description: "do B".into(),
                     worktree: Some("/wt/b".into()),
                     client_cwd: None,
@@ -767,14 +771,13 @@ mod tests {
                     resume_pane: None,
                     resources: Vec::new(),
                     resource_timeout_secs: None,
-                    task_name: None,
                 },
             ],
         };
         let json = serde_json::to_string(&req).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["type"], "claude_launch");
-        assert_eq!(v["tasks"][0]["task_id"], "t1");
+        assert_eq!(v["tasks"][0]["tag"], "t1");
         assert_eq!(v["tasks"][1]["worktree"], "/wt/b");
 
         let back: Request = serde_json::from_str(&json).unwrap();
@@ -790,7 +793,7 @@ mod tests {
             panes: vec![SupervisionTarget {
                 pane_id: "%3".into(),
                 task_description: "implement feature X".into(),
-                task_name: None,
+                tag: None,
                 repo_dir: None,
             }],
             model: "gpt-4o".into(),
@@ -821,15 +824,14 @@ mod tests {
     #[test]
     fn response_pane_assigned_round_trip() {
         let r = Response::PaneAssigned {
-            task_id: "pr-123".into(),
+            tag: "pr-123".into(),
             pane_id: "%3".into(),
             session_id: "uuid-xyz".into(),
-            task_name: None,
         };
         let json = serde_json::to_string(&r).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["type"], "pane_assigned");
-        assert_eq!(v["task_id"], "pr-123");
+        assert_eq!(v["tag"], "pr-123");
         assert_eq!(v["pane_id"], "%3");
         assert_eq!(v["session_id"], "uuid-xyz");
 

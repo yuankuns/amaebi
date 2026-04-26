@@ -163,8 +163,8 @@ pub struct DaemonState {
     /// Persistent SQLite connection for the task notebook
     /// (`~/.amaebi/tasks.db`).  Shared `Mutex` for the same reason as
     /// `db`: all reads and writes serialise through a single connection.
-    /// Lazy-initialised — the first `/claude --task <tag>` request opens
-    /// it; invocations without `--task` never touch the file.
+    /// Lazy-initialised — the first `/claude --tag <tag>` request opens
+    /// it; invocations without `--tag` never touch the file.
     pub tasks_db: Arc<Mutex<Option<rusqlite::Connection>>>,
 }
 
@@ -895,6 +895,16 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                 handle_claude_launch(&writer, tasks, &state).await?;
             }
 
+            Request::GenerateTag {
+                description,
+                repo_dir,
+            } => {
+                let tag =
+                    crate::task_tagger::generate_tag(&state, None, &description, &repo_dir).await;
+                let mut w = writer.lock().await;
+                write_frame(&mut *w, &Response::TagGenerated { tag }).await?;
+            }
+
             Request::SupervisePanes {
                 panes,
                 model,
@@ -1028,7 +1038,9 @@ async fn drive_agentic_loop(
 async fn handle_claude_launch(
     writer: &Arc<tokio::sync::Mutex<tokio::net::unix::OwnedWriteHalf>>,
     tasks: Vec<crate::ipc::TaskSpec>,
-    state: &Arc<DaemonState>,
+    // Unused at this scope after tag resolution moved client-side;
+    // kept in the signature for future per-launch daemon work.
+    _state: &Arc<DaemonState>,
 ) -> Result<()> {
     if tasks.is_empty() {
         let mut w = writer.lock().await;
@@ -1042,8 +1054,8 @@ async fn handle_claude_launch(
     // `ensure_and_acquire_idle` holds a single LOCK_EX for both expansion and
     // acquisition, eliminating the TOCTOU race.
     let total_tasks = tasks.len();
-    for (task_idx, task) in tasks.into_iter().enumerate() {
-        let task_id = task.task_id.clone();
+    for (tagx, task) in tasks.into_iter().enumerate() {
+        let tag = task.tag.clone();
         let auto_enter = task.auto_enter;
 
         // Defense in depth against a stale / custom client that bypasses
@@ -1058,7 +1070,7 @@ async fn handle_claude_launch(
                     message: format!(
                         "[error] task {:?}: --resume-pane is incompatible with --resource; \
                          env injection requires a fresh `claude` launch",
-                        task_id
+                        tag
                     ),
                 },
             )
@@ -1199,7 +1211,7 @@ async fn handle_claude_launch(
         {
             // --- resume-pane path ---
             let rp_owned = rp.clone();
-            let tid_for_lease = task_id.clone();
+            let tid_for_lease = tag.clone();
             let sid_for_lease = sid_placeholder.clone();
             let probe = tokio::task::spawn_blocking(move || {
                     let state = pane_lease::read_state()?;
@@ -1286,7 +1298,7 @@ async fn handle_claude_launch(
             let wt_val: Option<String> = match task.worktree.clone() {
                 Some(wt) => Some(wt),
                 None => {
-                    let tid = task_id.clone();
+                    let tid = tag.clone();
                     let cwd = task.client_cwd.clone();
                     let base = ctx_start_branch.clone();
                     match tokio::task::spawn_blocking(move || {
@@ -1298,7 +1310,7 @@ async fn handle_claude_launch(
                         Ok(path) => Some(path.to_string_lossy().into_owned()),
                         Err(e) => {
                             tracing::warn!(
-                                task_id = %task_id,
+                                tag = %tag,
                                 error = %e,
                                 "auto-worktree creation failed; launching claude without worktree isolation"
                             );
@@ -1308,7 +1320,7 @@ async fn handle_claude_launch(
                 }
             };
 
-            let tid_for_lease = task_id.clone();
+            let tid_for_lease = tag.clone();
             let wt_for_lease = wt_val.clone();
             let sid_for_lease = sid_placeholder.clone();
             let pane_result = tokio::task::spawn_blocking(move || {
@@ -1325,7 +1337,7 @@ async fn handle_claude_launch(
                 Ok((pid, hc)) => (pid, hc, wt_val),
                 Err(e) => {
                     cleanup_auto_worktree(was_explicit_worktree, &wt_val, &task.client_cwd).await;
-                    let remaining = total_tasks - task_idx;
+                    let remaining = total_tasks - tagx;
                     let mut w = writer.lock().await;
                     if let Some(cap) = e.downcast_ref::<pane_lease::CapacityError>() {
                         write_frame(
@@ -1435,7 +1447,7 @@ async fn handle_claude_launch(
                 .collect();
             let holder = resource_lease::Holder {
                 pane_id: pane_id.clone(),
-                task_id: task_id.clone(),
+                tag: tag.clone(),
                 session_id: session_id.clone(),
             };
             let wait = match task.resource_timeout_secs {
@@ -1744,38 +1756,18 @@ async fn handle_claude_launch(
             }
         }
 
-        // Resolve notebook tag.  Explicit `--task <name>` wins verbatim;
-        // otherwise ask Haiku to invent one (or reuse an existing tag in
-        // this repo for a continuing task).  The tagger always returns
-        // a usable string — it falls back to a slug+date on LLM failure
-        // — so this never blocks pane assignment.
-        let effective_tag: String = match task.task_name.clone() {
-            Some(t) if !t.trim().is_empty() => t,
-            _ => {
-                // The tagger keys against a canonical repo path.  Prefer
-                // client_cwd (where the user invoked amaebi chat) over
-                // the auto-worktree path so resume works across fresh
-                // worktrees for the same underlying project.
-                let effective_cwd = task.client_cwd.clone().unwrap_or_else(|| pane_id.clone());
-                let repo_dir = session::canonical_key(std::path::Path::new(&effective_cwd));
-                crate::task_tagger::generate_tag(
-                    state,
-                    None, // TODO: plumb through the active chat model
-                    &task.description,
-                    &repo_dir,
-                )
-                .await
-            }
-        };
-
+        // Resolve notebook tag.  Explicit `--tag <name>` wins verbatim;
+        // Tag was resolved by the client via Request::GenerateTag
+        // before this ClaudeLaunch arrived (or supplied by `--tag`).
+        // It's used as pane lease holder / worktree dir / tmux title /
+        // notebook key — all three are already wired up upstream.
         let mut w = writer.lock().await;
         write_frame(
             &mut *w,
             &Response::PaneAssigned {
-                task_id: task.task_id,
+                tag: task.tag,
                 pane_id,
                 session_id,
-                task_name: Some(effective_tag),
             },
         )
         .await?;
@@ -2136,7 +2128,7 @@ async fn release_task_leases_for_holder(state: &Arc<DaemonState>, holder: &str) 
             Err(_) => return,
         };
         let Some(conn) = guard.as_ref() else {
-            return; // tasks.db never opened (no --task in this daemon's lifetime)
+            return; // tasks.db never opened (no --tag in this daemon's lifetime)
         };
         if let Err(e) = tasks::release_all_by_holder(conn, &holder) {
             tracing::warn!(holder, error = %e, "failed to release task leases");
@@ -2148,13 +2140,13 @@ async fn release_task_leases_for_holder(state: &Arc<DaemonState>, holder: &str) 
 /// Render the task-notebook preamble for one supervision iteration.
 ///
 /// Returns the empty string when no pane opted into the notebook, so
-/// supervision prompts for non-`--task` invocations are bit-identical
+/// supervision prompts for non-`--tag` invocations are bit-identical
 /// to before this PR.
 ///
 /// On the first iteration (`is_first_turn = true`) this also writes a
 /// `desc` row for every notebook pane whose `task_description` is
 /// non-empty: this is how the CLI-supplied `<desc>` gets persisted for
-/// later resume (`/claude --task foo` with no desc reads back the most
+/// later resume (`/claude --tag foo` with no desc reads back the most
 /// recent row).
 async fn build_notebook_context(
     state: &Arc<DaemonState>,
@@ -2164,7 +2156,7 @@ async fn build_notebook_context(
     // Fast path: no notebook participation → empty preamble.
     let any_notebook = panes
         .iter()
-        .any(|p| p.task_name.is_some() && p.repo_dir.is_some());
+        .any(|p| p.tag.is_some() && p.repo_dir.is_some());
     if !any_notebook {
         return String::new();
     }
@@ -2190,8 +2182,7 @@ async fn build_notebook_context(
         let mut grouped: std::collections::BTreeMap<(String, String), String> =
             std::collections::BTreeMap::new();
         for p in &panes_cl {
-            let (Some(repo_dir), Some(tag)) = (p.repo_dir.as_deref(), p.task_name.as_deref())
-            else {
+            let (Some(repo_dir), Some(tag)) = (p.repo_dir.as_deref(), p.tag.as_deref()) else {
                 continue;
             };
             let key = (repo_dir.to_string(), tag.to_string());
@@ -2256,20 +2247,20 @@ async fn handle_supervision_inner(
     holder: &str,
 ) -> Result<()> {
     // --- Task notebook lease acquisition (opt-in: only panes with
-    //     task_name set participate).  Must run before entering the
+    //     tag set participate).  Must run before entering the
     //     supervision loop so a conflict returns cleanly without
     //     starting timers or LLM calls.  All-or-nothing: if any lease
     //     is held by another session, release whatever we already got
     //     and error out.
     let notebook_panes: Vec<&crate::ipc::SupervisionTarget> = panes
         .iter()
-        .filter(|p| p.task_name.is_some() && p.repo_dir.is_some())
+        .filter(|p| p.tag.is_some() && p.repo_dir.is_some())
         .collect();
     if !notebook_panes.is_empty() {
         let state_cl = Arc::clone(state);
         let holder_cl = holder.to_string();
         // Dedup by (repo_dir, tag).  Multiple panes in one `/claude`
-        // invocation may share a tag when the user passed `--task foo`
+        // invocation may share a tag when the user passed `--tag foo`
         // for a multi-task launch; without dedup the second acquire
         // would see the row this very call just inserted and reject
         // the whole request as a self-conflict.
@@ -2278,7 +2269,7 @@ async fn handle_supervision_inner(
         let lease_inputs: Vec<(String, String)> = notebook_panes
             .iter()
             .filter_map(|p| {
-                let key = (p.repo_dir.clone().unwrap(), p.task_name.clone().unwrap());
+                let key = (p.repo_dir.clone().unwrap(), p.tag.clone().unwrap());
                 if seen.insert(key.clone()) {
                     Some(key)
                 } else {
@@ -2570,7 +2561,7 @@ async fn handle_supervision_inner(
             .as_deref()
             .unwrap_or("(none yet — this is the first check)");
 
-        // Task notebook context (opt-in: only panes with task_name + repo_dir).
+        // Task notebook context (opt-in: only panes with tag + repo_dir).
         // Read-only: per-turn fetch of recent verdicts and the tag's latest
         // stored desc.  Rendered into a dedicated prompt section that is
         // clearly labelled "from prior supervision sessions" so the LLM does
@@ -2703,15 +2694,14 @@ async fn handle_supervision_inner(
 
         // Persist verdict to task notebook (best-effort, once per unique
         // `(repo_dir, tag)`).  Deduped because multiple panes sharing a
-        // tag (user `--task foo` for a multi-task launch) would otherwise
+        // tag (user `--tag foo` for a multi-task launch) would otherwise
         // append duplicate rows for a single supervision turn.  Failures
         // (panic OR SQLite Err) are logged but must not break the loop —
         // notebook is auxiliary to the live verdict decision.
         let mut verdict_targets: std::collections::HashSet<(String, String)> =
             std::collections::HashSet::new();
         for target in panes.iter() {
-            if let (Some(repo_dir), Some(tag)) =
-                (target.repo_dir.as_deref(), target.task_name.as_deref())
+            if let (Some(repo_dir), Some(tag)) = (target.repo_dir.as_deref(), target.tag.as_deref())
             {
                 verdict_targets.insert((repo_dir.to_string(), tag.to_string()));
             }
@@ -2760,8 +2750,8 @@ async fn handle_supervision_inner(
     }
 }
 
-/// Create a git worktree at `~/.amaebi/worktrees/<repo-name>/<task_id>-<uuid8>`
-/// on a new branch named `<task_id>-<uuid8>`.
+/// Create a git worktree at `~/.amaebi/worktrees/<repo-name>/<tag>-<uuid8>`
+/// on a new branch named `<tag>-<uuid8>`.
 ///
 /// Every parallel `/claude` task needs its own worktree so that concurrent
 /// Claude sessions editing the same repository do not trample each other's
@@ -2770,40 +2760,40 @@ async fn handle_supervision_inner(
 /// which avoids polluting the project tree and requires no `.gitignore` entry.
 /// A per-repo subdirectory (the basename of the git root) prevents collisions
 /// across different repositories; the `-<uuid8>` suffix makes each
-/// worktree/branch unique for a given `task_id` across runs.
+/// worktree/branch unique for a given `tag` across runs.
 ///
 /// `client_cwd` is the working directory of the invoking client.  Git is run
 /// with `-C <client_cwd>` so the correct repository is targeted even when the
 /// daemon was started from a different directory.
 ///
 /// Returns the absolute path of the newly created worktree, or an error if:
-/// - `task_id` contains unsafe characters (path separators, `..`), or
+/// - `tag` contains unsafe characters (path separators, `..`), or
 /// - the client's directory is not inside a git repository, or
 /// - `git worktree add` fails (e.g. branch name already exists).
 ///
 /// All git commands are synchronous; call this from `spawn_blocking`.
 fn create_task_worktree(
-    task_id: &str,
+    tag: &str,
     client_cwd: Option<&str>,
     start_branch: Option<&str>,
 ) -> anyhow::Result<std::path::PathBuf> {
     use std::path::PathBuf;
 
-    // Sanitize task_id: allow only characters that are safe as both a
+    // Sanitize tag: allow only characters that are safe as both a
     // filesystem path component and a git branch name.
-    if task_id.is_empty()
-        || task_id == ".."
-        || task_id.contains('/')
-        || task_id.contains('\\')
-        || task_id.contains("..")
-        || !task_id
+    if tag.is_empty()
+        || tag == ".."
+        || tag.contains('/')
+        || tag.contains('\\')
+        || tag.contains("..")
+        || !tag
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
     {
         anyhow::bail!(
-            "task_id {:?} contains unsafe characters; \
+            "tag {:?} contains unsafe characters; \
              only ASCII alphanumerics, '-', '_', and '.' are allowed",
-            task_id
+            tag
         );
     }
 
@@ -2844,7 +2834,7 @@ fn create_task_worktree(
     };
     let repo_namespace = format!("{repo_basename}-{path_hash}");
 
-    // Place worktrees under ~/.amaebi/worktrees/<repo-hash>/<task_id>-<uuid8>.
+    // Place worktrees under ~/.amaebi/worktrees/<repo-hash>/<tag>-<uuid8>.
     // A short UUID suffix guarantees uniqueness across runs so repeated
     // invocations with the same task description never collide on the branch
     // name or directory path — the same approach Claude Code uses for its own
@@ -2855,7 +2845,7 @@ fn create_task_worktree(
         .filter(|c| c.is_ascii_alphanumeric())
         .take(8)
         .collect::<String>();
-    let unique_name = format!("{task_id}-{short_id}");
+    let unique_name = format!("{tag}-{short_id}");
 
     let wt_path = amaebi_home()?
         .join("worktrees")
@@ -2869,7 +2859,7 @@ fn create_task_worktree(
     std::fs::create_dir_all(wt_parent)
         .with_context(|| format!("creating worktree parent directory {}", wt_parent.display()))?;
 
-    // Create the worktree on a new branch named <task_id>-<uuid8>.
+    // Create the worktree on a new branch named <tag>-<uuid8>.
     // If a start_branch is provided (e.g. the head branch of a PR), the new
     // branch is forked from that branch rather than from HEAD.  This ensures
     // Claude starts with the right commits already in place.
@@ -7341,7 +7331,7 @@ mod tests {
             pane_id: "%7".to_string(),
             window_id: "@3".to_string(),
             status: pane_lease::PaneStatus::Busy,
-            task_id: Some("task-abc".to_string()),
+            tag: Some("task-abc".to_string()),
             session_id: Some("sess-xyz".to_string()),
             worktree: Some(worktree.to_string()),
             heartbeat_at: now,
@@ -7353,7 +7343,7 @@ mod tests {
         let panes = vec![crate::ipc::SupervisionTarget {
             pane_id: "%7".to_string(),
             task_description: "do the thing".to_string(),
-            task_name: None,
+            tag: None,
             repo_dir: None,
         }];
         release_supervised_panes(&panes).await;
@@ -7379,7 +7369,7 @@ mod tests {
             Some(worktree),
             "worktree must be preserved so tier-1 reuse can match"
         );
-        assert!(lease.task_id.is_none(), "task_id must be cleared");
+        assert!(lease.tag.is_none(), "tag must be cleared");
         assert!(lease.session_id.is_none(), "session_id must be cleared");
     }
 
@@ -7392,7 +7382,7 @@ mod tests {
         let panes = vec![crate::ipc::SupervisionTarget {
             pane_id: "%999".to_string(),
             task_description: "nonexistent".to_string(),
-            task_name: None,
+            tag: None,
             repo_dir: None,
         }];
         release_supervised_panes(&panes).await;
@@ -7449,7 +7439,7 @@ mod tests {
         let writer = Arc::new(tokio::sync::Mutex::new(server_writer));
 
         let task = crate::ipc::TaskSpec {
-            task_id: "task-missing".to_string(),
+            tag: "task-missing".to_string(),
             description: String::new(),
             worktree: None,
             client_cwd: None,
@@ -7457,7 +7447,6 @@ mod tests {
             resume_pane: Some("%999".to_string()),
             resources: Vec::new(),
             resource_timeout_secs: None,
-            task_name: None,
         };
         let state = test_minimal_daemon_state();
         handle_claude_launch(&writer, vec![task], &state)
@@ -7491,7 +7480,7 @@ mod tests {
             pane_id: "%42".to_string(),
             window_id: "@1".to_string(),
             status: pane_lease::PaneStatus::Idle,
-            task_id: None,
+            tag: None,
             session_id: None,
             worktree: Some("/tmp/fake-worktree/resume".to_string()),
             heartbeat_at: now,
@@ -7512,7 +7501,7 @@ mod tests {
         let writer = Arc::new(tokio::sync::Mutex::new(server_writer));
 
         let task = crate::ipc::TaskSpec {
-            task_id: "task-nodesc".to_string(),
+            tag: "task-nodesc".to_string(),
             description: String::new(),
             worktree: None,
             client_cwd: None,
@@ -7520,7 +7509,6 @@ mod tests {
             resume_pane: Some("%42".to_string()),
             resources: Vec::new(),
             resource_timeout_secs: None,
-            task_name: None,
         };
         let state = test_minimal_daemon_state();
         handle_claude_launch(&writer, vec![task], &state)
@@ -7561,7 +7549,7 @@ mod tests {
             pane_id: "%9999999".to_string(),
             window_id: "@1".to_string(),
             status: pane_lease::PaneStatus::Idle,
-            task_id: None,
+            tag: None,
             session_id: None,
             worktree: Some("/tmp/fake-worktree/resume-probe".to_string()),
             heartbeat_at: now,
@@ -7578,7 +7566,7 @@ mod tests {
         let writer = Arc::new(tokio::sync::Mutex::new(server_writer));
 
         let task = crate::ipc::TaskSpec {
-            task_id: "task-probe".to_string(),
+            tag: "task-probe".to_string(),
             // Non-empty description: skips the lease-description prefetch
             // early-return and forces execution into the tmux probe branch.
             description: "run this task".to_string(),
@@ -7588,7 +7576,6 @@ mod tests {
             resume_pane: Some("%9999999".to_string()),
             resources: Vec::new(),
             resource_timeout_secs: None,
-            task_name: None,
         };
         let state = test_minimal_daemon_state();
         handle_claude_launch(&writer, vec![task], &state)

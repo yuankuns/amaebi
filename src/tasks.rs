@@ -2,12 +2,12 @@
 //!
 //! Persists supervision-loop verdicts and task descriptions across
 //! supervision sessions so a long-running task can resume with history
-//! intact when `/claude --task <tag>` is invoked again.
+//! intact when `/claude --tag <tag>` is invoked again.
 //!
 //! One table, keyed by `(repo_dir, tag)`:
 //!
 //! * `kind = "desc"` — the `<desc>` passed on the CLI.  Written once per
-//!   `/claude --task <tag> "<desc>"` invocation.  On resume without a
+//!   `/claude --tag <tag> "<desc>"` invocation.  On resume without a
 //!   `<desc>`, the supervisor falls back to the most recent `desc` row.
 //! * `kind = "verdict"` — one row per supervision turn, containing the
 //!   supervisor LLM's `WAIT: ...` / `STEER: ...` / `DONE: ...` line.
@@ -15,7 +15,7 @@
 //!   tag.
 //! * `kind = "lease"` — at most one live row per `(repo_dir, tag)`.
 //!   Guarantees same-tag supervision is serialised: parallel `/claude
-//!   --task <tag>` invocations synchronously reject while another
+//!   --tag <tag>` invocations synchronously reject while another
 //!   session still holds the lease.  TTL is 24 h; a stale lease is
 //!   auto-replaced on the next acquire.
 //!
