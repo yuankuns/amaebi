@@ -88,10 +88,12 @@ pub fn fallback_tag(description: &str) -> String {
     }
 }
 
-/// Return the most recent distinct tags seen in `repo_dir`, up to
-/// [`EXISTING_TAG_CONTEXT_LIMIT`].  Used as Haiku's context so it can
-/// reuse an existing tag for a continuing task.
-fn existing_tags(state: &Arc<DaemonState>, repo_dir: &str) -> Result<Vec<String>> {
+/// Return the most recent tags in `repo_dir` paired with the latest
+/// `desc` row for each tag, up to [`EXISTING_TAG_CONTEXT_LIMIT`].
+/// Giving Haiku BOTH the tag name and its desc lets it judge
+/// semantic continuity — without the desc, a tag name is opaque and
+/// Haiku tends to blindly reuse whatever it sees.
+fn existing_tag_context(state: &Arc<DaemonState>, repo_dir: &str) -> Result<Vec<(String, String)>> {
     let guard = state
         .tasks_db
         .lock()
@@ -99,23 +101,33 @@ fn existing_tags(state: &Arc<DaemonState>, repo_dir: &str) -> Result<Vec<String>
     let Some(conn) = guard.as_ref() else {
         return Ok(Vec::new());
     };
+    // For each tag under this repo, pick the most recent `desc` row.
+    // Correlated subquery is cheapest for the small scale expected
+    // (typically a handful of tags per repo).
     let mut stmt = conn
         .prepare(
-            "SELECT tag FROM task_notes \
+            "SELECT tag, COALESCE(( \
+                 SELECT content FROM task_notes d \
+                 WHERE d.repo_dir = task_notes.repo_dir \
+                   AND d.tag = task_notes.tag \
+                   AND d.kind = 'desc' \
+                 ORDER BY d.timestamp DESC LIMIT 1 \
+             ), '') AS latest_desc \
+             FROM task_notes \
              WHERE repo_dir = ?1 \
              GROUP BY tag \
              ORDER BY MAX(timestamp) DESC \
              LIMIT ?2",
         )
-        .context("preparing existing_tags query")?;
+        .context("preparing existing_tag_context query")?;
     let rows = stmt
         .query_map(
             params![repo_dir, EXISTING_TAG_CONTEXT_LIMIT as i64],
-            |row| row.get::<_, String>(0),
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
         )
-        .context("running existing_tags query")?;
+        .context("running existing_tag_context query")?;
     rows.collect::<rusqlite::Result<Vec<_>>>()
-        .context("collecting existing_tags rows")
+        .context("collecting existing_tag_context rows")
 }
 
 /// Ask Haiku for a tag.  Synchronous round-trip; callers await it.
@@ -137,39 +149,54 @@ pub async fn generate_tag(
     let existing = {
         let state_for_list = Arc::clone(state);
         let repo = repo_dir.to_string();
-        tokio::task::spawn_blocking(move || existing_tags(&state_for_list, &repo))
+        tokio::task::spawn_blocking(move || existing_tag_context(&state_for_list, &repo))
             .await
-            .unwrap_or_else(|e| Err(anyhow::anyhow!("existing_tags panicked: {e}")))
+            .unwrap_or_else(|e| Err(anyhow::anyhow!("existing_tag_context panicked: {e}")))
             .unwrap_or_else(|e| {
                 tracing::warn!(error = %e, "failed to list existing tags; proceeding with empty context");
                 Vec::new()
             })
     };
 
-    let system = "You are naming an ongoing supervision-loop task for a local notebook. \
+    let system = "You are naming a long-running supervision task for a local notebook. \
                   Output exactly one tag and nothing else.\n\n\
+                  Default behaviour: CREATE A NEW TAG derived from the new task description. \
+                  Only reuse an existing tag when the new description is clearly a direct \
+                  continuation of the SAME underlying task (same feature being iterated, \
+                  same bug being hunted, same migration being advanced).  Different \
+                  subsystems or unrelated work in the same repo MUST get a new tag.\n\n\
                   Rules:\n\
-                  - 2 to 4 words, lowercase, ASCII, hyphen-separated (e.g. `fmha4-paged-migration`).\n\
-                  - If the new description is semantically the SAME ongoing task as one of the \
-                    existing tags, output that tag VERBATIM.  Otherwise, create a new tag.\n\
-                  - No punctuation other than hyphens. No quotes, no explanation.\n\
-                  - Keep it short; the tag is a key, not a summary.";
+                  - 2 to 4 words, lowercase, ASCII only, hyphen-separated \
+                  (e.g. `fmha4-paged-migration`).\n\
+                  - No punctuation other than hyphens.  No quotes, no explanation.\n\
+                  - Keep it short; the tag is a lookup key, not a summary.";
 
     let existing_block = if existing.is_empty() {
         "No existing tags in this repo.".to_string()
     } else {
-        format!(
-            "Existing tags (most recently active first):\n{}",
-            existing
-                .iter()
-                .map(|t| format!("- {t}"))
-                .collect::<Vec<_>>()
-                .join("\n")
-        )
+        let mut s = String::from("Existing tags in this repo (most recently active first):\n");
+        for (tag, desc) in &existing {
+            // Truncate historical desc to keep the prompt compact.
+            let desc_preview: String = desc.chars().take(120).collect();
+            let ellipsis = if desc.chars().count() > 120 {
+                "…"
+            } else {
+                ""
+            };
+            if desc.is_empty() {
+                s.push_str(&format!("- `{tag}` (no recorded desc)\n"));
+            } else {
+                s.push_str(&format!("- `{tag}`: {desc_preview}{ellipsis}\n"));
+            }
+        }
+        s
     };
 
-    let user =
-        format!("{existing_block}\n\nNew task description:\n{description}\n\nOutput only the tag.");
+    let user = format!(
+        "{existing_block}\n\
+         New task description:\n{description}\n\n\
+         Output only the tag."
+    );
 
     let messages = vec![Message::system(system), Message::user(user)];
     let model = tagger_model_for(chat_model);
