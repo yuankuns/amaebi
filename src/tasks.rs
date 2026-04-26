@@ -295,7 +295,7 @@ pub fn recent_verdicts(conn: &Connection, repo_dir: &str, tag: &str) -> Result<V
 }
 
 // ---------------------------------------------------------------------------
-// Observability — `amaebi task list`
+// Observability — `amaebi tag list`
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
@@ -307,7 +307,7 @@ pub struct ActiveLease {
 }
 
 /// Return every live (non-stale) lease.  Stale rows are filtered out so
-/// `amaebi task list` does not show dead holders; they are cleaned up
+/// `amaebi tag list` does not show dead holders; they are cleaned up
 /// on the next acquire.
 pub fn list_active_leases(conn: &Connection) -> Result<Vec<ActiveLease>> {
     let now = now_epoch();
@@ -345,7 +345,7 @@ pub fn list_active_leases(conn: &Connection) -> Result<Vec<ActiveLease>> {
 }
 
 /// Force-release any live lease for `(repo_dir, tag)`, regardless of
-/// holder.  Used by `amaebi task release <tag>` to recover from a
+/// holder.  Used by `amaebi tag release <tag>` to recover from a
 /// stranded holder without waiting out the 24 h TTL.  Returns the
 /// number of rows deleted.
 pub fn force_release(conn: &Connection, repo_dir: &str, tag: &str) -> Result<usize> {

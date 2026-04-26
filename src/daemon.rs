@@ -891,8 +891,12 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                 }
             }
 
-            Request::ClaudeLaunch { tasks } => {
-                handle_claude_launch(&writer, tasks, &state).await?;
+            Request::ClaudeLaunch {
+                tasks,
+                session_id,
+                repo_dir,
+            } => {
+                handle_claude_launch(&writer, tasks, session_id, repo_dir, &state).await?;
             }
 
             Request::GenerateTag {
@@ -1038,9 +1042,9 @@ async fn drive_agentic_loop(
 async fn handle_claude_launch(
     writer: &Arc<tokio::sync::Mutex<tokio::net::unix::OwnedWriteHalf>>,
     tasks: Vec<crate::ipc::TaskSpec>,
-    // Unused at this scope after tag resolution moved client-side;
-    // kept in the signature for future per-launch daemon work.
-    _state: &Arc<DaemonState>,
+    session_id: Option<String>,
+    repo_dir: Option<String>,
+    state: &Arc<DaemonState>,
 ) -> Result<()> {
     if tasks.is_empty() {
         let mut w = writer.lock().await;
@@ -1048,11 +1052,123 @@ async fn handle_claude_launch(
         return Ok(());
     }
 
+    // Acquire notebook leases BEFORE any pane allocation or `claude`
+    // startup.  Without this, a tag-conflict rejection would fire from
+    // `handle_supervision_inner` long after the racing launch has
+    // already created worktrees and kicked off claude in real panes —
+    // leaving an uncontrolled session behind.  All-or-nothing: on
+    // conflict, roll back whatever we've acquired and return without
+    // touching tmux.  Skipped when the caller didn't opt into the
+    // notebook (no session_id or repo_dir).  Holder id matches the one
+    // `handle_supervision` will later derive from the same session_id,
+    // so `release_all_by_holder` in the supervision cleanup path
+    // releases the leases we're taking here.
+    //
+    // `lease_holder` is `Some` iff we actually inserted rows above; on
+    // any early-return path below we release by holder so a partial
+    // per-task failure doesn't leak leases until the 24 h TTL expires.
+    // The happy path disarms it just before returning, since the
+    // follow-up `SupervisePanes` wrapper owns the cleanup from that
+    // point on.
+    let mut lease_holder: Option<String> = None;
+    if let (Some(sid), Some(repo)) = (session_id.as_deref(), repo_dir.as_deref()) {
+        let holder = format!("supervision:{sid}");
+        // Dedup tags within this launch — multiple panes may share a
+        // tag when the caller passed `--tag foo` once for several
+        // tasks.  Without dedup the second acquire would see the row
+        // the first one just inserted and reject the whole request as
+        // a self-conflict.
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let lease_tags: Vec<String> = tasks
+            .iter()
+            .filter(|t| t.resume_pane.is_none())
+            .filter_map(|t| {
+                if seen.insert(t.tag.clone()) {
+                    Some(t.tag.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if !lease_tags.is_empty() {
+            let state_cl = Arc::clone(state);
+            let repo_cl = repo.to_string();
+            let holder_cl = holder.clone();
+            let acquire_result =
+                tokio::task::spawn_blocking(move || -> Result<Result<(), String>> {
+                    ensure_tasks_db(&state_cl)?;
+                    let mut guard = state_cl
+                        .tasks_db
+                        .lock()
+                        .map_err(|e| anyhow::anyhow!("tasks_db mutex poisoned: {e}"))?;
+                    let conn = guard.as_mut().expect("tasks_db just ensured");
+                    let mut acquired: Vec<String> = Vec::new();
+                    for tag in &lease_tags {
+                        match tasks::acquire_lease(conn, &repo_cl, tag, &holder_cl)? {
+                            tasks::AcquireLeaseResult::Acquired => {
+                                acquired.push(tag.clone());
+                            }
+                            tasks::AcquireLeaseResult::Held {
+                                holder: incumbent,
+                                age_secs,
+                            } => {
+                                for t in &acquired {
+                                    let _ = tasks::release_lease(conn, &repo_cl, t, &holder_cl);
+                                }
+                                let hours = age_secs / 3600;
+                                let mins = (age_secs % 3600) / 60;
+                                let msg = format!(
+                                    "task '{tag}' is already held by {incumbent} \
+                                     (age {hours}h{mins}m, TTL 24h); wait for it to \
+                                     finish, pick another tag, or use \
+                                     `amaebi tag release {tag}` to force-release"
+                                );
+                                return Ok(Err(msg));
+                            }
+                        }
+                    }
+                    Ok(Ok(()))
+                })
+                .await
+                .map_err(|e| anyhow::anyhow!("task-lease acquire panicked: {e}"))??;
+            if let Err(msg) = acquire_result {
+                let mut w = writer.lock().await;
+                write_frame(
+                    &mut *w,
+                    &Response::Error {
+                        message: format!("[supervision] {msg}"),
+                    },
+                )
+                .await?;
+                write_frame(&mut *w, &Response::Done).await?;
+                return Ok(());
+            }
+            lease_holder = Some(holder);
+        }
+    }
+
     // For each task: acquire a pane (auto-expanding the pool if needed), then
     // launch `claude` (or inject a prompt into an already-running session) via
     // tmux send-keys.
     // `ensure_and_acquire_idle` holds a single LOCK_EX for both expansion and
     // acquisition, eliminating the TOCTOU race.
+    //
+    // On any error-short-circuit inside the per-task loop (pane acquisition
+    // fail, session resolution fail, resource fail, tmux injection fail,
+    // etc.) we release notebook leases before returning via
+    // `release_launch_leases!` — otherwise the leases would sit until the
+    // 24 h TTL since the client, having seen `Response::Error`, never
+    // sends the follow-up `SupervisePanes` that would have taken over
+    // cleanup.  Placed immediately before every mid-launch
+    // `return Ok(());` that follows a `Response::Error` write.
+    macro_rules! release_launch_leases {
+        () => {{
+            if let Some(holder) = lease_holder.as_deref() {
+                release_task_leases_for_holder(state, holder).await;
+            }
+        }};
+    }
+
     let total_tasks = tasks.len();
     for (tagx, task) in tasks.into_iter().enumerate() {
         let tag = task.tag.clone();
@@ -1075,6 +1191,8 @@ async fn handle_claude_launch(
                 },
             )
             .await?;
+            drop(w);
+            release_launch_leases!();
             return Ok(());
         }
 
@@ -1136,6 +1254,8 @@ async fn handle_claude_launch(
                             },
                         )
                         .await?;
+                        drop(w);
+                        release_launch_leases!();
                         return Ok(());
                     }
                 };
@@ -1160,6 +1280,8 @@ async fn handle_claude_launch(
                         };
                         let mut w = writer.lock().await;
                         write_frame(&mut *w, &Response::Error { message }).await?;
+                        drop(w);
+                        release_launch_leases!();
                         return Ok(());
                     }
                 }
@@ -1290,6 +1412,8 @@ async fn handle_claude_launch(
                         },
                     )
                     .await?;
+                    drop(w);
+                    release_launch_leases!();
                     return Ok(());
                 }
             }
@@ -1358,6 +1482,8 @@ async fn handle_claude_launch(
                         )
                         .await?;
                     }
+                    drop(w);
+                    release_launch_leases!();
                     return Ok(());
                 }
             }
@@ -1403,6 +1529,8 @@ async fn handle_claude_launch(
                     },
                 )
                 .await?;
+                drop(w);
+                release_launch_leases!();
                 return Ok(());
             }
         };
@@ -1515,6 +1643,8 @@ async fn handle_claude_launch(
                         },
                     )
                     .await?;
+                    drop(w);
+                    release_launch_leases!();
                     return Ok(());
                 }
             }
@@ -1704,6 +1834,8 @@ async fn handle_claude_launch(
                 },
             )
             .await?;
+            drop(w);
+            release_launch_leases!();
             return Ok(());
         }
 
@@ -2084,8 +2216,7 @@ async fn handle_supervision(
     // (stable per supervision request), fall back to the first pane id.
     let holder = supervision_holder_id(&panes, session_id.as_deref());
 
-    let result =
-        handle_supervision_inner(writer, frame_rx, &panes, model, state, session_id, &holder).await;
+    let result = handle_supervision_inner(writer, frame_rx, &panes, model, state, session_id).await;
 
     // Unified resume hint + Done.  Inner no longer writes
     // Response::Done itself; this wrapper writes the hint first (so
@@ -2267,90 +2398,13 @@ async fn handle_supervision_inner(
     model: String,
     state: &Arc<DaemonState>,
     session_id: Option<String>,
-    holder: &str,
 ) -> Result<()> {
-    // --- Task notebook lease acquisition (opt-in: only panes with
-    //     tag set participate).  Must run before entering the
-    //     supervision loop so a conflict returns cleanly without
-    //     starting timers or LLM calls.  All-or-nothing: if any lease
-    //     is held by another session, release whatever we already got
-    //     and error out.
-    let notebook_panes: Vec<&crate::ipc::SupervisionTarget> = panes
-        .iter()
-        .filter(|p| p.tag.is_some() && p.repo_dir.is_some())
-        .collect();
-    if !notebook_panes.is_empty() {
-        let state_cl = Arc::clone(state);
-        let holder_cl = holder.to_string();
-        // Dedup by (repo_dir, tag).  Multiple panes in one `/claude`
-        // invocation may share a tag when the user passed `--tag foo`
-        // for a multi-task launch; without dedup the second acquire
-        // would see the row this very call just inserted and reject
-        // the whole request as a self-conflict.
-        let mut seen: std::collections::HashSet<(String, String)> =
-            std::collections::HashSet::new();
-        let lease_inputs: Vec<(String, String)> = notebook_panes
-            .iter()
-            .filter_map(|p| {
-                let key = (p.repo_dir.clone().unwrap(), p.tag.clone().unwrap());
-                if seen.insert(key.clone()) {
-                    Some(key)
-                } else {
-                    None
-                }
-            })
-            .collect();
-        let acquire_result = tokio::task::spawn_blocking(move || -> Result<Result<(), String>> {
-            ensure_tasks_db(&state_cl)?;
-            let mut guard = state_cl
-                .tasks_db
-                .lock()
-                .map_err(|e| anyhow::anyhow!("tasks_db mutex poisoned: {e}"))?;
-            let conn = guard.as_mut().expect("tasks_db just ensured");
-
-            let mut acquired: Vec<(String, String)> = Vec::new();
-            for (repo_dir, tag) in &lease_inputs {
-                match tasks::acquire_lease(conn, repo_dir, tag, &holder_cl)? {
-                    tasks::AcquireLeaseResult::Acquired => {
-                        acquired.push((repo_dir.clone(), tag.clone()));
-                    }
-                    tasks::AcquireLeaseResult::Held {
-                        holder: incumbent,
-                        age_secs,
-                    } => {
-                        // Roll back anything we already acquired.
-                        for (r, t) in &acquired {
-                            let _ = tasks::release_lease(conn, r, t, &holder_cl);
-                        }
-                        let hours = age_secs / 3600;
-                        let mins = (age_secs % 3600) / 60;
-                        let msg = format!(
-                            "task '{tag}' is already held by {incumbent} \
-                             (age {hours}h{mins}m, TTL 24h); wait for it to \
-                             finish, pick another tag, or use \
-                             `amaebi task release {tag}` to force-release"
-                        );
-                        return Ok(Err(msg));
-                    }
-                }
-            }
-            Ok(Ok(()))
-        })
-        .await
-        .map_err(|e| anyhow::anyhow!("task-lease acquire panicked: {e}"))??;
-        if let Err(msg) = acquire_result {
-            let mut w = writer.lock().await;
-            write_frame(
-                &mut *w,
-                &Response::Error {
-                    message: format!("[supervision] {msg}"),
-                },
-            )
-            .await?;
-            // wrapper writes Response::Done after the resume hint
-            return Ok(());
-        }
-    }
+    // Notebook leases are acquired in `handle_claude_launch` BEFORE any
+    // pane/worktree/claude work so a tag-conflict rejection never
+    // leaves a real running session behind.  By the time supervision
+    // starts, the lease rows we'll use are already ours under the
+    // same holder id derived in the wrapper; cleanup still flows
+    // through `release_all_by_holder` there.
 
     // Max time to wait between LLM checks.  Default 5 min; override with
     // AMAEBI_SUPERVISION_INTERVAL_SECS.  This is the *ceiling*: each iteration
@@ -7472,7 +7526,7 @@ mod tests {
             resource_timeout_secs: None,
         };
         let state = test_minimal_daemon_state();
-        handle_claude_launch(&writer, vec![task], &state)
+        handle_claude_launch(&writer, vec![task], None, None, &state)
             .await
             .expect("launch returns ok even on per-task error");
         drop(writer);
@@ -7534,7 +7588,7 @@ mod tests {
             resource_timeout_secs: None,
         };
         let state = test_minimal_daemon_state();
-        handle_claude_launch(&writer, vec![task], &state)
+        handle_claude_launch(&writer, vec![task], None, None, &state)
             .await
             .expect("launch returns ok even on per-task error");
         drop(writer);
@@ -7601,7 +7655,7 @@ mod tests {
             resource_timeout_secs: None,
         };
         let state = test_minimal_daemon_state();
-        handle_claude_launch(&writer, vec![task], &state)
+        handle_claude_launch(&writer, vec![task], None, None, &state)
             .await
             .expect("launch returns ok even on per-task error");
         drop(writer);

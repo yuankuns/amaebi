@@ -594,6 +594,12 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
         // before ClaudeLaunch so pane/worktree/notebook all use the
         // resolved tag from the start.
         resolve_missing_tags(&socket, &mut tasks, &cwd_str).await?;
+        // One-shot `amaebi ask "/claude ..."` never sends SupervisePanes,
+        // so there is no holder lifecycle to tie a notebook lease to.
+        // Skip the lease by leaving session_id/repo_dir as None — matches
+        // the pre-existing behaviour for this path.  The supervised
+        // interactive chat loop (below, in run_chat_loop) supplies both
+        // and is where the race-safe acquire actually runs.
         let req = Request::ClaudeLaunch {
             tasks: tasks
                 .into_iter()
@@ -608,6 +614,8 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
                     resource_timeout_secs: t.resource_timeout_secs,
                 })
                 .collect(),
+            session_id: None,
+            repo_dir: None,
         };
         let mut req_line = serde_json::to_string(&req).context("serializing ClaudeLaunch")?;
         req_line.push('\n');
@@ -1091,6 +1099,8 @@ pub async fn run_chat_loop(
                             resource_timeout_secs: t.resource_timeout_secs,
                         })
                         .collect(),
+                    session_id: Some(session_id.clone()),
+                    repo_dir: invocation_repo_dir.clone(),
                 };
                 let mut req_line = serde_json::to_string(&req)?;
                 req_line.push('\n');
@@ -2004,16 +2014,12 @@ async fn flush_steer_buffer(
 // Daemon auto-start
 // ---------------------------------------------------------------------------
 
-/// Connect to the daemon socket, starting the daemon in the background if it
-/// is not already running.
-///
-/// On the first failed connection attempt the daemon binary is spawned with
 /// Fill in `tasks[*].tag` when empty, asking the daemon to generate a
 /// tag via its Haiku tagger.  One dedicated short-lived connection per
 /// task — keeps the dispatcher on the main connection cleanly focused
-/// on ClaudeLaunch / SupervisePanes frames.  On any IPC failure the
-/// tag is left empty and the caller can decide what to do (typically
-/// fall back to a local slug).
+/// on ClaudeLaunch / SupervisePanes frames.  Any IPC failure propagates
+/// as `Err` to the caller; the caller is expected to surface the error
+/// to the user and skip the launch rather than ship an empty tag.
 async fn resolve_missing_tags(
     socket: &std::path::Path,
     tasks: &mut [ClaudeTask],

@@ -180,6 +180,20 @@ pub enum Request {
     ClaudeLaunch {
         /// The tasks to launch in parallel.
         tasks: Vec<TaskSpec>,
+        /// Chat session UUID issuing this launch.  Used together with
+        /// `repo_dir` to acquire the notebook lease up front — rejecting a
+        /// tag conflict BEFORE allocating panes or starting `claude`.
+        /// Matches the `session_id` the client will later send on
+        /// [`Request::SupervisePanes`] so the holder id is stable across
+        /// both phases (cleanup in `handle_supervision` releases by
+        /// that same holder).
+        #[serde(default)]
+        session_id: Option<String>,
+        /// Canonicalised repo directory for this launch.  Keyed with
+        /// each task's `tag` to form the notebook lease key.  Must match
+        /// the `repo_dir` on the corresponding [`SupervisionTarget`].
+        #[serde(default)]
+        repo_dir: Option<String>,
     },
     /// Ask the daemon to generate a notebook tag for a task description.
     ///
@@ -773,18 +787,29 @@ mod tests {
                     resource_timeout_secs: None,
                 },
             ],
+            session_id: Some("sess-123".into()),
+            repo_dir: Some("/home/user/repo".into()),
         };
         let json = serde_json::to_string(&req).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["type"], "claude_launch");
         assert_eq!(v["tasks"][0]["tag"], "t1");
         assert_eq!(v["tasks"][1]["worktree"], "/wt/b");
+        assert_eq!(v["session_id"], "sess-123");
+        assert_eq!(v["repo_dir"], "/home/user/repo");
 
         let back: Request = serde_json::from_str(&json).unwrap();
-        let Request::ClaudeLaunch { tasks } = back else {
+        let Request::ClaudeLaunch {
+            tasks,
+            session_id,
+            repo_dir,
+        } = back
+        else {
             panic!("expected ClaudeLaunch");
         };
         assert_eq!(tasks.len(), 2);
+        assert_eq!(session_id.as_deref(), Some("sess-123"));
+        assert_eq!(repo_dir.as_deref(), Some("/home/user/repo"));
     }
 
     #[test]
