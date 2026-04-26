@@ -1174,27 +1174,10 @@ async fn handle_claude_launch(
         let tag = task.tag.clone();
         let auto_enter = task.auto_enter;
 
-        // Defense in depth against a stale / custom client that bypasses
-        // the CLI parser: the reuse path cannot apply env vars (claude is
-        // already intercepting keystrokes), so rejecting up front avoids
-        // silently dropping the env injection the caller asked for.
-        if task.resume_pane.is_some() && !task.resources.is_empty() {
-            let mut w = writer.lock().await;
-            write_frame(
-                &mut *w,
-                &Response::Error {
-                    message: format!(
-                        "[error] task {:?}: --resume-pane is incompatible with --resource; \
-                         env injection requires a fresh `claude` launch",
-                        tag
-                    ),
-                },
-            )
-            .await?;
-            drop(w);
-            release_launch_leases!();
-            return Ok(());
-        }
+        // `--resume-pane` + `--resource` is allowed: we still need the
+        // lock in resource-state.json even on the reuse path so two
+        // tasks can't race for the same simulator.  The env/prompt_hint
+        // parts are skipped further down, guarded by `!had_claude`.
 
         // Gather git context from the client's working directory: current
         // branch, remote URL, recent commits, and PR-specific information if
@@ -1650,23 +1633,32 @@ async fn handle_claude_launch(
             }
         };
 
-        // Render resource env/prompt-hint for injection.  Both are empty
-        // vectors/strings when no resources were requested — the normal
-        // launch path is unchanged for callers that don't use /resource.
-        let resource_env: Vec<(String, String)> =
-            resource_lease::render_env(&resource_leases, &resource_pool);
-        let resource_prompt_hint: String =
-            resource_lease::render_prompt_hint(&resource_leases, &resource_pool);
-
-        // Prepend the resource prompt hint to the LLM-facing description so
-        // the first turn knows what hardware it has and how to use it.
-        // Kept separate from the git preamble (added earlier) so an operator
-        // reading the pane output can tell the two apart.
-        let description = if resource_prompt_hint.is_empty() {
-            description
+        // Render resource env vars ONLY on the fresh-launch path.  On the
+        // reuse path (`had_claude == true`) claude is already running and
+        // its shell is gone, so `export SIM_PORT=...` can no longer be
+        // applied — the leases are still held (for scheduling) but env
+        // injection is a no-op.  The prompt_hint used to be prepended to
+        // the task description here; that channel was replaced by the
+        // per-worktree AGENTS.md (see `ensure_worktree_agents_md` below),
+        // which claude loads at session start and survives `/compact`.
+        let resource_env: Vec<(String, String)> = if had_claude {
+            Vec::new()
         } else {
-            format!("{resource_prompt_hint}\n\n{description}")
+            resource_lease::render_env(&resource_leases, &resource_pool)
         };
+
+        // Write AGENTS.md once per worktree so the resource constraint
+        // survives `/compact` and supervision restarts.  Best-effort:
+        // I/O failure is logged and launch continues.
+        if !resource_leases.is_empty() {
+            if let Err(e) = ensure_worktree_agents_md(&worktree, &resource_leases, &resource_pool) {
+                tracing::warn!(
+                    pane_id = %pane_id,
+                    error = %e,
+                    "failed to write AGENTS.md; LLM will not see the resource hint on restart"
+                );
+            }
+        }
 
         // Build the key sequences to inject into the pane.
         //
@@ -2991,6 +2983,73 @@ fn create_task_worktree(
 /// Escape a string for safe use as a single shell argument (single-quote wrapping).
 fn shell_escape(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+const AGENTS_MD_BEGIN: &str = "<!-- amaebi-managed: begin -->";
+const AGENTS_MD_END: &str = "<!-- amaebi-managed: end -->";
+
+/// Ensure `<worktree>/AGENTS.md` contains an amaebi-managed block that
+/// tells claude which resources this worktree is pinned to.  Called on
+/// every launch (fresh and resume); the "block already present" branch
+/// makes resume a no-op so we never clobber a user's edits.
+///
+/// - File missing: create it with a short header and the managed block.
+/// - File exists without the begin marker: append the managed block.
+/// - File exists with the begin marker: leave it alone (stale content
+///   is intentionally kept so resume doesn't rewrite).
+///
+/// No-op when `worktree` is `None` or `leases` is empty.  Best-effort
+/// for the caller: I/O failures surface as `Err` and should be logged
+/// at warn-level, not treated as a hard launch failure.
+fn ensure_worktree_agents_md(
+    worktree: &Option<String>,
+    leases: &[resource_lease::ResourceLease],
+    pool: &[resource_lease::ResourceDef],
+) -> std::io::Result<()> {
+    let Some(wt) = worktree.as_ref() else {
+        return Ok(());
+    };
+    if leases.is_empty() {
+        return Ok(());
+    }
+    let path = std::path::Path::new(wt).join("AGENTS.md");
+    let hint = resource_lease::render_prompt_hint(leases, pool);
+    // An empty hint means every lease either has no `prompt_hint` set in
+    // `resources.toml`, or its pool entry disappeared (stale state vs. a
+    // re-edited TOML).  Either way, writing a block with empty body would
+    // suggest "no constraints assigned" to claude, which is misleading —
+    // skip instead.  A later launch with a non-empty hint will still
+    // create the file.
+    if hint.trim().is_empty() {
+        return Ok(());
+    }
+    let block = format!("{AGENTS_MD_BEGIN}\n## Assigned resources\n\n{hint}\n{AGENTS_MD_END}\n");
+
+    match std::fs::read_to_string(&path) {
+        Ok(existing) => {
+            if existing.contains(AGENTS_MD_BEGIN) {
+                return Ok(());
+            }
+            // Append (preserving user content).  Ensure exactly one blank
+            // line separator between existing content and our block.
+            let mut out = existing;
+            if !out.ends_with('\n') {
+                out.push('\n');
+            }
+            out.push('\n');
+            out.push_str(&block);
+            std::fs::write(&path, out)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let header = "# Project rules\n\n\
+                This file is loaded by Claude Code at session start and acts as a\n\
+                persistent project rule set. Edits by you are preserved; the block\n\
+                between the `amaebi-managed` markers is auto-generated by `amaebi`\n\
+                when a task first launches with `--resource`.\n\n";
+            std::fs::write(&path, format!("{header}{block}"))
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// Remove an auto-created git worktree and its branch on task-setup failure.
@@ -7938,5 +7997,137 @@ mod tests {
     #[test]
     fn strip_tui_chrome_empty_input() {
         assert_eq!(strip_tui_chrome(""), "");
+    }
+
+    // ------------------------------------------------------------------
+    // ensure_worktree_agents_md tests
+    // ------------------------------------------------------------------
+
+    fn agents_md_lease(name: &str, class: &str) -> resource_lease::ResourceLease {
+        resource_lease::ResourceLease {
+            name: name.to_string(),
+            class: class.to_string(),
+            status: resource_lease::ResourceStatus::Busy,
+            pane_id: Some("%7".to_string()),
+            tag: Some("t".to_string()),
+            session_id: Some("s".to_string()),
+            heartbeat_at: 0,
+        }
+    }
+
+    fn agents_md_def(name: &str, class: &str, hint: &str) -> resource_lease::ResourceDef {
+        resource_lease::ResourceDef {
+            name: name.to_string(),
+            class: class.to_string(),
+            metadata: std::collections::HashMap::new(),
+            env: std::collections::HashMap::new(),
+            prompt_hint: Some(hint.to_string()),
+        }
+    }
+
+    #[test]
+    fn ensure_worktree_agents_md_creates_file_when_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let wt = Some(dir.path().to_string_lossy().to_string());
+        let leases = vec![agents_md_lease("sim-9902", "simulator")];
+        let pool = vec![agents_md_def("sim-9902", "simulator", "use sim-9902 ONLY")];
+        ensure_worktree_agents_md(&wt, &leases, &pool).expect("write ok");
+
+        let contents = std::fs::read_to_string(dir.path().join("AGENTS.md")).unwrap();
+        assert!(contents.contains("# Project rules"), "header missing");
+        assert!(contents.contains(AGENTS_MD_BEGIN));
+        assert!(contents.contains(AGENTS_MD_END));
+        assert!(contents.contains("## Assigned resources"));
+        assert!(contents.contains("use sim-9902 ONLY"));
+    }
+
+    #[test]
+    fn ensure_worktree_agents_md_appends_to_existing_user_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("AGENTS.md");
+        std::fs::write(&path, "# My rules\nFoo\n").unwrap();
+
+        let wt = Some(dir.path().to_string_lossy().to_string());
+        let leases = vec![agents_md_lease("sim-9902", "simulator")];
+        let pool = vec![agents_md_def("sim-9902", "simulator", "use sim-9902 ONLY")];
+        ensure_worktree_agents_md(&wt, &leases, &pool).expect("append ok");
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            contents.starts_with("# My rules\nFoo\n"),
+            "user content must stay at the top: {contents:?}"
+        );
+        assert!(contents.contains(AGENTS_MD_BEGIN));
+        assert!(contents.contains("use sim-9902 ONLY"));
+        let user_idx = contents.find("# My rules").unwrap();
+        let marker_idx = contents.find(AGENTS_MD_BEGIN).unwrap();
+        assert!(user_idx < marker_idx, "managed block must be appended");
+    }
+
+    #[test]
+    fn ensure_worktree_agents_md_skips_when_block_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("AGENTS.md");
+        let pre = format!(
+            "# existing\n\n{AGENTS_MD_BEGIN}\n## Assigned resources\n\nold hint\n{AGENTS_MD_END}\n"
+        );
+        std::fs::write(&path, &pre).unwrap();
+
+        let wt = Some(dir.path().to_string_lossy().to_string());
+        let leases = vec![agents_md_lease("sim-9902", "simulator")];
+        let pool = vec![agents_md_def("sim-9902", "simulator", "NEW HINT")];
+        ensure_worktree_agents_md(&wt, &leases, &pool).expect("noop ok");
+        ensure_worktree_agents_md(&wt, &leases, &pool).expect("idempotent");
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(after, pre, "existing managed block must not be rewritten");
+        assert!(!after.contains("NEW HINT"));
+    }
+
+    #[test]
+    fn ensure_worktree_agents_md_noop_when_no_resources() {
+        let dir = tempfile::tempdir().unwrap();
+        let wt = Some(dir.path().to_string_lossy().to_string());
+        ensure_worktree_agents_md(&wt, &[], &[]).expect("no-op");
+        assert!(!dir.path().join("AGENTS.md").exists());
+    }
+
+    #[test]
+    fn ensure_worktree_agents_md_noop_when_no_worktree() {
+        let leases = vec![agents_md_lease("sim-9902", "simulator")];
+        let pool = vec![agents_md_def("sim-9902", "simulator", "hint")];
+        ensure_worktree_agents_md(&None, &leases, &pool).expect("no-op");
+    }
+
+    #[test]
+    fn ensure_worktree_agents_md_noop_when_hint_is_empty() {
+        // Lease exists but its pool def has no `prompt_hint` — rendering
+        // returns an empty string.  Writing a block with empty body would
+        // mislead claude into thinking it has an empty constraint set; skip.
+        let dir = tempfile::tempdir().unwrap();
+        let wt = Some(dir.path().to_string_lossy().to_string());
+        let leases = vec![agents_md_lease("sim-9902", "simulator")];
+        let pool = vec![resource_lease::ResourceDef {
+            name: "sim-9902".to_string(),
+            class: "simulator".to_string(),
+            metadata: std::collections::HashMap::new(),
+            env: std::collections::HashMap::new(),
+            prompt_hint: None,
+        }];
+        ensure_worktree_agents_md(&wt, &leases, &pool).expect("no-op");
+        assert!(!dir.path().join("AGENTS.md").exists());
+    }
+
+    #[test]
+    fn ensure_worktree_agents_md_noop_when_pool_missing_entry() {
+        // Lease for `sim-9902` but the pool no longer has that entry
+        // (e.g. resources.toml was re-edited).  render_prompt_hint returns
+        // "" because the lookup fails — same no-op as the missing-hint case.
+        let dir = tempfile::tempdir().unwrap();
+        let wt = Some(dir.path().to_string_lossy().to_string());
+        let leases = vec![agents_md_lease("sim-9902", "simulator")];
+        let pool: Vec<resource_lease::ResourceDef> = Vec::new();
+        ensure_worktree_agents_md(&wt, &leases, &pool).expect("no-op");
+        assert!(!dir.path().join("AGENTS.md").exists());
     }
 }

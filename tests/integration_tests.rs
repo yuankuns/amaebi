@@ -3002,19 +3002,18 @@ async fn claude_launch_legacy_payload_without_resources_still_dispatches() {
     let _ = child.kill().await;
 }
 
-/// Defense in depth for Copilot review (round 2, comment 8): a custom
-/// client that bypasses `parse_claude` by sending a `ClaudeLaunch` with
-/// both `resume_pane` and `resources` must still be rejected by the
-/// daemon with a clear error — the reuse path cannot apply env vars,
-/// and silently dropping them would mean scripts run in the pane
-/// without the hardware binding the caller thought they'd get.
+/// The `--resume-pane` + `--resource` combo used to be rejected at the
+/// daemon boundary.  It is now allowed: the daemon attempts to acquire
+/// the resource lock (which is process-independent and still needed on
+/// the reuse path so two tasks can't race for the same hardware) and
+/// only skips env/prompt_hint rendering.  This test confirms the old
+/// "mutually exclusive" rejection is gone — the failure we see here is
+/// the normal "resource not defined" error from the acquisition step,
+/// NOT the pre-change parse-level guard.
 #[tokio::test]
-async fn claude_launch_resume_pane_with_resources_is_rejected_by_daemon() {
+async fn claude_launch_resume_pane_with_resources_is_not_rejected_outright() {
     let server = MockLlmServer::start().await;
     let home = setup_home().expect("setup_home");
-    // Pre-seed a plausible lease for the resume_pane target so the
-    // rejection comes from the resume+resource mutual-exclusion guard,
-    // not from a missing-lease error earlier in the pipeline.
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -3033,7 +3032,7 @@ async fn claude_launch_resume_pane_with_resources_is_rejected_by_daemon() {
 
     let req = Request::ClaudeLaunch {
         tasks: vec![ClaudeLaunchTaskSpec {
-            tag: "bad-combo".to_string(),
+            tag: "combo".to_string(),
             description: "".to_string(),
             auto_enter: true,
             resume_pane: Some("%41".to_string()),
@@ -3044,24 +3043,18 @@ async fn claude_launch_resume_pane_with_resources_is_rejected_by_daemon() {
     let json = serde_json::to_string(&req).expect("serialise");
     let responses = send_claude_launch_raw(&socket, &json).await;
 
-    let saw_rejection = responses.iter().any(|r| {
+    let saw_old_mutex_rejection = responses.iter().any(|r| {
         matches!(
             r,
             Response::Error { message }
-                if message.contains("--resume-pane") && message.contains("--resource")
+                if message.contains("incompatible")
+                    && message.contains("--resume-pane")
+                    && message.contains("--resource")
         )
     });
-    let saw_pane_assigned = responses
-        .iter()
-        .any(|r| matches!(r, Response::PaneAssigned { .. }));
-
     assert!(
-        saw_rejection,
-        "daemon must reject resume_pane + resources combo; got {responses:?}"
-    );
-    assert!(
-        !saw_pane_assigned,
-        "no pane must be assigned when the daemon rejects the combo; got {responses:?}"
+        !saw_old_mutex_rejection,
+        "daemon must no longer reject the combo with the pre-change mutex error; got {responses:?}"
     );
 
     let _ = child.kill().await;
