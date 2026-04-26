@@ -26,9 +26,9 @@ amaebi ask "what's using the most disk space?"
 amaebi chat
 ```
 
-Requires Rust 1.85+ (install via [rustup](https://rustup.rs/)), and either a
-GitHub Copilot subscription or an Amazon Bedrock bearer token. tmux and Docker
-are optional.
+Requires a recent stable Rust toolchain (install via
+[rustup](https://rustup.rs/)), and either a GitHub Copilot subscription or an
+Amazon Bedrock bearer token. tmux and Docker are optional.
 
 ## How It Works
 

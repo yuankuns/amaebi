@@ -114,9 +114,7 @@ correction.
 
 The prompt input uses `rustyline` for line editing — arrow keys, Emacs
 bindings, CJK-aware cursor movement, and persistent history across
-sessions. This replaced a hand-rolled editor; see commit `0bb236a` and the
-memory note at
-`~/.claude/projects/-home-yuankuns-amaebi/memory/feedback_prefer_libraries.md`.
+sessions. This replaced a hand-rolled editor; see commit `0bb236a`.
 
 ## Session identity
 

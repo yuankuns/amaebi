@@ -63,7 +63,7 @@ All SQLite files use WAL mode and 0600 permissions.
 
 ### SQLite vs. JSON
 
-Source of truth is SQLite for `memory_db`, `inbox.db`, `cron.db`, and
+Source of truth is SQLite for `memory.db`, `inbox.db`, `cron.db`, and
 `tasks.db`. JSON is reserved for files that must tolerate frequent concurrent
 readers without WAL overhead:
 
@@ -75,7 +75,7 @@ readers without WAL overhead:
 
 Atomic writes use `rename(2)` after staging to a temp file in the same
 directory; no `tempfile` crate usage. The project convention (see
-`/home/yuankuns/amaebi/CLAUDE.md`) is: state goes into SQLite unless the
+[CLAUDE.md](../CLAUDE.md)) is: state goes into SQLite unless the
 concurrent-reader pattern demands JSON.
 
 ## Worktree layout
@@ -144,11 +144,11 @@ The daemon accepts `provider/model` strings and dispatches to one of two
 provider backends (`src/provider.rs`):
 
 - `bedrock/<model>` or a known Bedrock alias → `src/bedrock.rs`
-- `copilot/<model>` or a bare Copilot model → `src/copilot.rs`
+- `copilot/<model>` → `src/copilot.rs`
 
 Unprefixed names first consult `~/.amaebi/config.json` user aliases, then
-the built-in Bedrock alias table (`src/provider.rs:64`), falling back to
-Copilot.
+the built-in Bedrock alias table (`src/provider.rs:64`), and otherwise
+default to Bedrock (see `resolve_with_aliases` in `src/provider.rs`).
 
 The default (`DEFAULT_MODEL` at `src/provider.rs:105`) is
 `claude-sonnet-4.6[1m]`. The `[1m]` suffix opts into Bedrock's 1M-context
