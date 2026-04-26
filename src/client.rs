@@ -436,22 +436,13 @@ fn parse_claude(input: &str) -> Option<Result<Vec<ClaudeTask>, String>> {
             .to_string()));
     }
 
-    // --resume-pane and --resource are mutually exclusive: on the reuse
-    // path `claude` is already running in the pane and can no longer
-    // receive new env vars (every keystroke is intercepted by the Claude
-    // Code TUI as chat input), so `export SIM_PORT=...` cannot be applied.
-    // Rejecting at parse time gives a clear error instead of silently
-    // dropping env injection — the user's scripts would otherwise see
-    // `$SIM_PORT` unset and fail mysteriously.
-    if resume_pane.is_some() && !resources.is_empty() {
-        return Some(Err(
-            "--resume-pane and --resource are mutually exclusive: env var injection \
-             requires a fresh `claude` launch.  Either drop --resume-pane (the scheduler \
-             will start a new pane and apply env vars), or drop --resource (the reused \
-             pane will inherit whatever env was in effect at its original launch)."
-                .to_string(),
-        ));
-    }
+    // `--resume-pane` + `--resource` IS allowed: on the reuse path we
+    // still acquire the lock in `resource-state.json` (that constraint
+    // is process-independent), we just skip env injection and rely on
+    // the worktree's AGENTS.md (auto-generated on first launch) to keep
+    // the LLM aware of its resource assignment.  See the daemon's
+    // `handle_claude_launch` for the had_claude-branch that skips
+    // env/prompt_hint rendering.
 
     // Description is required in the normal path, but optional with
     // --resume-pane: if omitted, the daemon reuses the description
@@ -2587,19 +2578,31 @@ mod tests {
     }
 
     #[test]
-    fn parse_claude_resume_pane_and_resource_are_mutually_exclusive() {
-        // Regression: env-var injection requires a fresh claude launch, so
-        // combining --resume-pane (reuse path) with --resource is
-        // meaningless and must be rejected at parse time rather than
-        // silently dropping the env injection.
-        let err = match parse_claude("/claude --resume-pane %41 --resource sim-9900") {
-            Some(Err(msg)) => msg,
-            other => panic!("expected Err, got {other:?}"),
-        };
-        assert!(
-            err.contains("--resume-pane") && err.contains("--resource"),
-            "error must mention both flags, got: {err}"
+    fn parse_claude_resume_pane_with_resource_is_allowed() {
+        // Regression: the combo used to be rejected at parse time because
+        // env-var injection can't run against an already-launched claude.
+        // We now accept it — the daemon acquires the resource lock (which
+        // is process-independent) and skips env/prompt_hint rendering on
+        // the had_claude branch.  AGENTS.md carries the constraint forward
+        // across /compact.
+        let tasks = claude_tasks("/claude --resume-pane %41 --resource sim-9900 \"work\"");
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].resume_pane.as_deref(), Some("%41"));
+        assert_eq!(tasks[0].resources, vec!["sim-9900".to_string()]);
+        assert_eq!(tasks[0].description, "work");
+    }
+
+    #[test]
+    fn parse_claude_resume_pane_with_resource_and_timeout_ok() {
+        // Timeout is just a number; the lock acquisition path on resume
+        // still honours it the same way as a fresh launch.
+        let tasks = claude_tasks(
+            "/claude --resume-pane %41 --resource sim-9900 --resource-timeout 120 \"work\"",
         );
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].resume_pane.as_deref(), Some("%41"));
+        assert_eq!(tasks[0].resources, vec!["sim-9900".to_string()]);
+        assert_eq!(tasks[0].resource_timeout_secs, Some(120));
     }
 
     #[test]
