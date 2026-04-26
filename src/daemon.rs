@@ -2087,23 +2087,27 @@ async fn handle_supervision(
     let result =
         handle_supervision_inner(writer, frame_rx, &panes, model, state, session_id, &holder).await;
 
-    // Unified resume hint — runs on every exit path (DONE, timeout,
-    // interrupt, model error, client disconnect, inner Err) because
-    // the inner fn's per-path exit messages don't carry the
-    // tag+pane_id info needed to resume later.  Best-effort: errors
-    // writing to the already-dying stream are swallowed.
-    if panes.iter().any(|t| t.tag.is_some()) {
-        let mut hint = String::from("\n[supervision] to resume any of these panes:\n");
-        for t in panes.iter() {
-            if let Some(tag) = t.tag.as_deref() {
-                hint.push_str(&format!(
-                    "  pane {pid} (tag={tag})\n    continue task:  /claude --tag {tag}\n    reuse pane:     /claude --resume-pane {pid}\n",
-                    pid = t.pane_id,
-                ));
-            }
-        }
+    // Unified resume hint + Done.  Inner no longer writes
+    // Response::Done itself; this wrapper writes the hint first (so
+    // clients still reading frames see it) and then the terminal Done
+    // frame.  Runs on every exit path (DONE, timeout, interrupt,
+    // model error, client disconnect, inner Err).  Best-effort:
+    // errors writing to an already-dying stream are swallowed.
+    {
         let mut w = writer.lock().await;
-        let _ = write_frame(&mut *w, &Response::Text { chunk: hint }).await;
+        if panes.iter().any(|t| t.tag.is_some()) {
+            let mut hint = String::from("\n[supervision] to resume any of these panes:\n");
+            for t in panes.iter() {
+                if let Some(tag) = t.tag.as_deref() {
+                    hint.push_str(&format!(
+                        "  pane {pid} (tag={tag})\n    continue task:  /claude --tag {tag}\n    reuse pane:     /claude --resume-pane {pid}\n",
+                        pid = t.pane_id,
+                    ));
+                }
+            }
+            let _ = write_frame(&mut *w, &Response::Text { chunk: hint }).await;
+        }
+        let _ = write_frame(&mut *w, &Response::Done).await;
     }
 
     // Best-effort cleanup: must run regardless of inner result so panes
@@ -2343,7 +2347,7 @@ async fn handle_supervision_inner(
                 },
             )
             .await?;
-            write_frame(&mut *w, &Response::Done).await?;
+            // wrapper writes Response::Done after the resume hint
             return Ok(());
         }
     }
@@ -2445,7 +2449,7 @@ async fn handle_supervision_inner(
                 },
             )
             .await?;
-            write_frame(&mut *w, &Response::Done).await?;
+            // wrapper writes Response::Done after the resume hint
             return Ok(());
         }
 
@@ -2500,7 +2504,7 @@ async fn handle_supervision_inner(
                     },
                 )
                 .await?;
-                write_frame(&mut *w, &Response::Done).await?;
+                // wrapper writes Response::Done after the resume hint
                 return Ok(());
             }
         }
@@ -2621,7 +2625,7 @@ async fn handle_supervision_inner(
                         },
                     )
                     .await?;
-                    write_frame(&mut *w, &Response::Done).await?;
+                    // wrapper writes Response::Done after the resume hint
                     return Ok(());
                 }
             }
@@ -2670,7 +2674,7 @@ async fn handle_supervision_inner(
                 },
             )
             .await?;
-            write_frame(&mut *w, &Response::Done).await?;
+            // wrapper writes Response::Done after the resume hint
             return Ok(());
         } else if let Some(rest) = trimmed.strip_prefix("STEER:") {
             if let Some((pane_id_raw, message)) = rest.trim().split_once(':') {
