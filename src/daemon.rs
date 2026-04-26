@@ -2087,6 +2087,25 @@ async fn handle_supervision(
     let result =
         handle_supervision_inner(writer, frame_rx, &panes, model, state, session_id, &holder).await;
 
+    // Unified resume hint — runs on every exit path (DONE, timeout,
+    // interrupt, model error, client disconnect, inner Err) because
+    // the inner fn's per-path exit messages don't carry the
+    // tag+pane_id info needed to resume later.  Best-effort: errors
+    // writing to the already-dying stream are swallowed.
+    if panes.iter().any(|t| t.tag.is_some()) {
+        let mut hint = String::from("\n[supervision] to resume any of these panes:\n");
+        for t in panes.iter() {
+            if let Some(tag) = t.tag.as_deref() {
+                hint.push_str(&format!(
+                    "  pane {pid} (tag={tag})\n    continue task:  /claude --tag {tag}\n    reuse pane:     /claude --resume-pane {pid}\n",
+                    pid = t.pane_id,
+                ));
+            }
+        }
+        let mut w = writer.lock().await;
+        let _ = write_frame(&mut *w, &Response::Text { chunk: hint }).await;
+    }
+
     // Best-effort cleanup: must run regardless of inner result so panes
     // are not stranded Busy for up to LEASE_TTL_SECS (24 h).  Task
     // leases released by `holder` identity — same outer-wrapper pattern
@@ -2643,25 +2662,11 @@ async fn handle_supervision_inner(
         // --- Parse response and act ---
         let verdict_line = if trimmed.starts_with("DONE:") || trimmed == "DONE" {
             let summary = trimmed.strip_prefix("DONE:").unwrap_or("").trim();
-            // Print a resume hint for each pane in the supervision batch
-            // so the user can pick up where it left off without digging
-            // into `amaebi tag list`.  Two resume forms are suggested:
-            //   1. `--tag <tag>`    — new pane + new worktree, notebook history preserved
-            //   2. `--resume-pane <pane_id>` — reuse the current claude session in-place
-            let mut hint = String::from("\n");
-            for t in panes.iter() {
-                let tag_display = t.tag.as_deref().unwrap_or("(no tag)");
-                hint.push_str(&format!(
-                    "  [pane {pid}] tag={tag}\n    resume: /claude --tag {tag}\n    or:     /claude --resume-pane {pid}\n",
-                    pid = t.pane_id,
-                    tag = tag_display,
-                ));
-            }
             let mut w = writer.lock().await;
             write_frame(
                 &mut *w,
                 &Response::Text {
-                    chunk: format!("  → DONE\n\n{summary}\n{hint}"),
+                    chunk: format!("  → DONE\n\n{summary}\n"),
                 },
             )
             .await?;

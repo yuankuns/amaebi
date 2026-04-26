@@ -256,7 +256,8 @@ fn sanitise_tag(raw: &str) -> String {
             }
         }
         let trimmed = out.trim_matches('-');
-        let bounded: String = trimmed.chars().take(48).collect();
+        // 32 char cap — safe for branch/directory names, matches plan.
+        let bounded: String = trimmed.chars().take(32).collect();
         let result = bounded.trim_end_matches('-').to_string();
         if !result.is_empty() {
             return result;
@@ -326,7 +327,7 @@ mod tests {
     fn sanitise_tag_collapses_dashes_and_caps_length() {
         let tag = sanitise_tag(&"a-".repeat(50));
         assert!(!tag.contains("--"));
-        assert!(tag.chars().count() <= 48);
+        assert!(tag.chars().count() <= 32);
     }
 
     #[test]
