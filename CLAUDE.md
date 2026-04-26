@@ -13,6 +13,16 @@
   3. `cargo clippy -- -D warnings` - Ensure there are zero clippy warnings.
 - Do not push code if `cargo fmt --check` or `cargo clippy` fails. GitHub Actions CI will reject it.
 
+## Versioning
+- `Cargo.toml` `version` is `MAJOR.MINOR.PATCH`.  Rule:
+  - `feat(...)` commit on master → MINOR +1, PATCH := 0
+  - `fix(...)` commit on master → PATCH +1
+  - Anything else (`refactor`, `chore`, `docs`, `test`, `spike`, merges…) → no bump
+  - MAJOR is never bumped automatically; a human edits `Cargo.toml` when a release warrants MAJOR+1 (big refactor, architecture shift, storage format change, etc.).
+- Each PR author bumps `Cargo.toml` in the PR itself.  Run `scripts/next-version.sh` to see what the version should be, then edit `Cargo.toml`.
+- CI runs `scripts/next-version.sh --check` on every PR and red-fails if `Cargo.toml` disagrees with what the commit history implies.
+- When MAJOR is bumped, tag the merge commit on master: `git tag vN.0.0 && git push origin vN.0.0`.
+
 ## Architecture
 - SQLite is the source of truth for `memory_db`, `inbox.db`, and `cron.db`. Do not use `.jsonl` or `.json` files for state storage. Avoid `tempfile` atomic writes for data that belongs in SQLite.
   - Exception: `~/.amaebi/sessions.json` is a lightweight non-authoritative directory→UUID mapping cache. It is intentionally JSON (not SQLite) because it is written by every CLI invocation and must tolerate concurrent readers without WAL overhead.

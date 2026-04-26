@@ -12,6 +12,17 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Full history — scripts/next-version.sh walks every commit on
+          # the branch to derive the expected Cargo.toml version.
+          fetch-depth: 0
+
+      - name: Version bump check
+        # Verifies that `Cargo.toml` was bumped according to the rule in
+        # CLAUDE.md: each `feat(...)` on master bumps MINOR (PATCH=0),
+        # each `fix(...)` bumps PATCH; MAJOR is human-controlled.  Fails
+        # the build if Cargo.toml disagrees with the history scan.
+        run: scripts/next-version.sh --check
 
       - name: Build dev image (if missing)
         run: |
