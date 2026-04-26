@@ -1561,17 +1561,43 @@ async fn handle_claude_launch(
                 // initialise (.bashrc, prompt rendering, etc.).
                 // Before subsequent sends (e.g. description after claude
                 // launch): let the target process start up.
+                // idx=0: give the new pane's shell a beat to init (bashrc, prompt).
+                // idx>0: give the launched process (claude TUI first render) time
+                //        to come up before we interact with it.
                 let wait = if idx == 0 { 1 } else { 5 };
                 std::thread::sleep(std::time::Duration::from_secs(wait));
 
-                // For the description injection (idx > 0 on a fresh pane),
-                // dismiss any Claude Code splash/welcome overlay first.
-                // Escape is a safe no-op if no overlay is active.
+                // For the description injection (idx > 0 on a fresh pane):
+                // accept the Claude Code trust dialog that fires on
+                // first-ever-seen worktrees ("Quick safety check: Is this a
+                // project you created or one you trust?" — default answer is
+                // "Yes, I trust this folder", selected by Enter).  Without
+                // this, our description is typed INTO the menu, chosen as
+                // the wrong option, or the prior `Escape` here selected
+                // "No, exit" and killed claude outright — which is what
+                // happened before this fix.
+                //
+                // Timing (on top of the 5 s claude-startup wait above):
+                //   2 s — let the splash / trust dialog fully render
+                //   Enter — accept "Yes" (or no-op if dialog isn't up:
+                //           the Claude Code TUI ignores Enter on an empty
+                //           prompt)
+                //   2 s — let the dialog dismiss and the TUI settle
+                //
+                // Shorter values (0.5 s / 1 s) were tried and occasionally
+                // caused the subsequent paste to land in a mid-render TUI
+                // state where it was discarded — the 2 s pads are the
+                // minimum that proved stable in manual testing.
+                //
+                // Only runs on fresh-pane launches (`!had_claude`); reuse
+                // path (`/compact` + inject) skips because the trust dialog
+                // was already accepted when the pane was first launched.
                 if idx > 0 && !had_claude {
+                    std::thread::sleep(std::time::Duration::from_secs(2));
                     let _ = std::process::Command::new("tmux")
-                        .args(["send-keys", "-t", &send_pane, "Escape"])
+                        .args(["send-keys", "-t", &send_pane, "Enter"])
                         .output();
-                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    std::thread::sleep(std::time::Duration::from_secs(2));
                 }
 
                 // Send text literally.
