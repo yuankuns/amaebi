@@ -54,6 +54,12 @@ pub struct TaskSpec {
     /// `0` means don't wait (fail immediately if any resource is busy).
     #[serde(default)]
     pub resource_timeout_secs: Option<u64>,
+    /// Optional task tag for supervision notebook persistence.  When
+    /// present, the supervision loop acquires a 24 h lease on
+    /// `(client_cwd, task_name)` and reads/writes
+    /// `~/.amaebi/tasks.db`.  When absent, notebook is bypassed.
+    #[serde(default)]
+    pub task_name: Option<String>,
 }
 
 /// A single pane+task pair for supervision.
@@ -61,6 +67,15 @@ pub struct TaskSpec {
 pub struct SupervisionTarget {
     pub pane_id: String,
     pub task_description: String,
+    /// Task notebook tag — carried from [`TaskSpec::task_name`] so the
+    /// supervision loop can read/write `~/.amaebi/tasks.db`.  `None`
+    /// disables the notebook path for this pane.
+    #[serde(default)]
+    pub task_name: Option<String>,
+    /// Canonicalized `client_cwd` at the time the task was launched.
+    /// Used together with `task_name` as the notebook lookup key.
+    #[serde(default)]
+    pub repo_dir: Option<String>,
 }
 
 /// A message sent from the client to the daemon over the Unix socket.
@@ -598,6 +613,7 @@ mod tests {
             resume_pane: None,
             resources: Vec::new(),
             resource_timeout_secs: None,
+            task_name: None,
         };
         let json = serde_json::to_string(&spec).unwrap();
         let back: TaskSpec = serde_json::from_str(&json).unwrap();
@@ -620,6 +636,7 @@ mod tests {
             resume_pane: Some("%41".into()),
             resources: Vec::new(),
             resource_timeout_secs: None,
+            task_name: None,
         };
         let json = serde_json::to_string(&spec).unwrap();
         let back: TaskSpec = serde_json::from_str(&json).unwrap();
@@ -666,6 +683,7 @@ mod tests {
             resume_pane: None,
             resources: vec!["sim-9900".into(), "class:gpu".into()],
             resource_timeout_secs: Some(300),
+            task_name: None,
         };
         let json = serde_json::to_string(&spec).unwrap();
         // Assert the wire field names so a silent serde rename is caught here,
@@ -677,6 +695,46 @@ mod tests {
         let back: TaskSpec = serde_json::from_str(&json).unwrap();
         assert_eq!(back.resources, vec!["sim-9900", "class:gpu"]);
         assert_eq!(back.resource_timeout_secs, Some(300));
+    }
+
+    #[test]
+    fn task_spec_task_name_absent_field_deserializes_as_none() {
+        // A PR #126/#127-era client (with resources, no task_name) must
+        // still deserialise against the new daemon.  Without
+        // `#[serde(default)]` on task_name, mixed-version deployments
+        // would fail every `/claude` call.
+        let legacy = r#"{"task_id":"x","description":"d","worktree":null,"client_cwd":null,"auto_enter":true,"resume_pane":null,"resources":[],"resource_timeout_secs":null}"#;
+        let back: TaskSpec = serde_json::from_str(legacy).expect("legacy must parse");
+        assert!(back.task_name.is_none());
+    }
+
+    #[test]
+    fn supervision_target_task_notebook_fields_absent_deserialize_as_none() {
+        // SupervisionTarget gained two new fields for the task notebook.
+        // Legacy payloads (pre-task-notebook PR) must still deserialise.
+        let legacy = r#"{"pane_id":"%3","task_description":"old task"}"#;
+        let back: SupervisionTarget = serde_json::from_str(legacy).expect("legacy must parse");
+        assert!(back.task_name.is_none());
+        assert!(back.repo_dir.is_none());
+    }
+
+    #[test]
+    fn supervision_target_round_trips_with_task_notebook_fields() {
+        let t = SupervisionTarget {
+            pane_id: "%3".into(),
+            task_description: "do the thing".into(),
+            task_name: Some("kernel-opt".into()),
+            repo_dir: Some("/home/me/proj".into()),
+        };
+        let json = serde_json::to_string(&t).unwrap();
+        // Pin the wire field names.
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["task_name"], "kernel-opt");
+        assert_eq!(v["repo_dir"], "/home/me/proj");
+
+        let back: SupervisionTarget = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.task_name.as_deref(), Some("kernel-opt"));
+        assert_eq!(back.repo_dir.as_deref(), Some("/home/me/proj"));
     }
 
     #[test]
@@ -692,6 +750,7 @@ mod tests {
                     resume_pane: None,
                     resources: Vec::new(),
                     resource_timeout_secs: None,
+                    task_name: None,
                 },
                 TaskSpec {
                     task_id: "t2".into(),
@@ -702,6 +761,7 @@ mod tests {
                     resume_pane: None,
                     resources: Vec::new(),
                     resource_timeout_secs: None,
+                    task_name: None,
                 },
             ],
         };
@@ -724,6 +784,8 @@ mod tests {
             panes: vec![SupervisionTarget {
                 pane_id: "%3".into(),
                 task_description: "implement feature X".into(),
+                task_name: None,
+                repo_dir: None,
             }],
             model: "gpt-4o".into(),
             session_id: Some("uuid-abc".into()),

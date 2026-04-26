@@ -623,6 +623,10 @@ async fn spawn_agent(args: serde_json::Value, ctx: &SpawnContext) -> Result<Stri
         // the alias table lets a child's switch_model call resolve user
         // aliases the same way the parent's does.
         user_aliases: Arc::clone(&ctx.user_aliases),
+        // Child agents never touch the task notebook; supervision-loop
+        // persistence is the parent supervision's concern, and children
+        // don't run supervision themselves.
+        tasks_db: Arc::new(std::sync::Mutex::new(None)),
     };
 
     let messages = vec![

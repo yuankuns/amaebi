@@ -14,6 +14,7 @@ use crate::memory_db;
 use crate::pane_lease;
 use crate::resource_lease;
 use crate::session;
+use crate::tasks;
 use crate::tools::{self, ToolExecutor};
 
 /// Resolve the raw model string to the API-level model ID for token lookups.
@@ -159,6 +160,12 @@ pub struct DaemonState {
     /// startup.  The user must restart the daemon after editing
     /// `~/.amaebi/config.json` for changes to take effect.
     pub user_aliases: Arc<std::collections::HashMap<String, String>>,
+    /// Persistent SQLite connection for the task notebook
+    /// (`~/.amaebi/tasks.db`).  Shared `Mutex` for the same reason as
+    /// `db`: all reads and writes serialise through a single connection.
+    /// Lazy-initialised — the first `/claude --task <tag>` request opens
+    /// it; invocations without `--task` never touch the file.
+    pub tasks_db: Arc<Mutex<Option<rusqlite::Connection>>>,
 }
 
 impl DaemonState {
@@ -203,8 +210,27 @@ impl DaemonState {
             compacting_sessions,
             active_sessions,
             user_aliases,
+            tasks_db: Arc::new(Mutex::new(None)),
         })
     }
+}
+
+/// Open (or reuse) the task notebook database handle on `state`.
+/// Returns an `Arc<Mutex<Connection>>` guarded callers can lock.
+/// Callers must be inside `spawn_blocking` — this helper runs file I/O
+/// on first invocation.
+fn ensure_tasks_db(state: &Arc<DaemonState>) -> Result<()> {
+    let mut guard = state
+        .tasks_db
+        .lock()
+        .map_err(|e| anyhow::anyhow!("tasks_db mutex poisoned: {e}"))?;
+    if guard.is_some() {
+        return Ok(());
+    }
+    let path = tasks::db_path().context("resolving tasks DB path")?;
+    let conn = tasks::init_db(&path).context("opening tasks DB")?;
+    *guard = Some(conn);
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -2035,11 +2061,143 @@ async fn handle_supervision(
     state: &Arc<DaemonState>,
     session_id: Option<String>,
 ) -> Result<()> {
-    let result = handle_supervision_inner(writer, frame_rx, &panes, model, state, session_id).await;
-    // Best-effort cleanup: must run regardless of inner result so panes are
-    // not stranded Busy for up to LEASE_TTL_SECS (24 h).
+    // Holder id used for task notebook leases: prefer the session UUID
+    // (stable per supervision request), fall back to the first pane id.
+    let holder = supervision_holder_id(&panes, session_id.as_deref());
+
+    let result =
+        handle_supervision_inner(writer, frame_rx, &panes, model, state, session_id, &holder).await;
+
+    // Best-effort cleanup: must run regardless of inner result so panes
+    // are not stranded Busy for up to LEASE_TTL_SECS (24 h).  Task
+    // leases released by `holder` identity — same outer-wrapper pattern
+    // as pane_lease / resource_lease, so every exit path (DONE, STEER,
+    // timeout, interrupt, model error, client disconnect, inner Err) is
+    // covered.
     release_supervised_panes(&panes).await;
+    release_task_leases_for_holder(state, &holder).await;
     result
+}
+
+/// Stable identifier stored as `task_notes.content` on the `kind='lease'`
+/// row so cleanup can find exactly the leases this supervision request
+/// owns.
+fn supervision_holder_id(
+    panes: &[crate::ipc::SupervisionTarget],
+    session_id: Option<&str>,
+) -> String {
+    if let Some(sid) = session_id {
+        return format!("supervision:{sid}");
+    }
+    // Fallback: first pane id.  Uniqueness is guaranteed inside a single
+    // live amaebi daemon because pane ids never repeat.
+    let first = panes
+        .first()
+        .map(|p| p.pane_id.as_str())
+        .unwrap_or("unknown");
+    format!("supervision:{first}")
+}
+
+/// Release every task lease held by `holder`, ignoring errors.  Runs in
+/// `spawn_blocking` because tasks.db is synchronous SQLite.
+async fn release_task_leases_for_holder(state: &Arc<DaemonState>, holder: &str) {
+    let state = Arc::clone(state);
+    let holder = holder.to_string();
+    let _ = tokio::task::spawn_blocking(move || {
+        let guard = match state.tasks_db.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        let Some(conn) = guard.as_ref() else {
+            return; // tasks.db never opened (no --task in this daemon's lifetime)
+        };
+        if let Err(e) = tasks::release_all_by_holder(conn, &holder) {
+            tracing::warn!(holder, error = %e, "failed to release task leases");
+        }
+    })
+    .await;
+}
+
+/// Render the task-notebook preamble for one supervision iteration.
+///
+/// Returns the empty string when no pane opted into the notebook, so
+/// supervision prompts for non-`--task` invocations are bit-identical
+/// to before this PR.
+///
+/// On the first iteration (`is_first_turn = true`) this also writes a
+/// `desc` row for every notebook pane whose `task_description` is
+/// non-empty: this is how the CLI-supplied `<desc>` gets persisted for
+/// later resume (`/claude --task foo` with no desc reads back the most
+/// recent row).
+async fn build_notebook_context(
+    state: &Arc<DaemonState>,
+    panes: &[crate::ipc::SupervisionTarget],
+    is_first_turn: bool,
+) -> String {
+    // Fast path: no notebook participation → empty preamble.
+    let any_notebook = panes
+        .iter()
+        .any(|p| p.task_name.is_some() && p.repo_dir.is_some());
+    if !any_notebook {
+        return String::new();
+    }
+
+    let state_cl = Arc::clone(state);
+    let panes_cl: Vec<crate::ipc::SupervisionTarget> = panes.to_vec();
+    let rendered = tokio::task::spawn_blocking(move || -> Result<String> {
+        let guard = state_cl
+            .tasks_db
+            .lock()
+            .map_err(|e| anyhow::anyhow!("tasks_db mutex poisoned: {e}"))?;
+        let Some(conn) = guard.as_ref() else {
+            return Ok(String::new());
+        };
+
+        let mut out = String::new();
+        for p in &panes_cl {
+            let (Some(repo_dir), Some(tag)) = (p.repo_dir.as_deref(), p.task_name.as_deref())
+            else {
+                continue;
+            };
+
+            // First-turn desc persistence: record the CLI-supplied desc
+            // (if any) so later resumes can recover it.  Re-running with
+            // the same desc will create a duplicate row; harmless, the
+            // reader picks the most recent by timestamp anyway.
+            if is_first_turn && !p.task_description.trim().is_empty() {
+                if let Err(e) = tasks::append_desc(conn, repo_dir, tag, &p.task_description) {
+                    tracing::warn!(tag, error = %e, "failed to persist task desc");
+                }
+            }
+
+            let latest = tasks::latest_desc(conn, repo_dir, tag)?
+                .unwrap_or_else(|| "(none recorded)".to_string());
+            let verdicts = tasks::recent_verdicts(conn, repo_dir, tag)?;
+
+            out.push_str(&format!("=== Task notebook for tag '{tag}' ===\n"));
+            out.push_str(&format!("Desc (most recent on record): {latest}\n"));
+            if verdicts.is_empty() {
+                out.push_str("No prior supervision verdicts for this tag.\n");
+            } else {
+                out.push_str(&format!(
+                    "Recent verdicts from prior supervision sessions ({}, oldest first):\n",
+                    verdicts.len()
+                ));
+                for v in &verdicts {
+                    out.push_str(&format!("  - {v}\n"));
+                }
+            }
+            out.push_str("=== End task notebook ===\n\n");
+        }
+        Ok(out)
+    })
+    .await
+    .unwrap_or_else(|e| Err(anyhow::anyhow!("notebook context task panicked: {e}")))
+    .unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "failed to build notebook context");
+        String::new()
+    });
+    rendered
 }
 
 /// Inner body of [`handle_supervision`]; see that function's doc for context.
@@ -2053,7 +2211,77 @@ async fn handle_supervision_inner(
     model: String,
     state: &Arc<DaemonState>,
     session_id: Option<String>,
+    holder: &str,
 ) -> Result<()> {
+    // --- Task notebook lease acquisition (opt-in: only panes with
+    //     task_name set participate).  Must run before entering the
+    //     supervision loop so a conflict returns cleanly without
+    //     starting timers or LLM calls.  All-or-nothing: if any lease
+    //     is held by another session, release whatever we already got
+    //     and error out.
+    let notebook_panes: Vec<&crate::ipc::SupervisionTarget> = panes
+        .iter()
+        .filter(|p| p.task_name.is_some() && p.repo_dir.is_some())
+        .collect();
+    if !notebook_panes.is_empty() {
+        let state_cl = Arc::clone(state);
+        let holder_cl = holder.to_string();
+        let lease_inputs: Vec<(String, String)> = notebook_panes
+            .iter()
+            .map(|p| (p.repo_dir.clone().unwrap(), p.task_name.clone().unwrap()))
+            .collect();
+        let acquire_result = tokio::task::spawn_blocking(move || -> Result<Result<(), String>> {
+            ensure_tasks_db(&state_cl)?;
+            let mut guard = state_cl
+                .tasks_db
+                .lock()
+                .map_err(|e| anyhow::anyhow!("tasks_db mutex poisoned: {e}"))?;
+            let conn = guard.as_mut().expect("tasks_db just ensured");
+
+            let mut acquired: Vec<(String, String)> = Vec::new();
+            for (repo_dir, tag) in &lease_inputs {
+                match tasks::acquire_lease(conn, repo_dir, tag, &holder_cl)? {
+                    tasks::AcquireLeaseResult::Acquired => {
+                        acquired.push((repo_dir.clone(), tag.clone()));
+                    }
+                    tasks::AcquireLeaseResult::Held {
+                        holder: incumbent,
+                        age_secs,
+                    } => {
+                        // Roll back anything we already acquired.
+                        for (r, t) in &acquired {
+                            let _ = tasks::release_lease(conn, r, t, &holder_cl);
+                        }
+                        let hours = age_secs / 3600;
+                        let mins = (age_secs % 3600) / 60;
+                        let msg = format!(
+                            "task '{tag}' is already held by {incumbent} \
+                             (age {hours}h{mins}m, TTL 24h); wait for it to \
+                             finish, pick another tag, or use \
+                             `amaebi task release {tag}` to force-release"
+                        );
+                        return Ok(Err(msg));
+                    }
+                }
+            }
+            Ok(Ok(()))
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("task-lease acquire panicked: {e}"))??;
+        if let Err(msg) = acquire_result {
+            let mut w = writer.lock().await;
+            write_frame(
+                &mut *w,
+                &Response::Error {
+                    message: format!("[supervision] {msg}"),
+                },
+            )
+            .await?;
+            write_frame(&mut *w, &Response::Done).await?;
+            return Ok(());
+        }
+    }
+
     // Max time to wait between LLM checks.  Default 5 min; override with
     // AMAEBI_SUPERVISION_INTERVAL_SECS.  This is the *ceiling*: each iteration
     // actually waits for the pane to go idle (see `IDLE_SECS` below) so that
@@ -2285,8 +2513,19 @@ async fn handle_supervision_inner(
         let prior = last_verdict
             .as_deref()
             .unwrap_or("(none yet — this is the first check)");
+
+        // Task notebook context (opt-in: only panes with task_name + repo_dir).
+        // Read-only: per-turn fetch of recent verdicts and the tag's latest
+        // stored desc.  Rendered into a dedicated prompt section that is
+        // clearly labelled "from prior supervision sessions" so the LLM does
+        // not confuse it with in-session continuity (`prior`).  First-turn
+        // side effect: write `task_description` as a `desc` row so resumes
+        // without a CLI desc can find it.
+        let notebook_context = build_notebook_context(state, panes, turn == 1).await;
+
         let user_content = format!(
-            "Current pane snapshots (check #{turn}, elapsed {elapsed_mins}m):\n\n\
+            "{notebook_context}\
+             Current pane snapshots (check #{turn}, elapsed {elapsed_mins}m):\n\n\
              {pane_snapshots}\n\
              Your previous verdict this session: {prior}"
         );
@@ -2400,12 +2639,39 @@ async fn handle_supervision_inner(
         // iteration can pass it back into the user prompt.  `verdict_line`
         // starts with "  → " and ends with "\n"; strip both for a compact
         // one-line carry-over.
-        last_verdict = Some(
-            verdict_line
-                .trim_start_matches("  → ")
-                .trim_end_matches('\n')
-                .to_string(),
-        );
+        let verdict_compact = verdict_line
+            .trim_start_matches("  → ")
+            .trim_end_matches('\n')
+            .to_string();
+        last_verdict = Some(verdict_compact.clone());
+
+        // Persist verdict to task notebook (best-effort, per-pane).  Only
+        // panes that opted into the notebook (task_name + repo_dir set)
+        // participate.  Failures are logged but must not break the
+        // supervision loop — notebook is auxiliary to the live verdict
+        // decision the LLM just made.
+        for target in panes.iter() {
+            if let (Some(repo_dir), Some(tag)) =
+                (target.repo_dir.as_deref(), target.task_name.as_deref())
+            {
+                let state_cl = Arc::clone(state);
+                let repo_dir = repo_dir.to_string();
+                let tag = tag.to_string();
+                let verdict = verdict_compact.clone();
+                let _ = tokio::task::spawn_blocking(move || -> Result<()> {
+                    let guard = state_cl
+                        .tasks_db
+                        .lock()
+                        .map_err(|e| anyhow::anyhow!("tasks_db mutex poisoned: {e}"))?;
+                    let conn = guard
+                        .as_ref()
+                        .ok_or_else(|| anyhow::anyhow!("tasks_db not initialised"))?;
+                    tasks::append_verdict(conn, &repo_dir, &tag, &verdict)
+                })
+                .await
+                .inspect_err(|e| tracing::warn!(error = %e, "verdict persist task panicked"));
+            }
+        }
 
         let mut w = writer.lock().await;
         write_frame(
@@ -6972,6 +7238,8 @@ mod tests {
         let panes = vec![crate::ipc::SupervisionTarget {
             pane_id: "%7".to_string(),
             task_description: "do the thing".to_string(),
+            task_name: None,
+            repo_dir: None,
         }];
         release_supervised_panes(&panes).await;
 
@@ -7009,6 +7277,8 @@ mod tests {
         let panes = vec![crate::ipc::SupervisionTarget {
             pane_id: "%999".to_string(),
             task_description: "nonexistent".to_string(),
+            task_name: None,
+            repo_dir: None,
         }];
         release_supervised_panes(&panes).await;
         let state = pane_lease::read_state().expect("read pane state");
@@ -7072,6 +7342,7 @@ mod tests {
             resume_pane: Some("%999".to_string()),
             resources: Vec::new(),
             resource_timeout_secs: None,
+            task_name: None,
         };
         handle_claude_launch(&writer, vec![task])
             .await
@@ -7133,6 +7404,7 @@ mod tests {
             resume_pane: Some("%42".to_string()),
             resources: Vec::new(),
             resource_timeout_secs: None,
+            task_name: None,
         };
         handle_claude_launch(&writer, vec![task])
             .await
@@ -7199,6 +7471,7 @@ mod tests {
             resume_pane: Some("%9999999".to_string()),
             resources: Vec::new(),
             resource_timeout_secs: None,
+            task_name: None,
         };
         handle_claude_launch(&writer, vec![task])
             .await
@@ -7329,6 +7602,7 @@ mod tests {
             compacting_sessions: Arc::new(Mutex::new(HashSet::new())),
             active_sessions: Arc::new(Mutex::new(HashSet::new())),
             user_aliases: Arc::new(std::collections::HashMap::new()),
+            tasks_db: Arc::new(Mutex::new(None)),
         });
 
         // "sid-quarantined" has no entry in the empty sessions.json under

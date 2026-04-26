@@ -183,7 +183,7 @@ fn save_map(path: &Path, map: &SessionMap) -> Result<()> {
 ///
 /// Falls back to the raw path if `canonicalize` fails (e.g. dir does not
 /// exist yet).
-fn canonical_key(dir: &Path) -> String {
+pub(crate) fn canonical_key(dir: &Path) -> String {
     std::fs::canonicalize(dir)
         .unwrap_or_else(|_| dir.to_path_buf())
         .to_string_lossy()

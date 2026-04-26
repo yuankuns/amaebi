@@ -224,6 +224,10 @@ struct ClaudeTask {
     resources: Vec<String>,
     /// Seconds to wait for busy resources.  `None` / `0` → fail fast.
     resource_timeout_secs: Option<u64>,
+    /// Optional task notebook tag passed via `--task`.  Enables
+    /// supervision persistence at `~/.amaebi/tasks.db` keyed by
+    /// `(client_cwd, task_name)`.
+    task_name: Option<String>,
 }
 
 /// A parsed slash command from user input.
@@ -306,6 +310,7 @@ fn parse_claude(input: &str) -> Option<Result<Vec<ClaudeTask>, String>> {
     let mut resume_pane: Option<String> = None;
     let mut auto_enter = true;
     let mut cwd: Option<String> = None;
+    let mut task_name: Option<String> = None;
     let mut resources: Vec<String> = Vec::new();
     let mut resource_timeout_secs: Option<u64> = None;
     // (description, was_quoted) pairs for non-flag tokens.
@@ -349,6 +354,15 @@ fn parse_claude(input: &str) -> Option<Result<Vec<ClaudeTask>, String>> {
             }
             "--no-enter" => {
                 auto_enter = false;
+            }
+            "--task" => {
+                i += 1;
+                if i >= tokens.len() || tokens[i].0.starts_with("--") {
+                    return Some(Err(
+                        "--task requires a tag (short identifier for the notebook)".to_string(),
+                    ));
+                }
+                task_name = Some(tokens[i].0.clone());
             }
             "--resource" => {
                 i += 1;
@@ -489,6 +503,7 @@ fn parse_claude(input: &str) -> Option<Result<Vec<ClaudeTask>, String>> {
                 resume_pane: resume_pane.clone(),
                 resources: resources.clone(),
                 resource_timeout_secs,
+                task_name: task_name.clone(),
             }
         })
         .collect();
@@ -637,6 +652,7 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
                     resume_pane: t.resume_pane,
                     resources: t.resources,
                     resource_timeout_secs: t.resource_timeout_secs,
+                    task_name: t.task_name,
                 })
                 .collect(),
         };
@@ -1082,6 +1098,16 @@ pub async fn run_chat_loop(
                     .iter()
                     .map(|t| (t.task_id.clone(), t.description.clone()))
                     .collect();
+                // `--task <tag>` is per-`/claude` invocation (the parser sets
+                // one value for all ClaudeTasks), so snapshot it once for the
+                // supervision request built after this loop.
+                let invocation_task_name: Option<String> =
+                    tasks.iter().find_map(|t| t.task_name.clone());
+                // Canonicalise client cwd once; paired with task_name it is
+                // the notebook lookup key stored on each SupervisionTarget.
+                let invocation_repo_dir: Option<String> = invocation_task_name
+                    .as_ref()
+                    .map(|_| crate::session::canonical_key(&cwd));
                 let req = Request::ClaudeLaunch {
                     tasks: tasks
                         .into_iter()
@@ -1094,6 +1120,7 @@ pub async fn run_chat_loop(
                             resume_pane: t.resume_pane,
                             resources: t.resources,
                             resource_timeout_secs: t.resource_timeout_secs,
+                            task_name: t.task_name,
                         })
                         .collect(),
                 };
@@ -1157,6 +1184,8 @@ pub async fn run_chat_loop(
                             .map(|(pid, desc)| crate::ipc::SupervisionTarget {
                                 pane_id: pid.clone(),
                                 task_description: desc.clone(),
+                                task_name: invocation_task_name.clone(),
+                                repo_dir: invocation_repo_dir.clone(),
                             })
                             .collect(),
                         model: model.clone(),
@@ -2589,6 +2618,25 @@ mod tests {
             err.contains("non-negative integer"),
             "msg should explain the format: {err}"
         );
+    }
+
+    #[test]
+    fn parse_claude_task_tag_is_collected() {
+        let tasks = claude_tasks("/claude --task kernel-opt \"run this\"");
+        assert_eq!(tasks[0].task_name.as_deref(), Some("kernel-opt"));
+        assert_eq!(tasks[0].description, "run this");
+    }
+
+    #[test]
+    fn parse_claude_task_without_value_errors() {
+        let result = parse_claude("/claude --task");
+        assert!(matches!(result, Some(Err(_))));
+    }
+
+    #[test]
+    fn parse_claude_without_task_flag_leaves_name_none() {
+        let tasks = claude_tasks("/claude \"just run\"");
+        assert!(tasks[0].task_name.is_none());
     }
 
     #[test]
