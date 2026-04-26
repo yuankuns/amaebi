@@ -24,6 +24,9 @@ mod responses;
 mod retry;
 mod sandbox;
 mod session;
+mod task_tagger;
+mod tasks;
+
 #[cfg(test)]
 mod test_utils;
 mod tools;
@@ -125,6 +128,7 @@ async fn main() -> Result<()> {
         cli::Command::Inbox { action } => run_inbox(action),
         cli::Command::Cron { action } => run_cron(action),
         cli::Command::Resource { action } => run_resource(action),
+        cli::Command::Tag { action } => run_tag(action),
         cli::Command::Dashboard => dashboard::run().await,
     }
 }
@@ -534,7 +538,7 @@ fn run_resource(action: cli::ResourceAction) -> Result<()> {
                         format!(
                             "pane={} task={} session={}",
                             l.pane_id.as_deref().unwrap_or("?"),
-                            l.task_id.as_deref().unwrap_or("?"),
+                            l.tag.as_deref().unwrap_or("?"),
                             l.session_id.as_deref().unwrap_or("?"),
                         ),
                     ),
@@ -571,7 +575,7 @@ fn run_resource(action: cli::ResourceAction) -> Result<()> {
                     format!(
                         "pane={} task={} session={}",
                         l.pane_id.as_deref().unwrap_or("?"),
-                        l.task_id.as_deref().unwrap_or("?"),
+                        l.tag.as_deref().unwrap_or("?"),
                         l.session_id.as_deref().unwrap_or("?"),
                     )
                 } else {
@@ -582,6 +586,53 @@ fn run_resource(action: cli::ResourceAction) -> Result<()> {
                     name = l.name,
                     class = l.class,
                 );
+            }
+            Ok(())
+        }
+    }
+}
+
+fn run_tag(action: cli::TagAction) -> Result<()> {
+    match action {
+        cli::TagAction::List => {
+            let path = tasks::db_path().context("resolving tasks DB path")?;
+            if !path.exists() {
+                println!("No task notebook yet (no `/claude --tag` has ever run).");
+                return Ok(());
+            }
+            let conn = tasks::init_db(&path).context("opening tasks DB")?;
+            let leases = tasks::list_active_leases(&conn).context("listing leases")?;
+            if leases.is_empty() {
+                println!("No active task leases.");
+                return Ok(());
+            }
+            for l in &leases {
+                let hours = l.age_secs / 3600;
+                let mins = (l.age_secs % 3600) / 60;
+                println!(
+                    "{repo_dir}  tag={tag:<20} holder={holder:<30} age={hours}h{mins:02}m",
+                    repo_dir = l.repo_dir,
+                    tag = l.tag,
+                    holder = l.holder,
+                );
+            }
+            Ok(())
+        }
+        cli::TagAction::Release { tag } => {
+            let path = tasks::db_path().context("resolving tasks DB path")?;
+            if !path.exists() {
+                println!("No task notebook exists — nothing to release.");
+                return Ok(());
+            }
+            let conn = tasks::init_db(&path).context("opening tasks DB")?;
+            let cwd = std::env::current_dir().context("resolving cwd")?;
+            let repo_dir = session::canonical_key(&cwd);
+            let n =
+                tasks::force_release(&conn, &repo_dir, &tag).context("force-releasing lease")?;
+            if n == 0 {
+                println!("No live lease for tag {tag:?} in {repo_dir}.");
+            } else {
+                println!("Released {n} lease(s) for tag {tag:?} in {repo_dir}.");
             }
             Ok(())
         }

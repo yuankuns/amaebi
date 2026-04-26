@@ -171,6 +171,16 @@ pub enum Command {
         #[command(subcommand)]
         action: ResourceAction,
     },
+    /// Inspect and recover task notebook leases.
+    ///
+    /// Reads `~/.amaebi/tasks.db` and shows which `(repo_dir, tag)`
+    /// pairs currently hold a live 24 h lease.  `release` force-clears
+    /// a stuck lease without waiting out the TTL, e.g. when the
+    /// supervision process died without releasing.
+    Tag {
+        #[command(subcommand)]
+        action: TagAction,
+    },
     /// Live TUI dashboard aggregating session, pane, inbox, and cron state.
     ///
     /// Full-screen view that auto-refreshes every 2 s.  Shows environment
@@ -186,6 +196,19 @@ pub enum Command {
 pub enum ResourceAction {
     /// List all resources in the pool with their status and current holder.
     List,
+}
+
+#[derive(clap::Subcommand, Debug)]
+pub enum TagAction {
+    /// List every live task notebook lease (repo_dir, tag, holder, age).
+    List,
+    /// Force-release the live lease for a tag in the current directory,
+    /// regardless of who holds it.  Use after a supervision crash when
+    /// you don't want to wait out the 24 h TTL.
+    Release {
+        /// The task tag, e.g. `kernel-opt`.
+        tag: String,
+    },
 }
 
 #[derive(clap::Subcommand, Debug)]

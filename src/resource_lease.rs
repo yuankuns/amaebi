@@ -138,7 +138,7 @@ pub struct ResourceLease {
     pub status: ResourceStatus,
     /// tmux pane that holds this lease (resource lifetime = pane lifetime).
     pub pane_id: Option<String>,
-    pub task_id: Option<String>,
+    pub tag: Option<String>,
     pub session_id: Option<String>,
     pub heartbeat_at: u64,
 }
@@ -150,7 +150,7 @@ impl ResourceLease {
             class: def.class.clone(),
             status: ResourceStatus::Idle,
             pane_id: None,
-            task_id: None,
+            tag: None,
             session_id: None,
             heartbeat_at: now_secs(),
         }
@@ -215,7 +215,7 @@ pub enum WaitPolicy {
 #[derive(Debug, Clone)]
 pub struct Holder {
     pub pane_id: String,
-    pub task_id: String,
+    pub tag: String,
     pub session_id: String,
 }
 
@@ -433,7 +433,7 @@ fn try_acquire_locked(
                         if let Some(l) = state.get_mut(n) {
                             l.status = ResourceStatus::Idle;
                             l.pane_id = None;
-                            l.task_id = None;
+                            l.tag = None;
                             l.session_id = None;
                         }
                     }
@@ -453,7 +453,7 @@ fn try_acquire_locked(
                         if let Some(l) = state.get_mut(n) {
                             l.status = ResourceStatus::Idle;
                             l.pane_id = None;
-                            l.task_id = None;
+                            l.tag = None;
                             l.session_id = None;
                         }
                     }
@@ -481,7 +481,7 @@ fn try_acquire_locked(
                 let lease = state.get_mut(&name).expect("candidate just found in state");
                 lease.status = ResourceStatus::Busy;
                 lease.pane_id = Some(holder.pane_id.clone());
-                lease.task_id = Some(holder.task_id.clone());
+                lease.tag = Some(holder.tag.clone());
                 lease.session_id = Some(holder.session_id.clone());
                 lease.heartbeat_at = now;
                 acquired.push(name);
@@ -494,7 +494,7 @@ fn try_acquire_locked(
                     if let Some(l) = state.get_mut(n) {
                         l.status = ResourceStatus::Idle;
                         l.pane_id = None;
-                        l.task_id = None;
+                        l.tag = None;
                         l.session_id = None;
                     }
                 }
@@ -651,7 +651,7 @@ pub async fn release_all_for_pane(pane_id: &str) -> Result<Vec<String>> {
                 if lease.pane_id.as_deref() == Some(pane.as_str()) {
                     lease.status = ResourceStatus::Idle;
                     lease.pane_id = None;
-                    lease.task_id = None;
+                    lease.tag = None;
                     lease.session_id = None;
                     lease.heartbeat_at = now_secs();
                     released.push(lease.name.clone());
@@ -814,7 +814,7 @@ mod tests {
     fn holder(pane: &str) -> Holder {
         Holder {
             pane_id: pane.to_string(),
-            task_id: "t".to_string(),
+            tag: "t".to_string(),
             session_id: "s".to_string(),
         }
     }
@@ -863,7 +863,7 @@ mod tests {
             class: "simulator".into(),
             status: ResourceStatus::Busy,
             pane_id: Some("%3".into()),
-            task_id: Some("t1".into()),
+            tag: Some("t1".into()),
             session_id: Some("s1".into()),
             heartbeat_at: 1234,
         };
@@ -1104,7 +1104,7 @@ mod tests {
                 &[ResourceRequest::Named("sim-9900".into())],
                 Holder {
                     pane_id: "%4".into(),
-                    task_id: "t".into(),
+                    tag: "t".into(),
                     session_id: "s".into(),
                 },
                 WaitPolicy::Wait {
@@ -1156,7 +1156,7 @@ mod tests {
             class: "simulator".into(),
             status: ResourceStatus::Busy,
             pane_id: Some("%3".into()),
-            task_id: None,
+            tag: None,
             session_id: None,
             heartbeat_at: 0,
         };
@@ -1175,7 +1175,7 @@ mod tests {
             class: "simulator".into(),
             status: ResourceStatus::Busy,
             pane_id: Some("%3".into()),
-            task_id: None,
+            tag: None,
             session_id: None,
             heartbeat_at: 0,
         };
@@ -1202,7 +1202,7 @@ mod tests {
                 class: "simulator".into(),
                 status: ResourceStatus::Busy,
                 pane_id: None,
-                task_id: None,
+                tag: None,
                 session_id: None,
                 heartbeat_at: 0,
             },
@@ -1211,7 +1211,7 @@ mod tests {
                 class: "gpu".into(),
                 status: ResourceStatus::Busy,
                 pane_id: None,
-                task_id: None,
+                tag: None,
                 session_id: None,
                 heartbeat_at: 0,
             },
@@ -1311,7 +1311,7 @@ mod tests {
                 class: "simulator".into(),
                 status: ResourceStatus::Busy,
                 pane_id: Some("%ghost".into()),
-                task_id: Some("dead".into()),
+                tag: Some("dead".into()),
                 session_id: Some("dead".into()),
                 heartbeat_at: now_secs().saturating_sub(LEASE_TTL_SECS + 1),
             },
@@ -1409,7 +1409,7 @@ mod tests {
                 class: "simulator".into(),
                 status: ResourceStatus::Busy,
                 pane_id: Some("%ghost".into()),
-                task_id: Some("dead".into()),
+                tag: Some("dead".into()),
                 session_id: Some("dead".into()),
                 heartbeat_at: now_secs().saturating_sub(LEASE_TTL_SECS + 1),
             },
