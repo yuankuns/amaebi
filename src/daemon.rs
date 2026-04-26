@@ -1707,12 +1707,99 @@ async fn handle_claude_launch(
     Ok(())
 }
 
+/// Return `true` when `line` is a visual TUI chrome fragment from the
+/// Claude Code terminal UI with no informational content — a horizontal
+/// separator, the always-present bottom status bar, an empty prompt
+/// cursor, or a pure box-drawing border segment.
+///
+/// Match criteria deliberately target **whole-line** chrome only so that
+/// real output containing these glyphs (e.g. a log line with `│` as a
+/// field separator) survives untouched.  Missing a chrome variant is
+/// fine (minor noise), false positives would silently drop real
+/// information the supervisor LLM needs — so every rule here is
+/// conservative and structure-anchored.
+fn is_tui_chrome_line(line: &str) -> bool {
+    let t = line.trim();
+    if t.is_empty() {
+        return false; // real blank lines are meaningful in tmux captures
+    }
+
+    // 1. All-horizontal-rule divider.  Claude Code renders these as long
+    //    runs of U+2500 / U+2501; a 10-char minimum avoids hitting a real
+    //    line that happens to start with a few dashes (e.g. markdown).
+    if t.chars().all(|c| c == '─' || c == '━') && t.chars().count() >= 10 {
+        return true;
+    }
+
+    // 2. Bottom status bar.  Anchored on two substrings Claude Code
+    //    always emits in its hint line, plus the "bypass permissions"
+    //    banner visible when `--dangerously-skip-permissions` is active.
+    if t.starts_with("⏵⏵ bypass permissions")
+        || t.contains("esc to interrupt")
+        || t.contains("ctrl+t to hide tasks")
+    {
+        return true;
+    }
+
+    // 3. Empty input prompt `❯` on its own.
+    if t == "❯" {
+        return true;
+    }
+
+    // 4. Pure box-drawing border: every char is a box-drawing glyph or
+    //    whitespace, AND at least one vertical/corner glyph is present.
+    //    The "must contain a vertical" requirement stops rule 4 from
+    //    swallowing short horizontal runs (e.g. a 3- or 8-dash markdown
+    //    separator) that rule 1's 10-char minimum intentionally let
+    //    through — rule 1 is the sole authority for "all-dashes" lines.
+    //    Vertical/corner glyphs are the real signature of a rendered
+    //    box frame.
+    let is_border = |c: char| {
+        matches!(
+            c,
+            '│' | '╭'
+                | '╮'
+                | '╯'
+                | '╰'
+                | '├'
+                | '┤'
+                | '┬'
+                | '┴'
+                | '─'
+                | '━'
+                | ' '
+                | '\t'
+        )
+    };
+    let has_vertical = |c: char| matches!(c, '│' | '╭' | '╮' | '╯' | '╰' | '├' | '┤' | '┬' | '┴');
+    if t.chars().all(is_border) && t.chars().any(has_vertical) {
+        return true;
+    }
+
+    false
+}
+
+/// Remove whole-line TUI chrome from `raw`, preserving line order and
+/// all blank lines.  Line-based filter: never rewrites content, only
+/// drops fully-chrome lines.
+fn strip_tui_chrome(raw: &str) -> String {
+    raw.lines()
+        .filter(|l| !is_tui_chrome_line(l))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Capture the last 200 lines of a tmux pane as plain text.
 /// Returns an empty string on failure so supervision can continue.
 ///
 /// 200-line window matches Claude Code's own default capture depth — enough
 /// that a busy pane (tool outputs, build logs) still shows what the Claude
 /// agent most recently did, not just the idle prompt that followed.
+///
+/// Post-capture, Claude Code's visual TUI chrome (divider rules, status
+/// bar, empty prompt cursor, border characters) is stripped via
+/// [`strip_tui_chrome`] so downstream supervision / idle-detection /
+/// LLM-prompt consumers see a high signal-to-noise view of the pane.
 fn capture_pane_text(pane_id: &str) -> String {
     match std::process::Command::new("tmux")
         .args(["capture-pane", "-t", pane_id, "-p", "-S", "-200"])
@@ -1728,7 +1815,8 @@ fn capture_pane_text(pane_id: &str) -> String {
                 );
                 return String::new();
             }
-            String::from_utf8_lossy(&output.stdout).into_owned()
+            let raw = String::from_utf8_lossy(&output.stdout);
+            strip_tui_chrome(&raw)
         }
         Err(e) => {
             tracing::warn!(pane_id, error = %e, "failed to spawn tmux capture-pane");
@@ -7210,5 +7298,148 @@ mod tests {
             summaries.is_empty(),
             "load_session_state must not read sentinel rows back; got {summaries:?}"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // TUI chrome stripping
+    //
+    // Fixtures modelled on real `tmux capture-pane` output of Claude Code
+    // TUIs.  The guiding invariant is asymmetric: missing a chrome line
+    // is merely noisy; eating a real-output line silently drops signal
+    // from the supervisor LLM's view, which is strictly worse.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn chrome_divider_line_is_stripped() {
+        assert!(is_tui_chrome_line(
+            "────────────────────────────────────────"
+        ));
+        // Heavy-weight divider variant.
+        assert!(is_tui_chrome_line("━━━━━━━━━━━━━━"));
+        // Indentation inside the divider line is tolerated.
+        assert!(is_tui_chrome_line("    ──────────────    "));
+    }
+
+    #[test]
+    fn chrome_short_dash_run_is_not_stripped() {
+        // Three dashes could be a real `---` separator or a command-line
+        // flag echo (`--help`).  The 10-char threshold prevents collateral.
+        assert!(!is_tui_chrome_line("---"));
+        assert!(!is_tui_chrome_line("────────")); // 8 chars, below threshold
+    }
+
+    #[test]
+    fn chrome_status_bar_is_stripped() {
+        assert!(is_tui_chrome_line(
+            "  ⏵⏵ bypass permissions on · 1 shell · esc to interrupt · ctrl+t to hide tasks · ↓ to manage"
+        ));
+        assert!(is_tui_chrome_line("  ⏵⏵ bypass permissions on"));
+        // Matched via the `esc to interrupt` substring (covers Claude Code
+        // hint rows that don't start with the bypass banner).
+        assert!(is_tui_chrome_line("  ↑/↓ navigate · esc to interrupt"));
+    }
+
+    #[test]
+    fn chrome_empty_prompt_cursor_is_stripped() {
+        assert!(is_tui_chrome_line("❯"));
+        assert!(is_tui_chrome_line("   ❯   "));
+    }
+
+    #[test]
+    fn chrome_empty_prompt_with_content_is_preserved() {
+        // A populated prompt is real user/Claude input — must not be eaten.
+        assert!(!is_tui_chrome_line("❯ what's the benchmark result?"));
+        assert!(!is_tui_chrome_line("❯ ls -la"));
+    }
+
+    #[test]
+    fn chrome_pure_border_line_is_stripped() {
+        // Empty middle of a bordered box, e.g. rendered by Claude Code's
+        // input/output panels.
+        assert!(is_tui_chrome_line("│                                   │"));
+        assert!(is_tui_chrome_line("╭───────────────╮"));
+        assert!(is_tui_chrome_line("╰───────────────╯"));
+    }
+
+    #[test]
+    fn chrome_log_with_pipe_separator_is_preserved() {
+        // Real log lines often use `│` as a visual separator; they contain
+        // non-border text so the all-border check rejects them.
+        assert!(!is_tui_chrome_line("2026-04-25 14:22 │ INFO │ build done"));
+        assert!(!is_tui_chrome_line("│ Build │ OK"));
+    }
+
+    #[test]
+    fn chrome_checkmark_progress_rows_are_preserved() {
+        // The ✔ rows in a Claude Code task list are *content*, not chrome.
+        // Regression for the supervision screenshot the user reported.
+        assert!(!is_tui_chrome_line("     ✔ A2: causal + paged combined"));
+        assert!(!is_tui_chrome_line(
+            "     ✔ Baseline perf (hd=128 fp16 GQA) before changes"
+        ));
+        assert!(!is_tui_chrome_line("      … +1 completed"));
+    }
+
+    #[test]
+    fn chrome_shell_prompt_and_errors_are_preserved() {
+        assert!(!is_tui_chrome_line("syk@host:/repo$ ls"));
+        assert!(!is_tui_chrome_line("error: lint failed at line 10"));
+        assert!(!is_tui_chrome_line("A1: 1.3× speedup"));
+    }
+
+    #[test]
+    fn strip_tui_chrome_on_real_supervision_screenshot() {
+        // Reproduces the pane snapshot the user pasted: a task header, a
+        // list of ✔ completions, a divider, an empty ❯ prompt, another
+        // divider, and the status bar.  Only the task + ✔ lines + the
+        // `… +N completed` summary should survive; dividers, the empty
+        // prompt, and the status bar must be filtered out.
+        let raw = "\
+继续fmha4_paged的功能迁移，根据ROADMAP.md一个一个功能往fmha4_paged加。每个功能加完要确保性能不掉，精度准确。
+     ✔ A2: causal + paged combined
+     ✔ Baseline perf (hd=128 fp16 GQA) before changes
+     ✔ A1: hd=64 vrow fallback port
+      … +1 completed
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on · 1 shell · esc to interrupt · ctrl+t to hide tasks · ↓ to manage
+";
+        let cleaned = strip_tui_chrome(raw);
+        // Content lines all survive.
+        assert!(cleaned.contains("继续fmha4_paged的功能迁移"));
+        assert!(cleaned.contains("✔ A2: causal + paged combined"));
+        assert!(cleaned.contains("✔ Baseline perf"));
+        assert!(cleaned.contains("✔ A1: hd=64 vrow fallback port"));
+        assert!(cleaned.contains("… +1 completed"));
+        // Chrome lines removed.
+        assert!(
+            !cleaned.contains("────────────────────────────────────────────────────────────────"),
+            "divider must be stripped"
+        );
+        assert!(
+            !cleaned.contains("bypass permissions"),
+            "status bar must be stripped"
+        );
+        // Empty prompt `❯` line is gone but blank lines around it stay.
+        let has_lone_caret = cleaned.lines().any(|l| l.trim() == "❯");
+        assert!(!has_lone_caret, "empty ❯ prompt must be stripped");
+    }
+
+    #[test]
+    fn strip_tui_chrome_preserves_blank_lines() {
+        // Blank lines carry structure (paragraph breaks, shell idle); we
+        // keep them so downstream trimming / tail extraction sees the
+        // same line-count boundaries as the original capture.
+        let raw = "line one\n\nline two\n\n\nline three\n";
+        let cleaned = strip_tui_chrome(raw);
+        assert_eq!(cleaned, "line one\n\nline two\n\n\nline three");
+    }
+
+    #[test]
+    fn strip_tui_chrome_empty_input() {
+        assert_eq!(strip_tui_chrome(""), "");
     }
 }
