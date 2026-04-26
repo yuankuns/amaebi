@@ -94,6 +94,8 @@ pub enum Response {
         task_id: String,
         pane_id: String,
         session_id: String,
+        #[serde(default)]
+        task_name: Option<String>,
     },
     /// Failure frame when the pane pool is full and the daemon cannot
     /// allocate more.  Surfaces BEFORE any tmux interaction so this path

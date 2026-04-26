@@ -255,6 +255,12 @@ pub enum Response {
         pane_id: String,
         /// amaebi session UUID for the new chat session running in the pane.
         session_id: String,
+        /// Resolved notebook tag for this task.  Either the user-supplied
+        /// `--task <tag>` verbatim, or an auto-generated tag from the
+        /// daemon's LLM tagger (via haiku).  `None` only when tagging was
+        /// skipped (e.g. tagger disabled in a future config).
+        #[serde(default)]
+        task_name: Option<String>,
     },
     /// The LLM called the `switch_model` tool and the active model changed.
     ///
@@ -818,6 +824,7 @@ mod tests {
             task_id: "pr-123".into(),
             pane_id: "%3".into(),
             session_id: "uuid-xyz".into(),
+            task_name: None,
         };
         let json = serde_json::to_string(&r).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();

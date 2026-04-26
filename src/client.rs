@@ -494,6 +494,11 @@ fn parse_claude(input: &str) -> Option<Result<Vec<ClaudeTask>, String>> {
         .enumerate()
         .map(|(idx, desc)| {
             let task_id = make_task_id(&desc, idx);
+            // task_name stays as the CLI override (if any) — the daemon
+            // resolves `None` via its LLM tagger to an auto-generated
+            // tag.  No client-side slug fallback because CJK descs
+            // yield uninformative `task-N` slugs that would collide
+            // across invocations.
             ClaudeTask {
                 task_id,
                 description: desc,
@@ -680,8 +685,13 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
                     task_id,
                     pane_id,
                     session_id: sid,
+                    task_name,
                 } => {
-                    let msg = format!("[pane {pane_id}] {task_id} → session {sid}\n");
+                    let tag_hint = task_name
+                        .as_deref()
+                        .map(|t| format!(" tag={t}"))
+                        .unwrap_or_default();
+                    let msg = format!("[pane {pane_id}] {task_id} → session {sid}{tag_hint}\n");
                     stdout.write_all(msg.as_bytes()).await?;
                 }
                 Response::CapacityError {
@@ -1093,21 +1103,31 @@ pub async fn run_chat_loop(
                         continue 'session;
                     }
                 };
-                // Save descriptions keyed by task_id for supervision prompt below.
+                // Save descriptions + per-task tags keyed by task_id so the
+                // supervision request built after this loop can look each
+                // pane's tag up individually.  Parser always fills a tag
+                // (auto-derived from task_id unless `--task` overrode it),
+                // so every pane participates in the notebook by default.
                 let task_descriptions: std::collections::HashMap<String, String> = tasks
                     .iter()
                     .map(|t| (t.task_id.clone(), t.description.clone()))
                     .collect();
-                // `--task <tag>` is per-`/claude` invocation (the parser sets
-                // one value for all ClaudeTasks), so snapshot it once for the
-                // supervision request built after this loop.
-                let invocation_task_name: Option<String> =
-                    tasks.iter().find_map(|t| t.task_name.clone());
-                // Canonicalise client cwd once; paired with task_name it is
-                // the notebook lookup key stored on each SupervisionTarget.
-                let invocation_repo_dir: Option<String> = invocation_task_name
-                    .as_ref()
-                    .map(|_| crate::session::canonical_key(&cwd));
+                let task_tags: std::collections::HashMap<String, Option<String>> = tasks
+                    .iter()
+                    .map(|t| (t.task_id.clone(), t.task_name.clone()))
+                    .collect();
+                // Canonicalise the effective client cwd — honour `--cwd` when
+                // set so `repo_dir` matches the path sent as `client_cwd` on
+                // each TaskSpec.  Without this, `/claude --cwd /other --task foo`
+                // would key the notebook against the chat process's cwd instead
+                // of the requested directory, breaking resume and lease.
+                let invocation_repo_dir: Option<String> = Some({
+                    let effective_cwd = tasks
+                        .iter()
+                        .find_map(|t| t.cwd.clone())
+                        .unwrap_or_else(|| cwd_str.clone());
+                    crate::session::canonical_key(std::path::Path::new(&effective_cwd))
+                });
                 let req = Request::ClaudeLaunch {
                     tasks: tasks
                         .into_iter()
@@ -1129,7 +1149,8 @@ pub async fn run_chat_loop(
                 write_half.write_all(req_line.as_bytes()).await?;
 
                 // Collect (pane_id, task_description) for supervision.
-                let mut launched: Vec<(String, String)> = Vec::new();
+                // (pane_id, description, task_name_tag) per launched pane.
+                let mut launched: Vec<(String, String, Option<String>)> = Vec::new();
 
                 loop {
                     let line = lines.next_line().await.context("reading daemon response")?;
@@ -1147,14 +1168,27 @@ pub async fn run_chat_loop(
                             task_id,
                             pane_id,
                             session_id: sid,
+                            task_name,
                         } => {
-                            let msg = format!("[pane {pane_id}] {task_id} → session {sid}\n");
+                            let tag_hint = task_name
+                                .as_deref()
+                                .map(|t| format!(" tag={t}"))
+                                .unwrap_or_default();
+                            let msg =
+                                format!("[pane {pane_id}] {task_id} → session {sid}{tag_hint}\n");
                             stdout.write_all(msg.as_bytes()).await?;
                             let desc = task_descriptions
                                 .get(&task_id)
                                 .cloned()
                                 .unwrap_or_else(|| task_id.clone());
-                            launched.push((pane_id, desc));
+                            // Prefer the daemon-resolved tag (may have been
+                            // auto-generated by the LLM tagger).  Fall back
+                            // to whatever the parser recorded, which is the
+                            // `--task` override when present.
+                            let tag = task_name
+                                .clone()
+                                .or_else(|| task_tags.get(&task_id).cloned().unwrap_or(None));
+                            launched.push((pane_id, desc, tag));
                         }
                         Response::CapacityError {
                             requested,
@@ -1181,10 +1215,10 @@ pub async fn run_chat_loop(
                     let supervise_req = Request::SupervisePanes {
                         panes: launched
                             .iter()
-                            .map(|(pid, desc)| crate::ipc::SupervisionTarget {
+                            .map(|(pid, desc, tag)| crate::ipc::SupervisionTarget {
                                 pane_id: pid.clone(),
                                 task_description: desc.clone(),
-                                task_name: invocation_task_name.clone(),
+                                task_name: tag.clone(),
                                 repo_dir: invocation_repo_dir.clone(),
                             })
                             .collect(),
@@ -2635,6 +2669,9 @@ mod tests {
 
     #[test]
     fn parse_claude_without_task_flag_leaves_name_none() {
+        // Parser doesn't pre-fill task_name — the daemon resolves `None`
+        // via its LLM tagger.  This lets non-ASCII descriptions (Chinese,
+        // Japanese, etc.) get a meaningful tag rather than `task-N`.
         let tasks = claude_tasks("/claude \"just run\"");
         assert!(tasks[0].task_name.is_none());
     }

@@ -216,10 +216,11 @@ impl DaemonState {
 }
 
 /// Open (or reuse) the task notebook database handle on `state`.
-/// Returns an `Arc<Mutex<Connection>>` guarded callers can lock.
+/// On first invocation opens `~/.amaebi/tasks.db` and stashes the
+/// connection in `state.tasks_db`; subsequent calls are no-ops.
 /// Callers must be inside `spawn_blocking` — this helper runs file I/O
 /// on first invocation.
-fn ensure_tasks_db(state: &Arc<DaemonState>) -> Result<()> {
+pub(crate) fn ensure_tasks_db(state: &Arc<DaemonState>) -> Result<()> {
     let mut guard = state
         .tasks_db
         .lock()
@@ -891,7 +892,7 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
             }
 
             Request::ClaudeLaunch { tasks } => {
-                handle_claude_launch(&writer, tasks).await?;
+                handle_claude_launch(&writer, tasks, &state).await?;
             }
 
             Request::SupervisePanes {
@@ -1027,6 +1028,7 @@ async fn drive_agentic_loop(
 async fn handle_claude_launch(
     writer: &Arc<tokio::sync::Mutex<tokio::net::unix::OwnedWriteHalf>>,
     tasks: Vec<crate::ipc::TaskSpec>,
+    state: &Arc<DaemonState>,
 ) -> Result<()> {
     if tasks.is_empty() {
         let mut w = writer.lock().await;
@@ -1742,6 +1744,30 @@ async fn handle_claude_launch(
             }
         }
 
+        // Resolve notebook tag.  Explicit `--task <name>` wins verbatim;
+        // otherwise ask Haiku to invent one (or reuse an existing tag in
+        // this repo for a continuing task).  The tagger always returns
+        // a usable string — it falls back to a slug+date on LLM failure
+        // — so this never blocks pane assignment.
+        let effective_tag: String = match task.task_name.clone() {
+            Some(t) if !t.trim().is_empty() => t,
+            _ => {
+                // The tagger keys against a canonical repo path.  Prefer
+                // client_cwd (where the user invoked amaebi chat) over
+                // the auto-worktree path so resume works across fresh
+                // worktrees for the same underlying project.
+                let effective_cwd = task.client_cwd.clone().unwrap_or_else(|| pane_id.clone());
+                let repo_dir = session::canonical_key(std::path::Path::new(&effective_cwd));
+                crate::task_tagger::generate_tag(
+                    state,
+                    None, // TODO: plumb through the active chat model
+                    &task.description,
+                    &repo_dir,
+                )
+                .await
+            }
+        };
+
         let mut w = writer.lock().await;
         write_frame(
             &mut *w,
@@ -1749,6 +1775,7 @@ async fn handle_claude_launch(
                 task_id: task.task_id,
                 pane_id,
                 session_id,
+                task_name: Some(effective_tag),
             },
         )
         .await?;
@@ -2153,19 +2180,34 @@ async fn build_notebook_context(
             return Ok(String::new());
         };
 
-        let mut out = String::new();
+        // Group panes by (repo_dir, tag) so each tag contributes at most
+        // one notebook section (and at most one first-turn desc write).
+        // Multiple panes sharing a tag would otherwise inflate the
+        // prompt with duplicate sections and insert duplicate desc rows.
+        // Within a group we keep the first non-empty task_description
+        // as the canonical desc to record; the remaining panes are for
+        // lookup only.
+        let mut grouped: std::collections::BTreeMap<(String, String), String> =
+            std::collections::BTreeMap::new();
         for p in &panes_cl {
             let (Some(repo_dir), Some(tag)) = (p.repo_dir.as_deref(), p.task_name.as_deref())
             else {
                 continue;
             };
+            let key = (repo_dir.to_string(), tag.to_string());
+            grouped
+                .entry(key)
+                .or_insert_with(|| p.task_description.clone());
+        }
 
+        let mut out = String::new();
+        for ((repo_dir, tag), desc) in &grouped {
             // First-turn desc persistence: record the CLI-supplied desc
             // (if any) so later resumes can recover it.  Re-running with
             // the same desc will create a duplicate row; harmless, the
             // reader picks the most recent by timestamp anyway.
-            if is_first_turn && !p.task_description.trim().is_empty() {
-                if let Err(e) = tasks::append_desc(conn, repo_dir, tag, &p.task_description) {
+            if is_first_turn && !desc.trim().is_empty() {
+                if let Err(e) = tasks::append_desc(conn, repo_dir, tag, desc) {
                     tracing::warn!(tag, error = %e, "failed to persist task desc");
                 }
             }
@@ -2226,9 +2268,23 @@ async fn handle_supervision_inner(
     if !notebook_panes.is_empty() {
         let state_cl = Arc::clone(state);
         let holder_cl = holder.to_string();
+        // Dedup by (repo_dir, tag).  Multiple panes in one `/claude`
+        // invocation may share a tag when the user passed `--task foo`
+        // for a multi-task launch; without dedup the second acquire
+        // would see the row this very call just inserted and reject
+        // the whole request as a self-conflict.
+        let mut seen: std::collections::HashSet<(String, String)> =
+            std::collections::HashSet::new();
         let lease_inputs: Vec<(String, String)> = notebook_panes
             .iter()
-            .map(|p| (p.repo_dir.clone().unwrap(), p.task_name.clone().unwrap()))
+            .filter_map(|p| {
+                let key = (p.repo_dir.clone().unwrap(), p.task_name.clone().unwrap());
+                if seen.insert(key.clone()) {
+                    Some(key)
+                } else {
+                    None
+                }
+            })
             .collect();
         let acquire_result = tokio::task::spawn_blocking(move || -> Result<Result<(), String>> {
             ensure_tasks_db(&state_cl)?;
@@ -2645,31 +2701,51 @@ async fn handle_supervision_inner(
             .to_string();
         last_verdict = Some(verdict_compact.clone());
 
-        // Persist verdict to task notebook (best-effort, per-pane).  Only
-        // panes that opted into the notebook (task_name + repo_dir set)
-        // participate.  Failures are logged but must not break the
-        // supervision loop — notebook is auxiliary to the live verdict
-        // decision the LLM just made.
+        // Persist verdict to task notebook (best-effort, once per unique
+        // `(repo_dir, tag)`).  Deduped because multiple panes sharing a
+        // tag (user `--task foo` for a multi-task launch) would otherwise
+        // append duplicate rows for a single supervision turn.  Failures
+        // (panic OR SQLite Err) are logged but must not break the loop —
+        // notebook is auxiliary to the live verdict decision.
+        let mut verdict_targets: std::collections::HashSet<(String, String)> =
+            std::collections::HashSet::new();
         for target in panes.iter() {
             if let (Some(repo_dir), Some(tag)) =
                 (target.repo_dir.as_deref(), target.task_name.as_deref())
             {
-                let state_cl = Arc::clone(state);
-                let repo_dir = repo_dir.to_string();
-                let tag = tag.to_string();
-                let verdict = verdict_compact.clone();
-                let _ = tokio::task::spawn_blocking(move || -> Result<()> {
-                    let guard = state_cl
-                        .tasks_db
-                        .lock()
-                        .map_err(|e| anyhow::anyhow!("tasks_db mutex poisoned: {e}"))?;
-                    let conn = guard
-                        .as_ref()
-                        .ok_or_else(|| anyhow::anyhow!("tasks_db not initialised"))?;
-                    tasks::append_verdict(conn, &repo_dir, &tag, &verdict)
-                })
-                .await
-                .inspect_err(|e| tracing::warn!(error = %e, "verdict persist task panicked"));
+                verdict_targets.insert((repo_dir.to_string(), tag.to_string()));
+            }
+        }
+        for (repo_dir, tag) in verdict_targets {
+            let state_cl = Arc::clone(state);
+            let verdict = verdict_compact.clone();
+            let repo_dir_log = repo_dir.clone();
+            let tag_log = tag.clone();
+            match tokio::task::spawn_blocking(move || -> Result<()> {
+                let guard = state_cl
+                    .tasks_db
+                    .lock()
+                    .map_err(|e| anyhow::anyhow!("tasks_db mutex poisoned: {e}"))?;
+                let conn = guard
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("tasks_db not initialised"))?;
+                tasks::append_verdict(conn, &repo_dir, &tag, &verdict)
+            })
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => tracing::warn!(
+                    error = %e,
+                    repo_dir = %repo_dir_log,
+                    tag = %tag_log,
+                    "failed to persist verdict"
+                ),
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    repo_dir = %repo_dir_log,
+                    tag = %tag_log,
+                    "verdict persist task panicked"
+                ),
             }
         }
 
@@ -4327,6 +4403,24 @@ where
     }
 }
 
+/// Public-to-crate wrapper so `task_tagger` can call the model without
+/// being a friend of this entire module.  Same semantics as
+/// `invoke_model` — no tools, caller-supplied `max_tokens`.  Intended
+/// only for short housekeeping calls (tag generation); production
+/// chat/supervision should stay inside `invoke_model` directly.
+pub(crate) async fn invoke_model_for_tagger<W>(
+    state: &DaemonState,
+    model: &str,
+    messages: &[Message],
+    max_completion_tokens: usize,
+    writer: &mut W,
+) -> Result<copilot::CopilotResponse>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    invoke_model(state, model, messages, &[], max_completion_tokens, writer).await
+}
+
 /// Call the Responses API with `tok`, evicting the token cache and retrying
 /// once on a 401/403 auth error.  Centralises retry/telemetry logic so both
 /// the gpt-5.x direct path and the chat-completions fallback path stay in sync.
@@ -5673,6 +5767,27 @@ async fn run_cron_job(state: Arc<DaemonState>, job: &cron::CronJob) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Minimal in-memory DaemonState for tests that exercise
+    /// handle_claude_launch error paths (resume-pane probes, etc.).
+    /// No real HTTP, no real memory DB file — just enough plumbing
+    /// for the code under test to run without panicking.  Tasks DB
+    /// starts empty; tests that trigger the LLM tagger must wire a
+    /// mock themselves.
+    fn test_minimal_daemon_state() -> Arc<DaemonState> {
+        Arc::new(DaemonState {
+            http: reqwest::Client::new(),
+            tokens: Arc::new(TokenCache::new()),
+            executor: Box::new(tools::LocalExecutor::new()),
+            db: Arc::new(Mutex::new(
+                rusqlite::Connection::open_in_memory().expect("open in-memory memory DB"),
+            )),
+            compacting_sessions: Arc::new(Mutex::new(HashSet::new())),
+            active_sessions: Arc::new(Mutex::new(HashSet::new())),
+            user_aliases: Arc::new(std::collections::HashMap::new()),
+            tasks_db: Arc::new(Mutex::new(None)),
+        })
+    }
 
     fn make_db_entry(id: i64, role: &str, content: &str) -> memory_db::DbMemoryEntry {
         memory_db::DbMemoryEntry {
@@ -7344,7 +7459,8 @@ mod tests {
             resource_timeout_secs: None,
             task_name: None,
         };
-        handle_claude_launch(&writer, vec![task])
+        let state = test_minimal_daemon_state();
+        handle_claude_launch(&writer, vec![task], &state)
             .await
             .expect("launch returns ok even on per-task error");
         drop(writer);
@@ -7406,7 +7522,8 @@ mod tests {
             resource_timeout_secs: None,
             task_name: None,
         };
-        handle_claude_launch(&writer, vec![task])
+        let state = test_minimal_daemon_state();
+        handle_claude_launch(&writer, vec![task], &state)
             .await
             .expect("launch returns ok even on per-task error");
         drop(writer);
@@ -7473,7 +7590,8 @@ mod tests {
             resource_timeout_secs: None,
             task_name: None,
         };
-        handle_claude_launch(&writer, vec![task])
+        let state = test_minimal_daemon_state();
+        handle_claude_launch(&writer, vec![task], &state)
             .await
             .expect("launch returns ok even on per-task error");
         drop(writer);

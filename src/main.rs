@@ -24,7 +24,9 @@ mod responses;
 mod retry;
 mod sandbox;
 mod session;
+mod task_tagger;
 mod tasks;
+
 #[cfg(test)]
 mod test_utils;
 mod tools;

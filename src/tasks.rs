@@ -163,7 +163,7 @@ pub fn acquire_lease(
         })
         .context("reading existing lease")?;
 
-    if let Some((id, incumbent, ts)) = existing {
+    if let Some((_id, incumbent, ts)) = existing {
         let age = now.saturating_sub(ts);
         if age <= LEASE_TTL_SECS {
             tx.rollback().ok();
@@ -172,9 +172,14 @@ pub fn acquire_lease(
                 age_secs: age,
             });
         }
-        // Stale — delete and replace.
-        tx.execute("DELETE FROM task_notes WHERE id = ?1", params![id])
-            .context("deleting stale lease")?;
+        // Stale — drop **all** lease rows for this key, not just the
+        // most recent.  Repeated crashes-and-reacquires could otherwise
+        // leave older stale rows accumulating indefinitely.
+        tx.execute(
+            "DELETE FROM task_notes WHERE repo_dir = ?1 AND tag = ?2 AND kind = 'lease'",
+            params![repo_dir, tag],
+        )
+        .context("deleting stale leases")?;
     }
 
     tx.execute(
