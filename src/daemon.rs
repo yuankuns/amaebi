@@ -2091,33 +2091,44 @@ async fn wait_for_pane_idle(
 /// swallow or defer the trailing Enter when it arrives before the pasted text
 /// has been rendered into the input field — which manifests as a STEER
 /// message appearing in the pane input but never submitting.
-fn send_pane_keys(pane_id: &str, text: &str) {
-    match std::process::Command::new("tmux")
+/// Returns `true` when BOTH the literal text injection and the trailing
+/// Enter press reported success to tmux.  Any tmux failure (exit-code non-
+/// zero, or spawn error) yields `false` so callers can accurately report
+/// whether the keystrokes actually reached the pane — important for
+/// supervision's `steer_dispatched` carry-over: claiming a STEER landed
+/// when tmux silently rejected it would poison the next turn's prompt.
+fn send_pane_keys(pane_id: &str, text: &str) -> bool {
+    let text_ok = match std::process::Command::new("tmux")
         .args(["send-keys", "-t", pane_id, "-l", "--", text])
         .status()
     {
-        Ok(s) if !s.success() => {
+        Ok(s) if s.success() => true,
+        Ok(s) => {
             tracing::warn!(pane_id, status = %s, "tmux send-keys (text) failed");
+            false
         }
         Err(e) => {
             tracing::warn!(pane_id, error = %e, "failed to spawn tmux send-keys (text)");
+            false
         }
-        _ => {}
-    }
+    };
     // Let the TUI process the pasted text before pressing Enter.
     std::thread::sleep(std::time::Duration::from_secs(1));
-    match std::process::Command::new("tmux")
+    let enter_ok = match std::process::Command::new("tmux")
         .args(["send-keys", "-t", pane_id, "Enter"])
         .status()
     {
-        Ok(s) if !s.success() => {
+        Ok(s) if s.success() => true,
+        Ok(s) => {
             tracing::warn!(pane_id, status = %s, "tmux send-keys (Enter) failed");
+            false
         }
         Err(e) => {
             tracing::warn!(pane_id, error = %e, "failed to spawn tmux send-keys (Enter)");
+            false
         }
-        _ => {}
-    }
+    };
+    text_ok && enter_ok
 }
 
 /// Release the pane lease for each `SupervisionTarget` in this supervision
@@ -2379,6 +2390,221 @@ async fn build_notebook_context(
     rendered
 }
 
+/// System prompt for the supervision LLM.  Extracted as a module-level
+/// constant so tests can assert its contents without rebuilding the whole
+/// supervision loop.
+///
+/// The wording is structured so the LLM's reading order matches the
+/// priority we want: drift is named as the primary failure mode; STEER
+/// is listed before WAIT/DONE; and the tie-break is explicitly "prefer
+/// STEER" rather than "default to WAIT" (a missed STEER costs hours, a
+/// stray STEER costs one keystroke).
+const SUPERVISION_SYSTEM_PROMPT: &str = concat!(
+    "You are supervising a Claude Code session executing a specific task in a ",
+    "tmux pane.  Your PRIMARY duty is to keep Claude on the task as stated.  ",
+    "Drift — switching approach, using a different resource, skipping a requirement, ",
+    "subtly redefining the goal — is the failure mode you must catch.  When drift ",
+    "appears, STEER immediately; do not wait for another turn to \"see if it self-corrects\".\n",
+    "\n",
+    "Each turn you see: the original task description (pinned at the top), any hard ",
+    "constraints, the last few verdicts you issued, and the current pane contents.  ",
+    "You respond with EXACTLY ONE of:\n",
+    "\n",
+    "STEER: <pane_id>: <message to send>\n",
+    "  Use STEER when ANY of the following holds:\n",
+    "  - Claude is at an idle prompt and asked a question or offered options — answer.\n",
+    "  - Claude's current action contradicts a hard constraint (wrong resource, wrong ",
+    "    container, wrong branch, forbidden command).  Name the specific constraint ",
+    "    in the STEER message.\n",
+    "  - Claude drifted from the task: switched approach without checking in, skipped ",
+    "    a requirement, reinterpreted the goal, or is working on a tangent.\n",
+    "  - Claude reports partial completion and the task description is not fully done.\n",
+    "  - Claude is stuck on an error and a concrete hint will unblock it.\n",
+    "  When in doubt between STEER and WAIT, prefer STEER — a wrong STEER costs one ",
+    "  keystroke, a missed STEER costs hours of wrong work.\n",
+    "\n",
+    "WAIT: <one sentence — what is Claude currently doing?>\n",
+    "  Use WAIT only when Claude is visibly, measurably making progress on the ORIGINAL ",
+    "  task, respecting hard constraints, and has not asked a question.  Long builds, ",
+    "  sim runs, and test executions are normal — WAIT is correct there.\n",
+    "\n",
+    "DONE: <paragraph summary of what was accomplished>\n",
+    "  The task is FULLY complete.  Require ALL of:\n",
+    "  1. Pane shows an explicit completion signal — a finished report, passing tests,\n",
+    "     a merged PR URL, 'done', '✓', 'all tests passed', or similar.\n",
+    "  2. That completion directly covers the task description given at session start\n",
+    "     (not a sub-step, not unrelated output).\n",
+    "  3. Claude is no longer working (idle prompt or returned to shell).\n",
+    "  An idle prompt alone is NOT sufficient — Claude may be waiting for user input ",
+    "  (prefer STEER) or may have been interrupted (prefer WAIT and re-check).\n",
+    "\n",
+    "Your response must start with STEER:, WAIT:, or DONE: — nothing else before it.",
+);
+
+/// Pure helper that formats the user message fed to the supervision LLM
+/// every turn.  Extracted from [`handle_supervision_inner`] so tests can
+/// exercise the prompt layout without standing up a full daemon loop.
+///
+/// Layout (top-to-bottom):
+///   1. `TASK — keep Claude focused on this:` with one line per pane.
+///      Pinned at byte 0 because LLM attention otherwise drifts to the
+///      long pane dumps.  The task is deliberately repeated inside each
+///      pane header further down.
+///   2. `HARD CONSTRAINTS` block (may be empty) from the pane's resource
+///      leases.
+///   3. Notebook context carried over from prior supervision sessions
+///      (may be empty).
+///   4. Recent verdict history (newest last) so the LLM can see whether
+///      its own prior STEERs landed.
+///   5. The last STEER in full, if one has been issued.
+///   6. The current pane snapshots.
+#[allow(clippy::too_many_arguments)] // the pieces are simple values from the loop;
+                                     // packaging them into a struct would just shift the verbosity one level without
+                                     // improving call-site readability.
+fn build_supervision_user_content(
+    task_lines: &[(String, String)],
+    hard_constraints: &str,
+    notebook_context: &str,
+    verdict_history: &std::collections::VecDeque<String>,
+    last_steer_full: Option<&str>,
+    pane_snapshots: &str,
+    turn: u64,
+    elapsed_mins: u64,
+) -> String {
+    let mut task_section = String::from("TASK — keep Claude focused on this:\n");
+    for (pane_id, desc) in task_lines {
+        // Task descriptions may be pasted multi-line input.  Flatten to a
+        // single line (escape newlines + CRs) so one pane stays on one
+        // line and the downstream section headers keep their column-0
+        // alignment.  See the verdict-history escape for the same reason.
+        let desc = desc
+            .replace("\r\n", "\\n")
+            .replace('\n', "\\n")
+            .replace('\r', "\\r");
+        task_section.push_str(&format!("  pane {pane_id}: {desc}\n"));
+    }
+
+    let verdict_history_block = if verdict_history.is_empty() {
+        "(none yet — this is the first check)".to_string()
+    } else {
+        let mut s = String::new();
+        for (i, v) in verdict_history.iter().enumerate() {
+            let age = verdict_history.len() - i;
+            let label = if age == 1 {
+                "last".to_string()
+            } else {
+                format!("{age} turns ago")
+            };
+            s.push_str(&format!("  [{label}] {}\n", v.trim()));
+        }
+        s
+    };
+
+    let last_steer_block = match last_steer_full {
+        // Newlines in the verdict were already escaped to `\n` upstream
+        // (see `verdict_single_line` in `handle_supervision_inner`) so the
+        // block stays one visible line — hence "escaped newlines" rather
+        // than "full text" in the header.
+        Some(s) => format!(
+            "Most recent STEER message (escaped newlines):\n  {}\n\n",
+            s.trim()
+        ),
+        None => String::new(),
+    };
+
+    // Assemble without source-indentation so every section header (TASK,
+    // HARD CONSTRAINTS, notebook context, verdict list, STEER carry-over,
+    // snapshot header) lands at column 0 in the LLM-facing output.
+    let mut out = task_section;
+    out.push('\n');
+    out.push_str(hard_constraints);
+    out.push_str(notebook_context);
+    out.push_str("Your recent verdicts this session (newest last):\n");
+    out.push_str(&verdict_history_block);
+    out.push('\n');
+    out.push_str(&last_steer_block);
+    out.push_str(&format!(
+        "Current pane snapshots (check #{turn}, elapsed {elapsed_mins}m):\n\n"
+    ));
+    out.push_str(pane_snapshots);
+    out
+}
+
+/// Render the hard constraints section for the supervision LLM.  For
+/// every supervised pane, if the pane currently holds one or more
+/// resource leases, render their `prompt_hint` under a section marked
+/// "HARD CONSTRAINTS".  Empty string when no pane has leases — the
+/// caller string-concats unconditionally.
+///
+/// Constraints are scoped per-pane so a supervised batch of two panes
+/// with different resources still sees each pane's own bindings.
+async fn render_hard_constraints(panes: &[crate::ipc::SupervisionTarget]) -> String {
+    let load_result = tokio::task::spawn_blocking(|| -> Result<_> {
+        let state = resource_lease::read_state()?;
+        let pool = resource_lease::load_pool()?;
+        Ok((state, pool))
+    })
+    .await;
+    // A load failure on either side (missing / malformed TOML, corrupted
+    // state JSON, mutex poisoning) is a **misconfiguration** we do not want
+    // supervision to silently ignore — the whole point of this section is
+    // to anchor hard constraints.  Surface a visible banner so the LLM
+    // knows the constraint set is unavailable, and log the error for ops.
+    let (state_map, pool) = match load_result {
+        Ok(Ok(pair)) => pair,
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "supervision: failed to load hard constraints");
+            return "HARD CONSTRAINTS — failed to load; see daemon logs.\n\n".to_string();
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "supervision: hard-constraints loader task panicked");
+            return "HARD CONSTRAINTS — failed to load; see daemon logs.\n\n".to_string();
+        }
+    };
+    let mut out = String::new();
+    for target in panes {
+        // Collect leases whose `pane_id` matches this supervised pane AND
+        // are still effectively Busy.  `effective_status()` maps a Busy
+        // lease whose heartbeat is older than `LEASE_TTL_SECS` back to
+        // Idle — rendering such stale leases as active "HARD CONSTRAINTS"
+        // would anchor the LLM to a resource the task no longer actually
+        // holds, driving spurious STEERs.
+        let mut leases: Vec<_> = state_map
+            .values()
+            .filter(|l| l.pane_id.as_deref() == Some(&target.pane_id))
+            .filter(|l| l.effective_status() == resource_lease::ResourceStatus::Busy)
+            .cloned()
+            .collect();
+        if leases.is_empty() {
+            continue;
+        }
+        // HashMap iteration order is nondeterministic.  Sort by (name, class)
+        // so a pane with multiple resources renders the same block every
+        // turn; otherwise the LLM sees prompt churn for what is logically
+        // the same constraint set (see `dashboard.rs` for the same pattern).
+        leases.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.class.cmp(&b.class)));
+        let hint = resource_lease::render_prompt_hint(&leases, &pool);
+        if hint.trim().is_empty() {
+            continue;
+        }
+        if out.is_empty() {
+            out.push_str("HARD CONSTRAINTS — violations require an immediate STEER:\n");
+        }
+        out.push_str(&format!(
+            "  pane {}:\n{}\n",
+            target.pane_id,
+            hint.lines()
+                .map(|l| format!("    {l}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ));
+    }
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    out
+}
+
 /// Inner body of [`handle_supervision`]; see that function's doc for context.
 ///
 /// Takes `panes` by reference so the outer wrapper retains ownership and can
@@ -2438,48 +2664,20 @@ async fn handle_supervision_inner(
     let deadline = supervision_start + max_duration;
     let mut turn: u64 = 0;
 
-    // Remember the previous turn's verdict so the LLM has continuity across
-    // iterations (e.g. "last turn you STEERed X; did Claude pick it up?").
-    // Stored as a short one-line summary that we feed back into `user_content`
-    // on the next iteration.
-    let mut last_verdict: Option<String> = None;
+    // Verdicts from this supervision session, newest-last.  Bounded so
+    // we never leak memory on 10-h runs; the LLM sees up to N most
+    // recent entries each turn.
+    const VERDICT_HISTORY_LEN: usize = 5;
+    let mut verdict_history: std::collections::VecDeque<String> =
+        std::collections::VecDeque::with_capacity(VERDICT_HISTORY_LEN);
+    // Keep the most recent STEER in full so the LLM can judge whether
+    // Claude acted on it.  None until the first STEER is emitted.
+    let mut last_steer_full: Option<String> = None;
 
     // Load skill files (SOUL.md, AGENTS.md, GPU_KERNEL.md) once and reuse
     // across all supervision turns so the LLM has project context for
     // higher-quality STEER decisions.
     let skill_msgs = load_skill_messages().await;
-
-    let system_prompt =
-        "You are supervising a Claude Code session executing a task in a tmux pane.\n\
-        Compare the pane content to the task description and respond with EXACTLY ONE of:\n\
-        \n\
-        WAIT: <one sentence — what is Claude currently doing?>\n\
-          Claude is actively working AND on track. No intervention needed.\n\
-          Use WAIT as the default when you're not certain between WAIT and DONE/STEER.\n\
-        \n\
-        STEER: <pane_id>: <message to send>\n\
-          Claude needs input or correction. The message will be typed into the pane.\n\
-          Use STEER when:\n\
-          - Claude is at an idle prompt and is ASKING A QUESTION or presenting OPTIONS\n\
-            (e.g. 'Should I also do X?', 'Which approach would you prefer?') — answer it.\n\
-          - Claude reports partial completion and the task description is NOT fully done yet\n\
-            (e.g. claims 'step 1 done' but step 2 was also requested).\n\
-          - Claude is stuck on an error and a concrete hint will unblock it.\n\
-          - Claude is going in the wrong direction vs. the task description.\n\
-        \n\
-        DONE: <paragraph summary of what was accomplished>\n\
-          The task is FULLY complete. Require ALL of:\n\
-          1. Pane shows an explicit completion signal — a finished report, passing tests,\n\
-             a merged PR URL, 'done', '✓', 'all tests passed', or similar.\n\
-          2. That completion directly covers the task description given at session start\n\
-             (not just a sub-step or unrelated output).\n\
-          3. Claude is no longer working (idle prompt or returned to shell).\n\
-          An idle prompt alone is NOT sufficient — Claude may be waiting for user input\n\
-          (see STEER) or may have been interrupted. If unsure, prefer WAIT and re-check\n\
-          next turn.\n\
-        \n\
-        Your response must start with WAIT:, STEER:, or DONE: — nothing else before it."
-            .to_string();
 
     loop {
         // --- Check wall-clock deadline ---
@@ -2623,30 +2821,38 @@ async fn handle_supervision_inner(
             ));
         }
 
-        // Thread the previous verdict into the prompt so the LLM can judge
-        // whether its last STEER landed, whether Claude actually finished
-        // the step it last reported, etc.  First iteration sends "(none)".
-        let prior = last_verdict
-            .as_deref()
-            .unwrap_or("(none yet — this is the first check)");
+        // Render hard constraints from the pane's resource leases.  Each
+        // pane's own leases are pulled from resource-state.json; rendering
+        // reuses `resource_lease::render_prompt_hint` so the wording is
+        // identical to what lands in AGENTS.md.
+        let hard_constraints = render_hard_constraints(panes).await;
 
         // Task notebook context (opt-in: only panes with tag + repo_dir).
         // Read-only: per-turn fetch of recent verdicts and the tag's latest
         // stored desc.  Rendered into a dedicated prompt section that is
         // clearly labelled "from prior supervision sessions" so the LLM does
-        // not confuse it with in-session continuity (`prior`).  First-turn
-        // side effect: write `task_description` as a `desc` row so resumes
-        // without a CLI desc can find it.
+        // not confuse it with in-session continuity (`verdict_history`).
+        // First-turn side effect: write `task_description` as a `desc` row
+        // so resumes without a CLI desc can find it.
         let notebook_context = build_notebook_context(state, panes, turn == 1).await;
 
-        let user_content = format!(
-            "{notebook_context}\
-             Current pane snapshots (check #{turn}, elapsed {elapsed_mins}m):\n\n\
-             {pane_snapshots}\n\
-             Your previous verdict this session: {prior}"
+        let task_lines: Vec<(String, String)> = snapshots
+            .iter()
+            .map(|s| (s.pane_id.clone(), s.task_description.clone()))
+            .collect();
+
+        let user_content = build_supervision_user_content(
+            &task_lines,
+            &hard_constraints,
+            &notebook_context,
+            &verdict_history,
+            last_steer_full.as_deref(),
+            &pane_snapshots,
+            turn,
+            elapsed_mins,
         );
 
-        let mut messages = vec![Message::system(system_prompt.clone())];
+        let mut messages = vec![Message::system(SUPERVISION_SYSTEM_PROMPT)];
         // Inject SOUL.md / AGENTS.md etc. right after the system message
         // so the supervision LLM has full project context.
         splice_skill_messages(&mut messages, skill_msgs.clone());
@@ -2710,6 +2916,11 @@ async fn handle_supervision_inner(
         let trimmed = response_text.trim();
 
         // --- Parse response and act ---
+        // `steer_dispatched` is true only when the parsed STEER was valid
+        // and actually sent into a pane — so the next turn's carry-over
+        // (`last_steer_full`) reflects a message claude really saw.
+        // Malformed / unknown-pane STEERs leave `last_steer_full` alone.
+        let mut steer_dispatched = false;
         let verdict_line = if trimmed.starts_with("DONE:") || trimmed == "DONE" {
             let summary = trimmed.strip_prefix("DONE:").unwrap_or("").trim();
             let mut w = writer.lock().await;
@@ -2730,17 +2941,45 @@ async fn handle_supervision_inner(
                 if !pane_id.is_empty() && !message.is_empty() && is_valid_pane {
                     let pid = pane_id.clone();
                     let msg = message.clone();
-                    tokio::task::spawn_blocking(move || send_pane_keys(&pid, &msg))
-                        .await
-                        .ok();
-                    format!("  → STEER {pane_id}: {message}\n")
+                    // `send_pane_keys` returns `true` only when both the
+                    // text injection and the trailing Enter succeeded at
+                    // tmux.  We also guard against JoinError (panic /
+                    // cancel) by pattern-matching the JoinHandle result.
+                    // Either failure leaves `steer_dispatched = false` so
+                    // next turn does not claim claude received a message
+                    // that never actually arrived.
+                    match tokio::task::spawn_blocking(move || send_pane_keys(&pid, &msg)).await {
+                        Ok(true) => {
+                            steer_dispatched = true;
+                        }
+                        Ok(false) => {
+                            tracing::warn!(
+                                pane_id = %pane_id,
+                                "tmux send-keys reported failure; treating STEER as undelivered"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                pane_id = %pane_id,
+                                error = %e,
+                                "send_pane_keys task failed; treating STEER as undelivered"
+                            );
+                        }
+                    }
+                    // Keep the `STEER: <pane>: <msg>` shape exactly as the
+                    // parser (and system prompt) expect, so when this line
+                    // is echoed back via `verdict_history` / `last_steer_full`
+                    // next turn the LLM is primed with the same grammar it
+                    // must emit.  A `STEER %X: ...` (no colon after STEER)
+                    // would be mis-parsed as WAIT on the next round-trip.
+                    format!("  → STEER: {pane_id}: {message}\n")
                 } else if !pane_id.is_empty() && !message.is_empty() && !is_valid_pane {
-                    format!("  → STEER {pane_id} (unknown pane, ignored)\n")
+                    format!("  → STEER: {pane_id} (unknown pane, ignored)\n")
                 } else {
-                    "  → STEER (malformed response)\n".to_string()
+                    "  → STEER: (malformed response)\n".to_string()
                 }
             } else {
-                "  → STEER (malformed response)\n".to_string()
+                "  → STEER: (malformed response)\n".to_string()
             }
         } else {
             // WAIT: <note> or bare WAIT
@@ -2759,7 +2998,25 @@ async fn handle_supervision_inner(
             .trim_start_matches("  → ")
             .trim_end_matches('\n')
             .to_string();
-        last_verdict = Some(verdict_compact.clone());
+        // The verdict_history rendering uses one line per entry; an
+        // embedded `\n` (possible when a STEER message spans multiple
+        // lines — parser doesn't reject them) would break the `[last] …`
+        // / `[N turns ago] …` table shape and push downstream section
+        // headers off column 0.  Escape newlines to a visible `\n` so
+        // the LLM still sees the content but the layout is preserved.
+        let verdict_single_line = verdict_compact.replace('\n', "\\n");
+        if verdict_history.len() >= VERDICT_HISTORY_LEN {
+            verdict_history.pop_front();
+        }
+        verdict_history.push_back(verdict_single_line.clone());
+        // Only stash the full text when the STEER was actually dispatched.
+        // `steer_dispatched` stays false for "unknown pane, ignored" and
+        // "malformed response" variants so the next turn's prompt does not
+        // claim claude received something it never did.  Use the escaped
+        // single-line form for the same layout-protection reason.
+        if steer_dispatched {
+            last_steer_full = Some(verdict_single_line);
+        }
 
         // Persist verdict to task notebook (best-effort, once per unique
         // `(repo_dir, tag)`).  Deduped because multiple panes sharing a
@@ -8025,6 +8282,25 @@ mod tests {
         }
     }
 
+    // ------------------------------------------------------------------
+    // Supervision prompt shape tests
+    //
+    // These tests cover the structural contract of the user content fed to
+    // the supervision LLM every turn: task pinned at byte 0, hard
+    // constraints block derived from the pane's resource leases, verdict
+    // history rendered in newest-last order, and the last STEER message
+    // carried forward verbatim.
+    // ------------------------------------------------------------------
+
+    fn supervision_test_target(pane_id: &str, desc: &str) -> crate::ipc::SupervisionTarget {
+        crate::ipc::SupervisionTarget {
+            pane_id: pane_id.to_string(),
+            task_description: desc.to_string(),
+            tag: None,
+            repo_dir: None,
+        }
+    }
+
     #[test]
     fn ensure_worktree_agents_md_creates_file_when_missing() {
         let dir = tempfile::tempdir().unwrap();
@@ -8129,5 +8405,153 @@ mod tests {
         let pool: Vec<resource_lease::ResourceDef> = Vec::new();
         ensure_worktree_agents_md(&wt, &leases, &pool).expect("no-op");
         assert!(!dir.path().join("AGENTS.md").exists());
+    }
+
+    #[test]
+    fn supervision_prompt_contains_pinned_task_section() {
+        let task_lines = vec![(
+            "%5".to_string(),
+            "implement feature X on sim-9900".to_string(),
+        )];
+        let history: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+        let out = build_supervision_user_content(
+            &task_lines,
+            "",
+            "",
+            &history,
+            None,
+            "=== Pane %5 ===\nidle\n",
+            1,
+            0,
+        );
+        assert!(
+            out.starts_with("TASK — keep Claude focused on this:\n"),
+            "user content must start with the pinned task header, got: {out:?}"
+        );
+        assert!(
+            out.contains("implement feature X on sim-9900"),
+            "task description must appear in the pinned section, got: {out:?}"
+        );
+        assert!(
+            out.contains("pane %5:"),
+            "pinned section must list the pane id, got: {out:?}"
+        );
+    }
+
+    #[test]
+    fn supervision_prompt_verdict_history_renders_multiple_lines() {
+        let task_lines = vec![("%5".to_string(), "task".to_string())];
+        let mut history = std::collections::VecDeque::new();
+        history.push_back("WAIT: building".to_string());
+        // Use the real on-wire shape the parser emits (`STEER: <pane>: …`
+        // with the leading colon) so the test catches future drift if the
+        // verdict format or parser prefix diverge.
+        history.push_back("STEER: %5: use sim-9900".to_string());
+        history.push_back("WAIT: now on sim-9900".to_string());
+        let out = build_supervision_user_content(&task_lines, "", "", &history, None, "snap", 4, 3);
+        assert!(
+            out.contains("[last] WAIT: now on sim-9900"),
+            "newest verdict must be labelled [last], got: {out:?}"
+        );
+        assert!(
+            out.contains("[2 turns ago] STEER: %5: use sim-9900"),
+            "second-newest verdict must be labelled [2 turns ago], got: {out:?}"
+        );
+        assert!(
+            out.contains("[3 turns ago] WAIT: building"),
+            "oldest verdict must be labelled [3 turns ago], got: {out:?}"
+        );
+    }
+
+    #[test]
+    fn supervision_prompt_last_steer_block_shows_full_text() {
+        let task_lines = vec![("%5".to_string(), "task".to_string())];
+        let history: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+        // Matches the real on-wire `STEER: <pane>: …` shape emitted by
+        // `handle_supervision_inner`.
+        let steer = "STEER: %5: stop — you are using sim-9903 but the \
+                     task says sim-9900; rerun with the correct port";
+        let out = build_supervision_user_content(
+            &task_lines,
+            "",
+            "",
+            &history,
+            Some(steer),
+            "snap",
+            2,
+            1,
+        );
+        assert!(
+            out.contains("Most recent STEER message (escaped newlines):"),
+            "missing STEER carry-over header, got: {out:?}"
+        );
+        assert!(
+            out.contains("rerun with the correct port"),
+            "full STEER text must appear verbatim, got: {out:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn supervision_prompt_no_constraints_when_no_leases() {
+        let _guard = crate::test_utils::with_temp_home();
+        let panes = vec![supervision_test_target("%5", "do the thing")];
+        let out = render_hard_constraints(&panes).await;
+        assert!(
+            out.is_empty(),
+            "no leases for this pane → empty constraints block, got: {out:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn supervision_prompt_hard_constraints_includes_resource_hint() {
+        let _guard = crate::test_utils::with_temp_home();
+
+        // Seed a pool file with a named resource that has a prompt_hint.
+        let pool_path = crate::auth::amaebi_home()
+            .expect("home")
+            .join("resources.toml");
+        std::fs::create_dir_all(pool_path.parent().unwrap()).expect("mkdir");
+        std::fs::write(
+            &pool_path,
+            r#"
+[[resource]]
+name = "sim-9900"
+class = "simulator"
+metadata = { port = "9900" }
+prompt_hint = "use sim-9900 (port {port}) only"
+"#,
+        )
+        .expect("write pool");
+
+        // Acquire the resource on %5 so the state file records a lease
+        // whose pane_id matches our supervised pane.  This uses the real
+        // resource_lease path, which also respects the flock.
+        let _leases = resource_lease::acquire_all(
+            &[resource_lease::ResourceRequest::Named("sim-9900".into())],
+            resource_lease::Holder {
+                pane_id: "%5".into(),
+                tag: "t".into(),
+                session_id: "s".into(),
+            },
+            resource_lease::WaitPolicy::Nowait,
+        )
+        .await
+        .expect("acquire");
+
+        let panes = vec![supervision_test_target("%5", "do the thing")];
+        let out = render_hard_constraints(&panes).await;
+
+        assert!(
+            out.contains("HARD CONSTRAINTS"),
+            "constraints section missing, got: {out:?}"
+        );
+        assert!(
+            out.contains("pane %5:"),
+            "constraints must be scoped per pane, got: {out:?}"
+        );
+        assert!(
+            out.contains("use sim-9900 (port 9900) only"),
+            "rendered prompt_hint must be included verbatim, got: {out:?}"
+        );
     }
 }
