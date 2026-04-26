@@ -1724,11 +1724,54 @@ fn is_tui_chrome_line(line: &str) -> bool {
         return false; // real blank lines are meaningful in tmux captures
     }
 
-    // 1. All-horizontal-rule divider.  Claude Code renders these as long
-    //    runs of U+2500 / U+2501; a 10-char minimum avoids hitting a real
-    //    line that happens to start with a few dashes (e.g. markdown).
-    if t.chars().all(|c| c == '─' || c == '━') && t.chars().count() >= 10 {
-        return true;
+    // Rules 1 and 4 both need to scan every char in the line; fold them
+    // into a single pass so a long-but-unmatched line (common case: real
+    // Claude Code output) pays for exactly one iteration rather than
+    // four.  Correctness is unchanged: we still check the same
+    // "all-dashes and >=10" (rule 1) and "all-border and
+    // has-vertical" (rule 4) predicates, just with the char scan
+    // amortised.
+    //
+    // Rule 1 (all-horizontal-rule divider): Claude Code renders these as
+    // long runs of U+2500 / U+2501; a 10-char minimum avoids hitting a
+    // real line that happens to start with a few dashes (e.g. markdown).
+    //
+    // Rule 4 (pure box-drawing border): every char is a box-drawing
+    // glyph or whitespace, AND at least one vertical/corner glyph is
+    // present.  The "must contain a vertical" requirement stops rule 4
+    // from swallowing short horizontal runs (e.g. a 3- or 8-dash
+    // markdown separator) that rule 1's 10-char minimum intentionally
+    // let through — rule 1 is the sole authority for "all-dashes"
+    // lines.  Vertical/corner glyphs are the real signature of a
+    // rendered box frame.
+    let mut char_count = 0usize;
+    let mut all_horizontal = true;
+    let mut all_border = true;
+    let mut has_vertical_glyph = false;
+    for c in t.chars() {
+        char_count += 1;
+        let is_horizontal = c == '─' || c == '━';
+        let is_vertical = matches!(c, '│' | '╭' | '╮' | '╯' | '╰' | '├' | '┤' | '┬' | '┴');
+        let is_border_glyph = is_horizontal || is_vertical || c == ' ' || c == '\t';
+        if !is_horizontal {
+            all_horizontal = false;
+        }
+        if !is_border_glyph {
+            all_border = false;
+        }
+        if is_vertical {
+            has_vertical_glyph = true;
+        }
+        // Early exit once neither composite predicate can still succeed.
+        if !all_horizontal && !all_border {
+            break;
+        }
+    }
+    if all_horizontal && char_count >= 10 {
+        return true; // rule 1
+    }
+    if all_border && has_vertical_glyph {
+        return true; // rule 4
     }
 
     // 2. Bottom status bar.  Anchored on two substrings Claude Code
@@ -1743,36 +1786,6 @@ fn is_tui_chrome_line(line: &str) -> bool {
 
     // 3. Empty input prompt `❯` on its own.
     if t == "❯" {
-        return true;
-    }
-
-    // 4. Pure box-drawing border: every char is a box-drawing glyph or
-    //    whitespace, AND at least one vertical/corner glyph is present.
-    //    The "must contain a vertical" requirement stops rule 4 from
-    //    swallowing short horizontal runs (e.g. a 3- or 8-dash markdown
-    //    separator) that rule 1's 10-char minimum intentionally let
-    //    through — rule 1 is the sole authority for "all-dashes" lines.
-    //    Vertical/corner glyphs are the real signature of a rendered
-    //    box frame.
-    let is_border = |c: char| {
-        matches!(
-            c,
-            '│' | '╭'
-                | '╮'
-                | '╯'
-                | '╰'
-                | '├'
-                | '┤'
-                | '┬'
-                | '┴'
-                | '─'
-                | '━'
-                | ' '
-                | '\t'
-        )
-    };
-    let has_vertical = |c: char| matches!(c, '│' | '╭' | '╮' | '╯' | '╰' | '├' | '┤' | '┬' | '┴');
-    if t.chars().all(is_border) && t.chars().any(has_vertical) {
         return true;
     }
 
@@ -2226,10 +2239,12 @@ async fn handle_supervision_inner(
         }
 
         // Security note: `snap.full_content` is the output of `capture_pane_text`,
-        // which captures only the last 60 visible lines of the pane.  This bounds
-        // the amount of data sent to the LLM, but those lines could still contain
-        // secrets (e.g. env vars printed by a build script).  A future improvement
-        // could add redaction of common secret patterns.
+        // which captures the last 200 lines of the pane and then strips TUI
+        // chrome (dividers, status bar, empty `❯` prompt, bordered-panel rows).
+        // This bounds the amount of data sent to the LLM, but those lines
+        // could still contain secrets (e.g. env vars printed by a build
+        // script).  A future improvement could add redaction of common
+        // secret patterns.
         let mut pane_snapshots = String::new();
         for snap in &snapshots {
             pane_snapshots.push_str(&format!(
