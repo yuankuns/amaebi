@@ -14,9 +14,9 @@
 - Do not push code if `cargo fmt --check` or `cargo clippy` fails. GitHub Actions CI will reject it.
 
 ## Versioning
-- `Cargo.toml` `version` is calendar-versioned `YYYY.M.N` (no leading zeros on `M`/`N`).  Rule:
-  - `YYYY` / `M` = year and month of the latest commit on `master`
-  - `N` = count of `feat(...)` / `fix(...)` / `docs(...)` commits on `master` within the current `(YYYY, M)` month
+- `Cargo.toml` `version` is calendar-versioned `YYYY.M.N` (no leading zeros on `M`/`N`).  The version is computed from the git history of the checked-out branch (HEAD) — on a PR branch that includes the PR's own commits, on `master` it is the master history.  Rule:
+  - `YYYY` / `M` = year and month of the latest commit on HEAD
+  - `N` = count of `feat(...)` / `fix(...)` / `docs(...)` commits on HEAD within the current `(YYYY, M)` month
   - Other prefixes (`refactor`, `chore`, `test`, `revert`, `spike`, merges…) do not bump `N`
   - A new month automatically resets `N` to 0 (and increments to 1 on the first qualifying commit of the month)
 - Each PR author bumps `Cargo.toml` in the PR itself so it matches what master will look like after the PR lands.  Run `scripts/next-version.sh` to see what the version should be, then edit `Cargo.toml`.
