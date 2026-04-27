@@ -14,14 +14,13 @@
 - Do not push code if `cargo fmt --check` or `cargo clippy` fails. GitHub Actions CI will reject it.
 
 ## Versioning
-- `Cargo.toml` `version` is `MAJOR.MINOR.PATCH`.  Rule:
-  - `feat(...)` commit on master → MINOR +1, PATCH := 0
-  - `fix(...)` commit on master → PATCH +1
-  - Anything else (`refactor`, `chore`, `docs`, `test`, `spike`, merges…) → no bump
-  - MAJOR is never bumped automatically; a human edits `Cargo.toml` when a release warrants MAJOR+1 (big refactor, architecture shift, storage format change, etc.).
-- Each PR author bumps `Cargo.toml` in the PR itself.  Run `scripts/next-version.sh` to see what the version should be, then edit `Cargo.toml`.
+- `Cargo.toml` `version` is calendar-versioned `YYYY.M.N` (no leading zeros on `M`/`N`).  The version is computed from the git history of the checked-out branch (HEAD) — on a PR branch that includes the PR's own commits, on `master` it is the master history.  Rule:
+  - `YYYY` / `M` = year and month of the latest commit on HEAD
+  - `N` = count of `feat(...)` / `fix(...)` / `docs(...)` commits on HEAD within the current `(YYYY, M)` month
+  - Other prefixes (`refactor`, `chore`, `test`, `revert`, `spike`, merges…) do not bump `N`
+  - A new month automatically resets `N` to 0 (and increments to 1 on the first qualifying commit of the month)
+- Each PR author bumps `Cargo.toml` in the PR itself so it matches what master will look like after the PR lands.  Run `scripts/next-version.sh` to see what the version should be, then edit `Cargo.toml`.
 - CI runs `scripts/next-version.sh --check` on every PR and red-fails if `Cargo.toml` disagrees with what the commit history implies.
-- When MAJOR is bumped, tag the merge commit on master: `git tag vN.0.0 && git push origin vN.0.0`.
 
 ## Architecture
 - SQLite is the source of truth for `memory_db`, `inbox.db`, and `cron.db`. Do not use `.jsonl` or `.json` files for state storage. Avoid `tempfile` atomic writes for data that belongs in SQLite.

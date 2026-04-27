@@ -1,18 +1,25 @@
 #!/usr/bin/env bash
 #
-# Derive the project version from git history on the current branch.
+# Derive the project version from the git history of the checked-out
+# branch (HEAD) — on a PR branch this includes the PR's own commits;
+# on master it is the master history.
 #
-# Rule (see CLAUDE.md):
-#   - Baseline: 0.0.0
-#   - Walk commits in chronological order:
-#       feat(...): MINOR += 1, PATCH := 0
-#       fix(...):  PATCH += 1
-#       anything else: ignored
-#   - MAJOR is never bumped automatically; a human bumps `Cargo.toml`
-#     manually when they decide a release warrants MAJOR+1.  Once MAJOR
-#     is > 0 in `Cargo.toml`, the scanner uses it verbatim as the floor:
-#     only MINOR/PATCH are derived from history SINCE the commit that
-#     last changed MAJOR in `Cargo.toml`.
+# Rule (see CLAUDE.md): calendar versioning, `YYYY.M.N`.
+#   - MAJOR = year of latest commit on HEAD
+#   - MINOR = month of latest commit (1..12, no leading zero)
+#   - PATCH (N) = count of commits on HEAD whose subject starts with
+#                 `feat(` / `feat:` / `fix(` / `fix:` / `docs(` / `docs:`,
+#                 counted WITHIN the current (YYYY, M) month only.
+#                 Other prefixes (`refactor`, `chore`, `test`, `revert`,
+#                 `spike`, merges, etc.) do not bump N.
+#   - Each new month resets N to 0.
+#   - Initial month (no qualifying commits yet): `YYYY.M.0`.
+#
+# Examples:
+#   2026-04-01  feat(...):   -> 2026.4.1
+#   2026-04-02  fix(...):    -> 2026.4.2
+#   2026-04-03  refactor:    -> 2026.4.2  (no bump)
+#   2026-05-05  feat(...):   -> 2026.5.1  (month rollover; N reset then +1)
 #
 # Usage:
 #   scripts/next-version.sh            # print the expected version
@@ -31,63 +38,43 @@ cd "$repo_root"
 cargo_toml="$repo_root/Cargo.toml"
 [[ -f "$cargo_toml" ]] || die "Cargo.toml not found at $cargo_toml"
 
-# --- read MAJOR.MINOR.PATCH from Cargo.toml (first `version = "X.Y.Z"` line) ---
+# --- read version from Cargo.toml (first `version = "X.Y.Z"` line) ---
 cargo_version=$(awk -F'"' '/^version = "/ { print $2; exit }' "$cargo_toml")
 [[ -n "$cargo_version" ]] || die "could not parse version from $cargo_toml"
 
-if [[ ! "$cargo_version" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
-    die "Cargo.toml version '$cargo_version' is not MAJOR.MINOR.PATCH"
-fi
-cargo_major=${BASH_REMATCH[1]}
-cargo_minor=${BASH_REMATCH[2]}
-cargo_patch=${BASH_REMATCH[3]}
-
-# --- pick the scan window ---
-# When MAJOR == 0 we scan the full history.  Otherwise we find the latest
-# commit that touched the MAJOR digit in Cargo.toml and only count commits
-# after it — that way a human-chosen MAJOR bump resets the counters.
-if [[ "$cargo_major" == "0" ]]; then
-    base_range=""   # scan everything
+# --- walk every commit on the checked-out branch (HEAD), chronological,
+#     tracking the (year, month) of the latest commit and N within that
+#     month.  We use committer date (%cI) since merges land at merge-time
+#     and that is what a human reader treats as "when the change landed".
+#     On a fresh repo with no commits (`git log HEAD` fails under
+#     `pipefail`), we short-circuit to today's YYYY.M.0.
+if ! git rev-parse --verify --quiet HEAD >/dev/null; then
+    today_year=$(date -u +%Y)
+    today_month_padded=$(date -u +%m)
+    # Strip any leading zero without relying on GNU `%-m` (BSD/macOS safe).
+    today_month=$((10#$today_month_padded))
+    expected="${today_year}.${today_month}.0"
 else
-    # Find the most recent commit whose diff of Cargo.toml changed the
-    # leading MAJOR digit.  `git log -L` would be overkill; a simple
-    # `git log -G'^version = "N\.'` over `Cargo.toml` is enough.
-    base_commit=$(git log -n 1 --format=%H -G"^version = \"${cargo_major}\." -- Cargo.toml 2>/dev/null || true)
-    if [[ -z "$base_commit" ]]; then
-        # MAJOR > 0 but no commit ever introduced that MAJOR — treat as
-        # "starting fresh from this MAJOR": no history counts, so the
-        # expected version is MAJOR.0.0.
-        echo "${cargo_major}.0.0"
-        if [[ "${1:-}" == "--check" ]]; then
-            if [[ "$cargo_version" != "${cargo_major}.0.0" ]]; then
-                echo "next-version: Cargo.toml=$cargo_version but expected ${cargo_major}.0.0" >&2
-                exit 1
-            fi
-        fi
-        exit 0
-    fi
-    base_range="${base_commit}..HEAD"
+    expected=$(git log --reverse --format='%cI%x09%s' | awk '
+        BEGIN { year = 0; month = 0; n = 0 }
+        {
+            # %cI is a full ISO-8601 timestamp; the first 7 chars are YYYY-MM.
+            y = substr($1, 1, 4) + 0
+            m = substr($1, 6, 2) + 0
+            # Subject is everything after the tab.
+            tab = index($0, "\t")
+            subj = substr($0, tab + 1)
+
+            if (y != year || m != month) {
+                year = y; month = m; n = 0
+            }
+            if (subj ~ /^feat[(:]/ || subj ~ /^fix[(:]/ || subj ~ /^docs[(:]/) {
+                n++
+            }
+        }
+        END { printf "%d.%d.%d\n", year, month, n }
+    ')
 fi
-
-# --- scan commit subjects, chronological order ---
-# Conventional-commit prefixes we care about.  Accept both `feat(scope):`
-# and `feat:` forms.  Everything else is ignored (refactor, chore, docs,
-# test, spike, merge commits, ...).
-minor=0
-patch=0
-while IFS= read -r subject; do
-    case "$subject" in
-        feat\(*\):*|feat:*)
-            minor=$((minor + 1))
-            patch=0
-            ;;
-        fix\(*\):*|fix:*)
-            patch=$((patch + 1))
-            ;;
-    esac
-done < <(git log $base_range --reverse --format=%s)
-
-expected="${cargo_major}.${minor}.${patch}"
 
 if [[ "${1:-}" == "--check" ]]; then
     if [[ "$cargo_version" != "$expected" ]]; then
@@ -95,10 +82,10 @@ if [[ "${1:-}" == "--check" ]]; then
 next-version: Cargo.toml version mismatch.
   Cargo.toml says: $cargo_version
   History implies: $expected
-  (MAJOR=$cargo_major fixed by Cargo.toml; MINOR/PATCH derived from
-   commit history — feat bumps MINOR, fix bumps PATCH.)
-Fix: edit Cargo.toml to '$expected', or if this PR should bump MAJOR,
-     also edit Cargo.toml MAJOR and re-run this check.
+  (Rule: YYYY.M.N — year/month from the latest commit on the current
+   branch (HEAD); N is the count of feat/fix/docs commits in that month
+   on the same branch.  Other prefixes do not bump N.)
+Fix: edit Cargo.toml to '$expected' and commit.
 EOF
         exit 1
     fi
