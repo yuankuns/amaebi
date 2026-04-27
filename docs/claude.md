@@ -30,7 +30,7 @@ Parsing lives in `src/client.rs:280` (`parse_claude`); launch handling is in
 | `--cwd <path>` | Client working directory (used to locate the git repo for auto-worktree) |
 | `--no-enter` | Inject the task description but do not press Enter |
 | `--tag <name>` | Persistent task notebook identifier |
-| `--resume-pane <pane_id>` | Reuse an existing pane (e.g. `%41`) via `/compact + inject` |
+| `--resume-pane <pane_id>` | Reuse an existing pane (e.g. `%41`) — inject task into existing claude |
 | `--resource <spec>` | Acquire a resource lease and inject its env vars |
 | `--resource-timeout <secs>` | How long to wait for a busy resource before failing |
 
@@ -85,9 +85,11 @@ amaebi tag release <tag>
 ### `--resume-pane <pane_id>` (PR #124)
 
 Reuse the `claude` already running in a tmux pane instead of launching a new
-one. The daemon sends `/compact` to clear Claude's context, then injects the
-new task description. This is the tier-1 reuse path: no new worktree, no
-30-second `claude` startup.
+one. The daemon injects the new task description directly into the existing
+conversation — resume means *continue*, so prior hard constraints, todo
+lists, and partial state are preserved. If stale context needs pruning, type
+`/compact` into the pane manually. This is the tier-1 reuse path: no new
+worktree, no 30-second `claude` startup.
 
 ```text
 /claude --resume-pane %41 "now run the benchmarks on the optimised kernel"
@@ -148,14 +150,14 @@ when leases are released.
 When `--resume-pane` is given, the daemon takes a fast path:
 
 1. Look up the pane in `~/.amaebi/tmux-state.json` — must exist and be live.
-2. Send `/compact` to the pane. Claude Code compresses its context and
-   returns to a prompt.
-3. Inject the new task description.
-4. Resume supervision under the same pane lease.
+2. Inject the new task description into the existing claude conversation.
+3. Resume supervision under the same pane lease.
 
-No worktree creation, no new `claude` process spawn, no API key dance. Use
-this for iterative refinement: "run the benchmarks now", "try the other
-branch".
+No worktree creation, no new `claude` process spawn, no API key dance, and
+no automatic `/compact` — the prior conversation is preserved so hard
+constraints, todo lists, and partial state carry over.  Use this for
+iterative refinement: "run the benchmarks now", "try the other branch".  If
+stale context ever needs pruning, type `/compact` into the pane manually.
 
 ## Where worktrees live
 

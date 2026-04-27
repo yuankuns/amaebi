@@ -1299,8 +1299,9 @@ async fn handle_claude_launch(
         //    `task.worktree` is always None here.  We read the lease, inherit
         //    its worktree, and acquire THAT pane specifically via
         //    `pane_lease::acquire_lease`.  `had_claude` is forced true so
-        //    `handle_claude_launch` runs the `/compact + inject` tier-1
-        //    reuse path instead of launching a fresh `claude` process.
+        //    `handle_claude_launch` runs the tier-1 reuse path (inject task
+        //    into existing claude) instead of launching a fresh `claude`
+        //    process.
         //
         // 2. Normal path: auto-create a worktree if the caller didn't pass
         //    `--worktree`, then let `ensure_and_acquire_idle` pick a pane.
@@ -1338,7 +1339,7 @@ async fn handle_claude_launch(
                     // The lease's `has_claude` flag is persisted state and can
                     // go stale (e.g. user `Ctrl-C`'d claude without the daemon
                     // noticing).  Cross-check at the tmux layer so we don't
-                    // inject `/compact` + a task prompt into a bare shell.
+                    // inject a task prompt into a bare shell.
                     let tmux_probe = std::process::Command::new("tmux")
                         .args([
                             "display-message",
@@ -1671,13 +1672,12 @@ async fn handle_claude_launch(
         //
         // Each element is (keys, press_enter).
         let key_sequence: Vec<(String, bool)> = if had_claude {
-            // Reusing an existing claude session in the same worktree: compact
-            // the prior conversation first so stale context does not pollute
-            // the new task, then inject the description.
-            vec![
-                ("/compact".to_string(), true),
-                (description.clone(), auto_enter),
-            ]
+            // Reusing an existing claude session in the same worktree: inject
+            // the new task description directly into the existing conversation.
+            // No automatic `/compact` — resume is meant to *continue* where the
+            // pane left off.  The user can run `/compact` manually if they
+            // decide stale context needs pruning.
+            vec![(description.clone(), auto_enter)]
         } else {
             // Fresh pane: launch claude with --dangerously-skip-permissions so
             // the autonomous session never blocks on an interactive approval
@@ -1752,8 +1752,9 @@ async fn handle_claude_launch(
                 // minimum that proved stable in manual testing.
                 //
                 // Only runs on fresh-pane launches (`!had_claude`); reuse
-                // path (`/compact` + inject) skips because the trust dialog
-                // was already accepted when the pane was first launched.
+                // path (inject task into existing claude) skips because the
+                // trust dialog was already accepted when the pane was first
+                // launched.
                 if idx > 0 && !had_claude {
                     std::thread::sleep(std::time::Duration::from_secs(2));
                     let _ = std::process::Command::new("tmux")
@@ -2143,7 +2144,7 @@ fn send_pane_keys(pane_id: &str, text: &str) -> bool {
 /// it via [`pane_lease::PaneLease::effective_status`], during which a second
 /// `/claude` invocation cannot reuse it and the scheduler has to spin up a
 /// fresh pane instead of reusing the existing `claude` session via the
-/// tier-1 `/compact` + inject path.
+/// tier-1 reuse path (inject task into existing claude).
 ///
 /// Release failures are logged and swallowed: they must never mask the
 /// supervision loop's `Result`.  Each release runs on a blocking thread since
@@ -2209,8 +2210,8 @@ async fn release_supervised_panes(panes: &[crate::ipc::SupervisionTarget]) {
 /// Regardless of which exit point the inner loop takes (timeout, DONE,
 /// interrupted, client disconnect, model error), [`release_supervised_panes`] runs
 /// unconditionally afterward so a pane is never stranded `Busy` — unblocking
-/// the tier-1 reuse path (`/compact` + inject) for the next `/claude` task in
-/// the same worktree.
+/// the tier-1 reuse path (inject task into existing claude) for the next
+/// `/claude` task in the same worktree.
 async fn handle_supervision(
     writer: &Arc<tokio::sync::Mutex<tokio::net::unix::OwnedWriteHalf>>,
     frame_rx: &mut tokio::sync::mpsc::Receiver<String>,
@@ -7796,9 +7797,9 @@ mod tests {
     /// `release_supervised_panes` must flip a Busy pane to Idle and clear its
     /// task/session fields while preserving `has_claude` and `worktree` so the
     /// next `/claude` invocation can reuse the same Claude Code session via
-    /// the tier-1 (`/compact` + inject) path.  Without this call, the pane
-    /// would stay Busy until `LEASE_TTL_SECS` (24 h) and a second `/claude`
-    /// would appear stuck.
+    /// the tier-1 reuse path (inject task into existing claude).  Without this
+    /// call, the pane would stay Busy until `LEASE_TTL_SECS` (24 h) and a
+    /// second `/claude` would appear stuck.
     #[tokio::test]
     async fn release_supervised_panes_unlocks_pane_and_preserves_reuse_fields() {
         let _guard = crate::test_utils::with_temp_home();
@@ -8012,7 +8013,7 @@ mod tests {
     /// When `--resume-pane` points at a lease that claims `has_claude=true`
     /// but the target tmux pane does not actually exist (or isn't running
     /// `claude`), the daemon must reject the request at the tmux probe step
-    /// rather than injecting `/compact` into whatever is there.  The task
+    /// rather than injecting a task prompt into whatever is there.  The task
     /// description is non-empty here so the lease-description prefetch is
     /// skipped and the probe runs.
     #[tokio::test]
@@ -8079,7 +8080,7 @@ mod tests {
         // trips the "not currently running `claude`" branch.  When there is
         // no tmux at all, the probe fails on `.output()` and surfaces the
         // "failed to inspect tmux pane" branch.  Either is acceptable; both
-        // are preferable to silently injecting `/compact` into the wrong
+        // are preferable to silently injecting a task prompt into the wrong
         // thing.
         assert!(
             err_texts.iter().any(|m| {
