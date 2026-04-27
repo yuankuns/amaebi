@@ -2219,11 +2219,68 @@ async fn handle_supervision(
     state: &Arc<DaemonState>,
     session_id: Option<String>,
 ) -> Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     // Holder id used for task notebook leases: prefer the session UUID
     // (stable per supervision request), fall back to the first pane id.
     let holder = supervision_holder_id(&panes, session_id.as_deref());
 
-    let result = handle_supervision_inner(writer, frame_rx, &panes, model, state, session_id).await;
+    // Shared turn counter: the inner loop bumps this on every iteration;
+    // the heartbeat task reads it so stalled supervision is diagnosable.
+    let turn_counter = Arc::new(AtomicU64::new(0));
+
+    // Spawn the heartbeat emitter.  Kept entirely in the wrapper so every
+    // inner exit path (DONE, STEER, timeout, interrupt, model error,
+    // client disconnect, inner Err) cancels it symmetrically — same
+    // pattern as `release_supervised_panes`.
+    let heartbeat_writer = Arc::clone(writer);
+    let heartbeat_start = std::time::Instant::now();
+    let heartbeat_turn = Arc::clone(&turn_counter);
+    let heartbeat_task = tokio::spawn(async move {
+        let mut ticker =
+            tokio::time::interval(std::time::Duration::from_secs(HEARTBEAT_INTERVAL_SECS));
+        // After a suspend (SIGSTOP, laptop sleep, heavy scheduler lag) the
+        // interval would otherwise fire a backlog burst of heartbeats as it
+        // "catches up" — which is both pointless and would swamp the client.
+        // Skip behavior drops the backlog and resumes at the next boundary.
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Skip the immediate fire `tokio::time::interval` emits on first tick
+        // so the first heartbeat lands one interval into the session.
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            let elapsed_secs = heartbeat_start.elapsed().as_secs();
+            let turn = heartbeat_turn.load(Ordering::Relaxed);
+            let mut w = heartbeat_writer.lock().await;
+            if write_frame(&mut *w, &Response::Heartbeat { elapsed_secs, turn })
+                .await
+                .is_err()
+            {
+                // Writer closed — client disconnected; stop heartbeating.
+                break;
+            }
+        }
+    });
+
+    let result = handle_supervision_inner(
+        writer,
+        frame_rx,
+        &panes,
+        model,
+        state,
+        session_id,
+        &turn_counter,
+    )
+    .await;
+
+    // Stop the heartbeat before we write the resume hint + Done so those
+    // terminal frames are not interleaved with a ticking heartbeat.
+    // `abort()` only requests cancellation; awaiting the JoinHandle ensures
+    // the task has actually unwound (including releasing the writer mutex)
+    // before we go on to emit the final Done frame.  The JoinError we
+    // expect here is cancellation, not a panic — swallow it.
+    heartbeat_task.abort();
+    let _ = heartbeat_task.await;
 
     // Unified resume hint + Done.  Inner no longer writes
     // Response::Done itself; this wrapper writes the hint first (so
@@ -2616,10 +2673,19 @@ async fn render_hard_constraints(panes: &[crate::ipc::SupervisionTarget]) -> Str
     out
 }
 
+/// How often `handle_supervision` emits a [`Response::Heartbeat`] frame on
+/// the supervision socket.  Chosen so a stuck daemon trips the client's
+/// 30-minute watchdog within ~30 minutes even on a pane that would
+/// otherwise produce no other frames (WAIT/STEER/DONE headers only land
+/// every `AMAEBI_SUPERVISION_INTERVAL_SECS`, defaulting to 5 minutes).
+const HEARTBEAT_INTERVAL_SECS: u64 = 10 * 60;
+
 /// Inner body of [`handle_supervision`]; see that function's doc for context.
 ///
 /// Takes `panes` by reference so the outer wrapper retains ownership and can
-/// pass it to [`release_supervised_panes`] after this returns.
+/// pass it to [`release_supervised_panes`] after this returns.  `turn_counter`
+/// is incremented on every iteration so the wrapper's heartbeat task can
+/// report the current turn number.
 async fn handle_supervision_inner(
     writer: &Arc<tokio::sync::Mutex<tokio::net::unix::OwnedWriteHalf>>,
     frame_rx: &mut tokio::sync::mpsc::Receiver<String>,
@@ -2627,6 +2693,7 @@ async fn handle_supervision_inner(
     model: String,
     state: &Arc<DaemonState>,
     session_id: Option<String>,
+    turn_counter: &Arc<std::sync::atomic::AtomicU64>,
 ) -> Result<()> {
     // Notebook leases are acquired in `handle_claude_launch` BEFORE any
     // pane/worktree/claude work so a tag-conflict rejection never
@@ -2768,6 +2835,7 @@ async fn handle_supervision_inner(
         }
 
         turn += 1;
+        turn_counter.store(turn, std::sync::atomic::Ordering::Relaxed);
         let elapsed_mins = supervision_start.elapsed().as_secs() / 60;
 
         // --- Capture pane snapshots (full for LLM, tail for display) ---

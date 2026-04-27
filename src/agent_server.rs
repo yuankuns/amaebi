@@ -341,6 +341,11 @@ impl acp::Agent for AmaebiAgent {
                     // ACP mode never sends ClaudeLaunch/GenerateTag.
                     tracing::debug!("unexpected pane/tag scheduler response in ACP mode");
                 }
+                Response::Heartbeat { .. } => {
+                    // ACP mode never runs supervision; explicit arm keeps
+                    // future enum additions a compile error.
+                    tracing::debug!("unexpected Heartbeat in ACP mode");
+                }
             }
         }
 

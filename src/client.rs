@@ -889,6 +889,12 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
                     Response::ModelSwitched { .. } => {
                         // ask mode has no persistent model variable to update.
                     }
+                    Response::Heartbeat { .. } => {
+                        // Supervision-only frame; never emitted on the Chat
+                        // path but keep an explicit arm so future enum
+                        // additions still force a compile error here.
+                        tracing::debug!("ignoring Heartbeat outside supervision loop");
+                    }
                 }
             }
 
@@ -1167,20 +1173,31 @@ pub async fn run_chat_loop(
                     write_half.write_all(req_line.as_bytes()).await?;
 
                     // Stream supervision output exactly like a Chat response.
-                    // We always arm a timeout so the client never hangs if the
-                    // daemon silently drops. Default: 12 h (slightly above the
-                    // daemon's 10 h default; both are configurable via env vars);
-                    // shortened to 5 s once an interrupt has been sent.
-                    let mut interrupt_sent = false;
-                    let supervision_deadline =
-                        tokio::time::Instant::now() + Duration::from_secs(12 * 60 * 60);
+                    // There is no client-side business timeout — supervision
+                    // length is a daemon concept (`AMAEBI_SUPERVISION_TIMEOUT_SECS`,
+                    // default 24 h) and mirroring it here via an env var would
+                    // silently desync whenever client + daemon run in different
+                    // shells.  Instead the client runs a 30-min watchdog: if
+                    // the daemon stops sending ANY frame (text, heartbeat,
+                    // done), assume it's stuck and end the session so the TUI
+                    // does not hang forever.  The daemon emits `Heartbeat`
+                    // every 10 min (see `HEARTBEAT_INTERVAL_SECS` in daemon.rs)
+                    // so a normal supervision — which sleeps ~5 min between
+                    // LLM calls — always has at most a 10-min frame gap.
+                    const WATCHDOG_INTERVAL_SECS: u64 = 30 * 60;
+                    // Pinned (not per-iteration) so a heartbeat arriving
+                    // during the 5 s drain does not push the deadline back —
+                    // we promise the user a bounded wait after Ctrl-C.
+                    let mut interrupt_drain_deadline: Option<tokio::time::Instant> = None;
                     'supervision: loop {
-                        let timeout_at = if interrupt_sent {
-                            // After interrupt, give daemon 5 s to respond with Done.
-                            tokio::time::Instant::now() + Duration::from_secs(5)
-                        } else {
-                            supervision_deadline
-                        };
+                        // Recomputed every iteration: any arriving frame (or
+                        // sigint) re-enters the loop and resets the watchdog.
+                        let watchdog_at = tokio::time::Instant::now()
+                            + Duration::from_secs(WATCHDOG_INTERVAL_SECS);
+                        let interrupt_sent = interrupt_drain_deadline.is_some();
+                        // Fallback to `watchdog_at` when the arm is disabled so
+                        // `sleep_until` still receives a valid Instant.
+                        let interrupt_drain_at = interrupt_drain_deadline.unwrap_or(watchdog_at);
                         tokio::select! {
                             biased;
 
@@ -1190,32 +1207,40 @@ pub async fn run_chat_loop(
                                     frame.push('\n');
                                     let _ = write_half.write_all(frame.as_bytes()).await;
                                 }
-                                interrupt_sent = true;
+                                interrupt_drain_deadline = Some(
+                                    tokio::time::Instant::now() + Duration::from_secs(5),
+                                );
                                 // Continue looping to drain remaining frames.
                             }
 
-                            _ = tokio::time::sleep_until(timeout_at) => {
-                                // Timed out: either post-interrupt 5 s drain or the
-                                // supervision hard ceiling.  The daemon may still be
-                                // running its supervision loop, so reusing this socket
-                                // for further Chat requests would desync the protocol.
-                                // Terminate the session cleanly instead.
-                                //
-                                // Flush any partially buffered markdown first so we
-                                // do not lose the last chunk the daemon had streamed
-                                // before we gave up waiting.  `break 'session`
-                                // bypasses the post-supervision-loop flush, so it
-                                // has to happen here.
+                            _ = tokio::time::sleep_until(interrupt_drain_at), if interrupt_sent => {
+                                // Post-interrupt 5 s drain: daemon should have
+                                // responded with Done by now; if not, give up
+                                // cleanly so the socket does not stay half-
+                                // alive for another Chat request (which would
+                                // desync the frame protocol).
                                 if let Some(remaining) = md_buf.flush_all() {
                                     let out = render_markdown(&remaining);
                                     stdout.write_all(out.as_bytes()).await?;
                                 }
-                                let reason = if interrupt_sent {
-                                    "[supervision] daemon did not stop within 5 s after interrupt; ending session.\n"
-                                } else {
-                                    "[supervision] hard timeout reached; ending session.\n"
-                                };
-                                stdout.write_all(reason.as_bytes()).await?;
+                                stdout
+                                    .write_all(b"[supervision] daemon did not stop within 5 s after interrupt; ending session.\n")
+                                    .await?;
+                                stdout.flush().await?;
+                                break 'session;
+                            }
+
+                            _ = tokio::time::sleep_until(watchdog_at), if !interrupt_sent => {
+                                // 30 min without any frame — treat daemon as
+                                // stuck (process alive but supervision task
+                                // deadlocked, etc.) and end the session.
+                                if let Some(remaining) = md_buf.flush_all() {
+                                    let out = render_markdown(&remaining);
+                                    stdout.write_all(out.as_bytes()).await?;
+                                }
+                                stdout
+                                    .write_all(b"[supervision] no frames from daemon for 30 min; assuming stuck daemon and ending session.\n")
+                                    .await?;
                                 stdout.flush().await?;
                                 break 'session;
                             }
@@ -1232,6 +1257,31 @@ pub async fn run_chat_loop(
                                             stdout.write_all(out.as_bytes()).await?;
                                             stdout.flush().await?;
                                         }
+                                    }
+                                    Response::Heartbeat { elapsed_secs, turn } => {
+                                        // Status line on stderr so it never
+                                        // interleaves with streamed stdout
+                                        // markdown.  Overwrites itself with `\r`
+                                        // so scrollback stays clean — the
+                                        // 5-min WAIT/STEER/DONE headers are
+                                        // already there for history.
+                                        let mins = elapsed_secs / 60;
+                                        let hours = mins / 60;
+                                        let rem_mins = mins % 60;
+                                        let msg = if hours > 0 {
+                                            format!(
+                                                "\r[supervision alive — turn #{turn}, {hours}h{rem_mins}m elapsed]"
+                                            )
+                                        } else {
+                                            format!(
+                                                "\r[supervision alive — turn #{turn}, {mins}m elapsed]"
+                                            )
+                                        };
+                                        let _ = tokio::io::stderr().write_all(msg.as_bytes()).await;
+                                        let _ = tokio::io::stderr().flush().await;
+                                        // Fall through — next select! iteration
+                                        // recomputes `watchdog_at`, so receiving
+                                        // this heartbeat resets the watchdog.
                                     }
                                     Response::Done => {
                                         if let Some(remaining) = md_buf.flush_all() {
@@ -1789,6 +1839,11 @@ pub async fn run_resume(
                     }
                     Response::ModelSwitched { .. } => {
                         // resume mode has no persistent model variable to update.
+                    }
+                    Response::Heartbeat { .. } => {
+                        // Supervision-only frame; never emitted on the
+                        // Resume path.
+                        tracing::debug!("ignoring Heartbeat outside supervision loop");
                     }
                 }
             }
