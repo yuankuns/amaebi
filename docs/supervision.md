@@ -33,7 +33,7 @@ All durations are in `handle_supervision_inner`:
 | Poll-interval ceiling | 5 min | `AMAEBI_SUPERVISION_INTERVAL_SECS` | Maximum wait between LLM calls |
 | Idle threshold | 10 s | (compile-time constant `IDLE_SECS`) | Pane must be unchanged this long before the LLM is called |
 | Idle poll period | 2 s | (compile-time constant `IDLE_POLL_SECS`) | How often to snapshot the pane while waiting for idle |
-| Hard timeout | 10 h | `AMAEBI_SUPERVISION_TIMEOUT_SECS` | Wall-clock ceiling; after this, supervision exits regardless |
+| Hard timeout | 24 h | `AMAEBI_SUPERVISION_TIMEOUT_SECS` | Wall-clock ceiling; after this, supervision exits regardless.  Matches the pane, resource, and task-notebook lease TTLs (all 24 h) so supervision never outlives the leases it holds. |
 
 The 5-minute ceiling (`src/daemon.rs:2418`) is the *maximum* gap between LLM
 calls. Each iteration also waits for 10 seconds of pane stability
@@ -42,8 +42,10 @@ every 2-5 seconds during active tool output. Net effect: supervision LLM cost
 drops ~70-80 % in typical sessions.
 
 The hard timeout (`src/daemon.rs:2437`) protects against runaway tasks. If
-supervision is still polling after 10 hours, it gives up, writes a summary,
-and releases the pane.
+supervision is still polling after 24 hours, it emits a single
+`[supervision] timeout after …` message and exits; the normal cleanup path
+then releases the pane and any resource/task leases.  No DONE summary is
+produced on this path — those only come from a `DONE:` verdict.
 
 ## What STEER does
 

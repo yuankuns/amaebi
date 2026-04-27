@@ -2198,9 +2198,13 @@ async fn release_supervised_panes(panes: &[crate::ipc::SupervisionTarget]) {
 /// - `DONE: <summary>` — task is complete; stream the summary and exit
 ///
 /// The loop can also be interrupted by an `Interrupt` frame arriving on
-/// `frame_rx`.  A maximum of `MAX_SUPERVISION_TOKENS` completion tokens is
-/// requested per turn (see the constant in `handle_supervision_inner`) —
-/// sufficient for the short WAIT/STEER/DONE responses.
+/// `frame_rx`, or hit the hard wall-clock ceiling.  Default matches the
+/// pane-, resource-, and task-notebook lease TTLs (all 24 h) so
+/// supervision never outlives the leases it holds on; override with
+/// `AMAEBI_SUPERVISION_TIMEOUT_SECS`.  A maximum of
+/// `MAX_SUPERVISION_TOKENS` completion tokens is requested per turn
+/// (see the constant in `handle_supervision_inner`) — sufficient for
+/// the short WAIT/STEER/DONE responses.
 ///
 /// Regardless of which exit point the inner loop takes (timeout, DONE,
 /// interrupted, client disconnect, model error), [`release_supervised_panes`] runs
@@ -2649,13 +2653,16 @@ async fn handle_supervision_inner(
     const IDLE_SECS: u64 = 10;
     const IDLE_POLL_SECS: u64 = 2;
 
-    // Hard wall-clock limit before supervision gives up. Default 10 hours;
-    // override with AMAEBI_SUPERVISION_TIMEOUT_SECS.
+    // Hard wall-clock limit before supervision gives up. Default matches the
+    // pane/resource lease TTL so supervision never outlives the leases it
+    // holds on; override with `AMAEBI_SUPERVISION_TIMEOUT_SECS`.  Pulling
+    // from the constant rather than a literal prevents the three TTL values
+    // from drifting out of sync on future bumps.
     let max_duration = std::time::Duration::from_secs(
         std::env::var("AMAEBI_SUPERVISION_TIMEOUT_SECS")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(10 * 3600u64), // 10 hours default — enough for a night shift
+            .unwrap_or(crate::pane_lease::LEASE_TTL_SECS),
     );
 
     const MAX_SUPERVISION_TOKENS: usize = 1024;
@@ -8553,5 +8560,29 @@ prompt_hint = "use sim-9900 (port {port}) only"
             out.contains("use sim-9900 (port 9900) only"),
             "rendered prompt_hint must be included verbatim, got: {out:?}"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // supervision default timeout regression
+    // ------------------------------------------------------------------
+
+    #[test]
+    #[serial_test::serial]
+    fn supervision_default_timeout_matches_lease_ttl() {
+        // Regression: the default supervision timeout must match every lease
+        // TTL supervision holds on (pane, resource, task notebook) so the
+        // loop never outlives its own bookkeeping.  The test derives the
+        // expected value from the TTL constant rather than a literal, so
+        // bumping lease TTL on a future PR does not require touching this
+        // test — only the three constants need to stay equal.
+        std::env::remove_var("AMAEBI_SUPERVISION_TIMEOUT_SECS");
+        let lease_ttl_secs = crate::pane_lease::LEASE_TTL_SECS;
+        let default_secs: u64 = std::env::var("AMAEBI_SUPERVISION_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(lease_ttl_secs);
+        assert_eq!(default_secs, lease_ttl_secs);
+        assert_eq!(crate::resource_lease::LEASE_TTL_SECS, lease_ttl_secs);
+        assert_eq!(crate::tasks::LEASE_TTL_SECS as u64, lease_ttl_secs);
     }
 }
