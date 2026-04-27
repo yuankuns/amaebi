@@ -295,6 +295,14 @@ pub enum Response {
     },
     /// Reply to [`Request::GenerateTag`] carrying the resolved tag.
     TagGenerated { tag: String },
+    /// Daemon-side liveness signal emitted every `HEARTBEAT_INTERVAL_SECS`
+    /// by the heartbeat task spawned in `handle_supervision` (the wrapper,
+    /// not `handle_supervision_inner`, so cancellation is guaranteed on
+    /// every exit path).  Carries (elapsed supervision seconds, current
+    /// turn number) so a stuck pane can be diagnosed even when no
+    /// WAIT/STEER/DONE was produced recently.  The client treats any
+    /// heartbeat as a watchdog reset; rendering it is optional.
+    Heartbeat { elapsed_secs: u64, turn: u64 },
     /// The [`Request::ClaudeLaunch`] was rejected because adding the requested
     /// panes would exceed the configured maximum.
     CapacityError {
@@ -606,6 +614,7 @@ mod tests {
             r#"{"type":"pane_assigned","tag":"pr-1","pane_id":"%3","session_id":"uuid-abc"}"#,
             r#"{"type":"capacity_error","requested":3,"max_panes":16,"current_busy":14}"#,
             r#"{"type":"model_switched","model":"bedrock/claude-opus-4.7"}"#,
+            r#"{"type":"heartbeat","elapsed_secs":600,"turn":2}"#,
         ];
         for frame in frames {
             let r: Response = serde_json::from_str(frame).unwrap();
@@ -623,6 +632,7 @@ mod tests {
                     | Response::PaneAssigned { .. }
                     | Response::CapacityError { .. }
                     | Response::ModelSwitched { .. }
+                    | Response::Heartbeat { .. }
             ));
         }
     }
@@ -862,6 +872,27 @@ mod tests {
 
         let back: Response = serde_json::from_str(&json).unwrap();
         assert!(matches!(back, Response::PaneAssigned { .. }));
+    }
+
+    #[test]
+    fn response_heartbeat_round_trip() {
+        let r = Response::Heartbeat {
+            elapsed_secs: 123,
+            turn: 7,
+        };
+        let s = serde_json::to_string(&r).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["type"], "heartbeat");
+        assert_eq!(v["elapsed_secs"], 123);
+        assert_eq!(v["turn"], 7);
+        let back: Response = serde_json::from_str(&s).unwrap();
+        assert!(matches!(
+            back,
+            Response::Heartbeat {
+                elapsed_secs: 123,
+                turn: 7
+            }
+        ));
     }
 
     #[test]
