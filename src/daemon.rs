@@ -2325,6 +2325,13 @@ async fn build_notebook_context(
     let state_cl = Arc::clone(state);
     let panes_cl: Vec<crate::ipc::SupervisionTarget> = panes.to_vec();
     let rendered = tokio::task::spawn_blocking(move || -> Result<String> {
+        // Lazy-open the DB if no prior code path did.  Resume-pane launches
+        // skip the tag-acquisition block in `handle_claude_launch`, so on
+        // the first supervision turn for a resumed tagged pane the handle
+        // may still be `None` — which would silently drop this pane's own
+        // prior verdict/desc history from the notebook preamble.
+        // `ensure_tasks_db` is idempotent.
+        ensure_tasks_db(&state_cl)?;
         let guard = state_cl
             .tasks_db
             .lock()
@@ -3045,6 +3052,12 @@ async fn handle_supervision_inner(
             let repo_dir_log = repo_dir.clone();
             let tag_log = tag.clone();
             match tokio::task::spawn_blocking(move || -> Result<()> {
+                // Lazy-open the DB if no prior code path did.  Resume-pane
+                // launches skip the tag-acquisition block in
+                // `handle_claude_launch` that normally opens it, so when a
+                // resumed pane produces the first verdict the handle may
+                // still be `None`.  `ensure_tasks_db` is idempotent.
+                ensure_tasks_db(&state_cl)?;
                 let guard = state_cl
                     .tasks_db
                     .lock()
@@ -8584,5 +8597,30 @@ prompt_hint = "use sim-9900 (port {port}) only"
         assert_eq!(default_secs, lease_ttl_secs);
         assert_eq!(crate::resource_lease::LEASE_TTL_SECS, lease_ttl_secs);
         assert_eq!(crate::tasks::LEASE_TTL_SECS as u64, lease_ttl_secs);
+    }
+
+    /// Regression: the supervision verdict-persist path must lazy-open
+    /// `tasks.db` when the daemon only ever served resume-pane launches
+    /// (which skip the tag-acquisition block that normally opens it).
+    /// Verifies `ensure_tasks_db` opens the handle on first call, then
+    /// is a cheap no-op on every subsequent call — so sprinkling it at
+    /// the top of every tasks_db consumer is safe.
+    #[test]
+    fn ensure_tasks_db_is_idempotent_and_lazy() {
+        // A daemon that has only served resume-pane launches reaches the
+        // verdict-persist / notebook-context sites with `tasks_db == None`,
+        // because the tag-acquisition block in `handle_claude_launch`
+        // (the sole prior opener) is gated on `resume_pane.is_none()`.
+        // Both sites must therefore call `ensure_tasks_db` unconditionally,
+        // which only works if the second call is a safe no-op.
+        let _guard = crate::test_utils::with_temp_home();
+        let state = test_minimal_daemon_state();
+        assert!(state.tasks_db.lock().unwrap().is_none());
+
+        ensure_tasks_db(&state).expect("first ensure_tasks_db opens DB");
+        assert!(state.tasks_db.lock().unwrap().is_some());
+
+        ensure_tasks_db(&state).expect("second ensure_tasks_db is a no-op");
+        assert!(state.tasks_db.lock().unwrap().is_some());
     }
 }
