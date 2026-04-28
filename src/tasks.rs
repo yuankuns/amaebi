@@ -29,7 +29,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use std::os::unix::fs::OpenOptionsExt;
 
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::auth::amaebi_home;
 
@@ -269,15 +269,23 @@ pub fn append_verdict(conn: &Connection, repo_dir: &str, tag: &str, verdict: &st
     Ok(())
 }
 
-/// Return up to [`RECENT_VERDICTS_WINDOW`] most recent verdicts, oldest
-/// first (so the supervisor sees them in chronological order when
-/// rendered into a prompt).
+/// Return up to [`RECENT_VERDICTS_WINDOW`] most recent verdicts,
+/// oldest first (so the supervisor sees them in chronological order
+/// when rendered into a prompt).  Called once at supervision start to
+/// snapshot the prior-session window; during the supervision loop the
+/// daemon tracks new verdicts in memory and never re-queries this
+/// function, so there is no double-read / overlap between DB and
+/// in-memory state.
 pub fn recent_verdicts(conn: &Connection, repo_dir: &str, tag: &str) -> Result<Vec<String>> {
     let mut stmt = conn
         .prepare(
+            // Tie-break on `id DESC` so two rows appended within the
+            // same second (timestamps are second-granularity) still
+            // have a deterministic "newest first" order matching
+            // insertion order, since `id` is autoincrement.
             "SELECT content FROM task_notes
              WHERE repo_dir = ?1 AND tag = ?2 AND kind = 'verdict'
-             ORDER BY timestamp DESC
+             ORDER BY timestamp DESC, id DESC
              LIMIT ?3",
         )
         .context("preparing recent_verdicts query")?;
@@ -290,8 +298,27 @@ pub fn recent_verdicts(conn: &Connection, repo_dir: &str, tag: &str) -> Result<V
     let mut out: Vec<String> = rows
         .collect::<rusqlite::Result<Vec<_>>>()
         .context("collecting recent_verdicts rows")?;
-    out.reverse(); // oldest first for prompt rendering
+    out.reverse(); // oldest first
     Ok(out)
+}
+
+/// Return the most recent dispatched STEER verdict for `(repo_dir, tag)`,
+/// or `None`.  Called once at supervision start to seed the in-memory
+/// `last_steer_full` carry-over; subsequent updates happen in memory.
+pub fn latest_steer(conn: &Connection, repo_dir: &str, tag: &str) -> Result<Option<String>> {
+    conn.query_row(
+        // Tie-break on `id DESC` so two STEERs written in the same
+        // second pick the latest by insertion order deterministically.
+        "SELECT content FROM task_notes
+         WHERE repo_dir = ?1 AND tag = ?2 AND kind = 'verdict'
+           AND content LIKE 'STEER:%'
+         ORDER BY timestamp DESC, id DESC
+         LIMIT 1",
+        params![repo_dir, tag],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .context("running latest_steer query")
 }
 
 // ---------------------------------------------------------------------------
@@ -480,24 +507,30 @@ mod tests {
     }
 
     #[test]
+    fn latest_steer_skips_wait_rows() {
+        let (conn, _g) = fresh_db();
+        append_verdict(&conn, "/proj", "kernel", "WAIT: one").unwrap();
+        assert!(latest_steer(&conn, "/proj", "kernel").unwrap().is_none());
+        append_verdict(&conn, "/proj", "kernel", "STEER: foo").unwrap();
+        append_verdict(&conn, "/proj", "kernel", "WAIT: two").unwrap();
+        assert_eq!(
+            latest_steer(&conn, "/proj", "kernel").unwrap().as_deref(),
+            Some("STEER: foo")
+        );
+    }
+
+    #[test]
     fn verdicts_isolated_by_repo_dir_and_tag() {
         let (conn, _g) = fresh_db();
         append_verdict(&conn, "/proj-a", "kernel", "a-v").unwrap();
         append_verdict(&conn, "/proj-b", "kernel", "b-v").unwrap();
         append_verdict(&conn, "/proj-a", "lint", "lint-v").unwrap();
 
-        assert_eq!(
-            recent_verdicts(&conn, "/proj-a", "kernel").unwrap(),
-            vec!["a-v".to_string()]
-        );
-        assert_eq!(
-            recent_verdicts(&conn, "/proj-b", "kernel").unwrap(),
-            vec!["b-v".to_string()]
-        );
-        assert_eq!(
-            recent_verdicts(&conn, "/proj-a", "lint").unwrap(),
-            vec!["lint-v".to_string()]
-        );
+        let contents = |repo: &str, tag: &str| recent_verdicts(&conn, repo, tag).unwrap();
+
+        assert_eq!(contents("/proj-a", "kernel"), vec!["a-v".to_string()]);
+        assert_eq!(contents("/proj-b", "kernel"), vec!["b-v".to_string()]);
+        assert_eq!(contents("/proj-a", "lint"), vec!["lint-v".to_string()]);
     }
 
     // ── lease ────────────────────────────────────────────────────────────

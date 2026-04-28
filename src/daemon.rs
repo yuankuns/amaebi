@@ -2431,21 +2431,9 @@ async fn build_notebook_context(
 
             let latest = tasks::latest_desc(conn, repo_dir, tag)?
                 .unwrap_or_else(|| "(none recorded)".to_string());
-            let verdicts = tasks::recent_verdicts(conn, repo_dir, tag)?;
 
             out.push_str(&format!("=== Task notebook for tag '{tag}' ===\n"));
             out.push_str(&format!("Desc (most recent on record): {latest}\n"));
-            if verdicts.is_empty() {
-                out.push_str("No prior supervision verdicts for this tag.\n");
-            } else {
-                out.push_str(&format!(
-                    "Recent verdicts from prior supervision sessions ({}, oldest first):\n",
-                    verdicts.len()
-                ));
-                for v in &verdicts {
-                    out.push_str(&format!("  - {v}\n"));
-                }
-            }
             out.push_str("=== End task notebook ===\n\n");
         }
         Ok(out)
@@ -2521,11 +2509,20 @@ const SUPERVISION_SYSTEM_PROMPT: &str = concat!(
 ///      pane header further down.
 ///   2. `HARD CONSTRAINTS` block (may be empty) from the pane's resource
 ///      leases.
-///   3. Notebook context carried over from prior supervision sessions
-///      (may be empty).
-///   4. Recent verdict history (newest last) so the LLM can see whether
-///      its own prior STEERs landed.
-///   5. The last STEER in full, if one has been issued.
+///   3. Notebook context (desc only) carried over from prior supervision
+///      sessions (may be empty).
+///   4. "Recent supervision verdicts" block.  `prior_window` is the
+///      DB-sourced snapshot taken once at session start (rendered as
+///      plain bullets = "prior sessions"); `this_session_verdicts` is
+///      the in-memory log of verdicts produced since this supervision
+///      started (rendered with `[last]` / `[N turns ago]` labels =
+///      "this session").  They are physically distinct Vecs so the
+///      two categories can never overlap, regardless of how many
+///      turns the session runs.
+///   5. The last STEER in full, if one has been issued (from
+///      in-memory `last_steers`, seeded at session start from
+///      `tasks::latest_steer` and then refreshed whenever a STEER is
+///      dispatched).
 ///   6. The current pane snapshots.
 #[allow(clippy::too_many_arguments)] // the pieces are simple values from the loop;
                                      // packaging them into a struct would just shift the verbosity one level without
@@ -2534,7 +2531,8 @@ fn build_supervision_user_content(
     task_lines: &[(String, String)],
     hard_constraints: &str,
     notebook_context: &str,
-    verdict_history: &std::collections::VecDeque<String>,
+    prior_window: &[String],
+    this_session_verdicts: &[String],
     last_steer_full: Option<&str>,
     pane_snapshots: &str,
     turn: u64,
@@ -2545,7 +2543,7 @@ fn build_supervision_user_content(
         // Task descriptions may be pasted multi-line input.  Flatten to a
         // single line (escape newlines + CRs) so one pane stays on one
         // line and the downstream section headers keep their column-0
-        // alignment.  See the verdict-history escape for the same reason.
+        // alignment.  See the verdict-block escape for the same reason.
         let desc = desc
             .replace("\r\n", "\\n")
             .replace('\n', "\\n")
@@ -2553,27 +2551,34 @@ fn build_supervision_user_content(
         task_section.push_str(&format!("  pane {pane_id}: {desc}\n"));
     }
 
-    let verdict_history_block = if verdict_history.is_empty() {
-        "(none yet — this is the first check)".to_string()
+    let verdict_block = if prior_window.is_empty() && this_session_verdicts.is_empty() {
+        "(none yet — this is the first check)\n".to_string()
     } else {
         let mut s = String::new();
-        for (i, v) in verdict_history.iter().enumerate() {
-            let age = verdict_history.len() - i;
+        for v in prior_window {
+            // Escape embedded newlines so the bullet stays one visible
+            // line; same rationale as the current-session labels below.
+            let line = v.trim().replace('\n', "\\n");
+            s.push_str(&format!("  - {line}\n"));
+        }
+        let n = this_session_verdicts.len();
+        for (i, v) in this_session_verdicts.iter().enumerate() {
+            let age = n - i;
             let label = if age == 1 {
                 "last".to_string()
             } else {
                 format!("{age} turns ago")
             };
-            s.push_str(&format!("  [{label}] {}\n", v.trim()));
+            let line = v.trim().replace('\n', "\\n");
+            s.push_str(&format!("  [{label}] {line}\n"));
         }
         s
     };
 
     let last_steer_block = match last_steer_full {
         // Newlines in the verdict were already escaped to `\n` upstream
-        // (see `verdict_single_line` in `handle_supervision_inner`) so the
-        // block stays one visible line — hence "escaped newlines" rather
-        // than "full text" in the header.
+        // so the block stays one visible line — hence "escaped newlines"
+        // rather than "full text" in the header.
         Some(s) => format!(
             "Most recent STEER message (escaped newlines):\n  {}\n\n",
             s.trim()
@@ -2588,8 +2593,8 @@ fn build_supervision_user_content(
     out.push('\n');
     out.push_str(hard_constraints);
     out.push_str(notebook_context);
-    out.push_str("Your recent verdicts this session (newest last):\n");
-    out.push_str(&verdict_history_block);
+    out.push_str("Recent supervision verdicts (oldest first; this session labelled):\n");
+    out.push_str(&verdict_block);
     out.push('\n');
     out.push_str(&last_steer_block);
     out.push_str(&format!(
@@ -2687,6 +2692,17 @@ const HEARTBEAT_INTERVAL_SECS: u64 = 10 * 60;
 /// pass it to [`release_supervised_panes`] after this returns.  `turn_counter`
 /// is incremented on every iteration so the wrapper's heartbeat task can
 /// report the current turn number.
+///
+/// Verdict history rendering: at session start we query the DB **once**
+/// per `(repo_dir, tag)` to snapshot two things — the last
+/// [`tasks::RECENT_VERDICTS_WINDOW`] verdicts (rendered as plain-bullet
+/// "prior sessions" entries) and the last dispatched STEER.  During the
+/// loop the daemon is the sole writer for its `(repo_dir, tag)` lease,
+/// so new verdicts are tracked in-memory (`this_session: Vec<String>`
+/// per key; `last_steer_full: Option<String>` per key).  Each turn's
+/// prompt is rendered directly from these in-memory snapshots; no
+/// per-turn DB SELECT runs.  The DB still receives an INSERT per
+/// verdict so later daemon restarts / tag resumes inherit history.
 async fn handle_supervision_inner(
     writer: &Arc<tokio::sync::Mutex<tokio::net::unix::OwnedWriteHalf>>,
     frame_rx: &mut tokio::sync::mpsc::Receiver<String>,
@@ -2746,15 +2762,56 @@ async fn handle_supervision_inner(
     let deadline = supervision_start + max_duration;
     let mut turn: u64 = 0;
 
-    // Verdicts from this supervision session, newest-last.  Bounded so
-    // we never leak memory on 10-h runs; the LLM sees up to N most
-    // recent entries each turn.
-    const VERDICT_HISTORY_LEN: usize = 5;
-    let mut verdict_history: std::collections::VecDeque<String> =
-        std::collections::VecDeque::with_capacity(VERDICT_HISTORY_LEN);
-    // Keep the most recent STEER in full so the LLM can judge whether
-    // Claude acted on it.  None until the first STEER is emitted.
-    let mut last_steer_full: Option<String> = None;
+    // One-time DB snapshot of each supervised (repo_dir, tag) pair's
+    // prior-session history (last RECENT_VERDICTS_WINDOW verdicts,
+    // oldest-first) and last dispatched STEER.  These become the
+    // "prior sessions" rendering input; during the loop they are
+    // read-only.  New verdicts produced by this supervision session
+    // accumulate in `this_session` (below) and update `last_steers`
+    // in-memory — no per-turn DB read.  Safe because the (repo, tag)
+    // lease guarantees we are the sole writer for the keys we hold.
+    type SupTagKey = (String, String);
+    let (prior_windows, mut last_steers): (
+        std::collections::BTreeMap<SupTagKey, Vec<String>>,
+        std::collections::BTreeMap<SupTagKey, Option<String>>,
+    ) = {
+        let state_cl = Arc::clone(state);
+        let panes_cl: Vec<crate::ipc::SupervisionTarget> = panes.to_vec();
+        tokio::task::spawn_blocking(move || -> Result<_> {
+            ensure_tasks_db(&state_cl)?;
+            let guard = state_cl
+                .tasks_db
+                .lock()
+                .map_err(|e| anyhow::anyhow!("tasks_db mutex poisoned: {e}"))?;
+            let mut prior: std::collections::BTreeMap<SupTagKey, Vec<String>> =
+                std::collections::BTreeMap::new();
+            let mut steer: std::collections::BTreeMap<SupTagKey, Option<String>> =
+                std::collections::BTreeMap::new();
+            let Some(conn) = guard.as_ref() else {
+                return Ok((prior, steer));
+            };
+            for p in &panes_cl {
+                if let (Some(repo), Some(tag)) = (p.repo_dir.as_deref(), p.tag.as_deref()) {
+                    let key = (repo.to_string(), tag.to_string());
+                    if let std::collections::btree_map::Entry::Vacant(e) = prior.entry(key.clone())
+                    {
+                        e.insert(tasks::recent_verdicts(conn, repo, tag)?);
+                    }
+                    if let std::collections::btree_map::Entry::Vacant(e) = steer.entry(key) {
+                        e.insert(tasks::latest_steer(conn, repo, tag)?);
+                    }
+                }
+            }
+            Ok::<_, anyhow::Error>((prior, steer))
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("verdict snapshot panicked: {e}"))??
+    };
+    // Verdicts produced by this supervision session, per (repo, tag).
+    // Populated lazily as each key first emits a verdict.  Rendered
+    // alongside `prior_windows` each turn with age-based labels.
+    let mut this_session: std::collections::BTreeMap<SupTagKey, Vec<String>> =
+        std::collections::BTreeMap::new();
 
     // Load skill files (SOUL.md, AGENTS.md, GPU_KERNEL.md) once and reuse
     // across all supervision turns so the LLM has project context for
@@ -2911,13 +2968,43 @@ async fn handle_supervision_inner(
         let hard_constraints = render_hard_constraints(panes).await;
 
         // Task notebook context (opt-in: only panes with tag + repo_dir).
-        // Read-only: per-turn fetch of recent verdicts and the tag's latest
-        // stored desc.  Rendered into a dedicated prompt section that is
-        // clearly labelled "from prior supervision sessions" so the LLM does
-        // not confuse it with in-session continuity (`verdict_history`).
+        // Read-only: emits the header + latest `desc` for each supervised
+        // tag.  Previously also included a "Recent verdicts from prior
+        // sessions" bullet list, but that has been unified into the
+        // single DB-sourced verdict block rendered below.
         // First-turn side effect: write `task_description` as a `desc` row
         // so resumes without a CLI desc can find it.
         let notebook_context = build_notebook_context(state, panes, turn == 1).await;
+
+        // Resolve the supervision key (repo, tag) for this turn.  Same
+        // first-pane resolution used by `build_notebook_context` and
+        // the verdict-persist dedupe below: multi-pane supervision
+        // today shares a single tag, so any pane's key is canonical.
+        let tag_key: Option<SupTagKey> = panes.iter().find_map(|p| {
+            p.repo_dir
+                .as_deref()
+                .zip(p.tag.as_deref())
+                .map(|(r, t)| (r.to_string(), t.to_string()))
+        });
+        // Render inputs come straight from the in-memory snapshots —
+        // no per-turn DB read.  `prior_window` is the session-start
+        // snapshot (plain bullets); `this_session_verdicts` is the
+        // live Vec we've appended to this session (age-labelled).
+        let empty_vec: Vec<String> = Vec::new();
+        let prior_window: &[String] = tag_key
+            .as_ref()
+            .and_then(|k| prior_windows.get(k))
+            .map(|v| v.as_slice())
+            .unwrap_or(&empty_vec);
+        let this_session_verdicts: &[String] = tag_key
+            .as_ref()
+            .and_then(|k| this_session.get(k))
+            .map(|v| v.as_slice())
+            .unwrap_or(&empty_vec);
+        let last_steer_full: Option<&str> = tag_key
+            .as_ref()
+            .and_then(|k| last_steers.get(k))
+            .and_then(|o| o.as_deref());
 
         let task_lines: Vec<(String, String)> = snapshots
             .iter()
@@ -2928,8 +3015,9 @@ async fn handle_supervision_inner(
             &task_lines,
             &hard_constraints,
             &notebook_context,
-            &verdict_history,
-            last_steer_full.as_deref(),
+            prior_window,
+            this_session_verdicts,
+            last_steer_full,
             &pane_snapshots,
             turn,
             elapsed_mins,
@@ -2999,10 +3087,11 @@ async fn handle_supervision_inner(
         let trimmed = response_text.trim();
 
         // --- Parse response and act ---
-        // `steer_dispatched` is true only when the parsed STEER was valid
-        // and actually sent into a pane — so the next turn's carry-over
-        // (`last_steer_full`) reflects a message claude really saw.
-        // Malformed / unknown-pane STEERs leave `last_steer_full` alone.
+        // `steer_dispatched` is tracked for logging parity with the
+        // pre-refactor behaviour; the next turn's "last STEER" block is
+        // now sourced directly from `tasks::latest_steer` rather than
+        // being stashed in a local variable, so no in-memory carry-over
+        // is kept here.
         let mut steer_dispatched = false;
         let verdict_line = if trimmed.starts_with("DONE:") || trimmed == "DONE" {
             let summary = trimmed.strip_prefix("DONE:").unwrap_or("").trim();
@@ -3049,11 +3138,12 @@ async fn handle_supervision_inner(
                             );
                         }
                     }
-                    // Keep the `STEER: <pane>: <msg>` shape exactly as the
-                    // parser (and system prompt) expect, so when this line
-                    // is echoed back via `verdict_history` / `last_steer_full`
-                    // next turn the LLM is primed with the same grammar it
-                    // must emit.  A `STEER %X: ...` (no colon after STEER)
+                    // Keep the `STEER: <pane>: <msg>` shape exactly as
+                    // the parser (and system prompt) expect, so when
+                    // this line is echoed back via the DB-sourced
+                    // verdict block / `latest_steer` lookup next turn
+                    // the LLM is primed with the same grammar it must
+                    // emit.  A `STEER %X: ...` (no colon after STEER)
                     // would be mis-parsed as WAIT on the next round-trip.
                     format!("  → STEER: {pane_id}: {message}\n")
                 } else if !pane_id.is_empty() && !message.is_empty() && !is_valid_pane {
@@ -3073,51 +3163,70 @@ async fn handle_supervision_inner(
                 format!("  → WAIT: {note}\n")
             }
         };
-        // Remember this verdict (minus the display prefix) so the next
-        // iteration can pass it back into the user prompt.  `verdict_line`
-        // starts with "  → " and ends with "\n"; strip both for a compact
-        // one-line carry-over.
+        // Normalise the verdict to a compact single-line form before
+        // persisting.  `verdict_line` starts with "  → " and ends with
+        // "\n"; strip both, then escape embedded newlines (possible
+        // when a STEER message spans multiple lines — parser doesn't
+        // reject them) so the DB row stays one visible line.  This
+        // matters because the row is later read back into the prompt
+        // verdict block and into the "last STEER" carry-over; embedded
+        // newlines would break column-0 alignment of the downstream
+        // section headers.
         let verdict_compact = verdict_line
             .trim_start_matches("  → ")
             .trim_end_matches('\n')
             .to_string();
-        // The verdict_history rendering uses one line per entry; an
-        // embedded `\n` (possible when a STEER message spans multiple
-        // lines — parser doesn't reject them) would break the `[last] …`
-        // / `[N turns ago] …` table shape and push downstream section
-        // headers off column 0.  Escape newlines to a visible `\n` so
-        // the LLM still sees the content but the layout is preserved.
         let verdict_single_line = verdict_compact.replace('\n', "\\n");
-        if verdict_history.len() >= VERDICT_HISTORY_LEN {
-            verdict_history.pop_front();
-        }
-        verdict_history.push_back(verdict_single_line.clone());
-        // Only stash the full text when the STEER was actually dispatched.
-        // `steer_dispatched` stays false for "unknown pane, ignored" and
-        // "malformed response" variants so the next turn's prompt does not
-        // claim claude received something it never did.  Use the escaped
-        // single-line form for the same layout-protection reason.
-        if steer_dispatched {
-            last_steer_full = Some(verdict_single_line);
-        }
+        // `steer_dispatched` previously gated a local `last_steer_full`
+        // update so next turn's prompt would not claim claude received
+        // a message it never did.  Now that `last_steer_full` is derived
+        // from `tasks::latest_steer`, we enforce the same invariant by
+        // skipping the DB write when the STEER was not delivered.
+        // Malformed / unknown-pane STEERs and WAIT/DONE rows all flow
+        // through here unchanged.
+        let persist_this_verdict = if verdict_single_line.starts_with("STEER:") {
+            steer_dispatched
+        } else {
+            true
+        };
 
-        // Persist verdict to task notebook (best-effort, once per unique
-        // `(repo_dir, tag)`).  Deduped because multiple panes sharing a
-        // tag (user `--tag foo` for a multi-task launch) would otherwise
-        // append duplicate rows for a single supervision turn.  Failures
-        // (panic OR SQLite Err) are logged but must not break the loop —
-        // notebook is auxiliary to the live verdict decision.
-        let mut verdict_targets: std::collections::HashSet<(String, String)> =
+        // Record verdict in the in-memory `this_session` log and, if it
+        // was a dispatched STEER, refresh `last_steers` — these feed
+        // the next turn's prompt directly, no DB round-trip.  Then
+        // also write to `task_notes` so a future daemon restart or
+        // tag resume can reconstruct the same history.  Dedupe by
+        // unique `(repo_dir, tag)` — multiple panes sharing a tag
+        // (a `/claude --tag foo` multi-task launch) would otherwise
+        // double-record for a single supervision turn.
+        let mut verdict_targets: std::collections::HashSet<SupTagKey> =
             std::collections::HashSet::new();
-        for target in panes.iter() {
-            if let (Some(repo_dir), Some(tag)) = (target.repo_dir.as_deref(), target.tag.as_deref())
-            {
-                verdict_targets.insert((repo_dir.to_string(), tag.to_string()));
+        if persist_this_verdict {
+            for target in panes.iter() {
+                if let (Some(repo_dir), Some(tag)) =
+                    (target.repo_dir.as_deref(), target.tag.as_deref())
+                {
+                    verdict_targets.insert((repo_dir.to_string(), tag.to_string()));
+                }
+            }
+        }
+        let is_steer = verdict_single_line.starts_with("STEER:");
+        for key in &verdict_targets {
+            let entry = this_session.entry(key.clone()).or_default();
+            entry.push(verdict_single_line.clone());
+            // Cap the in-memory session log so a multi-hour
+            // supervision doesn't grow it without bound.  Matches the
+            // DB snapshot window so `prior_window + this_session`
+            // reflects roughly two windows of recent history at peak.
+            while entry.len() > tasks::RECENT_VERDICTS_WINDOW {
+                entry.remove(0);
+            }
+            if is_steer {
+                last_steers.insert(key.clone(), Some(verdict_single_line.clone()));
             }
         }
         for (repo_dir, tag) in verdict_targets {
             let state_cl = Arc::clone(state);
-            let verdict = verdict_compact.clone();
+            let verdict = verdict_single_line.clone();
             let repo_dir_log = repo_dir.clone();
             let tag_log = tag.clone();
             match tokio::task::spawn_blocking(move || -> Result<()> {
@@ -8502,12 +8611,14 @@ mod tests {
             "%5".to_string(),
             "implement feature X on sim-9900".to_string(),
         )];
-        let history: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+        let prior: Vec<String> = Vec::new();
+        let this_session: Vec<String> = Vec::new();
         let out = build_supervision_user_content(
             &task_lines,
             "",
             "",
-            &history,
+            &prior,
+            &this_session,
             None,
             "=== Pane %5 ===\nidle\n",
             1,
@@ -8528,16 +8639,105 @@ mod tests {
     }
 
     #[test]
-    fn supervision_prompt_verdict_history_renders_multiple_lines() {
-        let task_lines = vec![("%5".to_string(), "task".to_string())];
-        let mut history = std::collections::VecDeque::new();
-        history.push_back("WAIT: building".to_string());
-        // Use the real on-wire shape the parser emits (`STEER: <pane>: …`
-        // with the leading colon) so the test catches future drift if the
-        // verdict format or parser prefix diverge.
-        history.push_back("STEER: %5: use sim-9900".to_string());
-        history.push_back("WAIT: now on sim-9900".to_string());
-        let out = build_supervision_user_content(&task_lines, "", "", &history, None, "snap", 4, 3);
+    fn supervision_prompt_verdict_block_labels_prior_and_current_distinctly() {
+        let prior = vec![
+            "WAIT: prior-session WAIT A".to_string(),
+            "STEER: %5: prior-session STEER".to_string(),
+        ];
+        let this_session = vec![
+            "WAIT: this-session turn 1".to_string(),
+            "STEER: %5: this-session turn 2".to_string(),
+            "WAIT: this-session turn 3".to_string(),
+        ];
+        let out = build_supervision_user_content(
+            &[("%5".to_string(), "task".to_string())],
+            "",
+            "",
+            &prior,
+            &this_session,
+            None,
+            "snap",
+            3,
+            10,
+        );
+        // Prior rows render as plain bullets.
+        assert!(
+            out.contains("- WAIT: prior-session WAIT A"),
+            "prior WAIT row must render as bullet, got: {out:?}"
+        );
+        assert!(
+            out.contains("- STEER: %5: prior-session STEER"),
+            "prior STEER row must render as bullet, got: {out:?}"
+        );
+        // Current-session rows render with age labels, oldest = highest age.
+        assert!(
+            out.contains("[3 turns ago] WAIT: this-session turn 1"),
+            "oldest in-session turn must be [3 turns ago], got: {out:?}"
+        );
+        assert!(
+            out.contains("[2 turns ago] STEER: %5: this-session turn 2"),
+            "middle in-session turn must be [2 turns ago], got: {out:?}"
+        );
+        assert!(
+            out.contains("[last] WAIT: this-session turn 3"),
+            "newest in-session turn must be [last], got: {out:?}"
+        );
+    }
+
+    #[test]
+    fn supervision_prompt_verdict_block_all_prior_when_empty_session() {
+        let prior = vec!["WAIT: a".to_string(), "WAIT: b".to_string()];
+        let this_session: Vec<String> = Vec::new();
+        let out = build_supervision_user_content(
+            &[("%5".to_string(), "task".to_string())],
+            "",
+            "",
+            &prior,
+            &this_session,
+            None,
+            "snap",
+            0,
+            0,
+        );
+        assert!(
+            out.contains("- WAIT: a"),
+            "prior bullet a must render, got: {out:?}"
+        );
+        assert!(
+            out.contains("- WAIT: b"),
+            "prior bullet b must render, got: {out:?}"
+        );
+        assert!(
+            !out.contains("[last]"),
+            "no current-session label when session is empty, got: {out:?}"
+        );
+        assert!(
+            !out.contains("turns ago"),
+            "no age label when session is empty, got: {out:?}"
+        );
+    }
+
+    #[test]
+    fn supervision_prompt_verdict_block_all_current_when_no_prior_window() {
+        // Prior window empty (no DB history at session start); every
+        // row is rendered with the age-label treatment.
+        let prior: Vec<String> = Vec::new();
+        let this_session = vec![
+            "WAIT: building".to_string(),
+            "STEER: %5: use sim-9900".to_string(),
+            "WAIT: now on sim-9900".to_string(),
+        ];
+        let out = build_supervision_user_content(
+            &[("%5".to_string(), "task".to_string())],
+            "",
+            "",
+            &prior,
+            &this_session,
+            None,
+            "snap",
+            4,
+            3,
+        );
         assert!(
             out.contains("[last] WAIT: now on sim-9900"),
             "newest verdict must be labelled [last], got: {out:?}"
@@ -8555,7 +8755,8 @@ mod tests {
     #[test]
     fn supervision_prompt_last_steer_block_shows_full_text() {
         let task_lines = vec![("%5".to_string(), "task".to_string())];
-        let history: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+        let prior: Vec<String> = Vec::new();
+        let this_session: Vec<String> = Vec::new();
         // Matches the real on-wire `STEER: <pane>: …` shape emitted by
         // `handle_supervision_inner`.
         let steer = "STEER: %5: stop — you are using sim-9903 but the \
@@ -8564,7 +8765,8 @@ mod tests {
             &task_lines,
             "",
             "",
-            &history,
+            &prior,
+            &this_session,
             Some(steer),
             "snap",
             2,

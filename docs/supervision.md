@@ -20,9 +20,36 @@ notebook preamble (for `--tag` runs) and must return exactly one of:
 | `DONE: <summary>` | Task is complete | Stream the summary to the client, exit |
 
 The prompt that asks for this verdict is built from the pane capture plus the
-notebook preamble (`build_notebook_context`, `src/daemon.rs:2305`). The
-completion is capped at `MAX_SUPERVISION_TOKENS` — enough for a short verdict,
-not enough for a long narrative.
+notebook preamble (`build_notebook_context`, `src/daemon.rs`) — which now
+carries only the tag's latest `desc`.  The completion is capped at
+`MAX_SUPERVISION_TOKENS` — enough for a short verdict, not enough for a long
+narrative.
+
+### Verdict history
+
+At supervision start the loop queries `task_notes` **once** per
+`(repo_dir, tag)` to snapshot a prior-session window
+(`RECENT_VERDICTS_WINDOW = 10` rows, oldest first) and the last
+dispatched STEER.  These snapshots are read-only for the life of the
+session.  New verdicts produced by this session are accumulated in an
+in-memory `Vec<String>` per key and the live STEER is tracked
+in-memory as well, so each turn renders its prompt from memory — no
+per-turn DB SELECT runs.
+
+Rendering is straightforward because the two categories are physically
+distinct Vecs: the prior window renders as plain bullets
+(prior sessions), the in-session log renders with `[last]` /
+`[N turns ago]` labels.  An earlier design kept a `VecDeque<String>`
+alongside a DB-sourced "prior verdicts" section in the notebook — those
+two reads overlapped once the session ran long enough, so the LLM saw
+the same content twice.  Later intermediate designs tried to partition
+a single DB query by `id > session_start_id`; that worked but made
+every turn pay for a DB round-trip even though the daemon is the sole
+writer for its own leased key.  Keeping the in-session log in memory is
+both simpler and cheaper.
+
+The DB is still the write-through target for every verdict so a future
+daemon restart or `/claude --tag <same>` resume inherits the history.
 
 ## Timing
 
