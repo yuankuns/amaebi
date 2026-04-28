@@ -1001,6 +1001,12 @@ pub async fn run_chat_loop(
         eprintln!("Chat session started (ID: {session_id}). Empty line or Ctrl-D to exit.\n");
     }
 
+    // Snapshot session id for the history writer so each persisted
+    // prompt carries the chat's UUID in its `session_id` field, keeping
+    // `history.jsonl` correlatable with `~/.amaebi/sessions.json` and
+    // the daemon's per-session memory.
+    prompt_input::set_session_id(&session_id);
+
     let stream = connect_or_start_daemon(&socket).await?;
     let (read_half, mut write_half) = stream.into_split();
     let mut lines = BufReader::new(read_half).lines();
@@ -2190,6 +2196,16 @@ mod prompt_input {
     /// Basename of the persistent history file under `~/.amaebi/`.
     const HISTORY_FILENAME: &str = "history.jsonl";
 
+    /// Upper bound on bytes read from the tail of the history file when
+    /// seeding rustyline's in-memory ring.  The file is append-only
+    /// and grows without compaction; without this cap a multi-month
+    /// heavy user's first `amaebi chat` readline would scan tens of
+    /// MB every launch.  4 MiB comfortably holds `HISTORY_CAP = 1000`
+    /// rows at the `MAX_LINE_BYTES` (~3.8 KiB) ceiling, so a full
+    /// project's worth of matching history still loads — we only
+    /// drop the tail of a globally oversized file.
+    const LOAD_TAIL_BYTES: u64 = 4 * 1024 * 1024;
+
     /// Maximum byte length of a serialised history row *including* the
     /// trailing `\n`.  Kept comfortably below Linux's `PIPE_BUF` (4096) as
     /// a best-effort sizing budget for the "no explicit lock" design —
@@ -2236,6 +2252,33 @@ mod prompt_input {
     /// hop OS threads.  A single shared editor also preserves in-memory
     /// history across calls without any extra plumbing.
     static EDITOR: OnceLock<Mutex<rustyline::DefaultEditor>> = OnceLock::new();
+
+    /// Current chat session UUID, set once by [`set_session_id`] at the
+    /// start of `run_chat_loop` and read by [`append_history_line`] when
+    /// persisting each prompt row.  Kept as module-level state rather
+    /// than a `read_line_raw` parameter because the three call sites
+    /// pass the bare function pointer to `spawn_blocking`, and adding
+    /// an argument would require capturing via a closure at every site.
+    ///
+    /// `OnceLock` is intentional: a chat session only ever has one id,
+    /// and later resumes start a new `run_chat_loop` in a fresh
+    /// process, so a single set-per-process slot is sufficient.
+    static SESSION_ID: OnceLock<String> = OnceLock::new();
+
+    /// Record the current chat session id so subsequent history rows
+    /// carry it in their `session_id` field.  Idempotent and safe to
+    /// call before any readline; called once from `run_chat_loop`
+    /// after the session id has been resolved.
+    pub(super) fn set_session_id(id: &str) {
+        let _ = SESSION_ID.set(id.to_owned());
+    }
+
+    /// Read the session id snapshot for history rows.  Empty string
+    /// when `set_session_id` was not called (e.g. tests or non-chat
+    /// paths — `amaebi ask` does not persist history today).
+    fn current_session_id() -> String {
+        SESSION_ID.get().cloned().unwrap_or_default()
+    }
 
     /// Saved termios from the first TTY entry, used by [`restore_terminal_now`]
     /// as a belt-and-suspenders path when a detached readline task may have
@@ -2503,6 +2546,17 @@ mod prompt_input {
             return String::new();
         }
 
+        // Drop rows whose `display` was non-empty originally but whose
+        // truncated form is empty — a blank history entry is useless to
+        // the user (nothing recognisable to navigate to via ↑) and
+        // misleading when inspecting the file.  Non-empty inputs can
+        // only reach this state when the shrink loop drove the display
+        // budget below `MARKER.len()`, which means cwd / session_id
+        // already dominate the budget on their own.
+        if capped_display.is_empty() && !display.is_empty() {
+            return String::new();
+        }
+
         json.push('\n');
         json
     }
@@ -2525,7 +2579,8 @@ mod prompt_input {
             std::fs::create_dir_all(parent)?;
         }
         let cwd = cwd_for_history();
-        let json = build_history_line(display, "", &cwd, "", now_ms());
+        let session_id = current_session_id();
+        let json = build_history_line(display, "", &cwd, &session_id, now_ms());
         append_history_line_to_path(&path, &json)
     }
 
@@ -2626,6 +2681,12 @@ mod prompt_input {
     /// anything — matching the behaviour when `std::env::current_dir()`
     /// fails on a real run.
     ///
+    /// Bounded start-up cost: for files larger than [`LOAD_TAIL_BYTES`]
+    /// we seek to `file_len - LOAD_TAIL_BYTES` and skip the partial
+    /// first line, so the startup scan is capped regardless of how
+    /// much history has accumulated across months of use.  Oldest-
+    /// first ordering within the loaded window is preserved.
+    ///
     /// Truly-bounded line read: we scan `BufRead::fill_buf()` for `\n`
     /// and consume in chunks, so a pathologically huge line without a
     /// newline can never force the in-memory line buffer above
@@ -2641,19 +2702,36 @@ mod prompt_input {
         if cwd.is_empty() {
             return Ok(());
         }
-        let file = match std::fs::File::open(path) {
+        let mut file = match std::fs::File::open(path) {
             Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(e) => return Err(e),
         };
-        use std::io::BufRead as _;
+        use std::io::{BufRead as _, Seek as _};
+        // For files larger than the tail budget, seek near the end and
+        // discard the (probably-partial) first line we land in.  This
+        // bounds startup I/O to O(LOAD_TAIL_BYTES) regardless of how
+        // much history has accumulated, while still producing an
+        // oldest-first sequence within the returned window.
+        let len = file.metadata()?.len();
+        // Seeking mid-file almost always lands inside a record, so
+        // enter the loop in `discarding` mode: the existing skip-
+        // until-newline logic will drop the partial head of the first
+        // surviving line and resume parsing at the next line boundary.
+        let discard_head = if len > LOAD_TAIL_BYTES {
+            let offset = len - LOAD_TAIL_BYTES;
+            file.seek(std::io::SeekFrom::Start(offset))?;
+            true
+        } else {
+            false
+        };
         let mut reader = std::io::BufReader::new(file);
         // Per-line memory cap — slightly above MAX_LINE_BYTES so a
         // legitimate written-at-the-cap line still parses while anything
         // bigger is treated as garbage and discarded without OOMing.
         const READ_CAP: usize = MAX_LINE_BYTES + 64;
         let mut buf: Vec<u8> = Vec::with_capacity(512);
-        let mut discarding = false;
+        let mut discarding = discard_head;
         loop {
             let chunk = reader.fill_buf()?;
             if chunk.is_empty() {
@@ -2942,6 +3020,78 @@ mod prompt_input {
             let mut editor = test_editor();
             load_history_from_path(&path, "/cwd", &mut editor).expect("missing file is ok");
             assert!(collect_history(&editor).is_empty());
+        }
+
+        #[test]
+        fn load_history_bounds_tail_for_oversized_file() {
+            // Write far more than LOAD_TAIL_BYTES of valid rows.  The
+            // loader must seek to the tail, drop the partial first
+            // line, and preserve oldest-first ordering of what survives.
+            // Using "/p" as cwd keeps fixed fields cheap so we can pad
+            // `display` to ~4 KiB per row and exceed 4 MiB quickly.
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("history.jsonl");
+            let row_ts = |i: u64| i; // stable ordering keys
+            let filler = "x".repeat(3000);
+            let total = (LOAD_TAIL_BYTES as usize) / 3000 + 256;
+            for i in 0..total {
+                let display = format!("{filler}-{i}");
+                let line = build_history_line(&display, "", "/p", "", row_ts(i as u64));
+                append_history_line_to_path(&path, &line).unwrap();
+            }
+            // Final marker row we definitely want to see — shorter and
+            // unique so we can assert it lands in the editor.
+            let tail = build_history_line("tail-marker", "", "/p", "", u64::MAX);
+            append_history_line_to_path(&path, &tail).unwrap();
+
+            let mut editor = test_editor();
+            load_history_from_path(&path, "/p", &mut editor).expect("load");
+            let loaded = collect_history(&editor);
+            assert!(
+                loaded.last().map(|s| s.as_str()) == Some("tail-marker"),
+                "tail must be the last entry, got {:?}",
+                loaded.last()
+            );
+            assert!(
+                loaded.len() < total,
+                "tail window must drop older rows, loaded {} of {}",
+                loaded.len(),
+                total
+            );
+        }
+
+        #[test]
+        fn build_history_line_drops_row_when_display_truncates_to_empty() {
+            // Pick `cwd` large enough that the initial serialisation
+            // overflows `MAX_LINE_BYTES`, forcing the shrink loop to
+            // halve the 17-byte display to 8 bytes.  `MARKER.len()` is
+            // 14, so `truncate_utf8_with_marker(_, 8)` returns "" and
+            // `capped_display` becomes empty.  Re-serialised length is
+            // now small enough to fit, so the "total oversize" bail-out
+            // does NOT fire — only the explicit empty-display drop
+            // guards against writing a blank-display row.
+            //
+            // Target math for the chosen cwd_size = 3715:
+            //   fixed JSON overhead = 77 bytes (empty fields + ts=1)
+            //   initial: 77 + 17 + 3715 = 3809  (> MAX_LINE_BYTES)
+            //   shrunk: 77 +  0 + 3715 = 3792  (<= MAX_LINE_BYTES)
+            let cwd_size = 3715;
+            let cwd = "/".to_string() + &"x".repeat(cwd_size - 1);
+            let line = build_history_line("important prompt!", "", &cwd, "", 1);
+            assert!(
+                line.is_empty(),
+                "expected empty result (row dropped), got {} bytes: {line:?}",
+                line.len()
+            );
+        }
+
+        #[test]
+        fn build_history_line_includes_session_id_in_output() {
+            let line = build_history_line("hello", "", "/project", "sess-abc-123", 7);
+            assert!(line.ends_with('\n'));
+            let row: HistoryRow = serde_json::from_str(line.trim_end()).expect("parse");
+            assert_eq!(row.session_id, "sess-abc-123");
+            assert_eq!(row.display, "hello");
         }
     }
 }
