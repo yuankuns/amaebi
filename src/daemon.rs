@@ -2086,12 +2086,17 @@ async fn wait_for_pane_idle(
 /// Send literal text + Enter to a tmux pane (best-effort).
 ///
 /// Sends the text with `send-keys -l --` (literal, no keyname interpretation),
-/// pauses for 1 s to let the receiving TUI's paste buffer drain, then sends
+/// pauses to let the receiving TUI's paste buffer drain, then sends
 /// Enter as a separate key press.  The pause matches the `handle_claude_launch`
 /// injection path (daemon.rs:1081) and exists because Claude Code's TUI can
 /// swallow or defer the trailing Enter when it arrives before the pasted text
 /// has been rendered into the input field — which manifests as a STEER
 /// message appearing in the pane input but never submitting.
+///
+/// The sleep duration is kept in sync with the LLM-facing `tmux_send_text`
+/// tool via [`crate::tools::TEXT_RENDER_SLEEP_SECS`]; the previous 1 s value
+/// was not enough for multi-KB markdown pastes and caused dropped Enters.
+///
 /// Returns `true` when BOTH the literal text injection and the trailing
 /// Enter press reported success to tmux.  Any tmux failure (exit-code non-
 /// zero, or spawn error) yields `false` so callers can accurately report
@@ -2113,8 +2118,10 @@ fn send_pane_keys(pane_id: &str, text: &str) -> bool {
             false
         }
     };
-    // Let the TUI process the pasted text before pressing Enter.
-    std::thread::sleep(std::time::Duration::from_secs(1));
+    // Shared with `tmux_send_text` so both paste paths use the same render-delay.
+    std::thread::sleep(std::time::Duration::from_secs(
+        crate::tools::TEXT_RENDER_SLEEP_SECS,
+    ));
     let enter_ok = match std::process::Command::new("tmux")
         .args(["send-keys", "-t", pane_id, "Enter"])
         .status()
@@ -4063,8 +4070,13 @@ fn summarise_tool_detail(tool_name: &str, args: &serde_json::Value) -> String {
             .and_then(|v| v.as_str())
             .unwrap_or_default()
             .to_string(),
-        "tmux_send_keys" => args
-            .get("keys")
+        "tmux_send_text" => args
+            .get("text")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        "tmux_send_key" => args
+            .get("key")
             .and_then(|v| v.as_str())
             .unwrap_or_default()
             .to_string(),

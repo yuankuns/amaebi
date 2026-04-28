@@ -115,7 +115,8 @@ impl ToolExecutor for LocalExecutor {
                 shell_command(args, self.sandbox.as_deref(), self.default_cwd.as_deref()).await
             }
             "tmux_capture_pane" => tmux_capture_pane(args).await,
-            "tmux_send_keys" => tmux_send_keys(args).await,
+            "tmux_send_text" => tmux_send_text(args).await,
+            "tmux_send_key" => tmux_send_key(args).await,
             "tmux_wait" => tmux_wait(args).await,
             "wait_for_file" => wait_for_file(args).await,
             "tmux_rename_pane" => tmux_rename_pane(args).await,
@@ -216,49 +217,79 @@ async fn tmux_capture_pane(args: serde_json::Value) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-/// Build the argument list for `tmux send-keys`.
+/// Seconds to wait between sending a literal text paste and the
+/// trailing `Enter`, giving the receiving TUI time to render the paste.
+/// 5s covers Claude Code TUI markdown layout at typical paste sizes;
+/// the old 1s-or-none behavior raced the renderer and dropped Enters.
+pub const TEXT_RENDER_SLEEP_SECS: u64 = 5;
+
+/// Send a block of text into a tmux pane and submit it.
 ///
-/// Extracted as a pure function so the argument-construction logic can be
-/// unit-tested without requiring a real tmux session.
-fn tmux_send_keys_argv(target: &str, keys: &str, press_enter: bool) -> Vec<String> {
-    let mut args = vec![
-        "send-keys".to_string(),
-        "-t".to_string(),
-        target.to_string(),
-        keys.to_string(),
-    ];
-    // Avoid a double Enter when the caller explicitly sends the "Enter" key name.
-    // e.g. keys="Enter", enter=true (default) presses Enter once, not twice.
-    if press_enter && keys != "Enter" {
-        args.push("Enter".to_string());
-    }
-    args
-}
-
-/// Send keystrokes to a tmux pane (for interactive programs).
-async fn tmux_send_keys(args: serde_json::Value) -> Result<String> {
-    let keys = args["keys"]
+/// Uses `tmux send-keys -l --` (literal mode) so the bytes are sent
+/// verbatim — `Enter`, `C-c`, `\n`, and any other escape-like substring
+/// inside `text` are NOT interpreted as tmux key names.  After the text
+/// is injected we sleep `TEXT_RENDER_SLEEP_SECS` so the receiving TUI
+/// (Claude Code, shells, etc.) can finish rendering before the trailing
+/// `Enter` arrives — otherwise the Enter can be dropped or fire on an
+/// empty input field.
+///
+/// For single control keys (`C-c`, `Escape`, `q`, arrow keys), use
+/// `tmux_send_key` instead: no literal flag, no sleep, no Enter.
+async fn tmux_send_text(args: serde_json::Value) -> Result<String> {
+    let text = args["text"]
         .as_str()
-        .context("tmux_send_keys: missing string argument 'keys'")?;
+        .context("tmux_send_text: missing string argument 'text'")?;
     let target = args["target"].as_str().unwrap_or("%0");
-    // Default true: append an Enter keystroke so text is submitted.
-    // Set enter=false for single keypresses (q, Escape, C-c, arrow keys, etc.)
-    // to avoid an unintended trailing Enter.
-    let press_enter = args["enter"].as_bool().unwrap_or(true);
 
-    let argv = tmux_send_keys_argv(target, keys, press_enter);
-    let output = Command::new("tmux")
-        .args(&argv)
+    // `-l --` forces literal mode and defends against payloads starting with `-`.
+    let send = Command::new("tmux")
+        .args(["send-keys", "-t", target, "-l", "--", text])
         .output()
         .await
-        .context("spawning tmux send-keys")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("tmux send-keys failed: {stderr}");
+        .context("spawning tmux send-keys (text)")?;
+    if !send.status.success() {
+        let stderr = String::from_utf8_lossy(&send.stderr);
+        anyhow::bail!("tmux send-keys (text) failed: {stderr}");
     }
 
-    Ok(format!("sent keys to pane {target}"))
+    tokio::time::sleep(std::time::Duration::from_secs(TEXT_RENDER_SLEEP_SECS)).await;
+
+    let enter = Command::new("tmux")
+        .args(["send-keys", "-t", target, "Enter"])
+        .output()
+        .await
+        .context("spawning tmux send-keys (Enter)")?;
+    if !enter.status.success() {
+        let stderr = String::from_utf8_lossy(&enter.stderr);
+        anyhow::bail!("tmux send-keys (Enter) failed: {stderr}");
+    }
+
+    Ok(format!("sent {} bytes to pane {target}", text.len()))
+}
+
+/// Send a single tmux key (or key combo) to a pane.
+///
+/// `key` is passed straight to `tmux send-keys` WITHOUT `-l`, so tmux's
+/// key-name parser interprets it: `C-c`, `Escape`, `Up`, `q`, `Enter`,
+/// etc. all work.  No Enter is appended and no sleep runs — use
+/// `tmux_send_text` for prompt-like text + submit flows.
+async fn tmux_send_key(args: serde_json::Value) -> Result<String> {
+    let key = args["key"]
+        .as_str()
+        .context("tmux_send_key: missing string argument 'key'")?;
+    let target = args["target"].as_str().unwrap_or("%0");
+
+    let out = Command::new("tmux")
+        .args(["send-keys", "-t", target, key])
+        .output()
+        .await
+        .context("spawning tmux send-keys (key)")?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        anyhow::bail!("tmux send-keys (key) failed: {stderr}");
+    }
+
+    Ok(format!("sent key {key:?} to pane {target}"))
 }
 
 /// Poll a tmux pane until its output has been stable for `idle_secs`, then
@@ -727,33 +758,57 @@ pub fn tool_schemas(include_spawn_agent: bool) -> Vec<serde_json::Value> {
         serde_json::json!({
             "type": "function",
             "function": {
-                "name": "tmux_send_keys",
-                "description": "Send keystrokes to a tmux pane and press Enter to submit \
-                                (default). Use for interactive programs (e.g. answering \
-                                prompts, sending messages to another agent). Set enter=false \
-                                to type text without submitting. For background tasks prefer \
-                                shell_command.",
+                "name": "tmux_send_text",
+                "description": "Send a block of text to a tmux pane and submit it.  Use this \
+                                when you want to paste a prompt / command / message into an \
+                                interactive TUI (like Claude Code, a REPL, a shell).  The \
+                                text is sent literally (escape sequences and key names inside \
+                                the text are NOT interpreted), followed by a 5-second wait so \
+                                the receiving TUI can finish rendering, followed by Enter to \
+                                submit.  For single control keys like C-c, Escape, arrow \
+                                keys, or q, use tmux_send_key instead.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "keys": {
-                            "type": "string",
-                            "description": "Text to type (e.g. 'hello world'). \
-                                            For single keypresses such as 'q', 'Escape', \
-                                            'C-c', or arrow keys, set enter=false to avoid \
-                                            an unintended trailing Enter keystroke."
-                        },
                         "target": {
                             "type": "string",
-                            "description": "tmux target pane. Defaults to %0."
+                            "description": "tmux pane target (e.g. '%3' or 'session:0.1'). \
+                                            Defaults to '%0'."
                         },
-                        "enter": {
-                            "type": "boolean",
-                            "description": "Press Enter after sending keys (default true). \
-                                            Set false for control keys or partial input."
+                        "text": {
+                            "type": "string",
+                            "description": "The text to paste into the pane.  Will be \
+                                            followed by an automatic Enter after a \
+                                            render-delay."
                         }
                     },
-                    "required": ["keys"]
+                    "required": ["text"]
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "tmux_send_key",
+                "description": "Send a single tmux key (or key combo) to a pane.  Examples: \
+                                'C-c' (Ctrl-C), 'Escape', 'Up', 'q', 'Enter', 'C-m'.  Does \
+                                NOT append an Enter or sleep — use tmux_send_text for \
+                                prompt-style paste + submit flows.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "target": {
+                            "type": "string",
+                            "description": "tmux pane target (e.g. '%3' or 'session:0.1'). \
+                                            Defaults to '%0'."
+                        },
+                        "key": {
+                            "type": "string",
+                            "description": "A tmux key name (e.g. 'C-c', 'Escape', 'Up', \
+                                            'Enter') or printable character."
+                        }
+                    },
+                    "required": ["key"]
                 }
             }
         }),
@@ -1039,7 +1094,8 @@ mod tests {
         for name in [
             "shell_command",
             "tmux_capture_pane",
-            "tmux_send_keys",
+            "tmux_send_text",
+            "tmux_send_key",
             "tmux_wait",
             "wait_for_file",
             "read_file",
@@ -1559,54 +1615,49 @@ mod tests {
         assert!(result.starts_with("timeout:"), "got: {result}");
     }
 
-    // ---- tmux_send_keys enter parameter ------------------------------------
+    // ---- tmux_send_text / tmux_send_key split ------------------------------
 
     #[test]
-    fn tmux_send_keys_schema_has_enter_field() {
+    fn tmux_send_text_schema_exists_and_takes_text() {
         let schemas = tool_schemas(true);
         let schema = schemas
             .iter()
-            .find(|s| s["function"]["name"] == "tmux_send_keys")
-            .expect("tmux_send_keys schema must exist");
+            .find(|s| s["function"]["name"] == "tmux_send_text")
+            .expect("tmux_send_text schema must exist");
         let props = &schema["function"]["parameters"]["properties"];
         assert!(
-            !props["enter"].is_null(),
-            "tmux_send_keys schema must expose 'enter' property"
+            props.get("text").is_some(),
+            "tmux_send_text must expose 'text'"
         );
-        assert_eq!(
-            props["enter"]["type"].as_str(),
-            Some("boolean"),
-            "'enter' property must be boolean"
+        assert!(
+            props.get("enter").is_none(),
+            "tmux_send_text must NOT expose 'enter' (split tool replaces mode flag)"
         );
     }
 
     #[test]
-    fn tmux_send_keys_argv_appends_enter_by_default() {
-        // Default (press_enter=true) appends "Enter" as a separate arg.
-        let argv = tmux_send_keys_argv("%0", "hello world", true);
-        assert_eq!(argv.last().map(|s| s.as_str()), Some("Enter"));
-        assert!(argv.contains(&"hello world".to_string()));
+    fn tmux_send_key_schema_exists_and_takes_key() {
+        let schemas = tool_schemas(true);
+        let schema = schemas
+            .iter()
+            .find(|s| s["function"]["name"] == "tmux_send_key")
+            .expect("tmux_send_key schema must exist");
+        let props = &schema["function"]["parameters"]["properties"];
+        assert!(
+            props.get("key").is_some(),
+            "tmux_send_key must expose 'key'"
+        );
     }
 
     #[test]
-    fn tmux_send_keys_argv_no_enter_when_disabled() {
-        let argv = tmux_send_keys_argv("%0", "hello", false);
-        assert!(!argv.contains(&"Enter".to_string()));
-    }
-
-    #[test]
-    fn tmux_send_keys_argv_no_double_enter_when_keys_is_enter() {
-        // keys="Enter" + press_enter=true should produce only one "Enter" in argv.
-        let argv = tmux_send_keys_argv("%0", "Enter", true);
-        let enter_count = argv.iter().filter(|a| a.as_str() == "Enter").count();
-        assert_eq!(enter_count, 1, "must send exactly one Enter: {argv:?}");
-    }
-
-    #[test]
-    fn tmux_send_keys_argv_control_key_no_trailing_enter() {
-        // C-c with enter=false must not append Enter (would confuse the program).
-        let argv = tmux_send_keys_argv("%0", "C-c", false);
-        assert!(!argv.contains(&"Enter".to_string()));
+    fn tmux_send_keys_schema_removed() {
+        let schemas = tool_schemas(true);
+        assert!(
+            schemas
+                .iter()
+                .all(|s| s["function"]["name"] != "tmux_send_keys"),
+            "legacy tmux_send_keys schema must be removed"
+        );
     }
 
     #[tokio::test]
