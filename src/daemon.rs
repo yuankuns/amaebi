@@ -2739,8 +2739,23 @@ const SUPERVISION_SYSTEM_PROMPT: &str = concat!(
     "    \"observed_action\": \"<one sentence — what changed on disk this turn, per the git evidence?>\",\n",
     "    \"verdict\":         \"WAIT\" | \"STEER\" | \"DONE\",\n",
     "    \"rationale\":       \"<one sentence — why this verdict?>\",\n",
-    "    \"steer_message\":   \"<only present when verdict=STEER: the message to send to the pane; must name the drift concretely>\"\n",
+    "    \"steer_message\":   \"<only present when verdict=STEER: the message to send to the pane; must name the drift concretely>\",\n",
+    "    \"claude_responded_to_last_steer\": true | false | null\n",
     "  }\n",
+    "\n",
+    "Field guide for `claude_responded_to_last_steer` (drives the hard-boundary escalation):\n",
+    "  - `true`  — Claude engaged with the most recent STEER: adjusted approach,\n",
+    "              moved to the requested area, answered the question, or is visibly\n",
+    "              reasoning about the correction.  Pane thinking / reading counts\n",
+    "              as responded — Claude does not need to have edited files yet.\n",
+    "  - `false` — Claude ignored the STEER, continued the prior drift, or pretended\n",
+    "              not to see it.  Three consecutive `false` values trigger a hard\n",
+    "              interrupt (ESC + forced message), so be honest: do not set `false`\n",
+    "              merely because Claude's response is slow.\n",
+    "  - `null`  — No prior STEER in this session, or the recent history is\n",
+    "              WAIT/DONE only.  Use on the first turn.\n",
+    "  Judge from BOTH the pane (thinking / reading / tool calls) and the git diff.\n",
+    "\n",
     "\n",
     "Verdict rules:\n",
     "\n",
@@ -2835,6 +2850,7 @@ fn parse_supervision_verdict(
                 raw.trim().chars().take(200).collect::<String>()
             ),
             steer_message: None,
+            claude_responded_to_last_steer: None,
             timestamp: 0,
         };
         return SupervisionParsed {
@@ -2913,6 +2929,7 @@ fn parse_supervision_verdict(
                         verdict: tasks::VerdictKind::Wait,
                         rationale,
                         steer_message: None,
+                        claude_responded_to_last_steer: None,
                         timestamp: 0,
                     };
                     SupervisionParsed {
@@ -3285,6 +3302,30 @@ async fn handle_supervision_inner(
     // Claude acted on it.  None until the first STEER is emitted.
     let mut last_steer_full: Option<String> = None;
 
+    // Hard-boundary escalation: a soft STEER message only works if
+    // Claude actually reads it.  When Claude ignores K consecutive
+    // STEERs (judged by `claude_responded_to_last_steer` on each
+    // turn's structured verdict), we send an ESC to interrupt the
+    // current tool call and inject a forced-scope message.
+    //
+    // K is a compile-time constant on purpose: the right value
+    // depends on how the supervisor LLM calibrates "responded" and is
+    // a tuning knob rather than an operator-facing parameter.  Change
+    // this and rebuild.
+    const SUPERVISION_DRIFT_BLOCK_K: u32 = 3;
+    // Rolling count of consecutive STEER verdicts where the
+    // supervisor reported `claude_responded_to_last_steer = false`.
+    // Reset on any non-STEER verdict, on a STEER the supervisor
+    // marked `= true`, and after a hard-boundary fires.
+    let mut unresponsive_steer_count: u32 = 0;
+    // Most recent steer_message texts (after successful dispatch) so
+    // a triggered hard-boundary can echo them back to Claude verbatim
+    // — helps Claude understand which instruction it has been
+    // ignoring.  Bounded to K so we always include exactly the run
+    // that triggered the escalation.
+    let mut recent_steer_messages: std::collections::VecDeque<String> =
+        std::collections::VecDeque::with_capacity(SUPERVISION_DRIFT_BLOCK_K as usize);
+
     // Load skill files (SOUL.md, AGENTS.md, GPU_KERNEL.md) once and reuse
     // across all supervision turns so the LLM has project context for
     // higher-quality STEER decisions.
@@ -3616,12 +3657,185 @@ async fn handle_supervision_inner(
             last_steer_full = Some(verdict_single_line);
         }
 
+        // --- Hard-boundary escalation counter ---
+        //
+        // Bookkeeping runs on every verdict so non-STEER rounds reset
+        // the counter, preventing a scattered history like
+        // WAIT/STEER-ignored/WAIT/STEER-ignored/WAIT/STEER-ignored
+        // from tripping the boundary — only a run of CONSECUTIVE
+        // unresponsive STEERs counts.  Delegated to `update_drift_counter`
+        // so the rule is unit-testable.
+        update_drift_counter(
+            &mut unresponsive_steer_count,
+            &mut recent_steer_messages,
+            &record,
+            steer_dispatched,
+            SUPERVISION_DRIFT_BLOCK_K,
+        );
+
         // Persist structured verdict to task notebook (best-effort).
         persist_verdict_record(state, panes, &record).await;
 
-        let mut w = writer.lock().await;
-        write_frame(&mut *w, &Response::Text { chunk: display }).await?;
+        // Print the soft verdict line before any hard-boundary follow-up
+        // so the user-visible chat stream stays in turn order.
+        {
+            let mut w = writer.lock().await;
+            write_frame(&mut *w, &Response::Text { chunk: display }).await?;
+        }
+
+        // --- Trigger: K consecutive unresponsive STEERs ---
+        if unresponsive_steer_count >= SUPERVISION_DRIFT_BLOCK_K {
+            // The first supervised pane is the steering target by
+            // convention — same rule `parse_supervision_verdict` uses
+            // when mapping a STEER verdict to a pane.
+            if let Some(target) = panes.first() {
+                let pane_id = target.pane_id.clone();
+                let desc = target.task_description.clone();
+                let recent: Vec<String> = recent_steer_messages.iter().cloned().collect();
+                trigger_hard_boundary(writer, &pane_id, &desc, &recent).await?;
+
+                // Record a dedicated notebook row so the escalation is
+                // visible in prior-session history on the next run.
+                let hb_record = tasks::VerdictRecord {
+                    stated_intent: record.stated_intent.clone(),
+                    observed_action: record.observed_action.clone(),
+                    verdict: tasks::VerdictKind::Steer,
+                    rationale: format!(
+                        "HARD_BOUNDARY: K={SUPERVISION_DRIFT_BLOCK_K} drift escalation — \
+                         sent ESC + forced message into pane {pane_id}"
+                    ),
+                    steer_message: None,
+                    claude_responded_to_last_steer: None,
+                    timestamp: 0,
+                };
+                persist_verdict_record(state, panes, &hb_record).await;
+            } else {
+                tracing::warn!(
+                    "hard-boundary K reached but no pane to steer; skipping ESC + forced message"
+                );
+            }
+
+            // Reset state so the next tick starts a fresh count.  The
+            // injected forced message is itself a STEER; if Claude
+            // still ignores it we want the counter to re-accumulate
+            // from zero, not trip again on the very next turn.
+            unresponsive_steer_count = 0;
+            recent_steer_messages.clear();
+        }
     }
+}
+
+/// Update the hard-boundary escalation state for one verdict.
+///
+/// Pure function, extracted from `handle_supervision_inner` so the
+/// counter rules can be unit-tested without standing up a full loop.
+///
+/// Rules:
+/// - An unresponsive STEER (verdict=Steer AND dispatched=true AND
+///   `claude_responded_to_last_steer=Some(false)`) increments the
+///   counter and pushes the steer_message onto the FIFO of quoted
+///   messages (bounded to K entries).
+/// - Any other outcome — non-STEER verdict, responded=true, undelivered
+///   STEER — resets both counter and FIFO to zero.
+///
+/// Returns the new counter value so callers can compare against K.
+fn update_drift_counter(
+    counter: &mut u32,
+    recent_steer_messages: &mut std::collections::VecDeque<String>,
+    record: &tasks::VerdictRecord,
+    steer_dispatched: bool,
+    k: u32,
+) -> u32 {
+    let unresponsive = matches!(record.verdict, tasks::VerdictKind::Steer)
+        && steer_dispatched
+        && record.claude_responded_to_last_steer == Some(false);
+    if unresponsive {
+        *counter += 1;
+        if let Some(msg) = record.steer_message.as_deref() {
+            if recent_steer_messages.len() >= k as usize {
+                recent_steer_messages.pop_front();
+            }
+            recent_steer_messages.push_back(msg.to_string());
+        }
+    } else {
+        *counter = 0;
+        recent_steer_messages.clear();
+    }
+    *counter
+}
+
+/// Escape sequence sent to tmux to interrupt Claude's current tool call.
+/// Claude's TUI interprets a bare ESC as "cancel the active action"
+/// without exiting the process — the right tool for an escalation that
+/// still wants the conversation to continue afterward.
+const HARD_BOUNDARY_ESC: &str = "\x1b";
+
+/// Send ESC to the pane to interrupt the current tool call, then
+/// inject a forced-scope message that quotes the ignored STEERs and
+/// re-states the task.  Best-effort: a tmux failure is logged but does
+/// not propagate (the loop proceeds; the next tick may trigger again
+/// and retry).
+///
+/// `recent_steers` is the list of STEER messages that went
+/// unacknowledged (up to K entries, oldest first).  An empty slice is
+/// valid and simply omits the quoted-steer block.
+async fn trigger_hard_boundary(
+    writer: &Arc<tokio::sync::Mutex<tokio::net::unix::OwnedWriteHalf>>,
+    pane_id: &str,
+    desc: &str,
+    recent_steers: &[String],
+) -> Result<()> {
+    // 1. Surface the escalation to the chat stream before dispatching
+    //    so the user sees why an ESC landed in the pane.
+    {
+        let mut w = writer.lock().await;
+        write_frame(
+            &mut *w,
+            &Response::Text {
+                chunk: format!(
+                    "  → HARD BOUNDARY: Claude ignored {n} consecutive STEERs; \
+                     sending ESC + forced message to pane {pane_id}\n",
+                    n = recent_steers.len(),
+                ),
+            },
+        )
+        .await?;
+    }
+
+    // 2. ESC to interrupt the current tool call.  `send_pane_keys`
+    //    presses Enter after the keystrokes, which flushes any
+    //    prompt/command buffer Claude may have accumulated.
+    let pid_esc = pane_id.to_string();
+    if let Err(e) =
+        tokio::task::spawn_blocking(move || send_pane_keys(&pid_esc, HARD_BOUNDARY_ESC)).await
+    {
+        tracing::warn!(pane_id, error = %e, "hard-boundary ESC dispatch failed");
+    }
+
+    // 3. Forced message.  Quotes the ignored STEERs verbatim so Claude
+    //    sees the exact guidance it has been declining to follow.
+    let mut forced = String::from(
+        "Stop.  You have ignored the supervisor repeatedly.  Return to the original task.\n\n",
+    );
+    forced.push_str("Original task: ");
+    forced.push_str(desc.trim());
+    forced.push_str("\n\n");
+    if !recent_steers.is_empty() {
+        forced.push_str("Recent steering you did not act on:\n");
+        for s in recent_steers {
+            forced.push_str("  - ");
+            forced.push_str(s.trim());
+            forced.push('\n');
+        }
+    }
+    forced.push_str("\nRe-read the task above and resume work on it now.");
+
+    let pid_msg = pane_id.to_string();
+    if let Err(e) = tokio::task::spawn_blocking(move || send_pane_keys(&pid_msg, &forced)).await {
+        tracing::warn!(pane_id, error = %e, "hard-boundary forced-message dispatch failed");
+    }
+
+    Ok(())
 }
 
 /// Create a git worktree at `~/.amaebi/worktrees/<repo-name>/<tag>-<uuid8>`
@@ -8987,6 +9201,130 @@ mod tests {
         );
     }
 
+    // ── hard boundary (K consecutive unresponsive STEERs) ────────────────
+
+    fn mk_steer(responded: Option<bool>, msg: &str) -> tasks::VerdictRecord {
+        tasks::VerdictRecord {
+            stated_intent: "".into(),
+            observed_action: "".into(),
+            verdict: tasks::VerdictKind::Steer,
+            rationale: "drift".into(),
+            steer_message: Some(msg.into()),
+            claude_responded_to_last_steer: responded,
+            timestamp: 0,
+        }
+    }
+
+    fn mk_wait() -> tasks::VerdictRecord {
+        tasks::VerdictRecord {
+            stated_intent: "".into(),
+            observed_action: "".into(),
+            verdict: tasks::VerdictKind::Wait,
+            rationale: "ok".into(),
+            steer_message: None,
+            claude_responded_to_last_steer: None,
+            timestamp: 0,
+        }
+    }
+
+    #[test]
+    fn drift_counter_increments_on_unresponsive_steer() {
+        let mut counter = 0u32;
+        let mut buf = std::collections::VecDeque::new();
+        let r1 = mk_steer(Some(false), "s1");
+        let n = update_drift_counter(&mut counter, &mut buf, &r1, true, 3);
+        assert_eq!(n, 1);
+        let r2 = mk_steer(Some(false), "s2");
+        let n = update_drift_counter(&mut counter, &mut buf, &r2, true, 3);
+        assert_eq!(n, 2);
+        let r3 = mk_steer(Some(false), "s3");
+        let n = update_drift_counter(&mut counter, &mut buf, &r3, true, 3);
+        assert_eq!(n, 3);
+        // FIFO keeps every steer in the run up to K.
+        assert_eq!(buf.len(), 3);
+        assert_eq!(buf[0], "s1");
+        assert_eq!(buf[2], "s3");
+    }
+
+    #[test]
+    fn drift_counter_resets_on_wait() {
+        let mut counter = 2u32;
+        let mut buf = std::collections::VecDeque::from(vec!["s1".to_string(), "s2".into()]);
+        let n = update_drift_counter(&mut counter, &mut buf, &mk_wait(), false, 3);
+        assert_eq!(n, 0);
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn drift_counter_resets_on_responded_steer() {
+        let mut counter = 2u32;
+        let mut buf = std::collections::VecDeque::from(vec!["s1".to_string(), "s2".into()]);
+        let rec = mk_steer(Some(true), "s3");
+        let n = update_drift_counter(&mut counter, &mut buf, &rec, true, 3);
+        assert_eq!(n, 0, "responded=true must reset the counter");
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn drift_counter_resets_on_undelivered_steer() {
+        // Even if the verdict is STEER and the LLM marked the last
+        // STEER as ignored, an undelivered dispatch this turn means
+        // we can't blame Claude — counter resets.
+        let mut counter = 1u32;
+        let mut buf = std::collections::VecDeque::from(vec!["s1".to_string()]);
+        let rec = mk_steer(Some(false), "s2");
+        let n = update_drift_counter(&mut counter, &mut buf, &rec, false, 3);
+        assert_eq!(n, 0, "undelivered STEER must reset, not extend, the count");
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn drift_counter_fifo_bounded_to_k() {
+        // With K=3, pushing a 4th unresponsive STEER must evict the oldest.
+        let mut counter = 0u32;
+        let mut buf = std::collections::VecDeque::new();
+        for tag in ["s1", "s2", "s3", "s4"] {
+            update_drift_counter(&mut counter, &mut buf, &mk_steer(Some(false), tag), true, 3);
+        }
+        assert_eq!(counter, 4);
+        assert_eq!(buf.len(), 3);
+        assert_eq!(buf[0], "s2"); // s1 evicted
+        assert_eq!(buf[2], "s4");
+    }
+
+    #[test]
+    fn drift_counter_null_responded_does_not_increment() {
+        // `None` (null on the wire) means "no prior STEER to judge" — must
+        // not be counted as unresponsive.
+        let mut counter = 0u32;
+        let mut buf = std::collections::VecDeque::new();
+        let rec = mk_steer(None, "s1");
+        let n = update_drift_counter(&mut counter, &mut buf, &rec, true, 3);
+        assert_eq!(n, 0);
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn drift_counter_mixed_run_does_not_trip() {
+        // Scattered unresponsive STEERs separated by WAIT should NEVER
+        // accumulate enough to trip — only a CONSECUTIVE run counts.
+        let mut counter = 0u32;
+        let mut buf = std::collections::VecDeque::new();
+        let seq = [
+            (mk_steer(Some(false), "s1"), true),
+            (mk_wait(), false),
+            (mk_steer(Some(false), "s2"), true),
+            (mk_wait(), false),
+            (mk_steer(Some(false), "s3"), true),
+        ];
+        let mut max_seen = 0u32;
+        for (rec, dispatched) in &seq {
+            let n = update_drift_counter(&mut counter, &mut buf, rec, *dispatched, 3);
+            max_seen = max_seen.max(n);
+        }
+        assert_eq!(max_seen, 1, "WAIT in between should reset each time");
+    }
+
     #[test]
     fn event_stream_history_folds_identical_wait_runs() {
         let mk_wait = |intent: &str, obs: &str| tasks::VerdictRecord {
@@ -8995,6 +9333,7 @@ mod tests {
             verdict: tasks::VerdictKind::Wait,
             rationale: "still reading".into(),
             steer_message: None,
+            claude_responded_to_last_steer: None,
             timestamp: 0,
         };
         let records = vec![
@@ -9026,6 +9365,7 @@ mod tests {
                 verdict: tasks::VerdictKind::Wait,
                 rationale: "r".into(),
                 steer_message: None,
+                claude_responded_to_last_steer: None,
                 timestamp: 0,
             },
             tasks::VerdictRecord {
@@ -9034,6 +9374,7 @@ mod tests {
                 verdict: tasks::VerdictKind::Steer,
                 rationale: "drift".into(),
                 steer_message: Some("return to x".into()),
+                claude_responded_to_last_steer: None,
                 timestamp: 0,
             },
             tasks::VerdictRecord {
@@ -9042,6 +9383,7 @@ mod tests {
                 verdict: tasks::VerdictKind::Wait,
                 rationale: "r2".into(),
                 steer_message: None,
+                claude_responded_to_last_steer: None,
                 timestamp: 0,
             },
         ];
@@ -9063,6 +9405,7 @@ mod tests {
             verdict: tasks::VerdictKind::Wait,
             rationale: rationale.into(),
             steer_message: None,
+            claude_responded_to_last_steer: None,
             timestamp: 0,
         };
         // observed_action changes every round → every WAIT is a new event.

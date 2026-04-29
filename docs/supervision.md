@@ -32,9 +32,16 @@ and returns a single JSON object:
   "observed_action": "<what actually changed on disk this turn>",
   "verdict":         "WAIT" | "STEER" | "DONE",
   "rationale":       "<one sentence why>",
-  "steer_message":   "<only present when verdict=STEER>"
+  "steer_message":   "<only present when verdict=STEER>",
+  "claude_responded_to_last_steer": true | false | null
 }
 ```
+
+`claude_responded_to_last_steer` judges whether Claude acted on the most
+recent prior STEER — reading, thinking, or course-correcting all count
+as `true`; ignoring the STEER is `false`; no prior STEER exists yet is
+`null`. This field drives the **hard-boundary escalation** described
+below.
 
 All five fields land in `~/.amaebi/tasks.db` for every tick, so drift
 trajectories can be reconstructed across resumes. Rows written before
@@ -95,6 +102,51 @@ hypothesis) or has drifted off the task (touching files outside scope,
 silently reinterpreting the goal). The supervision prompt explicitly
 prefers STEER over WAIT when in doubt — a wrong STEER costs one
 keystroke, a missed STEER costs hours of wrong work.
+
+## Hard boundary: ESC + forced message after K ignored STEERs
+
+A plain STEER only works if Claude reads it. When Claude ignores
+`SUPERVISION_DRIFT_BLOCK_K` consecutive STEERs — judged by the
+supervisor's `claude_responded_to_last_steer: false` on each turn — the
+daemon escalates:
+
+1. **ESC keystroke** (`\x1b`) into the pane via `tmux send-keys`, which
+   cancels Claude's current tool call without exiting the TUI.
+2. **Forced message** injected as a new user turn, quoting the recent
+   ignored STEERs verbatim and re-stating the original task:
+   ```
+   Stop.  You have ignored the supervisor repeatedly.  Return to the original task.
+
+   Original task: <desc>
+
+   Recent steering you did not act on:
+     - <steer 1>
+     - <steer 2>
+     - <steer 3>
+
+   Re-read the task above and resume work on it now.
+   ```
+3. A dedicated notebook row is written: `rationale` starts with
+   `HARD_BOUNDARY: K=N drift escalation`, so prior-session history
+   (event stream) surfaces escalations distinctly.
+4. Counter + quoted-STEER FIFO are reset. The forced message is itself
+   a STEER; if Claude ignores it too, the counter accumulates fresh.
+
+`K` is a compile-time constant (`SUPERVISION_DRIFT_BLOCK_K` in
+`src/daemon.rs`), currently `3`. It is not surfaced as an env var — the
+right value depends on how the supervisor calibrates "responded" and is
+a tuning knob, not an operator parameter.
+
+The counter resets on any non-STEER verdict, on a STEER marked
+`responded=true`, and on a STEER the daemon could not dispatch (tmux
+failure — not Claude's fault). Scattered unresponsive STEERs separated
+by WAIT therefore never accumulate; only a *consecutive* run trips the
+boundary.
+
+The hard boundary does **not** roll back files (no `git checkout --`) or
+exit supervision. It is a soft-block: Claude is interrupted and
+re-prompted with the original task, but the loop continues so legitimate
+follow-up work can resume.
 
 ## What DONE does
 
