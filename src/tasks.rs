@@ -287,6 +287,21 @@ pub struct VerdictRecord {
     /// `verdict == Steer` AND the message was dispatched successfully.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub steer_message: Option<String>,
+    /// Whether Claude acted on the most recent prior STEER, judged by
+    /// the supervisor looking at the pane (thinking/reading counts) and
+    /// git diff together.
+    ///
+    /// * `Some(true)` — Claude responded meaningfully (followed the
+    ///   STEER, or at least engaged with it).
+    /// * `Some(false)` — Claude ignored or contradicted the STEER.
+    ///   Drives the K=3 hard-boundary counter.
+    /// * `None` — No prior STEER to compare against (first turn,
+    ///   or only WAIT/DONE verdicts have been issued).
+    ///
+    /// Added in the hard-boundary PR; legacy rows and pre-feature
+    /// verdicts deserialise as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_responded_to_last_steer: Option<bool>,
     /// Unix epoch seconds — server-assigned on append, populated on read.
     /// Not serialised into the JSON blob (the row's `timestamp` column
     /// is the source of truth).
@@ -391,6 +406,7 @@ fn parse_verdict_content(raw: &str) -> VerdictRecord {
         verdict: VerdictKind::Legacy,
         rationale: raw.to_string(),
         steer_message: None,
+        claude_responded_to_last_steer: None,
         timestamp: 0,
     }
 }
@@ -544,6 +560,7 @@ mod tests {
             verdict: VerdictKind::Steer,
             rationale: "touched file outside scope".into(),
             steer_message: Some("stop, return to reading src/auth.rs".into()),
+            claude_responded_to_last_steer: None,
             timestamp: 0,
         };
         append_verdict_record(&conn, "/proj", "kernel", &rec).unwrap();
@@ -589,6 +606,7 @@ mod tests {
             verdict: VerdictKind::Wait,
             rationale: rationale.into(),
             steer_message: None,
+            claude_responded_to_last_steer: None,
             timestamp: 0,
         };
         append_verdict_record(&conn, "/proj-a", "kernel", &mk("a-v")).unwrap();
