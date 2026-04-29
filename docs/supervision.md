@@ -8,21 +8,53 @@ Claude subprocess is making progress, and nudge it when it isn't.
 Implementation: `handle_supervision` / `handle_supervision_inner` in
 `src/daemon.rs:2207`.
 
-## WAIT / STEER / DONE
+## Structured verdict (drift-detection rework)
 
-Each iteration the supervision LLM sees the pane contents plus the task
-notebook preamble (for `--tag` runs) and must return exactly one of:
+Each iteration the supervisor LLM sees:
 
-| Verdict | Meaning | Effect |
-|---------|---------|--------|
-| `WAIT` | Still working, check again later | Sleep, re-snapshot on next tick |
-| `STEER: <pane_id>: <message>` | Pane is stuck or off-track | `tmux_send_keys` the message into the pane |
-| `DONE: <summary>` | Task is complete | Stream the summary to the client, exit |
+1. Task description pinned at the top
+2. Hard constraints from any resource leases the pane holds
+3. Task notebook preamble (for `--tag` runs) as an **event stream** — non-WAIT
+   rounds kept verbatim, runs of identical-signature WAITs folded into
+   `[N ticks] sustained WAIT: …` markers so a 24 h session doesn't drown
+   real drift events in hundreds of `reading files` lines
+4. **Filesystem ground truth** — per-pane `git diff` / `git status --short`
+   (from the pane's worktree) so the supervisor can compare Claude's
+   self-narration against what actually changed on disk
+5. In-session verdict history + the most recent STEER
+6. The current pane snapshots
 
-The prompt that asks for this verdict is built from the pane capture plus the
-notebook preamble (`build_notebook_context`, `src/daemon.rs:2305`). The
-completion is capped at `MAX_SUPERVISION_TOKENS` — enough for a short verdict,
-not enough for a long narrative.
+and returns a single JSON object:
+
+```json
+{
+  "stated_intent":   "<what Claude claims to be doing, distilled from pane>",
+  "observed_action": "<what actually changed on disk this turn>",
+  "verdict":         "WAIT" | "STEER" | "DONE",
+  "rationale":       "<one sentence why>",
+  "steer_message":   "<only present when verdict=STEER>"
+}
+```
+
+All five fields land in `~/.amaebi/tasks.db` for every tick, so drift
+trajectories can be reconstructed across resumes. Rows written before
+this schema existed read back with `verdict="LEGACY"` and the raw string
+in `rationale` — no migration required.
+
+Verdict semantics:
+
+| Verdict | Condition | Effect |
+|---------|-----------|--------|
+| `WAIT` | `stated_intent` and `observed_action` consistent, in scope, progressing | Re-snapshot on next tick |
+| `STEER` | Any drift signal: self-narration disagrees with diff, touched files outside task scope, hard-constraint violation, stuck at a prompt | `tmux send-keys` the `steer_message` into the pane |
+| `DONE` | Explicit completion signal + diff covers the deliverables + Claude is idle | Stream summary to the client, exit |
+
+Assembly: `build_supervision_user_content` (prompt) and
+`parse_supervision_verdict` (response), both in `src/daemon.rs`. An
+unparseable response degrades to a WAIT whose rationale carries the raw
+text, so a misbehaving model never silently skips a tick. The completion
+is capped at `MAX_SUPERVISION_TOKENS` — enough for the JSON object, not
+enough for a long narrative.
 
 ## Timing
 
@@ -30,34 +62,39 @@ All durations are in `handle_supervision_inner`:
 
 | Knob | Default | Env override | Purpose |
 |------|---------|--------------|---------|
-| Poll-interval ceiling | 5 min | `AMAEBI_SUPERVISION_INTERVAL_SECS` | Maximum wait between LLM calls |
-| Idle threshold | 10 s | (compile-time constant `IDLE_SECS`) | Pane must be unchanged this long before the LLM is called |
+| Poll-interval ceiling | 24 h | `AMAEBI_SUPERVISION_INTERVAL_SECS` | Rarely reached; the idle threshold is the real trigger. Kept as an escape hatch for manual rate-limiting. |
+| Idle threshold | 10 s | (compile-time constant `IDLE_SECS`) | Pane must be unchanged this long before the LLM is called — the primary pacing knob |
 | Idle poll period | 2 s | (compile-time constant `IDLE_POLL_SECS`) | How often to snapshot the pane while waiting for idle |
 | Hard timeout | 24 h | `AMAEBI_SUPERVISION_TIMEOUT_SECS` | Wall-clock ceiling; after this, supervision exits regardless.  Matches the pane, resource, and task-notebook lease TTLs (all 24 h) so supervision never outlives the leases it holds. |
 
-The 5-minute ceiling (`src/daemon.rs:2418`) is the *maximum* gap between LLM
-calls. Each iteration also waits for 10 seconds of pane stability
-(`src/daemon.rs:2431`) before taking a snapshot — this avoids calling the LLM
-every 2-5 seconds during active tool output. Net effect: supervision LLM cost
-drops ~70-80 % in typical sessions.
+The drift-detection rework dropped the prior 5-minute ceiling: Claude
+pauses briefly between tool calls even during active work, so a short
+ceiling would let the supervisor judge only after Claude was genuinely
+stuck — too late to catch drift in flight. Defaulting the ceiling to
+the full supervision timeout means a supervision turn fires as soon as
+the pane has been stable for `IDLE_SECS` (10 s), which is the real
+trigger we want. Effect (catching drift) is explicitly prioritised over
+cost (extra LLM calls).
 
-The hard timeout (`src/daemon.rs:2437`) protects against runaway tasks. If
-supervision is still polling after 24 hours, it emits a single
-`[supervision] timeout after …` message and exits; the normal cleanup path
-then releases the pane and any resource/task leases.  No DONE summary is
-produced on this path — those only come from a `DONE:` verdict.
+The hard timeout protects against runaway tasks. If supervision is still
+polling after 24 hours, it emits a single `[supervision] timeout after …`
+message and exits; the normal cleanup path then releases the pane and any
+resource/task leases. No DONE summary is produced on this path — those
+only come from a `DONE` verdict.
 
 ## What STEER does
 
-STEER verdicts are formatted as `STEER: <pane_id>: <message>`. The daemon
-parses the pane id, resolves it to a live tmux target, and sends the message
-via `tmux send-keys`, including Enter so Claude processes it. The pane sees
-the message as if you typed it.
+When the supervisor returns `verdict: "STEER"`, the daemon injects the
+`steer_message` into the first supervised pane via `tmux send-keys`,
+including Enter so Claude processes it. The pane sees the message as if
+you typed it.
 
 Steering is used when the LLM determines Claude is stuck (waiting at a
-confirmation prompt, looping on the same failing command, or chasing a wrong
-hypothesis). The supervision prompt is explicitly instructed to prefer WAIT
-over STEER when in doubt, to avoid thrashing.
+confirmation prompt, looping on the same failing command, chasing a wrong
+hypothesis) or has drifted off the task (touching files outside scope,
+silently reinterpreting the goal). The supervision prompt explicitly
+prefers STEER over WAIT when in doubt — a wrong STEER costs one
+keystroke, a missed STEER costs hours of wrong work.
 
 ## What DONE does
 

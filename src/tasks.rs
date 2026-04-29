@@ -9,10 +9,13 @@
 //! * `kind = "desc"` — the `<desc>` passed on the CLI.  Written once per
 //!   `/claude --tag <tag> "<desc>"` invocation.  On resume without a
 //!   `<desc>`, the supervisor falls back to the most recent `desc` row.
-//! * `kind = "verdict"` — one row per supervision turn, containing the
-//!   supervisor LLM's `WAIT: ...` / `STEER: ...` / `DONE: ...` line.
-//!   Read back as context for subsequent supervision runs on the same
-//!   tag.
+//! * `kind = "verdict"` — one row per supervision turn.  Content is a
+//!   JSON-serialised [`VerdictRecord`] capturing the four-field
+//!   verdict (`stated_intent`, `observed_action`, `verdict`,
+//!   `rationale`) plus an optional `steer_message`.  Rows written
+//!   before this schema existed are read back as
+//!   [`VerdictKind::Legacy`] with the raw text in `rationale` — no
+//!   migration required.
 //! * `kind = "lease"` — at most one live row per `(repo_dir, tag)`.
 //!   Guarantees same-tag supervision is serialised: parallel `/claude
 //!   --tag <tag>` invocations synchronously reject while another
@@ -38,9 +41,6 @@ use crate::auth::amaebi_home;
 /// `pane_lease::LEASE_TTL_SECS` so a crashed holder is reclaimable on
 /// the same timescale.
 pub const LEASE_TTL_SECS: i64 = 86_400;
-
-/// Maximum history rows returned to the supervisor per turn.
-pub const RECENT_VERDICTS_WINDOW: usize = 10;
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS task_notes (
@@ -257,41 +257,142 @@ pub fn latest_desc(conn: &Connection, repo_dir: &str, tag: &str) -> Result<Optio
 // Verdicts
 // ---------------------------------------------------------------------------
 
-/// Append a supervision verdict row.  Timestamp is derived server-side
-/// so callers need not order them.
-pub fn append_verdict(conn: &Connection, repo_dir: &str, tag: &str, verdict: &str) -> Result<()> {
+// ---------------------------------------------------------------------------
+// Structured verdicts
+// ---------------------------------------------------------------------------
+
+/// One supervision turn's full verdict record.  Serialised as JSON into
+/// the existing `content` column so no schema migration is required;
+/// rows written before this rework (plain `"WAIT: ..."` / `"STEER: ..."`
+/// strings) are read back as [`VerdictKind::Legacy`] with the raw text
+/// placed in `rationale`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct VerdictRecord {
+    /// What Claude claims to be doing this turn — distilled by the
+    /// supervisor from pane capture, not regex-scraped.  Empty string
+    /// when the supervisor produced no field value (including LEGACY
+    /// rows written before this schema existed).
+    #[serde(default)]
+    pub stated_intent: String,
+    /// Ground-truth observation: git diff delta, touched files, tool
+    /// calls this turn.
+    #[serde(default)]
+    pub observed_action: String,
+    /// The classification.
+    pub verdict: VerdictKind,
+    /// One-sentence reason for the verdict.
+    #[serde(default)]
+    pub rationale: String,
+    /// STEER payload actually sent into the pane — only present when
+    /// `verdict == Steer` AND the message was dispatched successfully.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub steer_message: Option<String>,
+    /// Unix epoch seconds — server-assigned on append, populated on read.
+    /// Not serialised into the JSON blob (the row's `timestamp` column
+    /// is the source of truth).
+    #[serde(skip)]
+    pub timestamp: i64,
+}
+
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum VerdictKind {
+    Wait,
+    Steer,
+    Done,
+    /// Placeholder for rows written before the structured schema existed.
+    /// Reader maps any non-JSON `content` to this variant.
+    Legacy,
+}
+
+impl VerdictRecord {
+    /// Render as a compact single-line summary suitable for
+    /// `amaebi tag list` and legacy prompt sections that still expect a
+    /// string form.
+    pub fn to_line(&self) -> String {
+        match self.verdict {
+            VerdictKind::Wait => {
+                if self.rationale.is_empty() {
+                    "WAIT".to_string()
+                } else {
+                    format!("WAIT: {}", self.rationale)
+                }
+            }
+            VerdictKind::Steer => match &self.steer_message {
+                Some(m) => format!("STEER: {m}"),
+                None => format!("STEER: {}", self.rationale),
+            },
+            VerdictKind::Done => format!("DONE: {}", self.rationale),
+            VerdictKind::Legacy => self.rationale.clone(),
+        }
+    }
+}
+
+/// Append a structured verdict.  Stored as JSON in `content`.
+pub fn append_verdict_record(
+    conn: &Connection,
+    repo_dir: &str,
+    tag: &str,
+    record: &VerdictRecord,
+) -> Result<()> {
+    let json = serde_json::to_string(record).context("serialising verdict record")?;
     conn.execute(
         "INSERT INTO task_notes (repo_dir, tag, kind, content, timestamp)
          VALUES (?1, ?2, 'verdict', ?3, ?4)",
-        params![repo_dir, tag, verdict, now_epoch()],
+        params![repo_dir, tag, json, now_epoch()],
     )
-    .context("appending verdict")?;
+    .context("appending verdict record")?;
     Ok(())
 }
 
-/// Return up to [`RECENT_VERDICTS_WINDOW`] most recent verdicts, oldest
-/// first (so the supervisor sees them in chronological order when
-/// rendered into a prompt).
-pub fn recent_verdicts(conn: &Connection, repo_dir: &str, tag: &str) -> Result<Vec<String>> {
+/// Return every verdict row for `(repo_dir, tag)`, oldest first.
+///
+/// Used by the event-stream history renderer which needs to run its
+/// own filtering (keep all non-WAIT, dedupe sustained WAIT, fold runs)
+/// rather than the fixed time-window in [`recent_verdicts`].  Legacy
+/// plain-string rows are surfaced as [`VerdictKind::Legacy`] so their
+/// content still makes it into the prompt.
+pub fn all_verdict_records(
+    conn: &Connection,
+    repo_dir: &str,
+    tag: &str,
+) -> Result<Vec<VerdictRecord>> {
     let mut stmt = conn
         .prepare(
-            "SELECT content FROM task_notes
+            "SELECT content, timestamp FROM task_notes
              WHERE repo_dir = ?1 AND tag = ?2 AND kind = 'verdict'
-             ORDER BY timestamp DESC
-             LIMIT ?3",
+             ORDER BY timestamp ASC, id ASC",
         )
-        .context("preparing recent_verdicts query")?;
+        .context("preparing all_verdict_records query")?;
     let rows = stmt
-        .query_map(
-            params![repo_dir, tag, RECENT_VERDICTS_WINDOW as i64],
-            |row| row.get::<_, String>(0),
-        )
-        .context("running recent_verdicts query")?;
-    let mut out: Vec<String> = rows
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .context("collecting recent_verdicts rows")?;
-    out.reverse(); // oldest first for prompt rendering
+        .query_map(params![repo_dir, tag], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })
+        .context("running all_verdict_records query")?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (content, ts) = row.context("decoding all_verdict_records row")?;
+        let mut rec = parse_verdict_content(&content);
+        rec.timestamp = ts;
+        out.push(rec);
+    }
     Ok(out)
+}
+
+/// Parse a `task_notes.content` string into a [`VerdictRecord`],
+/// tolerating legacy plain-text rows from before the JSON schema.
+fn parse_verdict_content(raw: &str) -> VerdictRecord {
+    if let Ok(parsed) = serde_json::from_str::<VerdictRecord>(raw) {
+        return parsed;
+    }
+    VerdictRecord {
+        stated_intent: String::new(),
+        observed_action: String::new(),
+        verdict: VerdictKind::Legacy,
+        rationale: raw.to_string(),
+        steer_message: None,
+        timestamp: 0,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -435,69 +536,76 @@ mod tests {
     // ── verdicts ─────────────────────────────────────────────────────────
 
     #[test]
-    fn recent_verdicts_empty_initially() {
+    fn structured_verdict_roundtrips() {
         let (conn, _g) = fresh_db();
-        let v = recent_verdicts(&conn, "/proj", "kernel").unwrap();
-        assert!(v.is_empty());
-    }
+        let rec = VerdictRecord {
+            stated_intent: "read src/auth.rs to understand sessions".into(),
+            observed_action: "modified src/daemon.rs".into(),
+            verdict: VerdictKind::Steer,
+            rationale: "touched file outside scope".into(),
+            steer_message: Some("stop, return to reading src/auth.rs".into()),
+            timestamp: 0,
+        };
+        append_verdict_record(&conn, "/proj", "kernel", &rec).unwrap();
 
-    #[test]
-    fn append_verdicts_and_read_oldest_first() {
-        let (conn, _g) = fresh_db();
-        // Use explicit timestamps so ordering is deterministic.
-        for (i, v) in ["first", "second", "third"].iter().enumerate() {
-            conn.execute(
-                "INSERT INTO task_notes (repo_dir, tag, kind, content, timestamp) \
-                 VALUES ('/proj', 'kernel', 'verdict', ?1, ?2)",
-                params![v, now_epoch() + i as i64],
-            )
-            .unwrap();
-        }
-        let v = recent_verdicts(&conn, "/proj", "kernel").unwrap();
-        assert_eq!(v, vec!["first", "second", "third"]);
-    }
-
-    #[test]
-    fn recent_verdicts_caps_at_window() {
-        let (conn, _g) = fresh_db();
-        let total = RECENT_VERDICTS_WINDOW + 5;
-        for i in 0..total {
-            conn.execute(
-                "INSERT INTO task_notes (repo_dir, tag, kind, content, timestamp) \
-                 VALUES ('/proj', 'kernel', 'verdict', ?1, ?2)",
-                params![format!("v{i}"), now_epoch() + i as i64],
-            )
-            .unwrap();
-        }
-        let v = recent_verdicts(&conn, "/proj", "kernel").unwrap();
-        assert_eq!(v.len(), RECENT_VERDICTS_WINDOW);
-        // Oldest-first means we should see the last 10 inserted, in order.
+        let all = all_verdict_records(&conn, "/proj", "kernel").unwrap();
+        assert_eq!(all.len(), 1);
+        let back = &all[0];
+        assert_eq!(back.stated_intent, rec.stated_intent);
+        assert_eq!(back.observed_action, rec.observed_action);
+        assert_eq!(back.verdict, VerdictKind::Steer);
         assert_eq!(
-            v.first().unwrap(),
-            &format!("v{}", total - RECENT_VERDICTS_WINDOW)
+            back.steer_message.as_deref(),
+            Some(rec.steer_message.as_deref().unwrap())
         );
-        assert_eq!(v.last().unwrap(), &format!("v{}", total - 1));
+        assert!(back.timestamp > 0);
+    }
+
+    #[test]
+    fn legacy_plain_string_verdict_reads_as_legacy() {
+        let (conn, _g) = fresh_db();
+        // Simulate a row written before the JSON schema existed.
+        conn.execute(
+            "INSERT INTO task_notes (repo_dir, tag, kind, content, timestamp) \
+             VALUES ('/proj', 'kernel', 'verdict', ?1, ?2)",
+            params!["WAIT: still reading files", now_epoch()],
+        )
+        .unwrap();
+
+        let all = all_verdict_records(&conn, "/proj", "kernel").unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].verdict, VerdictKind::Legacy);
+        assert_eq!(all[0].rationale, "WAIT: still reading files");
+        // Legacy render must still produce a non-empty line for the prompt.
+        assert_eq!(all[0].to_line(), "WAIT: still reading files");
     }
 
     #[test]
     fn verdicts_isolated_by_repo_dir_and_tag() {
         let (conn, _g) = fresh_db();
-        append_verdict(&conn, "/proj-a", "kernel", "a-v").unwrap();
-        append_verdict(&conn, "/proj-b", "kernel", "b-v").unwrap();
-        append_verdict(&conn, "/proj-a", "lint", "lint-v").unwrap();
+        let mk = |rationale: &str| VerdictRecord {
+            stated_intent: String::new(),
+            observed_action: String::new(),
+            verdict: VerdictKind::Wait,
+            rationale: rationale.into(),
+            steer_message: None,
+            timestamp: 0,
+        };
+        append_verdict_record(&conn, "/proj-a", "kernel", &mk("a-v")).unwrap();
+        append_verdict_record(&conn, "/proj-b", "kernel", &mk("b-v")).unwrap();
+        append_verdict_record(&conn, "/proj-a", "lint", &mk("lint-v")).unwrap();
 
-        assert_eq!(
-            recent_verdicts(&conn, "/proj-a", "kernel").unwrap(),
-            vec!["a-v".to_string()]
-        );
-        assert_eq!(
-            recent_verdicts(&conn, "/proj-b", "kernel").unwrap(),
-            vec!["b-v".to_string()]
-        );
-        assert_eq!(
-            recent_verdicts(&conn, "/proj-a", "lint").unwrap(),
-            vec!["lint-v".to_string()]
-        );
+        let reads = |r, t| -> Vec<String> {
+            all_verdict_records(&conn, r, t)
+                .unwrap()
+                .into_iter()
+                .map(|v| v.rationale)
+                .collect()
+        };
+
+        assert_eq!(reads("/proj-a", "kernel"), vec!["a-v".to_string()]);
+        assert_eq!(reads("/proj-b", "kernel"), vec!["b-v".to_string()]);
+        assert_eq!(reads("/proj-a", "lint"), vec!["lint-v".to_string()]);
     }
 
     // ── lease ────────────────────────────────────────────────────────────
