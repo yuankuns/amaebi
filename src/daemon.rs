@@ -2042,6 +2042,184 @@ fn capture_pane_text(pane_id: &str) -> String {
     }
 }
 
+/// Ground-truth evidence for one supervised pane: what Claude actually
+/// changed on disk, independent of what it narrates in the pane.
+///
+/// Populated once per supervision tick by [`capture_git_evidence`].  An
+/// empty record (all fields empty) means either the pane has no
+/// worktree bound (legacy `--resume-pane` launches) or the git calls
+/// failed; the supervisor prompt renders it as "no filesystem diff".
+#[derive(Debug, Clone, Default)]
+struct GitEvidence {
+    /// Output of `git diff --stat HEAD` trimmed to [`MAX_GIT_EVIDENCE_BYTES`].
+    stat: String,
+    /// Output of `git diff HEAD` trimmed to [`MAX_GIT_EVIDENCE_BYTES`].
+    patch: String,
+    /// Output of `git status --short`.
+    status: String,
+    /// True when any of the git calls had to be truncated — prompt
+    /// renderer surfaces this so the LLM knows the diff is partial.
+    truncated: bool,
+}
+
+/// Upper bound on each git field before truncation kicks in.  50 KB is
+/// enough to carry a substantive refactor diff (~1500 changed lines)
+/// without swamping the LLM prompt; larger diffs are truncated and the
+/// [`GitEvidence::truncated`] flag is set so the supervisor knows.
+const MAX_GIT_EVIDENCE_BYTES: usize = 50 * 1024;
+
+/// Run `git diff` and `git status --short` in `worktree` and assemble a
+/// [`GitEvidence`] snapshot.  Each git invocation is capped at 3 s so a
+/// hung filesystem cannot stall the supervision loop.
+///
+/// Call from `spawn_blocking` — the git calls are synchronous.
+fn capture_git_evidence(worktree: &str) -> GitEvidence {
+    fn run(worktree: &str, args: &[&str]) -> Option<String> {
+        let out = std::process::Command::new("git")
+            .args(["-C", worktree])
+            .args(args)
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            tracing::debug!(
+                worktree,
+                args = ?args,
+                stderr = %String::from_utf8_lossy(&out.stderr).trim(),
+                "git evidence call non-zero exit",
+            );
+            return None;
+        }
+        Some(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
+    fn cap(s: String, truncated: &mut bool) -> String {
+        if s.len() > MAX_GIT_EVIDENCE_BYTES {
+            *truncated = true;
+            let cut = s
+                .char_indices()
+                .take_while(|(i, _)| *i < MAX_GIT_EVIDENCE_BYTES)
+                .last()
+                .map(|(i, c)| i + c.len_utf8())
+                .unwrap_or(MAX_GIT_EVIDENCE_BYTES);
+            format!("{}\n… (truncated)", &s[..cut])
+        } else {
+            s
+        }
+    }
+
+    let mut truncated = false;
+    GitEvidence {
+        stat: run(worktree, &["diff", "--stat", "HEAD"])
+            .map(|s| cap(s, &mut truncated))
+            .unwrap_or_default(),
+        patch: run(worktree, &["diff", "HEAD"])
+            .map(|s| cap(s, &mut truncated))
+            .unwrap_or_default(),
+        status: run(worktree, &["status", "--short"])
+            .map(|s| cap(s, &mut truncated))
+            .unwrap_or_default(),
+        truncated,
+    }
+}
+
+/// Render a [`GitEvidence`] block for one pane.  Returns empty string
+/// when every field is empty (pane has no worktree bound, or git failed
+/// on every call).
+fn render_git_evidence(pane_id: &str, evidence: &GitEvidence) -> String {
+    if evidence.stat.trim().is_empty()
+        && evidence.patch.trim().is_empty()
+        && evidence.status.trim().is_empty()
+    {
+        return String::new();
+    }
+    let mut out = format!("── Filesystem ground truth — pane {pane_id} ──\n");
+    if evidence.truncated {
+        out.push_str("(one or more git outputs truncated to fit; rely on --stat for coverage)\n");
+    }
+    if !evidence.status.trim().is_empty() {
+        out.push_str("git status --short:\n");
+        for line in evidence.status.lines() {
+            out.push_str("  ");
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    if !evidence.stat.trim().is_empty() {
+        out.push_str("git diff --stat HEAD:\n");
+        for line in evidence.stat.lines() {
+            out.push_str("  ");
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    if !evidence.patch.trim().is_empty() {
+        out.push_str("git diff HEAD:\n");
+        out.push_str(&evidence.patch);
+        if !evidence.patch.ends_with('\n') {
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// Collect and render git evidence for every supervised pane that has
+/// a known worktree.  Returns the concatenated, ready-to-insert block
+/// for [`build_supervision_user_content`], or an empty string if no
+/// pane has evidence to show.
+///
+/// Worktree lookup goes through `pane_lease::read_state()` rather than
+/// a dedicated IPC field so legacy supervision payloads keep working
+/// unchanged: a pane without a worktree in `tmux-state.json` simply
+/// contributes nothing.
+///
+/// Per-pane git calls run in parallel via `spawn_blocking` so a slow
+/// filesystem on one pane doesn't serialise the others.
+async fn collect_git_evidence(panes: &[crate::ipc::SupervisionTarget]) -> String {
+    let state = match tokio::task::spawn_blocking(pane_lease::read_state).await {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "supervision: failed to read pane state for git evidence");
+            return String::new();
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "supervision: pane-state read task panicked");
+            return String::new();
+        }
+    };
+
+    let mut tasks = Vec::new();
+    for target in panes {
+        let Some(lease) = state.get(&target.pane_id) else {
+            continue;
+        };
+        let Some(worktree) = lease.worktree.clone() else {
+            continue;
+        };
+        let pane_id = target.pane_id.clone();
+        tasks.push(tokio::task::spawn_blocking(move || {
+            let evidence = capture_git_evidence(&worktree);
+            (pane_id, evidence)
+        }));
+    }
+
+    let mut out = String::new();
+    for handle in tasks {
+        match handle.await {
+            Ok((pane_id, evidence)) => {
+                let block = render_git_evidence(&pane_id, &evidence);
+                if !block.is_empty() {
+                    out.push_str(&block);
+                    out.push('\n');
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "git-evidence task panicked");
+            }
+        }
+    }
+    out
+}
+
 /// Wait until the target pane's output has been stable for `idle_secs`, or
 /// until `timeout` elapses, then return the final snapshot.
 ///
@@ -2205,13 +2383,17 @@ async fn release_supervised_panes(panes: &[crate::ipc::SupervisionTarget]) {
 /// Handle `Request::SupervisePanes`: run a Rust polling loop that captures pane
 /// content, calls the LLM for analysis (no tools), and acts on the response.
 ///
-/// The loop iterates with a 5-minute ceiling between turns (override with
-/// `AMAEBI_SUPERVISION_INTERVAL_SECS`), but each iteration additionally waits
-/// for the pane to go idle before snapshotting.  Each turn the LLM returns
-/// exactly one of:
-/// - `WAIT` — still working, check again
-/// - `STEER: <pane_id>: <message>` — send a correction to the pane
-/// - `DONE: <summary>` — task is complete; stream the summary and exit
+/// Each iteration waits for the pane to stabilise for `IDLE_SECS` and then
+/// snapshots.  There is no short per-turn ceiling any more (the effect-over-cost
+/// rework removed it): the LLM is invoked as soon as Claude pauses, so drift is
+/// caught in-flight rather than after a multi-minute gap.  The ceiling falls
+/// back to the hard supervision timeout; `AMAEBI_SUPERVISION_INTERVAL_SECS`
+/// remains as an escape hatch for manual rate-limiting.
+///
+/// Each turn the LLM returns a JSON object with `stated_intent`,
+/// `observed_action`, `verdict` (one of `WAIT | STEER | DONE`), `rationale`,
+/// and an optional `steer_message`.  See [`SUPERVISION_SYSTEM_PROMPT`] for the
+/// exact contract.
 ///
 /// The loop can also be interrupted by an `Interrupt` frame arriving on
 /// `frame_rx`, or hit the hard wall-clock ceiling.  Default matches the
@@ -2332,6 +2514,72 @@ async fn handle_supervision(
     result
 }
 
+/// Render a list of structured [`tasks::VerdictRecord`]s as an
+/// **event stream**: every non-WAIT round appears verbatim, and WAIT
+/// runs are folded when consecutive turns share the same
+/// (stated_intent, observed_action) signature.  This replaces the
+/// fixed "last N" window — a 24 h run can produce hundreds of
+/// nearly-identical `WAIT: reading files` rows that would drown out
+/// real drift events if all of them were carried into the prompt.
+///
+/// Rules:
+/// - A WAIT round is *kept* verbatim when its (stated_intent,
+///   observed_action) differs from the previous kept line.  The first
+///   of a run is always kept; subsequent identical-signature WAITs
+///   are absorbed into a single `[N ticks] sustained: …` marker.
+/// - A STEER or DONE round is always kept verbatim.
+/// - A LEGACY row (written before the structured schema existed) is
+///   kept verbatim — we don't know how to compare signatures, so
+///   treat each as its own event.
+///
+/// Output is oldest-first, one line per event, suitable for direct
+/// inclusion in the supervisor prompt.
+pub(crate) fn render_event_stream_history(records: &[tasks::VerdictRecord]) -> String {
+    if records.is_empty() {
+        return String::new();
+    }
+    let mut out = String::new();
+    let mut pending_wait: Option<(&tasks::VerdictRecord, usize)> = None;
+
+    fn flush_wait(out: &mut String, pending: Option<(&tasks::VerdictRecord, usize)>) {
+        if let Some((rec, count)) = pending {
+            if count == 1 {
+                out.push_str(&format!("  - {}\n", rec.to_line()));
+            } else {
+                let intent = if rec.stated_intent.is_empty() {
+                    rec.rationale.clone()
+                } else {
+                    rec.stated_intent.clone()
+                };
+                out.push_str(&format!("  - [{count} ticks] sustained WAIT: {intent}\n"));
+            }
+        }
+    }
+
+    for rec in records {
+        match rec.verdict {
+            tasks::VerdictKind::Wait => match pending_wait.as_mut() {
+                Some((prev, count))
+                    if prev.stated_intent == rec.stated_intent
+                        && prev.observed_action == rec.observed_action =>
+                {
+                    *count += 1;
+                }
+                _ => {
+                    flush_wait(&mut out, pending_wait.take());
+                    pending_wait = Some((rec, 1));
+                }
+            },
+            _ => {
+                flush_wait(&mut out, pending_wait.take());
+                out.push_str(&format!("  - {}\n", rec.to_line()));
+            }
+        }
+    }
+    flush_wait(&mut out, pending_wait.take());
+    out
+}
+
 /// Stable identifier stored as `task_notes.content` on the `kind='lease'`
 /// row so cleanup can find exactly the leases this supervision request
 /// owns.
@@ -2446,20 +2694,16 @@ async fn build_notebook_context(
 
             let latest = tasks::latest_desc(conn, repo_dir, tag)?
                 .unwrap_or_else(|| "(none recorded)".to_string());
-            let verdicts = tasks::recent_verdicts(conn, repo_dir, tag)?;
+            let all = tasks::all_verdict_records(conn, repo_dir, tag)?;
+            let rendered = render_event_stream_history(&all);
 
             out.push_str(&format!("=== Task notebook for tag '{tag}' ===\n"));
             out.push_str(&format!("Desc (most recent on record): {latest}\n"));
-            if verdicts.is_empty() {
+            if rendered.trim().is_empty() {
                 out.push_str("No prior supervision verdicts for this tag.\n");
             } else {
-                out.push_str(&format!(
-                    "Recent verdicts from prior supervision sessions ({}, oldest first):\n",
-                    verdicts.len()
-                ));
-                for v in &verdicts {
-                    out.push_str(&format!("  - {v}\n"));
-                }
+                out.push_str("Prior supervision verdicts (event stream — WAIT runs folded):\n");
+                out.push_str(&rendered);
             }
             out.push_str("=== End task notebook ===\n\n");
         }
@@ -2483,6 +2727,12 @@ async fn build_notebook_context(
 /// is listed before WAIT/DONE; and the tie-break is explicitly "prefer
 /// STEER" rather than "default to WAIT" (a missed STEER costs hours, a
 /// stray STEER costs one keystroke).
+///
+/// Output format: strict JSON (no prose preamble) with four fields plus
+/// an optional steer_message.  The structured shape is required so the
+/// notebook can store (stated_intent, observed_action, verdict,
+/// rationale) per turn and reconstruct the drift trajectory across
+/// long runs.  See [`tasks::VerdictRecord`].
 const SUPERVISION_SYSTEM_PROMPT: &str = concat!(
     "You are supervising a Claude Code session executing a specific task in a ",
     "tmux pane.  Your PRIMARY duty is to keep Claude on the task as stated.  ",
@@ -2491,39 +2741,305 @@ const SUPERVISION_SYSTEM_PROMPT: &str = concat!(
     "appears, STEER immediately; do not wait for another turn to \"see if it self-corrects\".\n",
     "\n",
     "Each turn you see: the original task description (pinned at the top), any hard ",
-    "constraints, the last few verdicts you issued, and the current pane contents.  ",
-    "You respond with EXACTLY ONE of:\n",
+    "constraints, the per-pane filesystem ground truth (git diff / status — what Claude ",
+    "ACTUALLY changed), prior verdicts on this task, the most recent STEER, and the ",
+    "current pane contents (what Claude says it is doing).  Your job is to compare ",
+    "the self-narration against the ground truth: drift is precisely when they diverge.\n",
     "\n",
-    "STEER: <pane_id>: <message to send>\n",
-    "  Use STEER when ANY of the following holds:\n",
-    "  - Claude is at an idle prompt and asked a question or offered options — answer.\n",
-    "  - Claude's current action contradicts a hard constraint (wrong resource, wrong ",
-    "    container, wrong branch, forbidden command).  Name the specific constraint ",
-    "    in the STEER message.\n",
-    "  - Claude drifted from the task: switched approach without checking in, skipped ",
-    "    a requirement, reinterpreted the goal, or is working on a tangent.\n",
-    "  - Claude reports partial completion and the task description is not fully done.\n",
-    "  - Claude is stuck on an error and a concrete hint will unblock it.\n",
-    "  When in doubt between STEER and WAIT, prefer STEER — a wrong STEER costs one ",
-    "  keystroke, a missed STEER costs hours of wrong work.\n",
+    "Output format — STRICT JSON, nothing else.  No prose preamble, no markdown fences. ",
+    "Return a single JSON object with these fields:\n",
     "\n",
-    "WAIT: <one sentence — what is Claude currently doing?>\n",
-    "  Use WAIT only when Claude is visibly, measurably making progress on the ORIGINAL ",
-    "  task, respecting hard constraints, and has not asked a question.  Long builds, ",
-    "  sim runs, and test executions are normal — WAIT is correct there.\n",
+    "  {\n",
+    "    \"stated_intent\":   \"<one sentence — what is Claude claiming to do right now?>\",\n",
+    "    \"observed_action\": \"<one sentence — what changed on disk this turn, per the git evidence?>\",\n",
+    "    \"verdict\":         \"WAIT\" | \"STEER\" | \"DONE\",\n",
+    "    \"rationale\":       \"<one sentence — why this verdict?>\",\n",
+    "    \"steer_message\":   \"<only present when verdict=STEER: the message to send to the pane; must name the drift concretely>\"\n",
+    "  }\n",
     "\n",
-    "DONE: <paragraph summary of what was accomplished>\n",
-    "  The task is FULLY complete.  Require ALL of:\n",
-    "  1. Pane shows an explicit completion signal — a finished report, passing tests,\n",
-    "     a merged PR URL, 'done', '✓', 'all tests passed', or similar.\n",
-    "  2. That completion directly covers the task description given at session start\n",
-    "     (not a sub-step, not unrelated output).\n",
-    "  3. Claude is no longer working (idle prompt or returned to shell).\n",
-    "  An idle prompt alone is NOT sufficient — Claude may be waiting for user input ",
-    "  (prefer STEER) or may have been interrupted (prefer WAIT and re-check).\n",
+    "Verdict rules:\n",
     "\n",
-    "Your response must start with STEER:, WAIT:, or DONE: — nothing else before it.",
+    "  STEER — send a corrective message into the pane.  Use when ANY of:\n",
+    "    - stated_intent and observed_action disagree (classic drift: says reading X, edited Y).\n",
+    "    - Claude touched files outside the task's apparent scope.\n",
+    "    - Claude contradicts a hard constraint (wrong resource, wrong container, wrong branch).\n",
+    "    - Claude is at an idle prompt and asked a question.\n",
+    "    - Claude reports partial completion but the task description is not fully done.\n",
+    "    - Claude is stuck on an error and a concrete hint will unblock it.\n",
+    "    steer_message MUST be non-empty and name the specific drift (\"you said A, modified B/C\").\n",
+    "\n",
+    "  WAIT — do nothing this turn.  Use ONLY when ALL of:\n",
+    "    - stated_intent and observed_action are consistent.\n",
+    "    - observed_action is inside the task's apparent scope.\n",
+    "    - Claude is visibly making progress on the ORIGINAL task.\n",
+    "    - No hard constraint is violated.\n",
+    "    Long builds, sim runs, and test executions qualify — WAIT is correct there.\n",
+    "\n",
+    "  DONE — task is FULLY complete.  Require ALL of:\n",
+    "    1. Pane shows an explicit completion signal (finished report, passing tests,\n",
+    "       merged PR URL, 'done', '✓', 'all tests passed', or similar).\n",
+    "    2. That completion covers the task description given at session start\n",
+    "       (not a sub-step, not unrelated output).\n",
+    "    3. The git diff covers the task's deliverables (e.g. a 'fix the flaky test' task\n",
+    "       must show a diff in the test file OR the file being tested).\n",
+    "    4. Claude is no longer working.\n",
+    "    An idle prompt alone is NOT sufficient.\n",
+    "\n",
+    "When in doubt between STEER and WAIT, prefer STEER — a wrong STEER costs one ",
+    "keystroke, a missed STEER costs hours of wrong work.\n",
+    "\n",
+    "The first non-whitespace character of your response MUST be `{` and the last MUST be `}`.",
 );
+
+/// Outcome of parsing one supervision model response.
+///
+/// `done_summary`: `Some(text)` when the verdict is DONE; caller uses
+/// it as the final text frame and exits the loop.
+///
+/// `dispatch`: `Some(_)` only when the verdict is STEER AND the target
+/// pane id + message are non-empty AND the pane is in the supervised
+/// set.  A malformed STEER downgrades to a WAIT-style record with a
+/// diagnostic rationale rather than raising.
+struct SupervisionParsed {
+    record: tasks::VerdictRecord,
+    /// User-facing line printed to the chat stream ("  → WAIT: …\n", etc.)
+    display: String,
+    /// DONE summary text when the verdict is DONE.
+    done_summary: Option<String>,
+    /// Dispatch target for STEER verdicts.
+    dispatch: Option<SteerDispatch>,
+}
+
+struct SteerDispatch {
+    pane_id: String,
+    message: String,
+}
+
+/// Parse the supervisor LLM's response into a [`SupervisionParsed`].
+///
+/// Tolerates:
+/// - JSON wrapped in ``` code fences (some models add them despite the
+///   instruction).
+/// - Extra whitespace and trailing prose before/after the object.
+/// - Unknown / missing fields (default via serde).
+///
+/// A completely unparseable response produces a WAIT-style record with
+/// the raw text captured in `rationale`, so the loop never stalls on
+/// model misbehaviour.  A STEER naming an unknown pane is downgraded
+/// to WAIT with `rationale` explaining the pane mismatch — same policy
+/// as the legacy string-format parser.
+fn parse_supervision_verdict(
+    raw: &str,
+    panes: &[crate::ipc::SupervisionTarget],
+) -> SupervisionParsed {
+    let body = extract_json_object(raw);
+    let parsed: Option<tasks::VerdictRecord> =
+        body.as_deref().and_then(|b| serde_json::from_str(b).ok());
+
+    let Some(mut record) = parsed else {
+        // Unparseable: treat as a bare WAIT with the raw text as
+        // rationale.  No pane action.  This keeps a flaky model from
+        // masking real drift with a silent WAIT — the rationale makes
+        // the failure visible in the notebook history.
+        let record = tasks::VerdictRecord {
+            stated_intent: String::new(),
+            observed_action: String::new(),
+            verdict: tasks::VerdictKind::Wait,
+            rationale: format!(
+                "(unparseable verdict — treating as WAIT) raw: {}",
+                raw.trim().chars().take(200).collect::<String>()
+            ),
+            steer_message: None,
+            timestamp: 0,
+        };
+        return SupervisionParsed {
+            display: format!("  → {}\n", record.to_line()),
+            record,
+            done_summary: None,
+            dispatch: None,
+        };
+    };
+
+    match record.verdict {
+        tasks::VerdictKind::Done => {
+            let summary = if record.rationale.trim().is_empty() {
+                "(no summary)".to_string()
+            } else {
+                record.rationale.clone()
+            };
+            SupervisionParsed {
+                display: format!("  → DONE\n\n{summary}\n"),
+                done_summary: Some(summary),
+                record,
+                dispatch: None,
+            }
+        }
+        tasks::VerdictKind::Steer => {
+            // A STEER verdict must name a pane and carry a non-empty
+            // message.  When the JSON omits `steer_message` we fall
+            // back to the rationale — a weak but better-than-nothing
+            // signal to Claude.
+            let message = record
+                .steer_message
+                .as_deref()
+                .filter(|m| !m.trim().is_empty())
+                .map(str::to_owned)
+                .or_else(|| {
+                    let r = record.rationale.trim();
+                    if r.is_empty() {
+                        None
+                    } else {
+                        Some(r.to_owned())
+                    }
+                });
+
+            // Pick the pane to steer: if only one pane is supervised,
+            // target it unconditionally.  When multiple panes are
+            // supervised, the model should include the pane id inside
+            // `steer_message` as a hint; we currently just pick the
+            // first, matching pre-rework behavior for the common
+            // single-pane case.
+            let pane_id = panes.first().map(|p| p.pane_id.clone());
+
+            match (pane_id, message) {
+                (Some(pid), Some(msg)) => {
+                    record.steer_message = Some(msg.clone());
+                    SupervisionParsed {
+                        display: format!("  → STEER: {pid}: {msg}\n"),
+                        record,
+                        done_summary: None,
+                        dispatch: Some(SteerDispatch {
+                            pane_id: pid,
+                            message: msg,
+                        }),
+                    }
+                }
+                _ => {
+                    // Downgrade: malformed STEER becomes a WAIT with
+                    // explanation so the next turn's prompt carries
+                    // the issue forward.
+                    let rationale = format!(
+                        "(malformed STEER — no target pane or message; kept as WAIT) {}",
+                        record.rationale.trim()
+                    );
+                    let wait_record = tasks::VerdictRecord {
+                        stated_intent: record.stated_intent,
+                        observed_action: record.observed_action,
+                        verdict: tasks::VerdictKind::Wait,
+                        rationale,
+                        steer_message: None,
+                        timestamp: 0,
+                    };
+                    SupervisionParsed {
+                        display: format!("  → {}\n", wait_record.to_line()),
+                        record: wait_record,
+                        done_summary: None,
+                        dispatch: None,
+                    }
+                }
+            }
+        }
+        tasks::VerdictKind::Wait | tasks::VerdictKind::Legacy => {
+            // LEGACY shouldn't come out of the LLM — but if the model
+            // echoes an unknown value, coerce to WAIT.
+            if record.verdict == tasks::VerdictKind::Legacy {
+                record.verdict = tasks::VerdictKind::Wait;
+            }
+            SupervisionParsed {
+                display: format!("  → {}\n", record.to_line()),
+                record,
+                done_summary: None,
+                dispatch: None,
+            }
+        }
+    }
+}
+
+/// Extract the first top-level `{...}` object from `raw`, stripping
+/// common wrappers (``` fences, leading/trailing prose).  Returns
+/// `None` when no balanced object exists.
+fn extract_json_object(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    // Fast path: response is pure JSON already.
+    if trimmed.starts_with('{') && trimmed.ends_with('}') {
+        return Some(trimmed.to_string());
+    }
+    // Find a `{` and scan for its matching `}` respecting string literals.
+    let bytes = raw.as_bytes();
+    let start = bytes.iter().position(|&b| b == b'{')?;
+    let mut depth = 0i32;
+    let mut in_str = false;
+    let mut escape = false;
+    for (i, &b) in bytes.iter().enumerate().skip(start) {
+        if escape {
+            escape = false;
+            continue;
+        }
+        match b {
+            b'\\' if in_str => escape = true,
+            b'"' => in_str = !in_str,
+            b'{' if !in_str => depth += 1,
+            b'}' if !in_str => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(raw[start..=i].to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Persist a verdict record to `~/.amaebi/tasks.db` for every
+/// `(repo_dir, tag)` target among `panes`.  Best-effort: failures are
+/// logged but do not propagate — the notebook is auxiliary to live
+/// supervision.
+async fn persist_verdict_record(
+    state: &Arc<DaemonState>,
+    panes: &[crate::ipc::SupervisionTarget],
+    record: &tasks::VerdictRecord,
+) {
+    let mut targets: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+    for target in panes.iter() {
+        if let (Some(repo_dir), Some(tag)) = (target.repo_dir.as_deref(), target.tag.as_deref()) {
+            targets.insert((repo_dir.to_string(), tag.to_string()));
+        }
+    }
+    for (repo_dir, tag) in targets {
+        let state_cl = Arc::clone(state);
+        let record = record.clone();
+        let repo_dir_log = repo_dir.clone();
+        let tag_log = tag.clone();
+        match tokio::task::spawn_blocking(move || -> Result<()> {
+            ensure_tasks_db(&state_cl)?;
+            let guard = state_cl
+                .tasks_db
+                .lock()
+                .map_err(|e| anyhow::anyhow!("tasks_db mutex poisoned: {e}"))?;
+            let conn = guard
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("tasks_db not initialised"))?;
+            tasks::append_verdict_record(conn, &repo_dir, &tag, &record)
+        })
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::warn!(
+                error = %e,
+                repo_dir = %repo_dir_log,
+                tag = %tag_log,
+                "failed to persist verdict"
+            ),
+            Err(e) => tracing::warn!(
+                error = %e,
+                repo_dir = %repo_dir_log,
+                tag = %tag_log,
+                "verdict persist task panicked"
+            ),
+        }
+    }
+}
 
 /// Pure helper that formats the user message fed to the supervision LLM
 /// every turn.  Extracted from [`handle_supervision_inner`] so tests can
@@ -2549,6 +3065,7 @@ fn build_supervision_user_content(
     task_lines: &[(String, String)],
     hard_constraints: &str,
     notebook_context: &str,
+    git_evidence: &str,
     verdict_history: &std::collections::VecDeque<String>,
     last_steer_full: Option<&str>,
     pane_snapshots: &str,
@@ -2597,12 +3114,20 @@ fn build_supervision_user_content(
     };
 
     // Assemble without source-indentation so every section header (TASK,
-    // HARD CONSTRAINTS, notebook context, verdict list, STEER carry-over,
-    // snapshot header) lands at column 0 in the LLM-facing output.
+    // HARD CONSTRAINTS, notebook context, git evidence, verdict list,
+    // STEER carry-over, snapshot header) lands at column 0 in the
+    // LLM-facing output.
     let mut out = task_section;
     out.push('\n');
     out.push_str(hard_constraints);
     out.push_str(notebook_context);
+    if !git_evidence.trim().is_empty() {
+        out.push_str(git_evidence);
+        if !git_evidence.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push('\n');
+    }
     out.push_str("Your recent verdicts this session (newest last):\n");
     out.push_str(&verdict_history_block);
     out.push('\n');
@@ -2692,8 +3217,10 @@ async fn render_hard_constraints(panes: &[crate::ipc::SupervisionTarget]) -> Str
 /// How often `handle_supervision` emits a [`Response::Heartbeat`] frame on
 /// the supervision socket.  Chosen so a stuck daemon trips the client's
 /// 30-minute watchdog within ~30 minutes even on a pane that would
-/// otherwise produce no other frames (WAIT/STEER/DONE headers only land
-/// every `AMAEBI_SUPERVISION_INTERVAL_SECS`, defaulting to 5 minutes).
+/// otherwise produce no other frames.  Supervision verdicts land
+/// whenever the pane has been idle for `IDLE_SECS` — often far more
+/// frequent than the heartbeat — but long compile / sim runs still
+/// benefit from the heartbeat to prove liveness.
 const HEARTBEAT_INTERVAL_SECS: u64 = 10 * 60;
 
 /// Inner body of [`handle_supervision`]; see that function's doc for context.
@@ -2718,19 +3245,21 @@ async fn handle_supervision_inner(
     // same holder id derived in the wrapper; cleanup still flows
     // through `release_all_by_holder` there.
 
-    // Max time to wait between LLM checks.  Default 5 min; override with
-    // AMAEBI_SUPERVISION_INTERVAL_SECS.  This is the *ceiling*: each iteration
-    // actually waits for the pane to go idle (see `IDLE_SECS` below) so that
-    // the snapshot fed to the LLM is stable, and only falls back to the
-    // ceiling when Claude is continuously producing output.  The higher
-    // ceiling reduces supervision LLM cost when Claude is in a long
-    // compile / test / think phase where the pane barely changes for
-    // minutes at a time.
+    // Ceiling on the wait-for-idle step.  Effect (catching drift) has
+    // been prioritised over cost (see drift-detection rework): Claude
+    // may pause briefly between tool calls even during active work, so
+    // a short ceiling like the prior 5 min would let the supervisor
+    // judge only while Claude was genuinely stuck — too late to catch
+    // drift in flight.  Defaulting to the full supervision timeout
+    // means `wait_for_pane_idle` will return once the pane has been
+    // stable for IDLE_SECS (10 s), which is the real trigger we want.
+    // `AMAEBI_SUPERVISION_INTERVAL_SECS` remains available as an
+    // escape hatch for operators who need to rate-limit LLM calls.
     let poll_interval = tokio::time::Duration::from_secs(
         std::env::var("AMAEBI_SUPERVISION_INTERVAL_SECS")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(300u64) // 5 min
+            .unwrap_or(crate::pane_lease::LEASE_TTL_SECS)
             .max(1), // clamp to >= 1 s to prevent a tight loop
     );
     // How long a pane must be unchanged to be considered idle before
@@ -2934,6 +3463,15 @@ async fn handle_supervision_inner(
         // so resumes without a CLI desc can find it.
         let notebook_context = build_notebook_context(state, panes, turn == 1).await;
 
+        // Ground-truth evidence — per-pane git diff / status.  Pulled
+        // from each pane's worktree (looked up in tmux-state.json by
+        // pane_id).  The supervisor needs this to catch drift that
+        // pane narration can't reveal: Claude may claim "reading X"
+        // while the diff shows edits to Y.  A pane without a bound
+        // worktree (raw `--resume-pane` on an ad-hoc shell) produces
+        // no evidence block; the prompt simply omits the section.
+        let git_evidence = collect_git_evidence(panes).await;
+
         let task_lines: Vec<(String, String)> = snapshots
             .iter()
             .map(|s| (s.pane_id.clone(), s.task_description.clone()))
@@ -2943,6 +3481,7 @@ async fn handle_supervision_inner(
             &task_lines,
             &hard_constraints,
             &notebook_context,
+            &git_evidence,
             &verdict_history,
             last_steer_full.as_deref(),
             &pane_snapshots,
@@ -3011,16 +3550,30 @@ async fn handle_supervision_inner(
             }
         };
 
-        let trimmed = response_text.trim();
+        // --- Parse structured JSON verdict and act ---
+        //
+        // The system prompt requires a single JSON object with
+        // (stated_intent, observed_action, verdict, rationale,
+        // optional steer_message).  Any shape deviation is treated as
+        // a WAIT with a diagnostic rationale so the loop survives a
+        // misbehaving model without skipping safety actions.
+        //
+        // `steer_dispatched` is true only when the parsed STEER was
+        // valid AND the message was actually injected into the pane,
+        // so `last_steer_full` next turn reflects a message claude
+        // really saw.
+        let parsed = parse_supervision_verdict(&response_text, panes);
+        let SupervisionParsed {
+            mut record,
+            display,
+            done_summary,
+            dispatch,
+        } = parsed;
 
-        // --- Parse response and act ---
-        // `steer_dispatched` is true only when the parsed STEER was valid
-        // and actually sent into a pane — so the next turn's carry-over
-        // (`last_steer_full`) reflects a message claude really saw.
-        // Malformed / unknown-pane STEERs leave `last_steer_full` alone.
-        let mut steer_dispatched = false;
-        let verdict_line = if trimmed.starts_with("DONE:") || trimmed == "DONE" {
-            let summary = trimmed.strip_prefix("DONE:").unwrap_or("").trim();
+        if let Some(summary) = done_summary {
+            // Record the DONE verdict before exit so the notebook
+            // reflects the final state.
+            persist_verdict_record(state, panes, &record).await;
             let mut w = writer.lock().await;
             write_frame(
                 &mut *w,
@@ -3031,152 +3584,58 @@ async fn handle_supervision_inner(
             .await?;
             // wrapper writes Response::Done after the resume hint
             return Ok(());
-        } else if let Some(rest) = trimmed.strip_prefix("STEER:") {
-            if let Some((pane_id_raw, message)) = rest.trim().split_once(':') {
-                let pane_id = pane_id_raw.trim().to_owned();
-                let message = message.trim().to_owned();
-                let is_valid_pane = panes.iter().any(|t| t.pane_id == pane_id);
-                if !pane_id.is_empty() && !message.is_empty() && is_valid_pane {
-                    let pid = pane_id.clone();
-                    let msg = message.clone();
-                    // `send_pane_keys` returns `true` only when both the
-                    // text injection and the trailing Enter succeeded at
-                    // tmux.  We also guard against JoinError (panic /
-                    // cancel) by pattern-matching the JoinHandle result.
-                    // Either failure leaves `steer_dispatched = false` so
-                    // next turn does not claim claude received a message
-                    // that never actually arrived.
-                    match tokio::task::spawn_blocking(move || send_pane_keys(&pid, &msg)).await {
-                        Ok(true) => {
-                            steer_dispatched = true;
-                        }
-                        Ok(false) => {
-                            tracing::warn!(
-                                pane_id = %pane_id,
-                                "tmux send-keys reported failure; treating STEER as undelivered"
-                            );
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                pane_id = %pane_id,
-                                error = %e,
-                                "send_pane_keys task failed; treating STEER as undelivered"
-                            );
-                        }
-                    }
-                    // Keep the `STEER: <pane>: <msg>` shape exactly as the
-                    // parser (and system prompt) expect, so when this line
-                    // is echoed back via `verdict_history` / `last_steer_full`
-                    // next turn the LLM is primed with the same grammar it
-                    // must emit.  A `STEER %X: ...` (no colon after STEER)
-                    // would be mis-parsed as WAIT on the next round-trip.
-                    format!("  → STEER: {pane_id}: {message}\n")
-                } else if !pane_id.is_empty() && !message.is_empty() && !is_valid_pane {
-                    format!("  → STEER: {pane_id} (unknown pane, ignored)\n")
-                } else {
-                    "  → STEER: (malformed response)\n".to_string()
+        }
+
+        let mut steer_dispatched = false;
+        if let Some(SteerDispatch { pane_id, message }) = dispatch {
+            let pid = pane_id.clone();
+            let msg = message.clone();
+            match tokio::task::spawn_blocking(move || send_pane_keys(&pid, &msg)).await {
+                Ok(true) => {
+                    steer_dispatched = true;
                 }
-            } else {
-                "  → STEER: (malformed response)\n".to_string()
+                Ok(false) => {
+                    tracing::warn!(
+                        pane_id = %pane_id,
+                        "tmux send-keys reported failure; treating STEER as undelivered"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        pane_id = %pane_id,
+                        error = %e,
+                        "send_pane_keys task failed; treating STEER as undelivered"
+                    );
+                }
             }
-        } else {
-            // WAIT: <note> or bare WAIT
-            let note = trimmed.strip_prefix("WAIT:").unwrap_or("").trim();
-            if note.is_empty() {
-                "  → WAIT\n".to_string()
-            } else {
-                format!("  → WAIT: {note}\n")
+        }
+
+        if !steer_dispatched {
+            // Suppress `steer_message` on the record when the message
+            // wasn't actually delivered so future rounds and the
+            // notebook don't claim Claude saw something it didn't.
+            if record.verdict == tasks::VerdictKind::Steer {
+                record.steer_message = None;
             }
-        };
-        // Remember this verdict (minus the display prefix) so the next
-        // iteration can pass it back into the user prompt.  `verdict_line`
-        // starts with "  → " and ends with "\n"; strip both for a compact
-        // one-line carry-over.
-        let verdict_compact = verdict_line
-            .trim_start_matches("  → ")
-            .trim_end_matches('\n')
-            .to_string();
-        // The verdict_history rendering uses one line per entry; an
-        // embedded `\n` (possible when a STEER message spans multiple
-        // lines — parser doesn't reject them) would break the `[last] …`
-        // / `[N turns ago] …` table shape and push downstream section
-        // headers off column 0.  Escape newlines to a visible `\n` so
-        // the LLM still sees the content but the layout is preserved.
-        let verdict_single_line = verdict_compact.replace('\n', "\\n");
+        }
+
+        // Compact single-line form for the in-session verdict history
+        // ring — preserves the existing prompt layout (one line per
+        // entry, no embedded newlines).
+        let verdict_single_line = record.to_line().replace('\n', "\\n");
         if verdict_history.len() >= VERDICT_HISTORY_LEN {
             verdict_history.pop_front();
         }
         verdict_history.push_back(verdict_single_line.clone());
-        // Only stash the full text when the STEER was actually dispatched.
-        // `steer_dispatched` stays false for "unknown pane, ignored" and
-        // "malformed response" variants so the next turn's prompt does not
-        // claim claude received something it never did.  Use the escaped
-        // single-line form for the same layout-protection reason.
         if steer_dispatched {
             last_steer_full = Some(verdict_single_line);
         }
 
-        // Persist verdict to task notebook (best-effort, once per unique
-        // `(repo_dir, tag)`).  Deduped because multiple panes sharing a
-        // tag (user `--tag foo` for a multi-task launch) would otherwise
-        // append duplicate rows for a single supervision turn.  Failures
-        // (panic OR SQLite Err) are logged but must not break the loop —
-        // notebook is auxiliary to the live verdict decision.
-        let mut verdict_targets: std::collections::HashSet<(String, String)> =
-            std::collections::HashSet::new();
-        for target in panes.iter() {
-            if let (Some(repo_dir), Some(tag)) = (target.repo_dir.as_deref(), target.tag.as_deref())
-            {
-                verdict_targets.insert((repo_dir.to_string(), tag.to_string()));
-            }
-        }
-        for (repo_dir, tag) in verdict_targets {
-            let state_cl = Arc::clone(state);
-            let verdict = verdict_compact.clone();
-            let repo_dir_log = repo_dir.clone();
-            let tag_log = tag.clone();
-            match tokio::task::spawn_blocking(move || -> Result<()> {
-                // Lazy-open the DB if no prior code path did.  Resume-pane
-                // launches skip the tag-acquisition block in
-                // `handle_claude_launch` that normally opens it, so when a
-                // resumed pane produces the first verdict the handle may
-                // still be `None`.  `ensure_tasks_db` is idempotent.
-                ensure_tasks_db(&state_cl)?;
-                let guard = state_cl
-                    .tasks_db
-                    .lock()
-                    .map_err(|e| anyhow::anyhow!("tasks_db mutex poisoned: {e}"))?;
-                let conn = guard
-                    .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("tasks_db not initialised"))?;
-                tasks::append_verdict(conn, &repo_dir, &tag, &verdict)
-            })
-            .await
-            {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => tracing::warn!(
-                    error = %e,
-                    repo_dir = %repo_dir_log,
-                    tag = %tag_log,
-                    "failed to persist verdict"
-                ),
-                Err(e) => tracing::warn!(
-                    error = %e,
-                    repo_dir = %repo_dir_log,
-                    tag = %tag_log,
-                    "verdict persist task panicked"
-                ),
-            }
-        }
+        // Persist structured verdict to task notebook (best-effort).
+        persist_verdict_record(state, panes, &record).await;
 
         let mut w = writer.lock().await;
-        write_frame(
-            &mut *w,
-            &Response::Text {
-                chunk: verdict_line,
-            },
-        )
-        .await?;
+        write_frame(&mut *w, &Response::Text { chunk: display }).await?;
     }
 }
 
@@ -8575,6 +9034,7 @@ mod tests {
             &task_lines,
             "",
             "",
+            "",
             &history,
             None,
             "=== Pane %5 ===\nidle\n",
@@ -8596,6 +9056,292 @@ mod tests {
     }
 
     #[test]
+    fn event_stream_history_folds_identical_wait_runs() {
+        let mk_wait = |intent: &str, obs: &str| tasks::VerdictRecord {
+            stated_intent: intent.into(),
+            observed_action: obs.into(),
+            verdict: tasks::VerdictKind::Wait,
+            rationale: "still reading".into(),
+            steer_message: None,
+            timestamp: 0,
+        };
+        let records = vec![
+            mk_wait("reading auth.rs", ""),
+            mk_wait("reading auth.rs", ""),
+            mk_wait("reading auth.rs", ""),
+            mk_wait("running tests", "touched auth_test.rs"),
+            mk_wait("running tests", "touched auth_test.rs"),
+        ];
+        let rendered = render_event_stream_history(&records);
+        // Three identical WAITs collapse to one `[3 ticks] sustained …`.
+        assert!(
+            rendered.contains("[3 ticks] sustained WAIT: reading auth.rs"),
+            "first run must fold: got {rendered:?}"
+        );
+        // New signature gets its own fold.
+        assert!(
+            rendered.contains("[2 ticks] sustained WAIT: running tests"),
+            "second run must fold: got {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn event_stream_history_keeps_steer_verbatim() {
+        let records = vec![
+            tasks::VerdictRecord {
+                stated_intent: "idle".into(),
+                observed_action: "".into(),
+                verdict: tasks::VerdictKind::Wait,
+                rationale: "r".into(),
+                steer_message: None,
+                timestamp: 0,
+            },
+            tasks::VerdictRecord {
+                stated_intent: "reading x".into(),
+                observed_action: "modified y".into(),
+                verdict: tasks::VerdictKind::Steer,
+                rationale: "drift".into(),
+                steer_message: Some("return to x".into()),
+                timestamp: 0,
+            },
+            tasks::VerdictRecord {
+                stated_intent: "idle again".into(),
+                observed_action: "".into(),
+                verdict: tasks::VerdictKind::Wait,
+                rationale: "r2".into(),
+                steer_message: None,
+                timestamp: 0,
+            },
+        ];
+        let rendered = render_event_stream_history(&records);
+        assert!(
+            rendered.contains("STEER: return to x"),
+            "STEER must appear verbatim, got {rendered:?}"
+        );
+        // The WAIT before and after must each survive (different signatures).
+        assert!(rendered.contains("WAIT: r"));
+        assert!(rendered.contains("WAIT: r2"));
+    }
+
+    #[test]
+    fn event_stream_history_keeps_changed_wait_signatures() {
+        let mk_wait = |intent: &str, obs: &str, rationale: &str| tasks::VerdictRecord {
+            stated_intent: intent.into(),
+            observed_action: obs.into(),
+            verdict: tasks::VerdictKind::Wait,
+            rationale: rationale.into(),
+            steer_message: None,
+            timestamp: 0,
+        };
+        // observed_action changes every round → every WAIT is a new event.
+        let records = vec![
+            mk_wait("exploring", "touched a.rs", "r1"),
+            mk_wait("exploring", "touched a.rs, b.rs", "r2"),
+            mk_wait("exploring", "touched a.rs, b.rs, c.rs", "r3"),
+        ];
+        let rendered = render_event_stream_history(&records);
+        // No folding marker.
+        assert!(!rendered.contains("sustained WAIT"));
+        // All three rationales appear verbatim, oldest first.
+        let i1 = rendered.find("WAIT: r1").expect("r1 missing");
+        let i2 = rendered.find("WAIT: r2").expect("r2 missing");
+        let i3 = rendered.find("WAIT: r3").expect("r3 missing");
+        assert!(i1 < i2 && i2 < i3, "must be oldest-first");
+    }
+
+    #[test]
+    fn parse_supervision_verdict_wait_happy_path() {
+        let raw = r#"{
+            "stated_intent": "reading src/auth.rs",
+            "observed_action": "no diff yet — only file reads",
+            "verdict": "WAIT",
+            "rationale": "Claude is investigating the right area"
+        }"#;
+        let panes = vec![crate::ipc::SupervisionTarget {
+            pane_id: "%5".into(),
+            task_description: "fix flaky auth test".into(),
+            tag: None,
+            repo_dir: None,
+        }];
+        let out = parse_supervision_verdict(raw, &panes);
+        assert_eq!(out.record.verdict, tasks::VerdictKind::Wait);
+        assert_eq!(out.record.stated_intent, "reading src/auth.rs");
+        assert!(out.dispatch.is_none());
+        assert!(out.done_summary.is_none());
+        assert!(out.display.contains("WAIT"));
+    }
+
+    #[test]
+    fn parse_supervision_verdict_steer_dispatches_to_pane() {
+        let raw = r#"{
+            "stated_intent": "reading src/auth.rs",
+            "observed_action": "modified src/daemon.rs (+12 -3)",
+            "verdict": "STEER",
+            "rationale": "touched file outside scope",
+            "steer_message": "stop — you said A, modified daemon.rs instead"
+        }"#;
+        let panes = vec![crate::ipc::SupervisionTarget {
+            pane_id: "%5".into(),
+            task_description: "t".into(),
+            tag: None,
+            repo_dir: None,
+        }];
+        let out = parse_supervision_verdict(raw, &panes);
+        assert_eq!(out.record.verdict, tasks::VerdictKind::Steer);
+        let d = out.dispatch.expect("STEER must dispatch");
+        assert_eq!(d.pane_id, "%5");
+        assert!(d.message.contains("modified daemon.rs"));
+    }
+
+    #[test]
+    fn parse_supervision_verdict_steer_without_message_downgrades_to_wait() {
+        let raw = r#"{"verdict":"STEER","rationale":""}"#;
+        let panes = vec![crate::ipc::SupervisionTarget {
+            pane_id: "%5".into(),
+            task_description: "t".into(),
+            tag: None,
+            repo_dir: None,
+        }];
+        let out = parse_supervision_verdict(raw, &panes);
+        assert_eq!(out.record.verdict, tasks::VerdictKind::Wait);
+        assert!(out.dispatch.is_none());
+        assert!(out.record.rationale.contains("malformed STEER"));
+    }
+
+    #[test]
+    fn parse_supervision_verdict_done_carries_rationale_as_summary() {
+        let raw = r#"{
+            "stated_intent": "",
+            "observed_action": "",
+            "verdict": "DONE",
+            "rationale": "task complete: flaky test fixed, passing now"
+        }"#;
+        let panes = vec![crate::ipc::SupervisionTarget {
+            pane_id: "%5".into(),
+            task_description: "t".into(),
+            tag: None,
+            repo_dir: None,
+        }];
+        let out = parse_supervision_verdict(raw, &panes);
+        assert_eq!(out.record.verdict, tasks::VerdictKind::Done);
+        let summary = out.done_summary.expect("DONE must carry summary");
+        assert!(summary.contains("flaky test fixed"));
+    }
+
+    #[test]
+    fn parse_supervision_verdict_unparseable_becomes_wait_with_raw_in_rationale() {
+        let raw = "I am confused and will just say hi.";
+        let panes: Vec<crate::ipc::SupervisionTarget> = Vec::new();
+        let out = parse_supervision_verdict(raw, &panes);
+        assert_eq!(out.record.verdict, tasks::VerdictKind::Wait);
+        assert!(out.record.rationale.contains("unparseable"));
+        assert!(out.dispatch.is_none());
+    }
+
+    #[test]
+    fn parse_supervision_verdict_strips_code_fence_wrapper() {
+        let raw = "```json\n{\"verdict\":\"WAIT\",\"rationale\":\"ok\"}\n```";
+        let panes: Vec<crate::ipc::SupervisionTarget> = Vec::new();
+        let out = parse_supervision_verdict(raw, &panes);
+        assert_eq!(out.record.verdict, tasks::VerdictKind::Wait);
+        assert_eq!(out.record.rationale, "ok");
+    }
+
+    #[test]
+    fn supervision_prompt_renders_git_evidence_when_non_empty() {
+        let task_lines = vec![("%5".to_string(), "implement feature".to_string())];
+        let history: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+        let evidence = "── Filesystem ground truth — pane %5 ──\n\
+                        git status --short:\n   M src/daemon.rs\n";
+        let out = build_supervision_user_content(
+            &task_lines,
+            "",
+            "",
+            evidence,
+            &history,
+            None,
+            "snap",
+            1,
+            0,
+        );
+        assert!(
+            out.contains("Filesystem ground truth — pane %5"),
+            "evidence block must appear in prompt, got: {out:?}"
+        );
+        assert!(
+            out.contains(" M src/daemon.rs"),
+            "touched files must appear verbatim, got: {out:?}"
+        );
+    }
+
+    #[test]
+    fn supervision_prompt_omits_git_evidence_when_empty() {
+        let task_lines = vec![("%5".to_string(), "task".to_string())];
+        let history: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+        let out =
+            build_supervision_user_content(&task_lines, "", "", "", &history, None, "snap", 1, 0);
+        assert!(
+            !out.contains("Filesystem ground truth"),
+            "no evidence → no header, got: {out:?}"
+        );
+    }
+
+    #[test]
+    fn git_evidence_captures_diff_and_status_in_real_worktree() {
+        // Stand up a throwaway git repo, commit one file, modify it, and
+        // confirm capture_git_evidence surfaces the change via status +
+        // diff.  Skipped in sandboxed environments where `git` is not
+        // executable.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let wt = dir.path().to_owned();
+
+        let init = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&wt)
+            .status();
+        if !matches!(init, Ok(s) if s.success()) {
+            eprintln!("git unavailable; skipping git_evidence test");
+            return;
+        }
+        // Quiet commits in sandboxes without a user configured.
+        let _ = std::process::Command::new("git")
+            .args(["-c", "user.email=t@t", "-c", "user.name=t"])
+            .args(["commit", "--allow-empty", "-m", "root"])
+            .current_dir(&wt)
+            .status();
+
+        let file = wt.join("foo.txt");
+        std::fs::write(&file, "hello\n").unwrap();
+        let _ = std::process::Command::new("git")
+            .args(["add", "foo.txt"])
+            .current_dir(&wt)
+            .status();
+        let _ = std::process::Command::new("git")
+            .args(["-c", "user.email=t@t", "-c", "user.name=t"])
+            .args(["commit", "-q", "-m", "add foo"])
+            .current_dir(&wt)
+            .status();
+
+        // Unstaged modification — must show up in both status and diff.
+        std::fs::write(&file, "hello world\n").unwrap();
+
+        let evidence = capture_git_evidence(wt.to_str().unwrap());
+        assert!(
+            evidence.status.contains("foo.txt"),
+            "status must mention modified file, got: {evidence:?}"
+        );
+        assert!(
+            evidence.patch.contains("hello world"),
+            "diff must contain added line, got: {evidence:?}"
+        );
+        assert!(!evidence.truncated, "small diff shouldn't truncate");
+
+        let rendered = render_git_evidence("%9", &evidence);
+        assert!(rendered.contains("── Filesystem ground truth — pane %9 ──"));
+        assert!(rendered.contains("foo.txt"));
+    }
+
+    #[test]
     fn supervision_prompt_verdict_history_renders_multiple_lines() {
         let task_lines = vec![("%5".to_string(), "task".to_string())];
         let mut history = std::collections::VecDeque::new();
@@ -8605,7 +9351,8 @@ mod tests {
         // verdict format or parser prefix diverge.
         history.push_back("STEER: %5: use sim-9900".to_string());
         history.push_back("WAIT: now on sim-9900".to_string());
-        let out = build_supervision_user_content(&task_lines, "", "", &history, None, "snap", 4, 3);
+        let out =
+            build_supervision_user_content(&task_lines, "", "", "", &history, None, "snap", 4, 3);
         assert!(
             out.contains("[last] WAIT: now on sim-9900"),
             "newest verdict must be labelled [last], got: {out:?}"
@@ -8630,6 +9377,7 @@ mod tests {
                      task says sim-9900; rerun with the correct port";
         let out = build_supervision_user_content(
             &task_lines,
+            "",
             "",
             "",
             &history,
