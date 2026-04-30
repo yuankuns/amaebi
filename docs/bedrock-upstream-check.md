@@ -128,6 +128,60 @@ Opus returns this kind of table in one shot. You pick which items are
 worth turning into PRs and kick them off separately — nothing in this
 doc commits to doing the work, only to surfacing it.
 
+## Deeper: reading the SDK source for wire details
+
+The release-notes pass answers *which* changes matter.  It does not
+answer *what the wire looks like* — a line like "Added support for
+structured outputs to Converse and ConverseStream APIs" does not tell
+you the JSON field name, which layer it nests into, or whether it
+produces a new event-stream event type.  For that, read the SDK
+source directly.  We don't depend on the SDK — we read it as a **living
+wire-contract reference** and translate the interesting bits into our
+handwritten client.
+
+`aws-sdk-bedrockruntime` is code-generated from AWS's smithy model, so
+the crate is a faithful mirror of the wire.  Three places carry the
+answers:
+
+| Question | Read | Mirrors our code |
+|---|---|---|
+| What JSON fields does ConverseStream accept on the **request** side, and how do they nest? | [`sdk/bedrockruntime/src/operation/converse_stream/_converse_stream_input.rs`][csi] and the `shape_*` serializers under [`sdk/bedrockruntime/src/protocol_serde/`][psd] (e.g. `shape_cache_point_block.rs`, `shape_tool_configuration.rs`). | `to_bedrock_request` / `to_bedrock_tools` in `src/bedrock.rs`. |
+| What event-stream variants can arrive on the **response** side, and what payload shape does each carry? | [`sdk/bedrockruntime/src/types/_converse_stream_output.rs`][cso] (the enum of every streamed event) plus the sibling `_content_block_*.rs`, `_tool_use_block_*.rs`, `_reasoning_content_block*.rs`, `_converse_stream_metadata_event.rs` shape files. | `parse_converse_stream` + `handle_frame` in `src/bedrock.rs`. |
+| How are event-stream frames **framed on the wire** (length prefix, CRCs, headers)? | [`smithy-rs/rust-runtime/aws-smithy-eventstream/src/frame.rs`][esf]. | `mod eventstream` in `src/bedrock.rs`. |
+
+[csi]: https://github.com/awslabs/aws-sdk-rust/blob/main/sdk/bedrockruntime/src/operation/converse_stream/_converse_stream_input.rs
+[cso]: https://github.com/awslabs/aws-sdk-rust/blob/main/sdk/bedrockruntime/src/types/_converse_stream_output.rs
+[psd]: https://github.com/awslabs/aws-sdk-rust/tree/main/sdk/bedrockruntime/src/protocol_serde
+[esf]: https://github.com/smithy-lang/smithy-rs/blob/main/rust-runtime/aws-smithy-eventstream/src/frame.rs
+
+### The four-step workflow
+
+When the release-notes pass flags something worth implementing:
+
+1. **Locate the type in `_converse_stream_input.rs` / `_converse_stream_output.rs`**.  The struct field name in Rust is usually the JSON key in camelCase; smithy-rs applies predictable renames (`snake_case_field` → `"snakeCaseField"`).  Named enum variants like `ContentBlock::CachePoint(_)` map to a content-block JSON object with `"cachePoint": {...}`.
+2. **Follow into the `shape_*` serializer** in `protocol_serde/` for the exact on-the-wire JSON shape — the smithy generator spells out every field name and nesting level.  You can copy the structure directly into our `serde_json::json!({ ... })` builders.
+3. **For streaming: find the corresponding variant in `_converse_stream_output.rs`** to confirm which `:event-type` header the server will send and what payload type to expect.  That tells us what new branch to add to `handle_frame`'s `match event_type`.
+4. **Translate into `src/bedrock.rs`** — keep it handwritten.  We are copying *wire knowledge*, not code.  The translation is usually a few new lines in `to_bedrock_request` and/or a new match arm in `handle_frame`.
+
+### Prompt for Opus
+
+Once you have both the release-notes output and the wire question, hand
+the whole thing to Opus in one shot:
+
+> The release-notes pass flagged *<feature>* as relevant.  Read the
+> corresponding smithy types / serializers in `aws-sdk-bedrockruntime`
+> (paths in [`docs/bedrock-upstream-check.md`](bedrock-upstream-check.md))
+> and tell me:
+>
+> 1. The exact JSON wire shape (field names, nesting, enum string values).
+> 2. Which `match event_type` branches in `handle_frame` and which fields
+>    in `to_bedrock_request` need to change in `src/bedrock.rs`.
+> 3. A ready-to-apply diff.  Keep the implementation handwritten — we
+>    read the SDK, we do not depend on it.
+
+Opus can `gh api` into the file paths above and read them without
+cloning the whole repo.
+
 ## What Opus needs to know to do a good job
 
 If you're running the check in a brand-new session that hasn't seen
