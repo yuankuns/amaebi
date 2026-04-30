@@ -271,8 +271,10 @@ async fn tmux_send_text(args: serde_json::Value) -> Result<String> {
 ///
 /// `key` is passed straight to `tmux send-keys` WITHOUT `-l`, so tmux's
 /// key-name parser interprets it: `C-c`, `Escape`, `Up`, `q`, `Enter`,
-/// etc. all work.  No Enter is appended and no sleep runs — use
-/// `tmux_send_text` for prompt-like text + submit flows.
+/// etc. all work.  `--` is still passed before `key` so a payload that
+/// starts with `-` can't be misread as a `send-keys` option flag.  No
+/// Enter is appended and no sleep runs — use `tmux_send_text` for
+/// prompt-like text + submit flows.
 async fn tmux_send_key(args: serde_json::Value) -> Result<String> {
     let key = args["key"]
         .as_str()
@@ -280,7 +282,7 @@ async fn tmux_send_key(args: serde_json::Value) -> Result<String> {
     let target = args["target"].as_str().unwrap_or("%0");
 
     let out = Command::new("tmux")
-        .args(["send-keys", "-t", target, key])
+        .args(["send-keys", "-t", target, "--", key])
         .output()
         .await
         .context("spawning tmux send-keys (key)")?;

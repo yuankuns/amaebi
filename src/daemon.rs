@@ -1774,8 +1774,13 @@ async fn handle_claude_launch(
                 }
                 if *press_enter {
                     // Wait for the TUI to render and accept the pasted text,
-                    // then press Enter.
-                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    // then press Enter.  Shared with `send_pane_keys` /
+                    // `tmux_send_text` via `TEXT_RENDER_SLEEP_SECS` so every
+                    // paste path uses the same render-delay; 1 s was not
+                    // enough for multi-KB markdown and dropped Enters.
+                    std::thread::sleep(std::time::Duration::from_secs(
+                        crate::tools::TEXT_RENDER_SLEEP_SECS,
+                    ));
                     let out = std::process::Command::new("tmux")
                         .args(["send-keys", "-t", &send_pane, "Enter"])
                         .output()?;
@@ -2087,14 +2092,14 @@ async fn wait_for_pane_idle(
 ///
 /// Sends the text with `send-keys -l --` (literal, no keyname interpretation),
 /// pauses to let the receiving TUI's paste buffer drain, then sends
-/// Enter as a separate key press.  The pause matches the `handle_claude_launch`
-/// injection path (daemon.rs:1081) and exists because Claude Code's TUI can
-/// swallow or defer the trailing Enter when it arrives before the pasted text
-/// has been rendered into the input field — which manifests as a STEER
-/// message appearing in the pane input but never submitting.
+/// Enter as a separate key press.  The pause exists because Claude Code's
+/// TUI can swallow or defer the trailing Enter when it arrives before the
+/// pasted text has been rendered into the input field — which manifests
+/// as a STEER message appearing in the pane input but never submitting.
 ///
-/// The sleep duration is kept in sync with the LLM-facing `tmux_send_text`
-/// tool via [`crate::tools::TEXT_RENDER_SLEEP_SECS`]; the previous 1 s value
+/// This helper and the `handle_claude_launch` literal-paste path share the
+/// same render delay via [`crate::tools::TEXT_RENDER_SLEEP_SECS`], kept in
+/// sync with the LLM-facing `tmux_send_text` tool; the previous 1 s value
 /// was not enough for multi-KB markdown pastes and caused dropped Enters.
 ///
 /// Returns `true` when BOTH the literal text injection and the trailing
