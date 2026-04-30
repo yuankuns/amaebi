@@ -16,7 +16,7 @@ notebook preamble (for `--tag` runs) and must return exactly one of:
 | Verdict | Meaning | Effect |
 |---------|---------|--------|
 | `WAIT` | Still working, check again later | Sleep, re-snapshot on next tick |
-| `STEER: <pane_id>: <message>` | Pane is stuck or off-track | `tmux_send_keys` the message into the pane |
+| `STEER: <pane_id>: <message>` | Pane is stuck or off-track | `tmux_send_text` the message into the pane |
 | `DONE: <summary>` | Task is complete | Stream the summary to the client, exit |
 
 The prompt that asks for this verdict is built from the pane capture plus the

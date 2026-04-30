@@ -824,7 +824,8 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
                                 "shell_command" => eprint!("{}", render_markdown(&format!("```bash\n$ {detail}\n```\n"))),
                                 "read_file" => eprintln!("📄 {detail}"),
                                 "edit_file" => eprintln!("✏️  {detail}"),
-                                "tmux_send_keys" => eprintln!("⌨️  send-keys: {detail}"),
+                                "tmux_send_text" => eprintln!("⌨️  send-text: {detail}"),
+                                "tmux_send_key" => eprintln!("⌨️  send-key: {detail}"),
                                 "tmux_capture_pane" => eprintln!("🖥️  capture: {detail}"),
                                 _ => eprintln!("🔧 {name}: {detail}"),
                             }
@@ -1795,7 +1796,8 @@ pub async fn run_resume(
                                 "shell_command" => eprint!("{}", render_markdown(&format!("```bash\n$ {detail}\n```\n"))),
                                 "read_file" => eprintln!("📄 {detail}"),
                                 "edit_file" => eprintln!("✏️  {detail}"),
-                                "tmux_send_keys" => eprintln!("⌨️  send-keys: {detail}"),
+                                "tmux_send_text" => eprintln!("⌨️  send-text: {detail}"),
+                                "tmux_send_key" => eprintln!("⌨️  send-key: {detail}"),
                                 "tmux_capture_pane" => eprintln!("🖥️  capture: {detail}"),
                                 _ => eprintln!("🔧 {name}: {detail}"),
                             }
@@ -2013,7 +2015,8 @@ async fn flush_steer_buffer(
                     "shell_command" => eprintln!("```bash\n$ {detail}\n```"),
                     "read_file" => eprintln!("📄 {detail}"),
                     "edit_file" => eprintln!("✏️  {detail}"),
-                    "tmux_send_keys" => eprintln!("⌨️  send-keys: {detail}"),
+                    "tmux_send_text" => eprintln!("⌨️  send-text: {detail}"),
+                    "tmux_send_key" => eprintln!("⌨️  send-key: {detail}"),
                     "tmux_capture_pane" => eprintln!("🖥️  capture: {detail}"),
                     _ => eprintln!("🔧 {name}: {detail}"),
                 }
