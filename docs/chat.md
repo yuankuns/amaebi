@@ -116,6 +116,25 @@ The prompt input uses `rustyline` for line editing — arrow keys, Emacs
 bindings, CJK-aware cursor movement, and persistent history across
 sessions. This replaced a hand-rolled editor; see commit `0bb236a`.
 
+Every successful prompt from the `amaebi chat` prompt input is appended
+to `~/.amaebi/history.jsonl` (one JSON object per line — `display`,
+`pasted_contents`, `timestamp_ms`, `cwd`, `session_id`). When
+`amaebi chat` opens, it seeds the in-memory ring with rows whose
+canonicalised `cwd` matches the current working directory, so pressing
+↑ in a given project shows prior commands from that same project
+(including slash commands like `/claude` and `/model`). The filter is
+intentional: a chat started in `~/projectA` does not replay prompts
+from `~/projectB`. Canonicalisation handles symlink / `..` / bind-mount
+variants of the same directory. To inspect every line across every
+project use `cat ~/.amaebi/history.jsonl`; to search, pass a pattern
+(e.g. `grep -F /claude ~/.amaebi/history.jsonl`).
+
+Note: only `amaebi chat`'s interactive prompt feeds this file.
+`amaebi ask` reads its single prompt + any steer-correction text via a
+plain `BufReader` on stdin (no rustyline), so those lines are not
+persisted and are not recalled by ↑ the next time you run
+`amaebi chat`.
+
 ## Session identity
 
 Every working directory gets a stable UUID stored in `~/.amaebi/sessions.json`
