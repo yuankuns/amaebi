@@ -79,6 +79,7 @@ Run `amaebi --help` for the full subcommand list.
 - **[resource-pool.md](docs/resource-pool.md)** — `~/.amaebi/resources.toml`, `--resource` semantics, env injection
 - **[dashboard.md](docs/dashboard.md)** — `amaebi dashboard` TUI
 - **[architecture.md](docs/architecture.md)** — two-process model, `~/.amaebi/` file inventory, request lifecycle
+- **[bedrock-upstream-check.md](docs/bedrock-upstream-check.md)** — how to fetch recent Bedrock API changes from `aws-sdk-rust` releases and hand them to Opus for analysis
 
 ### Not yet covered by dedicated docs
 
