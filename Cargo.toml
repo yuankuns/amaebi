@@ -1,6 +1,6 @@
 [package]
 name = "amaebi"
-version = "2026.4.65"
+version = "2026.4.66"
 edition = "2021"
 
 [[bin]]

@@ -57,11 +57,26 @@ Verdict semantics:
 | `DONE` | Explicit completion signal + diff covers the deliverables + Claude is idle | Stream summary to the client, exit |
 
 Assembly: `build_supervision_user_content` (prompt) and
-`parse_supervision_verdict` (response), both in `src/daemon.rs`. An
-unparseable response degrades to a WAIT whose rationale carries the raw
-text, so a misbehaving model never silently skips a tick. The completion
-is capped at `MAX_SUPERVISION_TOKENS` — enough for the JSON object, not
-enough for a long narrative.
+`parse_supervision_verdict` (response), both in `src/daemon.rs`. The
+completion is capped at `MAX_SUPERVISION_TOKENS` — enough for the JSON
+object, not enough for a long narrative.
+
+**Server-side schema enforcement (Bedrock).** On supported Claude
+models (Opus 4.6 / 4.7, Sonnet 4.6), the schema in
+`SUPERVISION_VERDICT_SCHEMA` is passed to ConverseStream via
+`outputConfig.textFormat = { type: "json_schema", ... }` (field added
+in `aws-sdk-bedrockruntime` 1.124.0, 2026-02-04). Bedrock guarantees
+the model's text output conforms to the schema — no code fences, no
+prose prefix, no field omission. The schema and `VerdictRecord` are
+pinned together by a drift-guard test so adding a field to one without
+the other fails CI.
+
+On unsupported models (older Claude, Copilot, Nova, …) the feature is
+silently skipped and the path relies on the prompt's shape instructions
+plus `parse_supervision_verdict`'s tolerant parser, which strips code
+fences, accepts missing optional fields, and degrades an unparseable
+response to a WAIT with the raw text in `rationale` so a misbehaving
+model never silently skips a tick.
 
 ## Timing
 

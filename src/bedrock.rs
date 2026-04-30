@@ -675,6 +675,80 @@ pub(crate) fn supports_1m_context(model_id: &str) -> bool {
         || model_id.starts_with("us.anthropic.claude-opus-4-6")
 }
 
+/// Returns true for Bedrock Claude models that reliably honor the
+/// `outputConfig.textFormat = { type: "json_schema", ... }` structured-output
+/// field added to ConverseStream in `aws-sdk-bedrockruntime` 1.124.0
+/// (2026-02-04).
+///
+/// Same allowlist as adaptive thinking — the feature is on the server
+/// side but practical support in Claude's response behavior tracks the
+/// same recent models (Opus 4.6 / 4.7, Sonnet 4.6).  Older Claude 4.x
+/// and 3.x models are left on the prompt-based JSON path to avoid
+/// surprising 400s.
+pub(crate) fn supports_structured_output(model_id: &str) -> bool {
+    model_id.starts_with("us.anthropic.claude-opus-4-7")
+        || model_id.starts_with("us.anthropic.claude-opus-4-6")
+        || model_id.starts_with("us.anthropic.claude-sonnet-4-6")
+}
+
+/// Describes a JSON schema the caller wants Bedrock to enforce on the
+/// model's text output.  Serialised into the request body under
+/// `outputConfig.textFormat` per the smithy model in
+/// `aws-sdk-bedrockruntime/src/types/_output_format.rs`.
+///
+/// The `schema` string is a stringified JSON schema document (not a
+/// nested JSON value — the SDK field type is `String`, confirmed in
+/// `JsonSchemaDefinition::schema`).  `name` and `description` are
+/// optional metadata that surface in tool/panel UIs.
+pub(crate) struct OutputSchema<'a> {
+    pub schema_json: &'a str,
+    pub name: Option<&'a str>,
+    pub description: Option<&'a str>,
+}
+
+/// Build the `outputConfig` body field when `schema` is present AND the
+/// target model is on the `supports_structured_output` allowlist.
+/// Returns `None` otherwise so the caller can simply omit the field.
+///
+/// Wire shape (from `protocol_serde/shape_output_format*.rs`):
+///
+/// ```json
+/// "outputConfig": {
+///   "textFormat": {
+///     "type": "json_schema",
+///     "structure": {
+///       "jsonSchema": {
+///         "schema": "<stringified JSON schema>",
+///         "name": "...",
+///         "description": "..."
+///       }
+///     }
+///   }
+/// }
+/// ```
+fn build_output_config(
+    model_id: &str,
+    schema: Option<&OutputSchema<'_>>,
+) -> Option<serde_json::Value> {
+    let schema = schema?;
+    if !supports_structured_output(model_id) {
+        return None;
+    }
+    let mut json_schema = serde_json::json!({ "schema": schema.schema_json });
+    if let Some(n) = schema.name {
+        json_schema["name"] = serde_json::Value::String(n.to_owned());
+    }
+    if let Some(d) = schema.description {
+        json_schema["description"] = serde_json::Value::String(d.to_owned());
+    }
+    Some(serde_json::json!({
+        "textFormat": {
+            "type": "json_schema",
+            "structure": { "jsonSchema": json_schema }
+        }
+    }))
+}
+
 /// Build the `additionalModelRequestFields` map for a Bedrock request.
 ///
 /// Merges all per-model feature flags (adaptive thinking, 1M context) into a
@@ -710,6 +784,7 @@ async fn send_with_retry(
     tools: &[serde_json::Value],
     max_tokens: usize,
     use_1m: bool,
+    output_schema: Option<&OutputSchema<'_>>,
 ) -> Result<reqwest::Response> {
     let parts = to_bedrock_request(messages);
     let bedrock_tools = to_bedrock_tools(tools);
@@ -731,6 +806,10 @@ async fn send_with_retry(
     let amrf = build_additional_model_request_fields(model_id, use_1m);
     if !amrf.is_empty() {
         body["additionalModelRequestFields"] = serde_json::Value::Object(amrf);
+    }
+
+    if let Some(output_config) = build_output_config(model_id, output_schema) {
+        body["outputConfig"] = output_config;
     }
 
     let url = converse_stream_endpoint(region, model_id);
@@ -1083,12 +1162,21 @@ where
 /// Reads `AWS_BEARER_TOKEN_BEDROCK` and `AWS_REGION` from the environment.
 /// Text chunks are forwarded to `writer` as `Response::Text` frames as they
 /// arrive.  Returns a [`CopilotResponse`] describing the full turn result.
+///
+/// When `output_schema` is `Some` and the target model is on
+/// [`supports_structured_output`], Bedrock enforces the schema on the
+/// model's text output server-side — removing the need for
+/// prompt-based "output JSON only" instructions and brittle regex
+/// post-processing on the client.  For unsupported models the field
+/// is silently omitted so the call still succeeds with a prompt-only
+/// JSON contract.
 pub async fn stream_chat<W>(
     http: &reqwest::Client,
     spec: &crate::provider::ModelSpec,
     messages: &[Message],
     tools: &[serde_json::Value],
     max_tokens: usize,
+    output_schema: Option<&OutputSchema<'_>>,
     writer: &mut W,
 ) -> Result<CopilotResponse>
 where
@@ -1102,6 +1190,7 @@ where
         model = %spec.display_name,
         model_id = %spec.model_id,
         use_1m = spec.use_1m,
+        structured_output = output_schema.is_some(),
         region = %region,
         "sending Bedrock ConverseStream request"
     );
@@ -1115,6 +1204,7 @@ where
         tools,
         max_tokens,
         spec.use_1m,
+        output_schema,
     )
     .await?;
     parse_converse_stream(resp, writer).await
@@ -1269,6 +1359,93 @@ mod tests {
             "no adaptive thinking for sonnet-4"
         );
         assert!(amrf.contains_key("anthropic_beta"), "1M beta present");
+    }
+
+    // ---- supports_structured_output + build_output_config -----------------
+
+    #[test]
+    fn structured_output_supported_models() {
+        assert!(supports_structured_output("us.anthropic.claude-opus-4-7"));
+        assert!(supports_structured_output(
+            "us.anthropic.claude-opus-4-6-v1"
+        ));
+        assert!(supports_structured_output(
+            "us.anthropic.claude-sonnet-4-6-v1:0"
+        ));
+    }
+
+    #[test]
+    fn structured_output_unsupported_models() {
+        // Older Claude 4.x and anything not on the allowlist.
+        assert!(!supports_structured_output(
+            "us.anthropic.claude-opus-4-5-20251101-v1:0"
+        ));
+        assert!(!supports_structured_output(
+            "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
+        ));
+        assert!(!supports_structured_output(
+            "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+        ));
+        assert!(!supports_structured_output(
+            "us.anthropic.claude-sonnet-4-20250514-v1:0"
+        ));
+        assert!(!supports_structured_output("gpt-4o"));
+        assert!(!supports_structured_output(""));
+    }
+
+    #[test]
+    fn output_config_none_when_schema_absent() {
+        let cfg = build_output_config("us.anthropic.claude-opus-4-7", None);
+        assert!(cfg.is_none());
+    }
+
+    #[test]
+    fn output_config_none_for_unsupported_model() {
+        let schema = OutputSchema {
+            schema_json: "{}",
+            name: None,
+            description: None,
+        };
+        let cfg = build_output_config("us.anthropic.claude-haiku-4-5", Some(&schema));
+        assert!(
+            cfg.is_none(),
+            "unsupported model must silently drop outputConfig"
+        );
+    }
+
+    #[test]
+    fn output_config_wire_shape_matches_sdk_model() {
+        // Wire shape cross-checked against `aws-sdk-bedrockruntime`'s
+        // `protocol_serde/shape_output_format*.rs` — structure must be
+        // `outputConfig.textFormat.{type, structure.jsonSchema.{schema, name, description}}`
+        // with `schema` as a STRINGIFIED JSON document (not a nested object).
+        let schema_doc = r#"{"type":"object","properties":{"verdict":{"type":"string"}}}"#;
+        let schema = OutputSchema {
+            schema_json: schema_doc,
+            name: Some("SupervisionVerdict"),
+            description: Some("Structured verdict output"),
+        };
+        let cfg = build_output_config("us.anthropic.claude-opus-4-7", Some(&schema))
+            .expect("supported model must emit outputConfig");
+        let text_format = &cfg["textFormat"];
+        assert_eq!(text_format["type"], "json_schema");
+        let json_schema = &text_format["structure"]["jsonSchema"];
+        assert_eq!(json_schema["schema"], schema_doc);
+        assert_eq!(json_schema["name"], "SupervisionVerdict");
+        assert_eq!(json_schema["description"], "Structured verdict output");
+    }
+
+    #[test]
+    fn output_config_omits_optional_metadata() {
+        let schema = OutputSchema {
+            schema_json: "{}",
+            name: None,
+            description: None,
+        };
+        let cfg = build_output_config("us.anthropic.claude-opus-4-7", Some(&schema)).unwrap();
+        let json_schema = &cfg["textFormat"]["structure"]["jsonSchema"];
+        assert!(json_schema.get("name").is_none());
+        assert!(json_schema.get("description").is_none());
     }
 
     // ---- to_bedrock_request: message conversion ---------------------------

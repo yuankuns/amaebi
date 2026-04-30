@@ -2733,6 +2733,30 @@ async fn build_notebook_context(
 /// notebook can store (stated_intent, observed_action, verdict,
 /// rationale) per turn and reconstruct the drift trajectory across
 /// long runs.  See [`tasks::VerdictRecord`].
+/// JSON schema for the supervisor's per-turn verdict.  Passed to Bedrock
+/// via `outputConfig.textFormat` so supported Claude models emit a
+/// schema-compliant JSON object server-side (no code fences, no prose
+/// prefix, no field omission).  Unsupported models + the Copilot path
+/// fall back to the prompt's shape instructions and the tolerant
+/// `parse_supervision_verdict` below.
+///
+/// Mirrors [`tasks::VerdictRecord`]; if that struct gains or renames a
+/// field the schema must change in lockstep — a unit test below pins the
+/// two to the same key set.
+pub(crate) const SUPERVISION_VERDICT_SCHEMA: &str = r#"{
+    "type": "object",
+    "properties": {
+        "stated_intent":   { "type": "string" },
+        "observed_action": { "type": "string" },
+        "verdict":         { "type": "string", "enum": ["WAIT", "STEER", "DONE"] },
+        "rationale":       { "type": "string" },
+        "steer_message":   { "type": ["string", "null"] },
+        "claude_responded_to_last_steer": { "type": ["boolean", "null"] }
+    },
+    "required": ["stated_intent", "observed_action", "verdict", "rationale"],
+    "additionalProperties": false
+}"#;
+
 const SUPERVISION_SYSTEM_PROMPT: &str = concat!(
     "You are supervising a Claude Code session executing a specific task in a ",
     "tmux pane.  Your PRIMARY duty is to keep Claude on the task as stated.  ",
@@ -3566,12 +3590,21 @@ async fn handle_supervision_inner(
         // We write our own formatted one-line status after parsing the response.
         let response_text = {
             let mut sink = tokio::io::sink();
-            match invoke_model(
+            let verdict_schema = crate::bedrock::OutputSchema {
+                schema_json: SUPERVISION_VERDICT_SCHEMA,
+                name: Some("SupervisionVerdict"),
+                description: Some(
+                    "Structured per-turn verdict from the supervision LLM, \
+                     mirroring tasks::VerdictRecord.",
+                ),
+            };
+            match invoke_model_with_schema(
                 state,
                 &model,
                 &messages,
                 &[],
                 MAX_SUPERVISION_TOKENS,
+                Some(&verdict_schema),
                 &mut sink,
             )
             .await
@@ -5533,12 +5566,42 @@ async fn invoke_model<W>(
 where
     W: AsyncWriteExt + Unpin,
 {
+    invoke_model_with_schema(
+        state,
+        model,
+        messages,
+        tools,
+        max_completion_tokens,
+        None,
+        writer,
+    )
+    .await
+}
+
+/// Same as [`invoke_model`], but optionally passes a JSON schema down to
+/// Bedrock so the model's text output is server-enforced to match.  The
+/// Copilot path ignores the schema (it has no equivalent field) and
+/// leaves JSON compliance to the prompt.
+#[allow(clippy::too_many_arguments)]
+async fn invoke_model_with_schema<W>(
+    state: &DaemonState,
+    model: &str,
+    messages: &[Message],
+    tools: &[serde_json::Value],
+    max_completion_tokens: usize,
+    output_schema: Option<&crate::bedrock::OutputSchema<'_>>,
+    writer: &mut W,
+) -> Result<copilot::CopilotResponse>
+where
+    W: AsyncWriteExt + Unpin,
+{
     let spec = crate::provider::resolve(model);
     tracing::debug!(
         provider = %spec.provider,
         model_id = %spec.model_id,
         display = %spec.display_name,
         use_1m = spec.use_1m,
+        structured_output = output_schema.is_some(),
         "invoke_model: resolved provider"
     );
 
@@ -5550,6 +5613,7 @@ where
                 messages,
                 tools,
                 max_completion_tokens,
+                output_schema,
                 writer,
             )
             .await
@@ -5571,6 +5635,9 @@ where
                 )
                 .await?;
             }
+            // Copilot has no Bedrock-equivalent structured-output field; the
+            // prompt-only JSON contract + `parse_supervision_verdict`
+            // fallback path remains the contract on that side.
             invoke_copilot(
                 state,
                 &spec.model_id,
@@ -9850,5 +9917,63 @@ prompt_hint = "use sim-9900 (port {port}) only"
 
         ensure_tasks_db(&state).expect("second ensure_tasks_db is a no-op");
         assert!(state.tasks_db.lock().unwrap().is_some());
+    }
+
+    // -----------------------------------------------------------------------
+    // SUPERVISION_VERDICT_SCHEMA drift guard
+    //
+    // The JSON schema string lives in daemon.rs; the canonical Rust shape
+    // lives in tasks::VerdictRecord.  These must stay aligned — a new
+    // VerdictRecord field that the schema does not list will be stripped by
+    // Bedrock's structured-output enforcement, silently dropping information
+    // the rest of the code relies on.  Pin the two together with a
+    // compile-time roundtrip + key-set check.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn supervision_verdict_schema_is_valid_json() {
+        let parsed: serde_json::Value = serde_json::from_str(SUPERVISION_VERDICT_SCHEMA)
+            .expect("SUPERVISION_VERDICT_SCHEMA must be valid JSON");
+        assert_eq!(parsed["type"], "object");
+        assert!(
+            parsed["properties"].is_object(),
+            "schema must declare an object with properties"
+        );
+    }
+
+    #[test]
+    fn supervision_verdict_schema_keys_cover_verdict_record_fields() {
+        // If this fails, VerdictRecord grew (or renamed) a field and the
+        // schema was not updated.  Either add the field to the schema's
+        // `properties` (and `required` if mandatory) or rename it
+        // symmetrically.  Silent drift will lose data on the wire.
+        let schema: serde_json::Value = serde_json::from_str(SUPERVISION_VERDICT_SCHEMA).unwrap();
+        let schema_keys: std::collections::BTreeSet<String> = schema["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+
+        // Serialise a fully-populated VerdictRecord and compare key sets.
+        let rec = tasks::VerdictRecord {
+            stated_intent: "i".into(),
+            observed_action: "o".into(),
+            verdict: tasks::VerdictKind::Steer,
+            rationale: "r".into(),
+            steer_message: Some("s".into()),
+            claude_responded_to_last_steer: Some(true),
+            timestamp: 0,
+        };
+        let v = serde_json::to_value(&rec).unwrap();
+        let record_keys: std::collections::BTreeSet<String> =
+            v.as_object().unwrap().keys().cloned().collect();
+
+        assert_eq!(
+            schema_keys, record_keys,
+            "schema properties must match VerdictRecord serialised keys exactly \
+             (missing in schema = field will be stripped by Bedrock; missing in \
+             record = dead schema entry)"
+        );
     }
 }
