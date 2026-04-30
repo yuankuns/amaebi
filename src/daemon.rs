@@ -5205,6 +5205,15 @@ where
     let mut read_cache: std::collections::HashMap<std::path::PathBuf, ((u128, u64), String)> =
         Default::default();
 
+    // Bedrock `malformed_model_output` / `malformed_tool_use` stopReasons
+    // (since bedrockruntime 1.119, 2025-12-02) signal a transient per-turn
+    // failure inside the model, not a protocol or quota error.  We retry
+    // each such turn once with identical `messages`; on the second strike
+    // we fall through to the `Other`-style termination path.  Bounded to
+    // one to prevent loop storms if the model is in a stuck pattern.
+    const MAX_MALFORMED_RETRIES: usize = 1;
+    let mut malformed_retries: usize = 0;
+
     loop {
         // Drain any steering corrections that arrived since the last model
         // call (covers non-tool turns and the time between tool completion
@@ -5295,6 +5304,7 @@ where
             FinishReason::Stop => "stop",
             FinishReason::Length => "length",
             FinishReason::ToolCalls => "tool_calls",
+            FinishReason::Malformed => "malformed",
             FinishReason::Other(_) => "other",
         };
         tracing::debug!(
@@ -5924,7 +5934,29 @@ where
                 // the top of the next loop iteration, before the model call.
             }
 
-            FinishReason::Other(ref reason) => {
+            FinishReason::Malformed if malformed_retries < MAX_MALFORMED_RETRIES => {
+                // Transient per-turn model error (Bedrock stopReason
+                // `malformed_model_output` / `malformed_tool_use`).  Retry
+                // the exact same request once — do not push any partial
+                // assistant text or tool calls onto `messages`, so the
+                // next iteration re-sends an identical payload.
+                malformed_retries += 1;
+                tracing::warn!(
+                    attempt = malformed_retries,
+                    "malformed model output; retrying turn with unchanged messages"
+                );
+                continue;
+            }
+
+            FinishReason::Malformed | FinishReason::Other(_) => {
+                // Second-strike Malformed (or any other unhandled
+                // finish reason): terminate the session cleanly and
+                // surface the reason string to the client.
+                let reason: String = match &resp.finish_reason {
+                    FinishReason::Other(s) => s.clone(),
+                    FinishReason::Malformed => "malformed_output".to_string(),
+                    _ => unreachable!(),
+                };
                 tracing::warn!(finish_reason = %reason, "session end: unexpected finish reason");
                 let warning = format!("\n[stopped: unexpected finish reason '{reason}']");
                 write_frame(writer, &Response::Text { chunk: warning }).await?;
