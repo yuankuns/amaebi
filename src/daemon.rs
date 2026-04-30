@@ -1713,10 +1713,13 @@ async fn handle_claude_launch(
         // with `send-keys -l --`, then send Enter as a separate key press.
         //
         // Timing: 1 s pause before the first send (bash init), 5 s before
-        // subsequent sends (e.g. claude startup), then 1 s after each text
-        // injection before pressing Enter.  No prompt-polling — simple
-        // fixed delays are robust against prompt character variations
-        // (❯, >, $, etc.).
+        // subsequent sends (e.g. claude startup), then
+        // `tools::TEXT_RENDER_SLEEP_SECS` after each text injection before
+        // pressing Enter (shared with `send_pane_keys` / `tmux_send_text`
+        // so every paste path uses the same render-delay — 1 s was not
+        // enough for multi-KB markdown and dropped Enters).  No prompt-
+        // polling — simple fixed delays are robust against prompt
+        // character variations (❯, >, $, etc.).
         let send_result = tokio::task::spawn_blocking(move || {
             for (idx, (keys, press_enter)) in key_sequence.iter().enumerate() {
                 // Before the very first send: let the new pane's shell
@@ -4001,9 +4004,10 @@ async fn flush_pending_unsolicited(
 const MAX_PROMPT_CHARS: usize = 4_000;
 /// Maximum chars stored for an assistant response in session history.
 const MAX_RESPONSE_CHARS: usize = 8_000;
-/// Maximum Unicode scalars kept in the `shell_command` preview returned by
-/// [`summarise_tool_detail`] before appending `…`.  Kept at module scope so
-/// regression tests can reference it without duplicating the `80` literal.
+/// Maximum Unicode scalars kept in the `shell_command` / `tmux_send_text`
+/// preview returned by [`summarise_tool_detail`] before appending `…`.
+/// Kept at module scope so regression tests can reference it without
+/// duplicating the `80` literal.
 const SHELL_DETAIL_MAX_CHARS: usize = 80;
 
 /// Truncate `s` to at most `max` Unicode scalar values (including the marker).
@@ -4041,6 +4045,20 @@ fn should_persist_tool_output(tool_name: &str) -> bool {
     tool_name != "read_file"
 }
 
+/// Bound a preview string to [`SHELL_DETAIL_MAX_CHARS`] Unicode scalars,
+/// appending `…` when truncation occurred.
+///
+/// Walks `char_indices` once to find the byte offset of the `(MAX+1)`-th
+/// scalar (guaranteed to be a char boundary), so it is safe against
+/// multi-byte UTF-8 — a raw `&s[..80]` byte slice would panic when byte 80
+/// lands inside a multi-byte sequence.
+fn truncate_detail_preview(s: &str) -> String {
+    match s.char_indices().nth(SHELL_DETAIL_MAX_CHARS) {
+        Some((byte_idx, _)) => format!("{}…", &s[..byte_idx]),
+        None => s.to_string(),
+    }
+}
+
 /// Build a short human-readable detail string for a tool call, used in
 /// `Response::ToolUse` frames so the client can render something like
 /// `shell_command: ls -la`.
@@ -4048,27 +4066,16 @@ fn should_persist_tool_output(tool_name: &str) -> bool {
 /// Must operate on Unicode scalar boundaries: shell commands routinely contain
 /// non-ASCII text (Chinese comments, em-dashes) and a raw byte slice like
 /// `&s[..80]` panics when the truncation index falls inside a multi-byte UTF-8
-/// sequence.  The `shell_command` branch truncates at 80 chars, appending `…`
-/// when the original was longer; other tools return their primary argument
-/// verbatim.
+/// sequence.  The `shell_command` and `tmux_send_text` branches truncate at
+/// 80 chars, appending `…` when the original was longer (and `tmux_send_text`
+/// additionally flattens newlines so multi-line pastes don't break the CLI's
+/// single-line renderer); other tools return their primary argument verbatim.
 fn summarise_tool_detail(tool_name: &str, args: &serde_json::Value) -> String {
     match tool_name {
         "shell_command" => args
             .get("command")
             .and_then(|v| v.as_str())
-            .map(|s| {
-                // `char_indices().nth(N)` walks the string once and returns
-                // the byte offset of the (N+1)-th Unicode scalar, which is by
-                // construction a char boundary.  Slicing at that byte offset
-                // is safe and avoids the double-iteration / allocation of the
-                // prior `chars().nth` + `chars().take(N).collect()` approach.
-                // `None` means the string has ≤ SHELL_DETAIL_MAX_CHARS chars
-                // and fits verbatim.
-                match s.char_indices().nth(SHELL_DETAIL_MAX_CHARS) {
-                    Some((byte_idx, _)) => format!("{}…", &s[..byte_idx]),
-                    None => s.to_string(),
-                }
-            })
+            .map(truncate_detail_preview)
             .unwrap_or_default(),
         "read_file" | "edit_file" => args
             .get("path")
@@ -4078,8 +4085,20 @@ fn summarise_tool_detail(tool_name: &str, args: &serde_json::Value) -> String {
         "tmux_send_text" => args
             .get("text")
             .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string(),
+            .map(|s| {
+                // Multi-KB markdown pastes are the common case for
+                // tmux_send_text; injecting the whole body into the tool
+                // detail spams logs/client output and the raw `\n` bytes
+                // break the CLI's single-line tool-use renderer.  Flatten
+                // whitespace first, then bound the preview to the same
+                // char limit as shell_command.
+                let flat: String = s
+                    .chars()
+                    .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+                    .collect();
+                truncate_detail_preview(&flat)
+            })
+            .unwrap_or_default(),
         "tmux_send_key" => args
             .get("key")
             .and_then(|v| v.as_str())
@@ -7691,6 +7710,38 @@ mod tests {
         let args = serde_json::json!({ "path": "/tmp/foo.rs" });
         assert_eq!(summarise_tool_detail("read_file", &args), "/tmp/foo.rs");
         assert_eq!(summarise_tool_detail("edit_file", &args), "/tmp/foo.rs");
+    }
+
+    #[test]
+    fn summarise_tool_detail_tmux_send_text_short_returned_verbatim() {
+        let args = serde_json::json!({ "text": "hello world" });
+        assert_eq!(
+            summarise_tool_detail("tmux_send_text", &args),
+            "hello world"
+        );
+    }
+
+    #[test]
+    fn summarise_tool_detail_tmux_send_text_long_truncates() {
+        // Multi-KB paste is the common real-world case — confirm the
+        // preview is bounded to SHELL_DETAIL_MAX_CHARS + ellipsis instead
+        // of spamming the whole body into logs / tool-use frames.
+        let text: String = "a".repeat(2_000);
+        let args = serde_json::json!({ "text": text });
+        let detail = summarise_tool_detail("tmux_send_text", &args);
+        assert_eq!(detail.chars().count(), SHELL_DETAIL_MAX_CHARS + 1);
+        assert!(detail.ends_with('…'));
+    }
+
+    #[test]
+    fn summarise_tool_detail_tmux_send_text_flattens_newlines() {
+        // Raw newlines would break the CLI's single-line tool-use renderer;
+        // flatten to spaces so the preview stays on one visual line.
+        let args = serde_json::json!({ "text": "line one\nline two\rline three" });
+        let detail = summarise_tool_detail("tmux_send_text", &args);
+        assert!(!detail.contains('\n'));
+        assert!(!detail.contains('\r'));
+        assert_eq!(detail, "line one line two line three");
     }
 
     #[test]
