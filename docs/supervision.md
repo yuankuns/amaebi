@@ -43,7 +43,9 @@ as `true`; ignoring the STEER is `false`; no prior STEER exists yet is
 `null`. This field drives the **hard-boundary escalation** described
 below.
 
-All five fields land in `~/.amaebi/tasks.db` for every tick, so drift
+The full `VerdictRecord` (all fields above, plus
+`claude_responded_to_last_steer` — see the hard-boundary section) is
+JSON-serialised into `~/.amaebi/tasks.db` for every tick, so drift
 trajectories can be reconstructed across resumes. Rows written before
 this schema existed read back with `verdict="LEGACY"` and the raw string
 in `rationale` — no migration required.

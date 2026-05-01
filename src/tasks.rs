@@ -9,11 +9,10 @@
 //! * `kind = "desc"` — the `<desc>` passed on the CLI.  Written once per
 //!   `/claude --tag <tag> "<desc>"` invocation.  On resume without a
 //!   `<desc>`, the supervisor falls back to the most recent `desc` row.
-//! * `kind = "verdict"` — one row per supervision turn.  Content is a
-//!   JSON-serialised [`VerdictRecord`] capturing the four-field
-//!   verdict (`stated_intent`, `observed_action`, `verdict`,
-//!   `rationale`) plus an optional `steer_message`.  Rows written
-//!   before this schema existed are read back as
+//! * `kind = "verdict"` — one row per supervision turn.  Content is
+//!   the JSON-serialised [`VerdictRecord`] (see its doc for the full
+//!   field set — the schema evolves so listing fields here would rot).
+//!   Rows written before this schema existed are read back as
 //!   [`VerdictKind::Legacy`] with the raw text in `rationale` — no
 //!   migration required.
 //! * `kind = "lease"` — at most one live row per `(repo_dir, tag)`.
@@ -360,29 +359,48 @@ pub fn append_verdict_record(
     Ok(())
 }
 
-/// Return every verdict row for `(repo_dir, tag)`, oldest first.
+/// Upper bound on rows returned by [`all_verdict_records`].
+///
+/// Supervision runs at ~2–4 ticks per minute; 5000 rows covers roughly
+/// a day of continuous activity.  Longer runs trim the oldest tail —
+/// older history has already informed prior verdicts, so losing it
+/// does not hurt drift detection.  Serves as a belt-and-braces cap on
+/// top of the time-window parameter: when a caller mistakenly passes
+/// `since_ts = 0` the result is still bounded.
+pub const MAX_VERDICT_ROWS: usize = 5_000;
+
+/// Return verdict rows for `(repo_dir, tag)` with `timestamp >= since_ts`,
+/// oldest first, capped at [`MAX_VERDICT_ROWS`].
 ///
 /// Used by the event-stream history renderer which needs to run its
 /// own filtering (keep all non-WAIT, dedupe sustained WAIT, fold runs)
 /// rather than the fixed time-window in [`recent_verdicts`].  Legacy
 /// plain-string rows are surfaced as [`VerdictKind::Legacy`] so their
 /// content still makes it into the prompt.
+///
+/// Pass `since_ts = 0` to load everything (capped) — intended for
+/// tests and one-off inspection; the supervision loop should always
+/// pass a real cutoff (e.g. 24 h ago) so per-tick work stays bounded.
 pub fn all_verdict_records(
     conn: &Connection,
     repo_dir: &str,
     tag: &str,
+    since_ts: i64,
 ) -> Result<Vec<VerdictRecord>> {
     let mut stmt = conn
         .prepare(
             "SELECT content, timestamp FROM task_notes
              WHERE repo_dir = ?1 AND tag = ?2 AND kind = 'verdict'
-             ORDER BY timestamp ASC, id ASC",
+               AND timestamp >= ?3
+             ORDER BY timestamp ASC, id ASC
+             LIMIT ?4",
         )
         .context("preparing all_verdict_records query")?;
     let rows = stmt
-        .query_map(params![repo_dir, tag], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-        })
+        .query_map(
+            params![repo_dir, tag, since_ts, MAX_VERDICT_ROWS as i64],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+        )
         .context("running all_verdict_records query")?;
     let mut out = Vec::new();
     for row in rows {
@@ -565,7 +583,7 @@ mod tests {
         };
         append_verdict_record(&conn, "/proj", "kernel", &rec).unwrap();
 
-        let all = all_verdict_records(&conn, "/proj", "kernel").unwrap();
+        let all = all_verdict_records(&conn, "/proj", "kernel", 0).unwrap();
         assert_eq!(all.len(), 1);
         let back = &all[0];
         assert_eq!(back.stated_intent, rec.stated_intent);
@@ -589,7 +607,7 @@ mod tests {
         )
         .unwrap();
 
-        let all = all_verdict_records(&conn, "/proj", "kernel").unwrap();
+        let all = all_verdict_records(&conn, "/proj", "kernel", 0).unwrap();
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].verdict, VerdictKind::Legacy);
         assert_eq!(all[0].rationale, "WAIT: still reading files");
@@ -614,7 +632,7 @@ mod tests {
         append_verdict_record(&conn, "/proj-a", "lint", &mk("lint-v")).unwrap();
 
         let reads = |r, t| -> Vec<String> {
-            all_verdict_records(&conn, r, t)
+            all_verdict_records(&conn, r, t, 0)
                 .unwrap()
                 .into_iter()
                 .map(|v| v.rationale)

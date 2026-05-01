@@ -2068,18 +2068,48 @@ struct GitEvidence {
 /// [`GitEvidence::truncated`] flag is set so the supervisor knows.
 const MAX_GIT_EVIDENCE_BYTES: usize = 50 * 1024;
 
+/// Wall-clock ceiling on each individual `git` invocation inside
+/// [`capture_git_evidence`].  A hung filesystem (stalled NFS, index
+/// lock never released) would otherwise block the supervision loop
+/// indefinitely.  3 s is generous: even a cold `git diff HEAD` on a
+/// reasonably sized repo returns in well under a second.
+const GIT_EVIDENCE_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// Run `git diff` and `git status --short` in `worktree` and assemble a
-/// [`GitEvidence`] snapshot.  Each git invocation is capped at 3 s so a
-/// hung filesystem cannot stall the supervision loop.
+/// [`GitEvidence`] snapshot.  Each git invocation is capped at
+/// [`GIT_EVIDENCE_CALL_TIMEOUT`] so a hung filesystem cannot stall the
+/// supervision loop; on timeout the child process is killed and the
+/// field is left empty.
 ///
-/// Call from `spawn_blocking` — the git calls are synchronous.
-fn capture_git_evidence(worktree: &str) -> GitEvidence {
-    fn run(worktree: &str, args: &[&str]) -> Option<String> {
-        let out = std::process::Command::new("git")
-            .args(["-C", worktree])
-            .args(args)
-            .output()
-            .ok()?;
+/// The post-capture `cap()` step bounds every field to
+/// [`MAX_GIT_EVIDENCE_BYTES`] for prompt-size purposes, but git can in
+/// principle fill memory with megabytes of diff before `output()`
+/// returns — the timeout is the real backstop on runaway output.
+async fn capture_git_evidence(worktree: String) -> GitEvidence {
+    async fn run(worktree: &str, args: &[&str]) -> Option<String> {
+        let mut cmd = tokio::process::Command::new("git");
+        cmd.args(["-C", worktree]).args(args).kill_on_drop(true);
+
+        let child_fut = cmd.output();
+        let out = match tokio::time::timeout(GIT_EVIDENCE_CALL_TIMEOUT, child_fut).await {
+            Ok(Ok(out)) => out,
+            Ok(Err(e)) => {
+                tracing::debug!(worktree, args = ?args, error = %e, "git evidence spawn failed");
+                return None;
+            }
+            Err(_) => {
+                // `kill_on_drop` terminates the child when the future is
+                // dropped, which happens as we fall out of this block.
+                tracing::warn!(
+                    worktree,
+                    args = ?args,
+                    timeout_ms = GIT_EVIDENCE_CALL_TIMEOUT.as_millis(),
+                    "git evidence call timed out; killing child"
+                );
+                return None;
+            }
+        };
+
         if !out.status.success() {
             tracing::debug!(
                 worktree,
@@ -2109,13 +2139,16 @@ fn capture_git_evidence(worktree: &str) -> GitEvidence {
 
     let mut truncated = false;
     GitEvidence {
-        stat: run(worktree, &["diff", "--stat", "HEAD"])
+        stat: run(&worktree, &["diff", "--stat", "HEAD"])
+            .await
             .map(|s| cap(s, &mut truncated))
             .unwrap_or_default(),
-        patch: run(worktree, &["diff", "HEAD"])
+        patch: run(&worktree, &["diff", "HEAD"])
+            .await
             .map(|s| cap(s, &mut truncated))
             .unwrap_or_default(),
-        status: run(worktree, &["status", "--short"])
+        status: run(&worktree, &["status", "--short"])
+            .await
             .map(|s| cap(s, &mut truncated))
             .unwrap_or_default(),
         truncated,
@@ -2196,8 +2229,8 @@ async fn collect_git_evidence(panes: &[crate::ipc::SupervisionTarget]) -> String
             continue;
         };
         let pane_id = target.pane_id.clone();
-        tasks.push(tokio::task::spawn_blocking(move || {
-            let evidence = capture_git_evidence(&worktree);
+        tasks.push(tokio::spawn(async move {
+            let evidence = capture_git_evidence(worktree).await;
             (pane_id, evidence)
         }));
     }
@@ -2694,7 +2727,17 @@ async fn build_notebook_context(
 
             let latest = tasks::latest_desc(conn, repo_dir, tag)?
                 .unwrap_or_else(|| "(none recorded)".to_string());
-            let all = tasks::all_verdict_records(conn, repo_dir, tag)?;
+            // Bound per-tick work: load only verdicts from the last
+            // supervision-lease TTL (24 h).  Older rows have already
+            // informed prior verdicts and don't need to be re-folded
+            // every tick.  Without this, a tag that has been running
+            // for days would re-read a growing SQLite result set on
+            // every supervision call.
+            let since_ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64 - crate::pane_lease::LEASE_TTL_SECS as i64)
+                .unwrap_or(0);
+            let all = tasks::all_verdict_records(conn, repo_dir, tag, since_ts)?;
             let rendered = render_event_stream_history(&all);
 
             out.push_str(&format!("=== Task notebook for tag '{tag}' ===\n"));
@@ -2860,13 +2903,17 @@ struct SteerDispatch {
 /// - JSON wrapped in ``` code fences (some models add them despite the
 ///   instruction).
 /// - Extra whitespace and trailing prose before/after the object.
-/// - Unknown / missing fields (default via serde).
+/// - Missing optional fields — every [`tasks::VerdictRecord`] field
+///   except `verdict` has `#[serde(default)]`.  `verdict` itself is
+///   required, and its absence makes the object unparseable (see
+///   below).
 ///
-/// A completely unparseable response produces a WAIT-style record with
-/// the raw text captured in `rationale`, so the loop never stalls on
-/// model misbehaviour.  A STEER naming an unknown pane is downgraded
-/// to WAIT with `rationale` explaining the pane mismatch — same policy
-/// as the legacy string-format parser.
+/// A completely unparseable response (including one with `verdict`
+/// missing) produces a WAIT-style record with the raw text captured
+/// in `rationale`, so the loop never stalls on model misbehaviour.
+/// A STEER naming an unknown pane is downgraded to WAIT with
+/// `rationale` explaining the pane mismatch — same policy as the
+/// legacy string-format parser.
 fn parse_supervision_verdict(
     raw: &str,
     panes: &[crate::ipc::SupervisionTarget],
@@ -2933,12 +2980,22 @@ fn parse_supervision_verdict(
                     }
                 });
 
-            // Pick the pane to steer: if only one pane is supervised,
-            // target it unconditionally.  When multiple panes are
-            // supervised, the model should include the pane id inside
-            // `steer_message` as a hint; we currently just pick the
-            // first, matching pre-rework behavior for the common
-            // single-pane case.
+            // Pick the pane to steer.  In practice `/claude` runs
+            // single-pane supervision, so `panes.first()` is correct
+            // for every production caller today.  A future multi-pane
+            // PR will need a dedicated `pane_id` field in the verdict
+            // JSON contract (and `SUPERVISION_VERDICT_SCHEMA` updated
+            // to match) so the supervisor can disambiguate — until
+            // that lands, warn so multi-pane sessions leave a visible
+            // breadcrumb in the logs instead of silently steering the
+            // wrong pane.
+            if panes.len() > 1 {
+                tracing::warn!(
+                    pane_count = panes.len(),
+                    "multi-pane STEER not yet supported; targeting panes[0] — \
+                     the other panes will not receive this message"
+                );
+            }
             let pane_id = panes.first().map(|p| p.pane_id.clone());
 
             match (pane_id, message) {
@@ -9696,8 +9753,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn git_evidence_captures_diff_and_status_in_real_worktree() {
+    #[tokio::test]
+    async fn git_evidence_captures_diff_and_status_in_real_worktree() {
         // Stand up a throwaway git repo, commit one file, modify it, and
         // confirm capture_git_evidence surfaces the change via status +
         // diff.  Skipped in sandboxed environments where `git` is not
@@ -9735,7 +9792,7 @@ mod tests {
         // Unstaged modification — must show up in both status and diff.
         std::fs::write(&file, "hello world\n").unwrap();
 
-        let evidence = capture_git_evidence(wt.to_str().unwrap());
+        let evidence = capture_git_evidence(wt.to_str().unwrap().to_owned()).await;
         assert!(
             evidence.status.contains("foo.txt"),
             "status must mention modified file, got: {evidence:?}"
