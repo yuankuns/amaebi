@@ -2984,19 +2984,36 @@ async fn handle_supervision_inner(
         // --- Invoke model (no tools) ---
         // Use sink() so the raw LLM tokens are NOT streamed to the client.
         // We write our own formatted one-line status after parsing the response.
+        //
+        // Enable 1-hour prompt caching: the supervision system prompt +
+        // pinned task desc + hard constraints + AGENTS.md are resent on
+        // every tick, unchanged, for up to the lease TTL (24 h by
+        // default).  A system-level cachePoint cuts input token cost on
+        // every cache hit to ~10% of uncached input pricing.
         let response_text = {
             let mut sink = tokio::io::sink();
-            match invoke_model(
+            match invoke_model_with_cache(
                 state,
                 &model,
                 &messages,
                 &[],
                 MAX_SUPERVISION_TOKENS,
+                Some(crate::bedrock::CacheTtl::OneHour),
                 &mut sink,
             )
             .await
             {
-                Ok(r) => r.text,
+                Ok(r) => {
+                    if r.cache_read_tokens.is_some() || r.cache_write_tokens.is_some() {
+                        tracing::debug!(
+                            cache_read = ?r.cache_read_tokens,
+                            cache_write = ?r.cache_write_tokens,
+                            prompt_tokens = r.prompt_tokens,
+                            "supervision: prompt-cache usage"
+                        );
+                    }
+                    r.text
+                }
                 Err(e) => {
                     let mut w = writer.lock().await;
                     write_frame(
@@ -4860,12 +4877,49 @@ async fn invoke_model<W>(
 where
     W: AsyncWriteExt + Unpin,
 {
+    invoke_model_with_cache(
+        state,
+        model,
+        messages,
+        tools,
+        max_completion_tokens,
+        None,
+        writer,
+    )
+    .await
+}
+
+/// Same as [`invoke_model`], but optionally passes a prompt-cache TTL
+/// down to Bedrock.  When `cache_ttl` is `Some` and the target model is
+/// on `supports_prompt_caching`, a trailing `cachePoint` block is added
+/// to the end of the `system` array so the system prompt (typically the
+/// large stable prefix of the request) is cached and reused across
+/// subsequent calls in the same session.  Copilot has no equivalent
+/// field; the TTL is silently dropped there.
+///
+/// Use [`bedrock::CacheTtl::FiveMinutes`] for interactive chat (short
+/// idle gaps) and [`bedrock::CacheTtl::OneHour`] for long-running
+/// supervision loops where the same prompt is resent on every tick.
+#[allow(clippy::too_many_arguments)]
+async fn invoke_model_with_cache<W>(
+    state: &DaemonState,
+    model: &str,
+    messages: &[Message],
+    tools: &[serde_json::Value],
+    max_completion_tokens: usize,
+    cache_ttl: Option<crate::bedrock::CacheTtl>,
+    writer: &mut W,
+) -> Result<copilot::CopilotResponse>
+where
+    W: AsyncWriteExt + Unpin,
+{
     let spec = crate::provider::resolve(model);
     tracing::debug!(
         provider = %spec.provider,
         model_id = %spec.model_id,
         display = %spec.display_name,
         use_1m = spec.use_1m,
+        cache_ttl = ?cache_ttl,
         "invoke_model: resolved provider"
     );
 
@@ -4877,6 +4931,7 @@ where
                 messages,
                 tools,
                 max_completion_tokens,
+                cache_ttl,
                 writer,
             )
             .await
@@ -4898,6 +4953,8 @@ where
                 )
                 .await?;
             }
+            // Copilot Chat Completions / Responses have no equivalent
+            // of Bedrock's cachePoint; TTL is silently dropped.
             invoke_copilot(
                 state,
                 &spec.model_id,
@@ -5278,15 +5335,30 @@ where
                 "auto-switching to AMAEBI_TOOL_MODEL for tool-execution turn"
             );
         }
-        let resp = invoke_model(
+        // Enable 5-minute prompt caching: across a multi-turn chat, the
+        // system prompt + tools + stable head of the history are resent
+        // unchanged each turn, so a system-level cachePoint drops input
+        // cost on every hit.  5-minute TTL matches typical idle gaps
+        // between user turns; going longer wastes cache capacity on
+        // sessions that won't continue.
+        let resp = invoke_model_with_cache(
             state,
             invoke_with,
             &messages,
             &schemas,
             response_max_tokens(invoke_with),
+            Some(crate::bedrock::CacheTtl::FiveMinutes),
             writer,
         )
         .await?;
+        if resp.cache_read_tokens.is_some() || resp.cache_write_tokens.is_some() {
+            tracing::debug!(
+                cache_read = ?resp.cache_read_tokens,
+                cache_write = ?resp.cache_write_tokens,
+                prompt_tokens = resp.prompt_tokens,
+                "chat: prompt-cache usage"
+            );
+        }
         last_turn_used_tools = matches!(resp.finish_reason, FinishReason::ToolCalls);
 
         last_prompt_tokens = resp.prompt_tokens;

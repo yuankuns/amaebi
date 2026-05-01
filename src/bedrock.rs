@@ -675,6 +675,78 @@ pub(crate) fn supports_1m_context(model_id: &str) -> bool {
         || model_id.starts_with("us.anthropic.claude-opus-4-6")
 }
 
+/// Returns true for Bedrock Claude models that honor `cachePoint` prompt
+/// caching blocks (added in `aws-sdk-bedrockruntime` 1.118, 2025-11-26;
+/// 1-hour TTL added in 1.122, 2026-01-20).
+///
+/// Same allowlist as adaptive thinking / structured output — the feature
+/// is on the server, but in practice honored-correctly-by-Claude support
+/// tracks the same recent models (Opus 4.6 / 4.7, Sonnet 4.6).  Older
+/// Claude 4.x and 3.x are left uncached to avoid surprising 400s or
+/// silent cache-miss billing.
+pub(crate) fn supports_prompt_caching(model_id: &str) -> bool {
+    model_id.starts_with("us.anthropic.claude-opus-4-7")
+        || model_id.starts_with("us.anthropic.claude-opus-4-6")
+        || model_id.starts_with("us.anthropic.claude-sonnet-4-6")
+}
+
+/// TTL for a Bedrock prompt-cache block.  Serialised to the wire strings
+/// `"5m"` / `"1h"` per the smithy `CacheTtl` enum in
+/// `aws-sdk-bedrockruntime/src/types/_cache_ttl.rs`.
+///
+/// Defaults to [`CacheTtl::FiveMinutes`] when the caller wants the
+/// standard behaviour; the 1-hour variant fits long-running supervision
+/// loops where the same system prompt + pinned task desc is resent on
+/// every tick for hours.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheTtl {
+    FiveMinutes,
+    OneHour,
+}
+
+impl CacheTtl {
+    /// Wire string accepted by Bedrock's `CachePointBlock.ttl` field.
+    fn as_wire_str(self) -> &'static str {
+        match self {
+            CacheTtl::FiveMinutes => "5m",
+            CacheTtl::OneHour => "1h",
+        }
+    }
+}
+
+/// Append a trailing `cachePoint` block to `system_blocks` when the
+/// target model is on [`supports_prompt_caching`] and a TTL is set.
+/// Leaves `system_blocks` untouched otherwise so the request wire
+/// shape is unchanged on unsupported paths.
+///
+/// Wire shape cross-checked against `shape_system_content_block.rs` and
+/// `shape_cache_point_block.rs` under
+/// `aws-sdk-bedrockruntime/src/protocol_serde/`: a
+/// `SystemContentBlock::CachePoint` serialises to
+/// `{"cachePoint": {"type": "default", "ttl": "..."}}`.
+fn maybe_append_system_cache_point(
+    system_blocks: &mut Vec<serde_json::Value>,
+    model_id: &str,
+    cache_ttl: Option<CacheTtl>,
+) {
+    let Some(ttl) = cache_ttl else {
+        return;
+    };
+    if !supports_prompt_caching(model_id) {
+        return;
+    }
+    if system_blocks.is_empty() {
+        // Nothing to cache — skip so we never emit a bare cachePoint.
+        return;
+    }
+    system_blocks.push(serde_json::json!({
+        "cachePoint": {
+            "type": "default",
+            "ttl": ttl.as_wire_str(),
+        }
+    }));
+}
+
 /// Build the `additionalModelRequestFields` map for a Bedrock request.
 ///
 /// Merges all per-model feature flags (adaptive thinking, 1M context) into a
@@ -710,6 +782,7 @@ async fn send_with_retry(
     tools: &[serde_json::Value],
     max_tokens: usize,
     use_1m: bool,
+    cache_ttl: Option<CacheTtl>,
 ) -> Result<reqwest::Response> {
     let parts = to_bedrock_request(messages);
     let bedrock_tools = to_bedrock_tools(tools);
@@ -719,8 +792,17 @@ async fn send_with_retry(
         "inferenceConfig": { "maxTokens": max_tokens },
     });
 
+    // Build the system array with an optional trailing cachePoint block.
+    // See [`maybe_append_system_cache_point`] for the wire shape.
+    // The cachePoint marks the END of the cacheable prefix: everything
+    // earlier in the system array is cached; messages[0..] and tools are
+    // NOT covered by a system-level cachePoint (that would need
+    // additional per-message cachePoints — deferred until we have data
+    // showing it's worth the complexity).
     if !parts.system.is_empty() {
-        body["system"] = serde_json::Value::Array(parts.system);
+        let mut system_array = parts.system;
+        maybe_append_system_cache_point(&mut system_array, model_id, cache_ttl);
+        body["system"] = serde_json::Value::Array(system_array);
     }
     if !bedrock_tools.is_empty() {
         body["toolConfig"] = serde_json::json!({ "tools": bedrock_tools });
@@ -851,6 +933,11 @@ where
         std::collections::HashMap::new();
     let mut finish_reason = FinishReason::Stop;
     let mut prompt_tokens = 0usize;
+    // Bedrock `usage.cacheReadInputTokens` / `cacheWriteInputTokens`
+    // from the `metadata` event, when present.  Absent means the model
+    // does not report them (unsupported model, or no cachePoint sent).
+    let mut cache_read_tokens: Option<usize> = None;
+    let mut cache_write_tokens: Option<usize> = None;
 
     // Cursor into raw_buf: bytes before `start` have been consumed.
     let mut start = 0usize;
@@ -871,6 +958,8 @@ where
                         &mut pending_tools,
                         &mut finish_reason,
                         &mut prompt_tokens,
+                        &mut cache_read_tokens,
+                        &mut cache_write_tokens,
                         writer,
                     )
                     .await?;
@@ -907,6 +996,8 @@ where
     tracing::debug!(
         text_len = text.len(),
         tool_calls = tool_calls.len(),
+        cache_read = ?cache_read_tokens,
+        cache_write = ?cache_write_tokens,
         "Bedrock ConverseStream complete"
     );
 
@@ -915,10 +1006,13 @@ where
         tool_calls,
         finish_reason,
         prompt_tokens,
+        cache_read_tokens,
+        cache_write_tokens,
     })
 }
 
 /// Process a single decoded event-stream frame.
+#[allow(clippy::too_many_arguments)]
 async fn handle_frame<W>(
     frame: &eventstream::Frame,
     text: &mut String,
@@ -926,6 +1020,8 @@ async fn handle_frame<W>(
     pending_tools: &mut std::collections::HashMap<u64, PartialToolUse>,
     finish_reason: &mut FinishReason,
     prompt_tokens: &mut usize,
+    cache_read_tokens: &mut Option<usize>,
+    cache_write_tokens: &mut Option<usize>,
     writer: &mut W,
 ) -> Result<()>
 where
@@ -1063,6 +1159,20 @@ where
                 if let Some(n) = usage.get("inputTokens").and_then(|v| v.as_u64()) {
                     *prompt_tokens = n as usize;
                 }
+                // Prompt-cache accounting.  Wire field names come from
+                // `aws-sdk-bedrockruntime/src/types/_token_usage.rs`:
+                // `cache_read_input_tokens` / `cache_write_input_tokens`
+                // with smithy's default camelCase rename.  Only present
+                // when the model emitted cachePoint-related accounting
+                // (i.e. our request included a cachePoint and the model
+                // supports caching); left as `None` otherwise so callers
+                // distinguish "unsupported/miss" from "zero".
+                if let Some(n) = usage.get("cacheReadInputTokens").and_then(|v| v.as_u64()) {
+                    *cache_read_tokens = Some(n as usize);
+                }
+                if let Some(n) = usage.get("cacheWriteInputTokens").and_then(|v| v.as_u64()) {
+                    *cache_write_tokens = Some(n as usize);
+                }
             }
         }
 
@@ -1083,12 +1193,14 @@ where
 /// Reads `AWS_BEARER_TOKEN_BEDROCK` and `AWS_REGION` from the environment.
 /// Text chunks are forwarded to `writer` as `Response::Text` frames as they
 /// arrive.  Returns a [`CopilotResponse`] describing the full turn result.
+#[allow(clippy::too_many_arguments)]
 pub async fn stream_chat<W>(
     http: &reqwest::Client,
     spec: &crate::provider::ModelSpec,
     messages: &[Message],
     tools: &[serde_json::Value],
     max_tokens: usize,
+    cache_ttl: Option<CacheTtl>,
     writer: &mut W,
 ) -> Result<CopilotResponse>
 where
@@ -1102,6 +1214,7 @@ where
         model = %spec.display_name,
         model_id = %spec.model_id,
         use_1m = spec.use_1m,
+        cache_ttl = ?cache_ttl,
         region = %region,
         "sending Bedrock ConverseStream request"
     );
@@ -1115,6 +1228,7 @@ where
         tools,
         max_tokens,
         spec.use_1m,
+        cache_ttl,
     )
     .await?;
     parse_converse_stream(resp, writer).await
@@ -1269,6 +1383,113 @@ mod tests {
             "no adaptive thinking for sonnet-4"
         );
         assert!(amrf.contains_key("anthropic_beta"), "1M beta present");
+    }
+
+    // ---- prompt caching: CacheTtl + maybe_append_system_cache_point --------
+
+    #[test]
+    fn cache_ttl_wire_strings_match_sdk_enum() {
+        // Pinned against `aws-sdk-bedrockruntime/src/types/_cache_ttl.rs`:
+        //   CacheTtl::OneHour    -> "1h"
+        //   CacheTtl::FiveMinutes -> "5m"
+        // If AWS adds a new TTL, the smithy enum gets a new variant with
+        // a new wire string — our enum is exhaustive so adding support
+        // is a conscious choice, not a silent miss.
+        assert_eq!(CacheTtl::OneHour.as_wire_str(), "1h");
+        assert_eq!(CacheTtl::FiveMinutes.as_wire_str(), "5m");
+    }
+
+    #[test]
+    fn prompt_caching_supported_models() {
+        assert!(supports_prompt_caching("us.anthropic.claude-opus-4-7"));
+        assert!(supports_prompt_caching("us.anthropic.claude-opus-4-6-v1"));
+        assert!(supports_prompt_caching(
+            "us.anthropic.claude-sonnet-4-6-v1:0"
+        ));
+    }
+
+    #[test]
+    fn prompt_caching_unsupported_models() {
+        // Older Claude 4.x, haiku, and anything else on the allowlist.
+        assert!(!supports_prompt_caching(
+            "us.anthropic.claude-opus-4-5-20251101-v1:0"
+        ));
+        assert!(!supports_prompt_caching(
+            "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
+        ));
+        assert!(!supports_prompt_caching(
+            "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+        ));
+        assert!(!supports_prompt_caching(
+            "us.anthropic.claude-sonnet-4-20250514-v1:0"
+        ));
+        assert!(!supports_prompt_caching("gpt-4o"));
+        assert!(!supports_prompt_caching(""));
+    }
+
+    #[test]
+    fn cache_point_not_appended_when_ttl_is_none() {
+        let mut sys = vec![serde_json::json!({"text": "You are helpful."})];
+        maybe_append_system_cache_point(&mut sys, "us.anthropic.claude-opus-4-7", None);
+        assert_eq!(sys.len(), 1, "no ttl means no cachePoint");
+        assert!(sys[0].get("cachePoint").is_none());
+    }
+
+    #[test]
+    fn cache_point_not_appended_for_unsupported_model() {
+        let mut sys = vec![serde_json::json!({"text": "You are helpful."})];
+        maybe_append_system_cache_point(
+            &mut sys,
+            "us.anthropic.claude-haiku-4-5",
+            Some(CacheTtl::OneHour),
+        );
+        assert_eq!(
+            sys.len(),
+            1,
+            "unsupported model must silently drop cachePoint"
+        );
+    }
+
+    #[test]
+    fn cache_point_not_appended_for_empty_system() {
+        // Guard: never emit a bare cachePoint without a preceding text
+        // block — there would be nothing to cache.
+        let mut sys: Vec<serde_json::Value> = Vec::new();
+        maybe_append_system_cache_point(
+            &mut sys,
+            "us.anthropic.claude-opus-4-7",
+            Some(CacheTtl::OneHour),
+        );
+        assert!(sys.is_empty());
+    }
+
+    #[test]
+    fn cache_point_appended_wire_shape_matches_sdk() {
+        // Wire shape cross-checked against `ser_system_content_block` +
+        // `ser_cache_point_block` in
+        // `aws-sdk-bedrockruntime/src/protocol_serde/`.
+        let mut sys = vec![serde_json::json!({"text": "You are a supervisor."})];
+        maybe_append_system_cache_point(
+            &mut sys,
+            "us.anthropic.claude-opus-4-7",
+            Some(CacheTtl::OneHour),
+        );
+        assert_eq!(sys.len(), 2, "text + cachePoint");
+        assert_eq!(sys[0]["text"], "You are a supervisor.");
+        let cp = &sys[1]["cachePoint"];
+        assert_eq!(cp["type"], "default");
+        assert_eq!(cp["ttl"], "1h");
+    }
+
+    #[test]
+    fn cache_point_five_minutes_wire_shape() {
+        let mut sys = vec![serde_json::json!({"text": "hi"})];
+        maybe_append_system_cache_point(
+            &mut sys,
+            "us.anthropic.claude-sonnet-4-6",
+            Some(CacheTtl::FiveMinutes),
+        );
+        assert_eq!(sys[1]["cachePoint"]["ttl"], "5m");
     }
 
     // ---- to_bedrock_request: message conversion ---------------------------
@@ -1474,6 +1695,8 @@ mod tests {
             &mut pending,
             &mut finish,
             &mut tokens,
+            &mut None,
+            &mut None,
             &mut sink,
         )
         .await
@@ -1532,6 +1755,8 @@ mod tests {
                 &mut pending,
                 &mut finish,
                 &mut tokens,
+                &mut None,
+                &mut None,
                 &mut sink,
             )
             .await
@@ -1567,6 +1792,8 @@ mod tests {
             &mut pending,
             &mut finish,
             &mut tokens,
+            &mut None,
+            &mut None,
             &mut sink,
         )
         .await
@@ -1593,6 +1820,8 @@ mod tests {
             &mut std::collections::HashMap::new(),
             &mut finish,
             &mut 0,
+            &mut None,
+            &mut None,
             &mut sink,
         )
         .await
@@ -1618,6 +1847,8 @@ mod tests {
             &mut std::collections::HashMap::new(),
             &mut finish,
             &mut 0,
+            &mut None,
+            &mut None,
             &mut sink,
         )
         .await
@@ -1634,6 +1865,8 @@ mod tests {
         );
 
         let mut tokens = 0usize;
+        let mut cache_read: Option<usize> = None;
+        let mut cache_write: Option<usize> = None;
         let mut sink = tokio::io::sink();
         let (parsed, _) = eventstream::try_parse_frame(&frame_bytes).unwrap().unwrap();
         handle_frame(
@@ -1643,11 +1876,54 @@ mod tests {
             &mut std::collections::HashMap::new(),
             &mut FinishReason::Stop,
             &mut tokens,
+            &mut cache_read,
+            &mut cache_write,
             &mut sink,
         )
         .await
         .unwrap();
         assert_eq!(tokens, 42);
+        assert_eq!(cache_read, None, "no cache fields in this payload");
+        assert_eq!(cache_write, None, "no cache fields in this payload");
+    }
+
+    #[tokio::test]
+    async fn parse_metadata_usage_with_cache_counts() {
+        // Wire field names per `_token_usage.rs` + smithy camelCase:
+        // input_tokens → inputTokens, cache_read_input_tokens →
+        // cacheReadInputTokens, etc.
+        let payload = br#"{"usage":{
+            "inputTokens":100,
+            "outputTokens":20,
+            "cacheReadInputTokens":80,
+            "cacheWriteInputTokens":5
+        }}"#;
+        let frame_bytes = eventstream::build_test_frame(
+            &[(":event-type", "metadata"), (":message-type", "event")],
+            payload,
+        );
+
+        let mut tokens = 0usize;
+        let mut cache_read: Option<usize> = None;
+        let mut cache_write: Option<usize> = None;
+        let mut sink = tokio::io::sink();
+        let (parsed, _) = eventstream::try_parse_frame(&frame_bytes).unwrap().unwrap();
+        handle_frame(
+            &parsed,
+            &mut String::new(),
+            &mut Vec::new(),
+            &mut std::collections::HashMap::new(),
+            &mut FinishReason::Stop,
+            &mut tokens,
+            &mut cache_read,
+            &mut cache_write,
+            &mut sink,
+        )
+        .await
+        .unwrap();
+        assert_eq!(tokens, 100);
+        assert_eq!(cache_read, Some(80));
+        assert_eq!(cache_write, Some(5));
     }
 
     #[tokio::test]
@@ -1667,6 +1943,8 @@ mod tests {
             &mut std::collections::HashMap::new(),
             &mut FinishReason::Stop,
             &mut 0,
+            &mut None,
+            &mut None,
             &mut sink,
         )
         .await;

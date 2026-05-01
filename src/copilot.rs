@@ -179,6 +179,13 @@ pub struct CopilotResponse {
     /// Input tokens consumed by this request, as reported by the API.
     /// Zero when the server did not include usage data (e.g. older endpoints).
     pub prompt_tokens: usize,
+    /// Bedrock prompt-cache read count for this turn (`usage.cacheReadInputTokens`).
+    /// `None` on providers/models that do not report it (Copilot; unsupported
+    /// Bedrock models; turns where no `cachePoint` marker was sent).
+    pub cache_read_tokens: Option<usize>,
+    /// Bedrock prompt-cache write count for this turn (`usage.cacheWriteInputTokens`).
+    /// `None` in the same cases as `cache_read_tokens`.
+    pub cache_write_tokens: Option<usize>,
 }
 
 // ---------------------------------------------------------------------------
@@ -329,6 +336,11 @@ impl SseAccumulator {
             tool_calls,
             finish_reason,
             prompt_tokens: self.prompt_tokens,
+            // Copilot's Chat Completions/Responses API has no equivalent
+            // of Bedrock's `usage.cacheReadInputTokens` — leave unset so
+            // callers distinguish "unsupported" from "cache miss".
+            cache_read_tokens: None,
+            cache_write_tokens: None,
         }
     }
 }
