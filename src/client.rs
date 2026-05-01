@@ -1035,14 +1035,51 @@ pub async fn run_chat_loop(
                 let raw_result = tokio::task::spawn_blocking(prompt_input::read_line_raw)
                     .await
                     .context("prompt input task panicked")?;
-                match raw_result {
-                    Ok(None) => break 'session,
-                    Ok(Some(line)) if line.is_empty() => break 'session,
-                    Ok(Some(line)) => line,
-                    // Ctrl-C during prompt input — exit the session cleanly.
-                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => break 'session,
+                // Translate the rustyline outcome + current Ctrl-C state
+                // into a `PromptInputDecision` (exit / send / continue /
+                // first-tap).  The contract:
+                //   * Ctrl-D (Ok(None))      → Exit (one-press)
+                //   * Empty / whitespace-only → Continue (silent re-prompt,
+                //                                never forwarded to the LLM)
+                //   * Single Ctrl-C           → FirstCtrlC (warn + re-prompt)
+                //   * Second Ctrl-C within
+                //     DOUBLE_CTRLC_WINDOW     → Exit
+                //   * Non-empty text          → Send
+                let (line_opt, is_interrupt) = match raw_result {
+                    Ok(line) => (line, false),
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => (None, true),
                     Err(e) => {
                         return Err(anyhow::Error::new(e).context("reading prompt from stdin"))
+                    }
+                };
+                // Capture `now` once and reuse it for both the
+                // double-tap-window check inside `classify_prompt_input`
+                // and the `last_ctrl_c` write below.  Two separate
+                // `Instant::now()` calls would let a scheduler delay
+                // between them flip a just-inside-window press into a
+                // just-outside one, and vice versa — the existing
+                // streaming-path double-Ctrl-C handling already captures
+                // `now` once for the same reason.
+                let now = Instant::now();
+                match classify_prompt_input(line_opt, is_interrupt, last_ctrl_c, now) {
+                    PromptInputDecision::Exit => break 'session,
+                    PromptInputDecision::Continue => continue 'session,
+                    PromptInputDecision::FirstCtrlC => {
+                        if std::io::stderr().is_terminal() {
+                            eprintln!(
+                                "[Ctrl-C again within {}s to exit, Ctrl-D to exit immediately]",
+                                DOUBLE_CTRLC_WINDOW.as_secs()
+                            );
+                        }
+                        last_ctrl_c = Some(now);
+                        continue 'session;
+                    }
+                    PromptInputDecision::Send(line) => {
+                        // Non-empty input consumed; clear any pending
+                        // single-Ctrl-C so the next press starts a fresh
+                        // double-tap window.
+                        last_ctrl_c = None;
+                        line
                     }
                 }
             }
@@ -3114,6 +3151,52 @@ fn is_within_window(last_press: Option<Instant>, now: Instant, window: Duration)
     }
 }
 
+/// What to do with a readline result at the idle chat prompt.
+///
+/// Kept as a pure enum + classifier (`classify_prompt_input`) so the
+/// chat-exit contract is unit-testable without spinning up an async
+/// client.  The live loop in [`run_chat_loop`] mirrors these outcomes
+/// one-to-one.
+#[derive(Debug, PartialEq, Eq)]
+enum PromptInputDecision {
+    /// Use the line as a user message to the daemon.
+    Send(String),
+    /// Silently re-prompt.  Used only for empty / whitespace-only
+    /// Enter.  (Single Ctrl-C presses go through `FirstCtrlC`
+    /// instead, so the caller can warn the user and record the
+    /// timestamp for the double-tap check.)
+    Continue,
+    /// Exit the chat session.  Triggered by Ctrl-D / EOF and by a
+    /// second Ctrl-C inside [`DOUBLE_CTRLC_WINDOW`].
+    Exit,
+    /// Record `now` as the first press of a potential Ctrl-C double
+    /// tap and re-prompt.  The caller stores this in `last_ctrl_c`.
+    FirstCtrlC,
+}
+
+/// Classify a raw readline outcome plus current Ctrl-C state into a
+/// [`PromptInputDecision`].  Does not mutate state; the caller is
+/// responsible for recording `FirstCtrlC` into `last_ctrl_c`.
+fn classify_prompt_input(
+    line: Option<String>,
+    is_interrupt: bool,
+    last_ctrl_c: Option<Instant>,
+    now: Instant,
+) -> PromptInputDecision {
+    if is_interrupt {
+        return if is_within_window(last_ctrl_c, now, DOUBLE_CTRLC_WINDOW) {
+            PromptInputDecision::Exit
+        } else {
+            PromptInputDecision::FirstCtrlC
+        };
+    }
+    match line {
+        None => PromptInputDecision::Exit,
+        Some(s) if s.trim().is_empty() => PromptInputDecision::Continue,
+        Some(s) => PromptInputDecision::Send(s),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3156,6 +3239,73 @@ mod tests {
             now,
             Duration::from_secs(2)
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // classify_prompt_input — chat idle-prompt exit contract
+    //
+    // The chat session's exit contract at the idle prompt is:
+    //   * Ctrl-D (EOF)                              → immediate exit
+    //   * Empty Enter / whitespace-only Enter       → silent re-prompt
+    //   * Single Ctrl-C                             → warn + re-prompt
+    //   * Second Ctrl-C within DOUBLE_CTRLC_WINDOW  → exit
+    //   * Non-empty text                            → send to daemon
+    //
+    // These tests pin that contract — regressing any of them turns a
+    // stray keystroke back into a session killer.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn classify_eof_is_exit() {
+        let d = classify_prompt_input(None, false, None, Instant::now());
+        assert_eq!(d, PromptInputDecision::Exit);
+    }
+
+    #[test]
+    fn classify_empty_line_is_continue() {
+        // An empty Enter on the idle prompt must not exit the chat and
+        // must not be forwarded to the daemon.  Regression guard against
+        // the pre-fix behaviour that broke sessions after long streams.
+        let d = classify_prompt_input(Some(String::new()), false, None, Instant::now());
+        assert_eq!(d, PromptInputDecision::Continue);
+    }
+
+    #[test]
+    fn classify_whitespace_only_is_continue() {
+        let d = classify_prompt_input(Some("   \t  ".to_string()), false, None, Instant::now());
+        assert_eq!(d, PromptInputDecision::Continue);
+    }
+
+    #[test]
+    fn classify_non_empty_line_is_send() {
+        let d = classify_prompt_input(Some("hello".into()), false, None, Instant::now());
+        assert_eq!(d, PromptInputDecision::Send("hello".into()));
+    }
+
+    #[test]
+    fn classify_first_ctrl_c_is_first_tap() {
+        // No prior Ctrl-C recorded → single Ctrl-C is a first tap, not an exit.
+        let d = classify_prompt_input(None, true, None, Instant::now());
+        assert_eq!(d, PromptInputDecision::FirstCtrlC);
+    }
+
+    #[test]
+    fn classify_second_ctrl_c_inside_window_is_exit() {
+        let now = Instant::now();
+        let first = now - Duration::from_secs(1);
+        let d = classify_prompt_input(None, true, Some(first), now);
+        assert_eq!(d, PromptInputDecision::Exit);
+    }
+
+    #[test]
+    fn classify_second_ctrl_c_after_window_is_first_tap() {
+        // Two Ctrl-Cs spaced beyond the window are independent presses
+        // — the second one starts its own double-tap window and does
+        // NOT exit.
+        let now = Instant::now();
+        let first = now - DOUBLE_CTRLC_WINDOW - Duration::from_secs(1);
+        let d = classify_prompt_input(None, true, Some(first), now);
+        assert_eq!(d, PromptInputDecision::FirstCtrlC);
     }
 
     // -----------------------------------------------------------------------
