@@ -2985,11 +2985,15 @@ async fn handle_supervision_inner(
         // Use sink() so the raw LLM tokens are NOT streamed to the client.
         // We write our own formatted one-line status after parsing the response.
         //
-        // Enable 1-hour prompt caching: the supervision system prompt +
-        // pinned task desc + hard constraints + AGENTS.md are resent on
-        // every tick, unchanged, for up to the lease TTL (24 h by
-        // default).  A system-level cachePoint cuts input token cost on
-        // every cache hit to ~10% of uncached input pricing.
+        // Enable 1-hour prompt caching.  Covers only the system-level
+        // blocks — `SUPERVISION_SYSTEM_PROMPT` plus the skill messages
+        // (SOUL.md / AGENTS.md) injected just above — which are resent
+        // unchanged on every tick for up to the lease TTL (24 h by
+        // default).  The per-tick task desc / hard constraints /
+        // notebook / pane snapshots live in the user-role message and
+        // are NOT cached (they vary every turn by design).  On a cache
+        // hit Bedrock charges the cached-read rate (~10% of uncached
+        // input) for the system prefix.
         let response_text = {
             let mut sink = tokio::io::sink();
             match invoke_model_with_cache(
@@ -5335,12 +5339,16 @@ where
                 "auto-switching to AMAEBI_TOOL_MODEL for tool-execution turn"
             );
         }
-        // Enable 5-minute prompt caching: across a multi-turn chat, the
-        // system prompt + tools + stable head of the history are resent
-        // unchanged each turn, so a system-level cachePoint drops input
-        // cost on every hit.  5-minute TTL matches typical idle gaps
-        // between user turns; going longer wastes cache capacity on
-        // sessions that won't continue.
+        // Enable 5-minute prompt caching.  Covers only the system-level
+        // blocks — the base system prompt plus any skill messages
+        // (SOUL.md / AGENTS.md) injected by `inject_skill_files`.
+        // Tools are a separate request field and the message history
+        // is user/assistant-role; neither is covered by a system-level
+        // cachePoint (extending to those would require additional
+        // cachePoints and a per-turn stability policy — deferred).
+        // 5-minute TTL matches typical idle gaps between user turns;
+        // going longer wastes cache capacity on sessions that won't
+        // continue.
         let resp = invoke_model_with_cache(
             state,
             invoke_with,

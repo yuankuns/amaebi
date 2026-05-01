@@ -679,11 +679,11 @@ pub(crate) fn supports_1m_context(model_id: &str) -> bool {
 /// caching blocks (added in `aws-sdk-bedrockruntime` 1.118, 2025-11-26;
 /// 1-hour TTL added in 1.122, 2026-01-20).
 ///
-/// Same allowlist as adaptive thinking / structured output — the feature
-/// is on the server, but in practice honored-correctly-by-Claude support
-/// tracks the same recent models (Opus 4.6 / 4.7, Sonnet 4.6).  Older
-/// Claude 4.x and 3.x are left uncached to avoid surprising 400s or
-/// silent cache-miss billing.
+/// The allowlist mirrors [`supports_adaptive_thinking`] — the underlying
+/// wire feature is a server-side flag, but honored-correctly-by-Claude
+/// behavior tracks the same recent models (Opus 4.6 / 4.7, Sonnet 4.6).
+/// Older Claude 4.x and 3.x are left uncached to avoid surprising 400s
+/// or silent cache-miss billing.
 pub(crate) fn supports_prompt_caching(model_id: &str) -> bool {
     model_id.starts_with("us.anthropic.claude-opus-4-7")
         || model_id.starts_with("us.anthropic.claude-opus-4-6")
