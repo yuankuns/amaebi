@@ -506,6 +506,9 @@ fn build_response(
         tool_calls,
         finish_reason,
         prompt_tokens,
+        // Responses API does not report Bedrock-equivalent cache counts.
+        cache_read_tokens: None,
+        cache_write_tokens: None,
     }
 }
 
