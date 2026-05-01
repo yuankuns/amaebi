@@ -65,6 +65,19 @@ else
             tab = index($0, "\t")
             subj = substr($0, tab + 1)
 
+            # Skip merge commits outright.  They never bump N (they are
+            # not feat/fix/docs) and — critically — they must not
+            # advance the (year, month) either.  GitHub synthesises a
+            # preview merge commit for every pull-request CI run with a
+            # timestamp of "now in UTC"; without this guard, a PR that
+            # ran even a second into a new month would roll the calver
+            # forward to that month even though no real commit on the
+            # branch falls there.  PR #143 broke exactly this way on
+            # 2026-05-01.
+            if (subj ~ /^Merge /) {
+                next
+            }
+
             if (y != year || m != month) {
                 year = y; month = m; n = 0
             }
