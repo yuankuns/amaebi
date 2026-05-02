@@ -296,16 +296,21 @@ in chat A cannot release a pane held by chat B — they're different conns).
 | PR | scope | blocks | status |
 |---|---|---|---|
 | **A** | this design doc | B, C | **this PR** |
-| **B** | `PaneAssigned` fields + client `[launched]` synthesis → `Request::Chat`.  Old `SupervisePanes` path untouched this PR. | E, F | blocked by A |
-| **C** | `task_done` tool + `Request::ClaudeRelease` + `Response::TaskReleased` + `HeldResources` table + socket-disconnect hook + idempotent release fn. | D, E | blocked by A |
+| **B** | `Response::PaneAssigned` gains `worktree` + `resources`. Daemon populates them; client ignores them for now (field-expansion only). | F | blocked by A |
+| **C** | `task_done` tool + `Request::ClaudeRelease` + `Response::TaskReleased` + `HeldResources` table + socket-disconnect hook + idempotent release fn. `handle_supervision` cleanup path also routes through the new release fn (double-release safe). Does not change the client cutover. | D, E | blocked by A |
 | **D** | chat system prompt: pane-alive invariant. | F | blocked by C |
-| **E** | client `/release %pane` + `/release all`. | – | blocked by B, C |
-| **F** | **delete** `handle_supervision*` + `Request::SupervisePanes` + verdict schema + verdict layer in `tasks.rs`. Big minus diff. | – | blocked by B, D |
+| **E** | client `/release %pane` + `/release all`. | – | blocked by C |
+| **F** | **atomic cutover + delete.**  In one PR: client synthesises `[launched]` and sends `Request::Chat` instead of `Request::SupervisePanes`; delete `handle_supervision*` + `Request::SupervisePanes` + verdict schema + verdict layer in `tasks.rs`.  Big minus diff. | – | blocked by B, C, D |
 
-B, C are parallelisable after A.  D depends on C (prompt needs to know the
-`task_done` tool exists).  E depends on B and C (needs `HeldResources` and
-`PaneAssigned` shape).  F deletes only after D has trained the LLM to use
-the new flow and after B has cut the client over to `Request::Chat`.
+B and C are parallelisable after A.  D depends on C (prompt must reference
+the `task_done` tool).  E depends on C (needs `HeldResources` and
+`Request::ClaudeRelease`).
+
+**Why F is atomic instead of split:** if the client cutover (stop sending
+`SupervisePanes`) lands before `HeldResources` + socket-break hook is live,
+panes leak until the 24 h TTL because the old `handle_supervision` cleanup
+path stops running and no new path has replaced it.  F does the cutover
+and the deletion in one commit so the release path is always live.
 
 ## Anti-patterns (non-exhaustive)
 
