@@ -15,9 +15,10 @@
 
 ## Versioning
 - `Cargo.toml` `version` is calendar-versioned `YYYY.M.N` (no leading zeros on `M`/`N`).  The version is computed from the git history of the checked-out branch (HEAD) — on a PR branch that includes the PR's own commits, on `master` it is the master history.  Rule:
-  - `YYYY` / `M` = year and month of the latest commit on HEAD
+  - `YYYY` / `M` = year and month of the latest **non-merge** commit on HEAD
   - `N` = count of `feat(...)` / `fix(...)` / `docs(...)` commits on HEAD within the current `(YYYY, M)` month
-  - Other prefixes (`refactor`, `chore`, `test`, `revert`, `spike`, merges…) do not bump `N`
+  - Other prefixes (`refactor`, `chore`, `test`, `revert`, `spike`, etc.) do not bump `N`
+  - Merge commits are detected by **topology** (2+ parents, not by subject text) and are skipped entirely — they neither bump `N` nor advance `(YYYY, M)`.  This matters because GitHub's PR CI runs against a synthetic `refs/pull/<N>/merge` merge commit whose committer date is "now in UTC"; without skipping by topology, a PR that ran even a second into a new month would roll the calver into a month no real commit on the branch belongs to.
   - A new month automatically resets `N` to 0 (and increments to 1 on the first qualifying commit of the month)
 - Each PR author bumps `Cargo.toml` in the PR itself so it matches what master will look like after the PR lands.  Run `scripts/next-version.sh` to see what the version should be, then edit `Cargo.toml`.
 - CI runs `scripts/next-version.sh --check` on every PR and red-fails if `Cargo.toml` disagrees with what the commit history implies.
