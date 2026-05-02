@@ -1149,6 +1149,10 @@ where
                 "end_turn" => FinishReason::Stop,
                 "tool_use" => FinishReason::ToolCalls,
                 "max_tokens" => FinishReason::Length,
+                // Transient "model botched this turn" signals (since
+                // bedrockruntime 1.119, 2025-12-02).  Handled as a one-shot
+                // retry in the session loop; see FinishReason::Malformed.
+                "malformed_model_output" | "malformed_tool_use" => FinishReason::Malformed,
                 other => FinishReason::Other(other.to_owned()),
             };
             tracing::debug!(stop_reason = reason, "Bedrock: messageStop");
@@ -1854,6 +1858,93 @@ mod tests {
         .await
         .unwrap();
         assert!(matches!(finish, FinishReason::Length));
+    }
+
+    #[tokio::test]
+    async fn parse_message_stop_malformed_model_output() {
+        let payload = br#"{"stopReason":"malformed_model_output"}"#;
+        let frame_bytes = eventstream::build_test_frame(
+            &[(":event-type", "messageStop"), (":message-type", "event")],
+            payload,
+        );
+
+        let mut finish = FinishReason::Stop;
+        let mut sink = tokio::io::sink();
+        let (parsed, _) = eventstream::try_parse_frame(&frame_bytes).unwrap().unwrap();
+        handle_frame(
+            &parsed,
+            &mut String::new(),
+            &mut Vec::new(),
+            &mut std::collections::HashMap::new(),
+            &mut finish,
+            &mut 0,
+            &mut sink,
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(finish, FinishReason::Malformed),
+            "malformed_model_output must map to Malformed, not Other"
+        );
+    }
+
+    #[tokio::test]
+    async fn parse_message_stop_malformed_tool_use() {
+        let payload = br#"{"stopReason":"malformed_tool_use"}"#;
+        let frame_bytes = eventstream::build_test_frame(
+            &[(":event-type", "messageStop"), (":message-type", "event")],
+            payload,
+        );
+
+        let mut finish = FinishReason::Stop;
+        let mut sink = tokio::io::sink();
+        let (parsed, _) = eventstream::try_parse_frame(&frame_bytes).unwrap().unwrap();
+        handle_frame(
+            &parsed,
+            &mut String::new(),
+            &mut Vec::new(),
+            &mut std::collections::HashMap::new(),
+            &mut finish,
+            &mut 0,
+            &mut sink,
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(finish, FinishReason::Malformed),
+            "malformed_tool_use must map to Malformed, not Other"
+        );
+    }
+
+    /// Regression guard: any stopReason value we do NOT explicitly match
+    /// must still fall through to `Other(_)` so the daemon terminates the
+    /// session cleanly instead of silently being treated as success.  This
+    /// also prevents a future PR from accidentally folding a new
+    /// transient-retry candidate into the `Malformed` branch without
+    /// discussion.
+    #[tokio::test]
+    async fn parse_message_stop_unknown_reason_still_other() {
+        let payload = br#"{"stopReason":"content_filtered"}"#;
+        let frame_bytes = eventstream::build_test_frame(
+            &[(":event-type", "messageStop"), (":message-type", "event")],
+            payload,
+        );
+
+        let mut finish = FinishReason::Stop;
+        let mut sink = tokio::io::sink();
+        let (parsed, _) = eventstream::try_parse_frame(&frame_bytes).unwrap().unwrap();
+        handle_frame(
+            &parsed,
+            &mut String::new(),
+            &mut Vec::new(),
+            &mut std::collections::HashMap::new(),
+            &mut finish,
+            &mut 0,
+            &mut sink,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(finish, FinishReason::Other(ref s) if s == "content_filtered"));
     }
 
     #[tokio::test]

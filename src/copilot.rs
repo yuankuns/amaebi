@@ -167,6 +167,17 @@ pub enum FinishReason {
     Stop,
     ToolCalls,
     Length,
+    /// The server completed the turn but flagged the output as malformed —
+    /// currently only emitted by Bedrock ConverseStream with stopReason
+    /// `malformed_model_output` or `malformed_tool_use` (added in the
+    /// 2025-12-02 `aws-sdk-bedrockruntime` 1.119 release).
+    ///
+    /// These are treated as transient: the server returned HTTP 200 with an
+    /// application-level "model botched this one turn" signal, and retrying
+    /// the same request with the same messages usually succeeds.  The daemon
+    /// retries once before falling back to the same termination path as
+    /// [`FinishReason::Other`].
+    Malformed,
     Other(String),
 }
 
