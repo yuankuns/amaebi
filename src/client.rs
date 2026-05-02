@@ -1064,7 +1064,19 @@ pub async fn run_chat_loop(
                 let now = Instant::now();
                 match classify_prompt_input(line_opt, is_interrupt, last_ctrl_c, now) {
                     PromptInputDecision::Exit => break 'session,
-                    PromptInputDecision::Continue => continue 'session,
+                    PromptInputDecision::Continue => {
+                        // Any intervening input — including an empty /
+                        // whitespace-only Enter — resets the double-tap
+                        // window.  The contract is that **consecutive**
+                        // Ctrl-C presses exit; a stray Enter between two
+                        // Ctrl-Cs should count as "not consecutive" and
+                        // make the second press behave like a fresh
+                        // first tap.  Without this clear, Ctrl-C → Enter
+                        // → Ctrl-C inside `DOUBLE_CTRLC_WINDOW` would
+                        // still exit.
+                        last_ctrl_c = None;
+                        continue 'session;
+                    }
                     PromptInputDecision::FirstCtrlC => {
                         if std::io::stderr().is_terminal() {
                             eprintln!(
@@ -3312,6 +3324,41 @@ mod tests {
         let first = now - DOUBLE_CTRLC_WINDOW - Duration::from_secs(1);
         let d = classify_prompt_input(None, true, Some(first), now);
         assert_eq!(d, PromptInputDecision::FirstCtrlC);
+    }
+
+    #[test]
+    fn ctrl_c_then_empty_enter_then_ctrl_c_does_not_exit() {
+        // The "two Ctrl-C to exit" contract requires the two presses to
+        // be **consecutive**.  Any intervening input — including an
+        // empty / whitespace-only Enter — must reset the double-tap
+        // window, so a subsequent Ctrl-C behaves like a fresh first
+        // tap.  This threads the same `last_ctrl_c` state that
+        // `run_chat_loop` threads, to make sure the clear-on-Continue
+        // call-site wiring stays in place.
+        let t0 = Instant::now();
+        let mut last_ctrl_c: Option<Instant> = None;
+
+        // Step 1: single Ctrl-C at the idle prompt → FirstCtrlC.  The
+        // caller records the timestamp.
+        let d1 = classify_prompt_input(None, true, last_ctrl_c, t0);
+        assert_eq!(d1, PromptInputDecision::FirstCtrlC);
+        last_ctrl_c = Some(t0);
+
+        // Step 2: empty Enter a moment later — well inside the
+        // double-tap window — is a `Continue`.  `run_chat_loop`
+        // clears `last_ctrl_c` on this path.
+        let t1 = t0 + Duration::from_millis(200);
+        let d2 = classify_prompt_input(Some(String::new()), false, last_ctrl_c, t1);
+        assert_eq!(d2, PromptInputDecision::Continue);
+        last_ctrl_c = None;
+
+        // Step 3: Ctrl-C again, still inside what would have been the
+        // original double-tap window.  Because Step 2 cleared the
+        // state, this is a fresh first tap — NOT Exit.
+        let t2 = t0 + Duration::from_millis(400);
+        assert!(t2 - t0 < DOUBLE_CTRLC_WINDOW);
+        let d3 = classify_prompt_input(None, true, last_ctrl_c, t2);
+        assert_eq!(d3, PromptInputDecision::FirstCtrlC);
     }
 
     // -----------------------------------------------------------------------
