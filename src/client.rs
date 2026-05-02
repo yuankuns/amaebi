@@ -965,7 +965,8 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
 /// Run a persistent multi-turn chat session on a single socket connection.
 ///
 /// Ctrl-C mid-generation → interrupt + steer prompt (same as `amaebi ask`).
-/// Double Ctrl-C within 2 s → exit. Empty line or Ctrl-D → exit.
+/// Double Ctrl-C within 2 s → exit. Ctrl-D → exit. Empty / whitespace-only
+/// Enter is a silent re-prompt (never forwarded to the daemon).
 #[allow(unused_assignments)] // steer_pending is read inside select! async blocks
 pub async fn run_chat_loop(
     socket: PathBuf,
@@ -999,7 +1000,7 @@ pub async fn run_chat_loop(
         crate::banner::print(&model, &session_id, &cwd);
     } else if std::io::stderr().is_terminal() {
         // Minimal fallback when the banner is opted out but we're still on a TTY.
-        eprintln!("Chat session started (ID: {session_id}). Empty line or Ctrl-D to exit.\n");
+        eprintln!("Chat session started (ID: {session_id}). Ctrl-D or double Ctrl-C to exit.\n");
     }
 
     // Snapshot session id for the history writer so each persisted
@@ -2435,7 +2436,12 @@ mod prompt_input {
             Ok(line) => {
                 // Match the old editor: only non-empty lines join history,
                 // so Up/Down navigation skips accidental bare-Enter presses.
-                let persist = !line.is_empty();
+                // Use `trim().is_empty()` so whitespace-only input — which
+                // the chat REPL classifies as `Continue` (silent re-prompt,
+                // never forwarded to the daemon) — also stays out of
+                // history, keeping what ↑ surfaces aligned with what was
+                // actually sent.
+                let persist = !line.trim().is_empty();
                 if persist {
                     let _ = ed.add_history_entry(line.as_str());
                 }
