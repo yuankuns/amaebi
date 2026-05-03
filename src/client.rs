@@ -303,6 +303,23 @@ fn format_task_released(
             out.push_str(&format!("  | {line}\n"));
         }
     }
+    // Resume hint — the pane and Claude process are preserved across
+    // release, so the user can pick this work up again via
+    // `/claude --resume-pane <pane>` (reuses the live Claude in this
+    // exact pane; no new worktree, no claude startup).  The old Rust
+    // supervision loop used to surface this (deleted in #153);
+    // restoring it here.
+    //
+    // NOTE: we deliberately do NOT suggest `/claude --tag <tag>` as an
+    // alternative.  The parser requires a description on the `--tag`
+    // path (only `--resume-pane` may omit it), and `--tag` no longer
+    // recalls prior desc/verdict history after PR #153 — so the hint
+    // would send users to a command that either errors out or fails
+    // to deliver what the name suggests.
+    out.push_str("  --- resume this pane ---\n");
+    out.push_str(&format!(
+        "  | reuse pane:    /claude --resume-pane {pane_id}\n"
+    ));
     out
 }
 
@@ -4078,5 +4095,104 @@ mod tests {
             MdState::Normal,
             "complete closing fence must exit InCodeBlock"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // format_task_released
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn format_task_released_header_includes_pane_and_tag() {
+        let out = format_task_released("%54", &[], Some("kernel-opt"), None, None, false, "");
+        assert!(out.starts_with("[released %54]"));
+        assert!(out.contains("tag=kernel-opt"));
+    }
+
+    #[test]
+    fn format_task_released_header_without_tag_omits_tag_field() {
+        let out = format_task_released("%54", &[], None, None, None, false, "");
+        assert!(out.starts_with("[released %54]"));
+        assert!(!out.contains("tag="));
+    }
+
+    #[test]
+    fn format_task_released_includes_summary_when_present() {
+        let out = format_task_released("%54", &[], None, Some("all tests pass"), None, false, "");
+        assert!(out.contains("  summary: all tests pass\n"));
+    }
+
+    #[test]
+    fn format_task_released_summary_absent_when_none() {
+        let out = format_task_released("%54", &[], None, None, None, false, "");
+        assert!(!out.contains("  summary: "));
+    }
+
+    #[test]
+    fn format_task_released_resume_hint_always_present() {
+        // Hint block must appear regardless of tag presence — the pane
+        // is preserved across release and --resume-pane is the correct
+        // reuse path.
+        let with_tag = format_task_released("%54", &[], Some("foo"), None, None, false, "");
+        let without_tag = format_task_released("%7", &[], None, None, None, false, "");
+        assert!(with_tag.contains("--- resume this pane ---"));
+        assert!(with_tag.contains("/claude --resume-pane %54"));
+        assert!(without_tag.contains("--- resume this pane ---"));
+        assert!(without_tag.contains("/claude --resume-pane %7"));
+    }
+
+    #[test]
+    fn format_task_released_does_not_suggest_tag_reentry() {
+        // Regression guard (Copilot review on PR #155): the parser
+        // requires a description on the `--tag` path, so a bare
+        // `/claude --tag <tag>` hint would error out.  Confirm the
+        // hint only mentions --resume-pane, never --tag.
+        let out = format_task_released("%54", &[], Some("kernel-opt"), None, None, false, "");
+        // The header still carries `tag=kernel-opt` as a label; the
+        // resume-hint block must NOT contain `/claude --tag`.
+        let hint_start = out.find("--- resume this pane ---").expect("hint present");
+        let hint = &out[hint_start..];
+        assert!(
+            !hint.contains("--tag"),
+            "resume hint must not suggest --tag; got: {hint}"
+        );
+    }
+
+    #[test]
+    fn format_task_released_pane_tail_rendered_with_pipe_prefix() {
+        let tail = "line1\nline2\nline3";
+        let out = format_task_released("%54", &[], None, None, None, false, tail);
+        assert!(out.contains("--- pane tail ---"));
+        assert!(out.contains("  | line1\n"));
+        assert!(out.contains("  | line2\n"));
+        assert!(out.contains("  | line3\n"));
+    }
+
+    #[test]
+    fn format_task_released_empty_pane_tail_skipped() {
+        // Empty / whitespace-only tail should not emit the tail block.
+        let out = format_task_released("%54", &[], None, None, None, false, "   \n\n  ");
+        assert!(!out.contains("--- pane tail ---"));
+    }
+
+    #[test]
+    fn format_task_released_resources_rendered_as_list() {
+        let out = format_task_released(
+            "%54",
+            &["xesim-9902".into(), "gpu-0".into()],
+            None,
+            None,
+            None,
+            false,
+            "",
+        );
+        assert!(out.contains("resources=[xesim-9902,gpu-0]"));
+    }
+
+    #[test]
+    fn format_task_released_worktree_dirty_flag_rendered() {
+        let clean = format_task_released("%54", &[], None, None, Some("/path"), false, "");
+        let dirty = format_task_released("%54", &[], None, None, Some("/path"), true, "");
+        assert!(clean.contains("worktree=/path\n") || clean.contains("worktree=/path "));
+        assert!(dirty.contains("worktree=/path (dirty)"));
     }
 }
