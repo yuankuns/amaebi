@@ -226,6 +226,19 @@ struct ClaudeTask {
     resource_timeout_secs: Option<u64>,
 }
 
+/// A parsed `/release` command.
+#[derive(Debug, PartialEq, Clone)]
+enum ReleaseCmd {
+    Pane {
+        pane_id: String,
+        clean: bool,
+        summary: Option<String>,
+    },
+    All {
+        clean: bool,
+    },
+}
+
 /// A parsed slash command from user input.
 #[derive(Debug, PartialEq)]
 enum SlashCommand {
@@ -233,6 +246,8 @@ enum SlashCommand {
     Model(Option<String>),
     /// `/claude "task" ...` — launch parallel Claude sessions.
     Claude(Result<Vec<ClaudeTask>, String>),
+    /// `/release %pane [--clean] [--summary "..."]` or `/release all [--clean]`.
+    Release(Result<ReleaseCmd, String>),
 }
 
 /// Parse a slash command from user input.
@@ -245,7 +260,110 @@ fn parse_slash_command(input: &str) -> Option<SlashCommand> {
     if let Some(result) = parse_claude(input) {
         return Some(SlashCommand::Claude(result));
     }
+    if let Some(result) = parse_release(input) {
+        return Some(SlashCommand::Release(result));
+    }
     None
+}
+
+/// Format a `Response::TaskReleased` frame for terminal output.  Shared by the
+/// Chat, Resume, Ask, and `/release` stream handlers so rendering is
+/// consistent no matter how the release was triggered (task_done, /release,
+/// socket break in a different conn, etc.).
+fn format_task_released(
+    pane_id: &str,
+    resources_freed: &[String],
+    tag: Option<&str>,
+    summary: Option<&str>,
+    worktree_path: Option<&str>,
+    worktree_dirty: bool,
+    pane_tail: &str,
+) -> String {
+    let mut out = format!("[released {pane_id}]");
+    if let Some(t) = tag {
+        out.push_str(&format!(" tag={t}"));
+    }
+    if !resources_freed.is_empty() {
+        out.push_str(&format!(" resources=[{}]", resources_freed.join(",")));
+    }
+    if let Some(wt) = worktree_path {
+        out.push_str(&format!(
+            " worktree={wt}{}",
+            if worktree_dirty { " (dirty)" } else { "" }
+        ));
+    }
+    out.push('\n');
+    if let Some(s) = summary {
+        out.push_str(&format!("  summary: {s}\n"));
+    }
+    if !pane_tail.trim().is_empty() {
+        out.push_str("  --- pane tail ---\n");
+        let tail_lines: Vec<&str> = pane_tail.lines().collect();
+        for line in tail_lines.iter().rev().take(20).rev() {
+            out.push_str(&format!("  | {line}\n"));
+        }
+    }
+    out
+}
+
+/// Parse `/release %54 [--clean] [--summary "..."]` or `/release all [--clean]`.
+///
+/// - `None` → not a `/release` command
+/// - `Some(Err(msg))` → parse error
+/// - `Some(Ok(cmd))` → a valid release target
+fn parse_release(input: &str) -> Option<Result<ReleaseCmd, String>> {
+    let rest = input.strip_prefix("/release")?;
+    if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let rest = rest.trim_start();
+    let usage = "usage: /release %<pane_id> [--clean] [--summary \"…\"] \
+                 or /release all [--clean]";
+    if rest.is_empty() {
+        return Some(Err(usage.into()));
+    }
+
+    let tokens: Vec<(String, bool)> = parse_quoted_args(rest);
+    let mut iter = tokens.into_iter();
+    let target_tok = match iter.next() {
+        Some((t, _)) => t,
+        None => return Some(Err(usage.into())),
+    };
+
+    let mut clean = false;
+    let mut summary: Option<String> = None;
+    while let Some((tok, _)) = iter.next() {
+        match tok.as_str() {
+            "--clean" => clean = true,
+            "--summary" => match iter.next() {
+                Some((s, _)) => summary = Some(s),
+                None => return Some(Err("--summary requires a value".into())),
+            },
+            other => return Some(Err(format!("unknown flag: {other}"))),
+        }
+    }
+
+    if target_tok == "all" {
+        if summary.is_some() {
+            return Some(Err(
+                "--summary is only valid with /release %<pane_id>".into()
+            ));
+        }
+        return Some(Ok(ReleaseCmd::All { clean }));
+    }
+    if let Some(stripped) = target_tok.strip_prefix('%') {
+        if stripped.is_empty() {
+            return Some(Err("pane id must follow % (e.g. %54)".into()));
+        }
+        return Some(Ok(ReleaseCmd::Pane {
+            pane_id: target_tok.clone(),
+            clean,
+            summary,
+        }));
+    }
+    Some(Err(format!(
+        "expected 'all' or a pane id like %54, got {target_tok}"
+    )))
 }
 
 /// Parse `/model [<name>]`.
@@ -632,6 +750,7 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
                     tag,
                     pane_id,
                     session_id: sid,
+                    ..
                 } => {
                     let msg = format!("[pane {pane_id}] tag={tag} → session {sid}\n");
                     stdout.write_all(msg.as_bytes()).await?;
@@ -890,11 +1009,25 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
                     Response::ModelSwitched { .. } => {
                         // ask mode has no persistent model variable to update.
                     }
-                    Response::Heartbeat { .. } => {
-                        // Supervision-only frame; never emitted on the Chat
-                        // path but keep an explicit arm so future enum
-                        // additions still force a compile error here.
-                        tracing::debug!("ignoring Heartbeat outside supervision loop");
+                    Response::TaskReleased {
+                        pane_id,
+                        resources_freed,
+                        tag,
+                        summary,
+                        worktree_path,
+                        worktree_dirty,
+                        pane_tail,
+                    } => {
+                        let out = format_task_released(
+                            &pane_id,
+                            &resources_freed,
+                            tag.as_deref(),
+                            summary.as_deref(),
+                            worktree_path.as_deref(),
+                            worktree_dirty,
+                            &pane_tail,
+                        );
+                        stdout.write_all(out.as_bytes()).await?;
                     }
                 }
             }
@@ -1160,10 +1293,17 @@ pub async fn run_chat_loop(
                 req_line.push('\n');
                 write_half.write_all(req_line.as_bytes()).await?;
 
-                // Collect (pane_id, task_description) for supervision.
-                // (pane_id, description, tag_tag) per launched pane.
-                // (pane_id, description, tag) per launched pane.
-                let mut launched: Vec<(String, String, String)> = Vec::new();
+                // Collect one launched block per pane so the synthesised user
+                // turn below carries the exact context the LLM needs to start
+                // supervising without any additional round-trip.
+                struct Launched {
+                    pane_id: String,
+                    description: String,
+                    tag: String,
+                    worktree: Option<String>,
+                    resources: Vec<String>,
+                }
+                let mut launched: Vec<Launched> = Vec::new();
 
                 loop {
                     let line = lines.next_line().await.context("reading daemon response")?;
@@ -1181,14 +1321,22 @@ pub async fn run_chat_loop(
                             tag,
                             pane_id,
                             session_id: sid,
+                            worktree,
+                            resources,
                         } => {
                             let msg = format!("[pane {pane_id}] tag={tag} → session {sid}\n");
                             stdout.write_all(msg.as_bytes()).await?;
-                            let desc = task_descriptions
+                            let description = task_descriptions
                                 .get(&tag)
                                 .cloned()
                                 .unwrap_or_else(|| tag.clone());
-                            launched.push((pane_id, desc, tag));
+                            launched.push(Launched {
+                                pane_id,
+                                description,
+                                tag,
+                                worktree,
+                                resources,
+                            });
                         }
                         Response::CapacityError {
                             requested,
@@ -1208,169 +1356,35 @@ pub async fn run_chat_loop(
                 }
                 stdout.flush().await?;
 
-                // If panes were successfully launched, send a SupervisePanes request
-                // to the daemon so it runs a Rust polling loop instead of asking the
-                // LLM to keep looping via an injected prompt.
+                // Synthesise a single user turn that concatenates the
+                // original task description(s) with a `[launched]` block per
+                // pane (pane_id + worktree + resources + tag).  The LLM owns
+                // the supervision loop from here — docs/design/claude-chat-
+                // takeover.md pins the contract.  The synthesised prompt is
+                // also echoed to the terminal so the human sees what the LLM
+                // sees.
                 if !launched.is_empty() {
-                    let supervise_req = Request::SupervisePanes {
-                        panes: launched
-                            .iter()
-                            .map(|(pid, desc, tag)| crate::ipc::SupervisionTarget {
-                                pane_id: pid.clone(),
-                                task_description: desc.clone(),
-                                tag: Some(tag.clone()),
-                                repo_dir: invocation_repo_dir.clone(),
-                            })
-                            .collect(),
-                        model: model.clone(),
-                        session_id: Some(session_id.clone()),
-                    };
-                    let mut req_line = serde_json::to_string(&supervise_req)?;
-                    req_line.push('\n');
-                    write_half.write_all(req_line.as_bytes()).await?;
-
-                    // Stream supervision output exactly like a Chat response.
-                    // There is no client-side business timeout — supervision
-                    // length is a daemon concept (`AMAEBI_SUPERVISION_TIMEOUT_SECS`,
-                    // default 24 h) and mirroring it here via an env var would
-                    // silently desync whenever client + daemon run in different
-                    // shells.  Instead the client runs a 30-min watchdog: if
-                    // the daemon stops sending ANY frame (text, heartbeat,
-                    // done), assume it's stuck and end the session so the TUI
-                    // does not hang forever.  The daemon emits `Heartbeat`
-                    // every 10 min (see `HEARTBEAT_INTERVAL_SECS` in daemon.rs)
-                    // so a normal supervision — which sleeps ~5 min between
-                    // LLM calls — always has at most a 10-min frame gap.
-                    const WATCHDOG_INTERVAL_SECS: u64 = 30 * 60;
-                    // Pinned (not per-iteration) so a heartbeat arriving
-                    // during the 5 s drain does not push the deadline back —
-                    // we promise the user a bounded wait after Ctrl-C.
-                    let mut interrupt_drain_deadline: Option<tokio::time::Instant> = None;
-                    'supervision: loop {
-                        // Recomputed every iteration: any arriving frame (or
-                        // sigint) re-enters the loop and resets the watchdog.
-                        let watchdog_at = tokio::time::Instant::now()
-                            + Duration::from_secs(WATCHDOG_INTERVAL_SECS);
-                        let interrupt_sent = interrupt_drain_deadline.is_some();
-                        // Fallback to `watchdog_at` when the arm is disabled so
-                        // `sleep_until` still receives a valid Instant.
-                        let interrupt_drain_at = interrupt_drain_deadline.unwrap_or(watchdog_at);
-                        tokio::select! {
-                            biased;
-
-                            _ = sigint.recv(), if !interrupt_sent => {
-                                let interrupt_req = Request::Interrupt { session_id: session_id.clone() };
-                                if let Ok(mut frame) = serde_json::to_string(&interrupt_req) {
-                                    frame.push('\n');
-                                    let _ = write_half.write_all(frame.as_bytes()).await;
-                                }
-                                interrupt_drain_deadline = Some(
-                                    tokio::time::Instant::now() + Duration::from_secs(5),
-                                );
-                                // Continue looping to drain remaining frames.
-                            }
-
-                            _ = tokio::time::sleep_until(interrupt_drain_at), if interrupt_sent => {
-                                // Post-interrupt 5 s drain: daemon should have
-                                // responded with Done by now; if not, give up
-                                // cleanly so the socket does not stay half-
-                                // alive for another Chat request (which would
-                                // desync the frame protocol).
-                                if let Some(remaining) = md_buf.flush_all() {
-                                    let out = render_markdown(&remaining);
-                                    stdout.write_all(out.as_bytes()).await?;
-                                }
-                                stdout
-                                    .write_all(b"[supervision] daemon did not stop within 5 s after interrupt; ending session.\n")
-                                    .await?;
-                                stdout.flush().await?;
-                                break 'session;
-                            }
-
-                            _ = tokio::time::sleep_until(watchdog_at), if !interrupt_sent => {
-                                // 30 min without any frame — treat daemon as
-                                // stuck (process alive but supervision task
-                                // deadlocked, etc.) and end the session.
-                                if let Some(remaining) = md_buf.flush_all() {
-                                    let out = render_markdown(&remaining);
-                                    stdout.write_all(out.as_bytes()).await?;
-                                }
-                                stdout
-                                    .write_all(b"[supervision] no frames from daemon for 30 min; assuming stuck daemon and ending session.\n")
-                                    .await?;
-                                stdout.flush().await?;
-                                break 'session;
-                            }
-
-                            line = lines.next_line() => {
-                                let line = line.context("reading supervision response")?;
-                                let Some(line) = line else { break 'session };
-                                let resp: Response = serde_json::from_str(&line)?;
-                                match resp {
-                                    Response::Text { chunk } => {
-                                        md_buf.push(&chunk);
-                                        while let Some(ready) = md_buf.flush_if_ready() {
-                                            let out = render_markdown(&ready);
-                                            stdout.write_all(out.as_bytes()).await?;
-                                            stdout.flush().await?;
-                                        }
-                                    }
-                                    Response::Heartbeat { elapsed_secs, turn } => {
-                                        // Status line on stderr so it never
-                                        // interleaves with streamed stdout
-                                        // markdown.  Overwrites itself with `\r`
-                                        // so scrollback stays clean — the
-                                        // 5-min WAIT/STEER/DONE headers are
-                                        // already there for history.
-                                        let mins = elapsed_secs / 60;
-                                        let hours = mins / 60;
-                                        let rem_mins = mins % 60;
-                                        let msg = if hours > 0 {
-                                            format!(
-                                                "\r[supervision alive — turn #{turn}, {hours}h{rem_mins}m elapsed]"
-                                            )
-                                        } else {
-                                            format!(
-                                                "\r[supervision alive — turn #{turn}, {mins}m elapsed]"
-                                            )
-                                        };
-                                        let _ = tokio::io::stderr().write_all(msg.as_bytes()).await;
-                                        let _ = tokio::io::stderr().flush().await;
-                                        // Fall through — next select! iteration
-                                        // recomputes `watchdog_at`, so receiving
-                                        // this heartbeat resets the watchdog.
-                                    }
-                                    Response::Done => {
-                                        if let Some(remaining) = md_buf.flush_all() {
-                                            let out = render_markdown(&remaining);
-                                            stdout.write_all(out.as_bytes()).await?;
-                                        }
-                                        stdout.write_all(b"\n").await?;
-                                        stdout.flush().await?;
-                                        break 'supervision;
-                                    }
-                                    Response::Error { message } => {
-                                        if let Some(remaining) = md_buf.flush_all() {
-                                            let out = render_markdown(&remaining);
-                                            stdout.write_all(out.as_bytes()).await?;
-                                        }
-                                        stdout.write_all(message.as_bytes()).await?;
-                                        stdout.write_all(b"\n").await?;
-                                        stdout.flush().await?;
-                                        break 'supervision;
-                                    }
-                                    _ => {}
-                                }
-                            }
+                    let mut synth = String::new();
+                    for l in &launched {
+                        if !synth.is_empty() {
+                            synth.push_str("\n\n---\n\n");
                         }
-                    }
-                    // Flush any remaining markdown (e.g. timeout break path).
-                    if let Some(remaining) = md_buf.flush_all() {
-                        let out = render_markdown(&remaining);
-                        stdout.write_all(out.as_bytes()).await?;
+                        synth.push_str(l.description.trim_end());
+                        synth.push_str("\n\n[launched]\n");
+                        synth.push_str(&format!("  pane: {}\n", l.pane_id));
+                        if let Some(wt) = l.worktree.as_deref() {
+                            synth.push_str(&format!("  worktree: {wt}\n"));
+                        }
+                        if !l.resources.is_empty() {
+                            synth.push_str(&format!("  resources: {}\n", l.resources.join(", ")));
+                        }
+                        synth.push_str(&format!("  tag: {}\n", l.tag));
                     }
                     stdout.write_all(b"\n").await?;
+                    stdout.write_all(synth.as_bytes()).await?;
+                    stdout.write_all(b"\n").await?;
                     stdout.flush().await?;
+                    next_prompt = Some(synth);
                 }
                 continue 'session;
             }
@@ -1387,6 +1401,80 @@ pub async fn run_chat_loop(
                     }
                 }
                 stdout.flush().await?;
+                continue 'session;
+            }
+            Some(SlashCommand::Release(parse_result)) => {
+                match parse_result {
+                    Err(msg) => {
+                        stdout.write_all(format!("{msg}\n").as_bytes()).await?;
+                        stdout.flush().await?;
+                    }
+                    Ok(cmd) => {
+                        let (target, clean, summary) = match cmd {
+                            ReleaseCmd::Pane {
+                                pane_id,
+                                clean,
+                                summary,
+                            } => (
+                                crate::ipc::ClaudeReleaseTarget::Pane { pane_id },
+                                clean,
+                                summary,
+                            ),
+                            ReleaseCmd::All { clean } => {
+                                (crate::ipc::ClaudeReleaseTarget::All, clean, None)
+                            }
+                        };
+                        let req = Request::ClaudeRelease {
+                            target,
+                            clean_worktree: clean,
+                            summary,
+                        };
+                        let mut req_line = serde_json::to_string(&req)?;
+                        req_line.push('\n');
+                        write_half.write_all(req_line.as_bytes()).await?;
+                        // Drain frames until Done — render each TaskReleased
+                        // inline so the user sees summary + pane tail + dirty
+                        // worktree flag for every pane they released.
+                        loop {
+                            let line = match lines.next_line().await {
+                                Ok(Some(l)) => l,
+                                _ => break 'session,
+                            };
+                            let resp: Response = match serde_json::from_str(&line) {
+                                Ok(r) => r,
+                                Err(_) => continue,
+                            };
+                            match resp {
+                                Response::Done => break,
+                                Response::Error { message } => {
+                                    stdout.write_all(format!("{message}\n").as_bytes()).await?;
+                                }
+                                Response::TaskReleased {
+                                    pane_id,
+                                    resources_freed,
+                                    tag,
+                                    summary,
+                                    worktree_path,
+                                    worktree_dirty,
+                                    pane_tail,
+                                } => {
+                                    let out = format_task_released(
+                                        &pane_id,
+                                        &resources_freed,
+                                        tag.as_deref(),
+                                        summary.as_deref(),
+                                        worktree_path.as_deref(),
+                                        worktree_dirty,
+                                        &pane_tail,
+                                    );
+                                    stdout.write_all(out.as_bytes()).await?;
+                                }
+                                _ => {}
+                            }
+                        }
+                        stdout.flush().await?;
+                    }
+                }
                 continue 'session;
             }
             None => {}
@@ -1539,6 +1627,33 @@ pub async fn run_chat_loop(
                             // carries the updated model, preserving carried_model
                             // across turns in the daemon.
                             model = new_model;
+                        }
+                        Response::TaskReleased {
+                            pane_id,
+                            resources_freed,
+                            tag,
+                            summary,
+                            worktree_path,
+                            worktree_dirty,
+                            pane_tail,
+                        } => {
+                            // Flush any in-flight markdown before the release
+                            // banner so the user sees a clear break.
+                            if let Some(remaining) = md_buf.flush_all() {
+                                let out = render_markdown(&remaining);
+                                stdout.write_all(out.as_bytes()).await?;
+                            }
+                            let out = format_task_released(
+                                &pane_id,
+                                &resources_freed,
+                                tag.as_deref(),
+                                summary.as_deref(),
+                                worktree_path.as_deref(),
+                                worktree_dirty,
+                                &pane_tail,
+                            );
+                            stdout.write_all(out.as_bytes()).await?;
+                            stdout.flush().await?;
                         }
                         _ => {}
                     }
@@ -1898,10 +2013,25 @@ pub async fn run_resume(
                     Response::ModelSwitched { .. } => {
                         // resume mode has no persistent model variable to update.
                     }
-                    Response::Heartbeat { .. } => {
-                        // Supervision-only frame; never emitted on the
-                        // Resume path.
-                        tracing::debug!("ignoring Heartbeat outside supervision loop");
+                    Response::TaskReleased {
+                        pane_id,
+                        resources_freed,
+                        tag,
+                        summary,
+                        worktree_path,
+                        worktree_dirty,
+                        pane_tail,
+                    } => {
+                        let out = format_task_released(
+                            &pane_id,
+                            &resources_freed,
+                            tag.as_deref(),
+                            summary.as_deref(),
+                            worktree_path.as_deref(),
+                            worktree_dirty,
+                            &pane_tail,
+                        );
+                        stdout.write_all(out.as_bytes()).await?;
                     }
                 }
             }
@@ -3500,6 +3630,60 @@ mod tests {
     fn parse_claude_false_positive_prefix_rejected() {
         assert!(parse_slash_command("/claudefoo").is_none());
         assert!(parse_slash_command("/claude--help").is_none());
+    }
+
+    #[test]
+    fn parse_release_pane_basic() {
+        let got = parse_release("/release %54").unwrap().unwrap();
+        assert_eq!(
+            got,
+            ReleaseCmd::Pane {
+                pane_id: "%54".into(),
+                clean: false,
+                summary: None,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_release_pane_with_flags_and_summary() {
+        let got = parse_release("/release %54 --clean --summary \"all green\"")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            got,
+            ReleaseCmd::Pane {
+                pane_id: "%54".into(),
+                clean: true,
+                summary: Some("all green".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_release_all_with_clean() {
+        let got = parse_release("/release all --clean").unwrap().unwrap();
+        assert_eq!(got, ReleaseCmd::All { clean: true });
+    }
+
+    #[test]
+    fn parse_release_all_rejects_summary() {
+        let err = parse_release("/release all --summary \"whatever\"")
+            .unwrap()
+            .unwrap_err();
+        assert!(err.contains("--summary"));
+    }
+
+    #[test]
+    fn parse_release_bare_returns_usage_err() {
+        let err = parse_release("/release").unwrap().unwrap_err();
+        assert!(err.contains("usage"));
+    }
+
+    #[test]
+    fn parse_release_false_positive_prefix_rejected() {
+        assert!(parse_release("/releases").is_none());
+        assert!(parse_release("/release-all").is_none());
     }
 
     #[test]

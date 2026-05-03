@@ -701,6 +701,13 @@ pub(crate) fn supports_prompt_caching(model_id: &str) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CacheTtl {
     FiveMinutes,
+    // Wire shape is validated by bedrock.rs tests but no production caller
+    // currently requests it — the old supervision loop was the sole
+    // consumer, and the chat-takeover redesign
+    // (docs/design/claude-chat-takeover.md) removed it.  Left in place so
+    // a future long-running caller can request 1h TTL without re-adding
+    // the enum variant and its Bedrock wire mapping.
+    #[allow(dead_code)]
     OneHour,
 }
 

@@ -129,6 +129,7 @@ impl ToolExecutor for LocalExecutor {
                      (child agents cannot spawn further agents)"
                 ),
             },
+            "task_done" => task_done(args),
             other => anyhow::bail!("unknown tool: {other}"),
         }
     }
@@ -454,6 +455,23 @@ fn subagent_default_model() -> String {
     }
 }
 
+/// `task_done` is intentionally a soft signal: the tool body only validates
+/// arguments and echoes them back.  The daemon's agentic-loop dispatch
+/// recognises `name == "task_done"` after the tool completes and calls
+/// `release_held_entry` + streams the `TaskReleased` frame.  This keeps the
+/// tool schema simple (no access to daemon state required at tool-exec
+/// time) and mirrors how `switch_model` / `spawn_agent` have side effects
+/// the loop observes via tool-name inspection.
+fn task_done(args: serde_json::Value) -> Result<String> {
+    let pane_id = args["pane_id"]
+        .as_str()
+        .context("task_done: missing string argument 'pane_id'")?;
+    let summary = args["summary"]
+        .as_str()
+        .context("task_done: missing string argument 'summary'")?;
+    Ok(format!("[task_done signalled pane={pane_id}]\n{summary}"))
+}
+
 async fn spawn_agent(args: serde_json::Value, ctx: &SpawnContext) -> Result<String> {
     let task = args["task"]
         .as_str()
@@ -660,6 +678,10 @@ async fn spawn_agent(args: serde_json::Value, ctx: &SpawnContext) -> Result<Stri
         // persistence is the parent supervision's concern, and children
         // don't run supervision themselves.
         tasks_db: Arc::new(std::sync::Mutex::new(None)),
+        // Children don't hold /claude panes — /claude goes through the
+        // parent daemon.  Fresh empty structures are cheap.
+        conn_id_counter: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+        held: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
     };
 
     let messages = vec![
@@ -686,6 +708,7 @@ async fn spawn_agent(args: serde_json::Value, ctx: &SpawnContext) -> Result<Stri
         &mut steer_rx,
         false,
         None,
+        None, // child agents never hold /claude panes
     )
     .await?;
 
@@ -934,6 +957,38 @@ pub fn tool_schemas(include_spawn_agent: bool) -> Vec<serde_json::Value> {
                         }
                     },
                     "required": ["path", "content"]
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "task_done",
+                "description": "Declare a /claude-launched pane's task complete.  Call this when \
+                                you have verified the task goal is met (tests pass, diff reviewed, \
+                                etc.) — NOT on speculation.  The daemon then releases amaebi's \
+                                ownership of the pane (pane lease, resource lease, task-notebook \
+                                lease) and streams a TaskReleased frame to the user with the pane \
+                                tail + worktree status + your summary.  The tmux pane and the \
+                                `claude` process inside it are NOT killed; the worktree is kept.  \
+                                After this call, the LLM no longer needs to monitor that pane.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "pane_id": {
+                            "type": "string",
+                            "description": "The tmux pane id (e.g. '%54') reported by the \
+                                            preceding [launched] block.  No default — explicit \
+                                            even in single-pane chats."
+                        },
+                        "summary": {
+                            "type": "string",
+                            "description": "Your final summary of what was accomplished.  \
+                                            Stream-rendered to the user AND archived to the \
+                                            inbox for later review."
+                        }
+                    },
+                    "required": ["pane_id", "summary"]
                 }
             }
         }),

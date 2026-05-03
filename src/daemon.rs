@@ -1,7 +1,9 @@
 use anyhow::{Context, Result};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
@@ -126,6 +128,41 @@ const MAX_CONSECUTIVE_COMPACT_FAILURES: u32 = 3;
 const COMPACT_SUMMARY_MAX_TOKENS: usize = 2_048;
 
 /// State shared across all concurrent client connections via `Arc`.
+/// Per-connection identifier allocated when a client first connects.  Used
+/// as the key into `DaemonState::held` so a socket break releases exactly
+/// the panes this connection owned.
+pub type ConnId = u64;
+
+/// Record of a single `/claude` pane whose ownership is held by a live
+/// client connection.  Dropped (and its leases released) when the LLM
+/// calls `task_done`, the user runs `/release`, the chat process exits
+/// cleanly, or the socket drops abnormally.
+#[derive(Debug, Clone)]
+pub struct TaskEntry {
+    pub pane_id: String,
+    pub resources: Vec<String>,
+    pub worktree: Option<PathBuf>,
+    pub tag: Option<String>,
+    /// Canonicalised `repo_dir` paired with `tag` to form the task
+    /// notebook lease key `(repo_dir, tag)`.  Needed on release so
+    /// `tasks::release_lease` can target ONLY this pane's lease,
+    /// leaving any sibling pane's leases (under the same holder id)
+    /// untouched — see the over-release bug otherwise.
+    pub task_repo_dir: Option<String>,
+    /// Holder id used when the notebook lease was acquired — typically
+    /// `supervision:{session_id}`.  Required by `tasks::release_lease`
+    /// which verifies ownership before freeing.
+    pub task_lease_holder: Option<String>,
+    /// Session UUID for inbox writes when release happens without a live
+    /// client to stream the result to (socket break, chat exit).
+    pub session_id: Option<String>,
+    /// The original `--tag "…"` description text, or the resume-pane
+    /// fallback, used as the inbox report's task description.
+    pub task_description: Option<String>,
+    #[allow(dead_code)] // consumed by dashboards / telemetry in a later PR
+    pub created_at: Instant,
+}
+
 pub struct DaemonState {
     pub http: reqwest::Client,
     pub tokens: Arc<TokenCache>,
@@ -166,6 +203,12 @@ pub struct DaemonState {
     /// Lazy-initialised — the first `/claude --tag <tag>` request opens
     /// it; invocations without `--tag` never touch the file.
     pub tasks_db: Arc<Mutex<Option<rusqlite::Connection>>>,
+    /// Monotonic counter for `ConnId` allocation in `handle_connection`.
+    pub conn_id_counter: Arc<AtomicU64>,
+    /// Per-connection panes currently held by amaebi.  Socket close drains
+    /// and releases; `task_done` / `/release` remove individual entries.
+    /// See `docs/design/claude-chat-takeover.md`.
+    pub held: Arc<Mutex<HashMap<ConnId, Vec<TaskEntry>>>>,
 }
 
 impl DaemonState {
@@ -211,6 +254,8 @@ impl DaemonState {
             active_sessions,
             user_aliases,
             tasks_db: Arc::new(Mutex::new(None)),
+            conn_id_counter: Arc::new(AtomicU64::new(1)),
+            held: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 }
@@ -665,6 +710,22 @@ async fn resolve_session_dir(session_id: &str) -> String {
 // ---------------------------------------------------------------------------
 
 async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Result<()> {
+    let conn_id: ConnId = state.conn_id_counter.fetch_add(1, Ordering::Relaxed);
+    let result = handle_connection_inner(stream, state.clone(), conn_id).await;
+
+    // Drain any panes still held by this connection — graceful exit, Ctrl-D,
+    // socket break, or an unhandled error all land here.  The design doc
+    // (`docs/design/claude-chat-takeover.md`) promises immediate release on
+    // connection drop, with 24 h TTL as a disaster backstop.
+    drain_held_on_conn_exit(&state, conn_id).await;
+    result
+}
+
+async fn handle_connection_inner(
+    stream: UnixStream,
+    state: Arc<DaemonState>,
+    conn_id: ConnId,
+) -> Result<()> {
     let (owned_reader, owned_writer) = stream.into_split();
 
     // Shared writer — the agentic-loop task holds the lock during generation;
@@ -807,6 +868,7 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                         &mut steer_rx,
                         true,
                         Some(&sid),
+                        None, // SubmitDetach: background task, no live conn → no panes to hold
                     )
                     .await
                     {
@@ -852,6 +914,7 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                     tmux_pane,
                     model,
                     session_id,
+                    conn_id,
                 )
                 .await?
                 {
@@ -883,6 +946,7 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                     tmux_pane,
                     model,
                     session_id,
+                    conn_id,
                 )
                 .await?
                 {
@@ -896,7 +960,7 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                 session_id,
                 repo_dir,
             } => {
-                handle_claude_launch(&writer, tasks, session_id, repo_dir, &state).await?;
+                handle_claude_launch(&writer, tasks, session_id, repo_dir, &state, conn_id).await?;
             }
 
             Request::GenerateTag {
@@ -909,13 +973,12 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                 write_frame(&mut *w, &Response::TagGenerated { tag }).await?;
             }
 
-            Request::SupervisePanes {
-                panes,
-                model,
-                session_id,
+            Request::ClaudeRelease {
+                target,
+                clean_worktree,
+                summary,
             } => {
-                let model = expand_user_alias(&model, &state.user_aliases);
-                handle_supervision(&writer, &mut frame_rx, panes, model, &state, session_id)
+                handle_claude_release(&writer, &state, conn_id, target, clean_worktree, summary)
                     .await?;
             }
         }
@@ -964,6 +1027,7 @@ async fn drive_agentic_loop(
     expected_sid: &str,
     messages: Vec<Message>,
     model: &str,
+    conn_id: ConnId,
 ) -> Option<anyhow::Result<(String, usize, Vec<Message>, String)>> {
     let (steer_tx, mut steer_rx) = tokio::sync::mpsc::channel::<Option<String>>(16);
     let writer_loop = Arc::clone(writer);
@@ -980,6 +1044,7 @@ async fn drive_agentic_loop(
             &mut steer_rx,
             true,
             Some(&sid_loop),
+            Some(conn_id),
         )
         .await
     });
@@ -1028,6 +1093,92 @@ async fn drive_agentic_loop(
 // Sub-handlers — one per Request variant
 // ---------------------------------------------------------------------------
 
+/// Handle `Request::ClaudeRelease`: user-initiated release of one or all
+/// panes held by this connection.  Streams one `TaskReleased` per released
+/// pane followed by `Response::Done`.  Unknown pane ids (e.g. a stale tag
+/// the user typed) stream an `Error` frame for that pane but do not abort
+/// the batch.
+async fn handle_claude_release(
+    writer: &Arc<tokio::sync::Mutex<tokio::net::unix::OwnedWriteHalf>>,
+    state: &Arc<DaemonState>,
+    conn_id: ConnId,
+    target: crate::ipc::ClaudeReleaseTarget,
+    clean_worktree: bool,
+    summary: Option<String>,
+) -> Result<()> {
+    let pane_ids: Vec<String> = match target {
+        crate::ipc::ClaudeReleaseTarget::Pane { pane_id } => vec![pane_id],
+        crate::ipc::ClaudeReleaseTarget::All => {
+            // Poisoned mutex: recover the guard rather than silently
+            // dropping the release list, matching the pattern used by
+            // release_held_entry / drain_held_on_conn_exit /
+            // pane_alive_held_panes.
+            let held = state.held.lock().unwrap_or_else(|poisoned| {
+                tracing::warn!(
+                    conn_id,
+                    "handle_claude_release: state.held mutex was poisoned; recovering for /release all"
+                );
+                poisoned.into_inner()
+            });
+            held.get(&conn_id)
+                .map(|v| v.iter().map(|e| e.pane_id.clone()).collect())
+                .unwrap_or_default()
+        }
+    };
+
+    if pane_ids.is_empty() {
+        let mut w = writer.lock().await;
+        write_frame(
+            &mut *w,
+            &Response::Error {
+                message: "no panes currently held by this connection".into(),
+            },
+        )
+        .await?;
+        write_frame(&mut *w, &Response::Done).await?;
+        return Ok(());
+    }
+
+    for pane_id in pane_ids.iter() {
+        // `summary` from a single /release %pane applies to THAT pane only.
+        // /release all leaves summary empty (user shouldn't mass-assign one).
+        let this_summary = if pane_ids.len() == 1 {
+            summary.clone()
+        } else {
+            None
+        };
+        match release_held_entry(
+            state,
+            conn_id,
+            pane_id,
+            clean_worktree,
+            this_summary,
+            ReleaseReason::UserOrLlm,
+        )
+        .await
+        {
+            Some(frame) => {
+                let mut w = writer.lock().await;
+                write_frame(&mut *w, &frame).await?;
+            }
+            None => {
+                let mut w = writer.lock().await;
+                write_frame(
+                    &mut *w,
+                    &Response::Error {
+                        message: format!("pane {pane_id} not held by this connection"),
+                    },
+                )
+                .await?;
+            }
+        }
+    }
+
+    let mut w = writer.lock().await;
+    write_frame(&mut *w, &Response::Done).await?;
+    Ok(())
+}
+
 /// Handle `Request::ClaudeLaunch`: assign tmux panes and launch `claude`
 /// (Claude Code CLI) sessions for each task.
 ///
@@ -1045,6 +1196,7 @@ async fn handle_claude_launch(
     session_id: Option<String>,
     repo_dir: Option<String>,
     state: &Arc<DaemonState>,
+    conn_id: ConnId,
 ) -> Result<()> {
     if tasks.is_empty() {
         let mut w = writer.lock().await;
@@ -1894,6 +2046,41 @@ async fn handle_claude_launch(
         // before this ClaudeLaunch arrived (or supplied by `--tag`).
         // It's used as pane lease holder / worktree dir / tmux title /
         // notebook key — all three are already wired up upstream.
+        // `worktree` + `resources` ride along so the client can synthesise a
+        // `[launched]` user turn without a second round-trip
+        // (`docs/design/claude-chat-takeover.md`, PR B/F).
+        let resources: Vec<String> = resource_leases.iter().map(|r| r.name.clone()).collect();
+        let entry = TaskEntry {
+            pane_id: pane_id.clone(),
+            resources: resources.clone(),
+            worktree: worktree.as_deref().map(PathBuf::from),
+            tag: Some(task.tag.clone()),
+            // Only record a repo_dir when we actually acquired a notebook
+            // lease (resume-pane paths skip acquisition).  Without the
+            // lease, the `(repo_dir, tag)` key wouldn't exist in tasks.db
+            // and release_lease would be a no-op — but keeping the field
+            // in sync with lease_holder keeps the release logic simple.
+            task_repo_dir: if lease_holder.is_some() {
+                repo_dir.clone()
+            } else {
+                None
+            },
+            task_lease_holder: lease_holder.clone(),
+            session_id: Some(session_id.clone()),
+            task_description: Some(raw_desc.clone()),
+            created_at: Instant::now(),
+        };
+        {
+            let mut held = state.held.lock().unwrap_or_else(|poisoned| {
+                tracing::warn!(
+                    conn_id,
+                    pane_id = %entry.pane_id,
+                    "handle_claude_launch: state.held mutex was poisoned; recovering to record TaskEntry"
+                );
+                poisoned.into_inner()
+            });
+            held.entry(conn_id).or_default().push(entry);
+        }
         let mut w = writer.lock().await;
         write_frame(
             &mut *w,
@@ -1901,6 +2088,8 @@ async fn handle_claude_launch(
                 tag: task.tag,
                 pane_id,
                 session_id,
+                worktree,
+                resources,
             },
         )
         .await?;
@@ -1911,453 +2100,13 @@ async fn handle_claude_launch(
     Ok(())
 }
 
-/// Return `true` when `line` is a visual TUI chrome fragment from the
-/// Claude Code terminal UI with no informational content — a horizontal
-/// separator, the always-present bottom status bar, an empty prompt
-/// cursor, or a pure box-drawing border segment.
-///
-/// Match criteria deliberately target **whole-line** chrome only so that
-/// real output containing these glyphs (e.g. a log line with `│` as a
-/// field separator) survives untouched.  Missing a chrome variant is
-/// fine (minor noise), false positives would silently drop real
-/// information the supervisor LLM needs — so every rule here is
-/// conservative and structure-anchored.
-fn is_tui_chrome_line(line: &str) -> bool {
-    let t = line.trim();
-    if t.is_empty() {
-        return false; // real blank lines are meaningful in tmux captures
-    }
-
-    // Rules 1 and 4 both need to scan every char in the line; fold them
-    // into a single pass so a long-but-unmatched line (common case: real
-    // Claude Code output) pays for exactly one iteration rather than
-    // four.  Correctness is unchanged: we still check the same
-    // "all-dashes and >=10" (rule 1) and "all-border and
-    // has-vertical" (rule 4) predicates, just with the char scan
-    // amortised.
-    //
-    // Rule 1 (all-horizontal-rule divider): Claude Code renders these as
-    // long runs of U+2500 / U+2501; a 10-char minimum avoids hitting a
-    // real line that happens to start with a few dashes (e.g. markdown).
-    //
-    // Rule 4 (pure box-drawing border): every char is a box-drawing
-    // glyph or whitespace, AND at least one vertical/corner glyph is
-    // present.  The "must contain a vertical" requirement stops rule 4
-    // from swallowing short horizontal runs (e.g. a 3- or 8-dash
-    // markdown separator) that rule 1's 10-char minimum intentionally
-    // let through — rule 1 is the sole authority for "all-dashes"
-    // lines.  Vertical/corner glyphs are the real signature of a
-    // rendered box frame.
-    let mut char_count = 0usize;
-    let mut all_horizontal = true;
-    let mut all_border = true;
-    let mut has_vertical_glyph = false;
-    for c in t.chars() {
-        char_count += 1;
-        let is_horizontal = c == '─' || c == '━';
-        let is_vertical = matches!(c, '│' | '╭' | '╮' | '╯' | '╰' | '├' | '┤' | '┬' | '┴');
-        let is_border_glyph = is_horizontal || is_vertical || c == ' ' || c == '\t';
-        if !is_horizontal {
-            all_horizontal = false;
-        }
-        if !is_border_glyph {
-            all_border = false;
-        }
-        if is_vertical {
-            has_vertical_glyph = true;
-        }
-        // Early exit once neither composite predicate can still succeed.
-        if !all_horizontal && !all_border {
-            break;
-        }
-    }
-    if all_horizontal && char_count >= 10 {
-        return true; // rule 1
-    }
-    if all_border && has_vertical_glyph {
-        return true; // rule 4
-    }
-
-    // 2. Bottom status bar.  Anchored on two substrings Claude Code
-    //    always emits in its hint line, plus the "bypass permissions"
-    //    banner visible when `--dangerously-skip-permissions` is active.
-    if t.starts_with("⏵⏵ bypass permissions")
-        || t.contains("esc to interrupt")
-        || t.contains("ctrl+t to hide tasks")
-    {
-        return true;
-    }
-
-    // 3. Empty input prompt `❯` on its own.
-    if t == "❯" {
-        return true;
-    }
-
-    false
-}
-
-/// Remove whole-line TUI chrome from `raw`, preserving line order and
-/// all blank lines.  Line-based filter: never rewrites content, only
-/// drops fully-chrome lines.
-fn strip_tui_chrome(raw: &str) -> String {
-    raw.lines()
-        .filter(|l| !is_tui_chrome_line(l))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-/// Capture the last 200 lines of a tmux pane as plain text.
-/// Returns an empty string on failure so supervision can continue.
-///
-/// 200-line window matches Claude Code's own default capture depth — enough
-/// that a busy pane (tool outputs, build logs) still shows what the Claude
-/// agent most recently did, not just the idle prompt that followed.
-///
-/// Post-capture, Claude Code's visual TUI chrome (divider rules, status
-/// bar, empty prompt cursor, border characters) is stripped via
-/// [`strip_tui_chrome`] so downstream supervision / idle-detection /
-/// LLM-prompt consumers see a high signal-to-noise view of the pane.
-fn capture_pane_text(pane_id: &str) -> String {
-    match std::process::Command::new("tmux")
-        .args(["capture-pane", "-t", pane_id, "-p", "-S", "-200"])
-        .output()
-    {
-        Ok(output) => {
-            if !output.status.success() {
-                tracing::warn!(
-                    pane_id,
-                    status = %output.status,
-                    stderr = %String::from_utf8_lossy(&output.stderr),
-                    "tmux capture-pane failed"
-                );
-                return String::new();
-            }
-            let raw = String::from_utf8_lossy(&output.stdout);
-            strip_tui_chrome(&raw)
-        }
-        Err(e) => {
-            tracing::warn!(pane_id, error = %e, "failed to spawn tmux capture-pane");
-            String::new()
-        }
-    }
-}
-
-/// Wait until the target pane's output has been stable for `idle_secs`, or
-/// until `timeout` elapses, then return the final snapshot.
-///
-/// This is the supervision-side equivalent of the `tmux_wait` LLM tool: the
-/// supervisor gets a *stable* pane snapshot (not mid-render garbage) but
-/// also gives up after `timeout` so a long-running Claude session cannot
-/// block supervision indefinitely.
-///
-/// Returns `(snapshot, idle)` — `idle=true` when the pane stabilised before
-/// timeout, `idle=false` when we hit the timeout with the pane still active.
-/// Either way the snapshot is the latest captured content, suitable for
-/// feeding to the supervision LLM.
-async fn wait_for_pane_idle(
-    pane_id: &str,
-    idle: std::time::Duration,
-    timeout: std::time::Duration,
-    poll: std::time::Duration,
-) -> (String, bool) {
-    let deadline = tokio::time::Instant::now() + timeout;
-    let pid = pane_id.to_owned();
-    let mut last_content = {
-        let pid = pid.clone();
-        tokio::task::spawn_blocking(move || capture_pane_text(&pid))
-            .await
-            .unwrap_or_default()
-    };
-    let mut stable_since = tokio::time::Instant::now();
-
-    loop {
-        if tokio::time::Instant::now() >= deadline {
-            return (last_content, false);
-        }
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        let sleep_dur = poll.min(remaining);
-        tokio::time::sleep(sleep_dur).await;
-
-        let pid = pid.clone();
-        let content = tokio::task::spawn_blocking(move || capture_pane_text(&pid))
-            .await
-            .unwrap_or_default();
-        if content != last_content {
-            last_content = content;
-            stable_since = tokio::time::Instant::now();
-        } else if stable_since.elapsed() >= idle {
-            return (last_content, true);
-        }
-    }
-}
-
-/// Send literal text + Enter to a tmux pane (best-effort).
-///
-/// Sends the text with `send-keys -l --` (literal, no keyname interpretation),
-/// pauses to let the receiving TUI's paste buffer drain, then sends
-/// Enter as a separate key press.  The pause exists because Claude Code's
-/// TUI can swallow or defer the trailing Enter when it arrives before the
-/// pasted text has been rendered into the input field — which manifests
-/// as a STEER message appearing in the pane input but never submitting.
-///
-/// This helper and the `handle_claude_launch` literal-paste path share the
-/// same render delay via [`crate::tools::TEXT_RENDER_SLEEP_SECS`], kept in
-/// sync with the LLM-facing `tmux_send_text` tool; the previous 1 s value
-/// was not enough for multi-KB markdown pastes and caused dropped Enters.
-///
-/// Returns `true` when BOTH the literal text injection and the trailing
-/// Enter press reported success to tmux.  Any tmux failure (exit-code non-
-/// zero, or spawn error) yields `false` so callers can accurately report
-/// whether the keystrokes actually reached the pane — important for
-/// supervision's `steer_dispatched` carry-over: claiming a STEER landed
-/// when tmux silently rejected it would poison the next turn's prompt.
-fn send_pane_keys(pane_id: &str, text: &str) -> bool {
-    let text_ok = match std::process::Command::new("tmux")
-        .args(["send-keys", "-t", pane_id, "-l", "--", text])
-        .status()
-    {
-        Ok(s) if s.success() => true,
-        Ok(s) => {
-            tracing::warn!(pane_id, status = %s, "tmux send-keys (text) failed");
-            false
-        }
-        Err(e) => {
-            tracing::warn!(pane_id, error = %e, "failed to spawn tmux send-keys (text)");
-            false
-        }
-    };
-    // Shared with `tmux_send_text` so both paste paths use the same render-delay.
-    std::thread::sleep(std::time::Duration::from_secs(
-        crate::tools::TEXT_RENDER_SLEEP_SECS,
-    ));
-    let enter_ok = match std::process::Command::new("tmux")
-        .args(["send-keys", "-t", pane_id, "Enter"])
-        .status()
-    {
-        Ok(s) if s.success() => true,
-        Ok(s) => {
-            tracing::warn!(pane_id, status = %s, "tmux send-keys (Enter) failed");
-            false
-        }
-        Err(e) => {
-            tracing::warn!(pane_id, error = %e, "failed to spawn tmux send-keys (Enter)");
-            false
-        }
-    };
-    text_ok && enter_ok
-}
-
-/// Release the pane lease for each `SupervisionTarget` in this supervision
-/// request, best-effort.  Iterates `panes` because a single `SupervisePanes`
-/// request can cover multiple panes in parallel; this releases every one.
-///
-/// Called unconditionally at every [`handle_supervision`] exit point — including
-/// timeout, DONE, interrupted, client-disconnect, and model-error paths — so a
-/// pane is never stranded in `Busy` past the end of its supervision loop.
-///
-/// Without this, a pane stays `Busy` until `LEASE_TTL_SECS` (24 h) downgrades
-/// it via [`pane_lease::PaneLease::effective_status`], during which a second
-/// `/claude` invocation cannot reuse it and the scheduler has to spin up a
-/// fresh pane instead of reusing the existing `claude` session via the
-/// tier-1 reuse path (inject task into existing claude).
-///
-/// Release failures are logged and swallowed: they must never mask the
-/// supervision loop's `Result`.  Each release runs on a blocking thread since
-/// [`pane_lease::release_lease`] takes an `flock` lock.
-async fn release_supervised_panes(panes: &[crate::ipc::SupervisionTarget]) {
-    for target in panes {
-        let pane_id = target.pane_id.clone();
-        let outcome = tokio::task::spawn_blocking(move || pane_lease::release_lease(&pane_id))
-            .await
-            .map_err(anyhow::Error::from)
-            .and_then(|r| r);
-        if let Err(e) = outcome {
-            tracing::warn!(
-                pane_id = %target.pane_id,
-                error = %e,
-                "failed to release supervision pane lease"
-            );
-        }
-        // Release any external resources (GPUs, simulators) that were
-        // acquired alongside this pane.  Matched by pane_id on the resource
-        // lease, so this is safe whether or not the caller actually
-        // requested resources.
-        match resource_lease::release_all_for_pane(&target.pane_id).await {
-            Ok(names) if !names.is_empty() => {
-                tracing::debug!(
-                    pane_id = %target.pane_id,
-                    released = ?names,
-                    "released resource leases on supervision exit"
-                );
-            }
-            Ok(_) => {}
-            Err(e) => {
-                tracing::warn!(
-                    pane_id = %target.pane_id,
-                    error = %e,
-                    "failed to release resource leases on supervision exit"
-                );
-            }
-        }
-    }
-}
-
-/// Handle `Request::SupervisePanes`: run a Rust polling loop that captures pane
-/// content, calls the LLM for analysis (no tools), and acts on the response.
-///
-/// The loop iterates with a 5-minute ceiling between turns (override with
-/// `AMAEBI_SUPERVISION_INTERVAL_SECS`), but each iteration additionally waits
-/// for the pane to go idle before snapshotting.  Each turn the LLM returns
-/// exactly one of:
-/// - `WAIT` — still working, check again
-/// - `STEER: <pane_id>: <message>` — send a correction to the pane
-/// - `DONE: <summary>` — task is complete; stream the summary and exit
-///
-/// The loop can also be interrupted by an `Interrupt` frame arriving on
-/// `frame_rx`, or hit the hard wall-clock ceiling.  Default matches the
-/// pane-, resource-, and task-notebook lease TTLs (all 24 h) so
-/// supervision never outlives the leases it holds on; override with
-/// `AMAEBI_SUPERVISION_TIMEOUT_SECS`.  A maximum of
-/// `MAX_SUPERVISION_TOKENS` completion tokens is requested per turn
-/// (see the constant in `handle_supervision_inner`) — sufficient for
-/// the short WAIT/STEER/DONE responses.
-///
-/// Regardless of which exit point the inner loop takes (timeout, DONE,
-/// interrupted, client disconnect, model error), [`release_supervised_panes`] runs
-/// unconditionally afterward so a pane is never stranded `Busy` — unblocking
-/// the tier-1 reuse path (inject task into existing claude) for the next
-/// `/claude` task in the same worktree.
-async fn handle_supervision(
-    writer: &Arc<tokio::sync::Mutex<tokio::net::unix::OwnedWriteHalf>>,
-    frame_rx: &mut tokio::sync::mpsc::Receiver<String>,
-    panes: Vec<crate::ipc::SupervisionTarget>,
-    model: String,
-    state: &Arc<DaemonState>,
-    session_id: Option<String>,
-) -> Result<()> {
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    // Holder id used for task notebook leases: prefer the session UUID
-    // (stable per supervision request), fall back to the first pane id.
-    let holder = supervision_holder_id(&panes, session_id.as_deref());
-
-    // Shared turn counter: the inner loop bumps this on every iteration;
-    // the heartbeat task reads it so stalled supervision is diagnosable.
-    let turn_counter = Arc::new(AtomicU64::new(0));
-
-    // Spawn the heartbeat emitter.  Kept entirely in the wrapper so every
-    // inner exit path (DONE, STEER, timeout, interrupt, model error,
-    // client disconnect, inner Err) cancels it symmetrically — same
-    // pattern as `release_supervised_panes`.
-    let heartbeat_writer = Arc::clone(writer);
-    let heartbeat_start = std::time::Instant::now();
-    let heartbeat_turn = Arc::clone(&turn_counter);
-    let heartbeat_task = tokio::spawn(async move {
-        let mut ticker =
-            tokio::time::interval(std::time::Duration::from_secs(HEARTBEAT_INTERVAL_SECS));
-        // After a suspend (SIGSTOP, laptop sleep, heavy scheduler lag) the
-        // interval would otherwise fire a backlog burst of heartbeats as it
-        // "catches up" — which is both pointless and would swamp the client.
-        // Skip behavior drops the backlog and resumes at the next boundary.
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        // Skip the immediate fire `tokio::time::interval` emits on first tick
-        // so the first heartbeat lands one interval into the session.
-        ticker.tick().await;
-        loop {
-            ticker.tick().await;
-            let elapsed_secs = heartbeat_start.elapsed().as_secs();
-            let turn = heartbeat_turn.load(Ordering::Relaxed);
-            let mut w = heartbeat_writer.lock().await;
-            if write_frame(&mut *w, &Response::Heartbeat { elapsed_secs, turn })
-                .await
-                .is_err()
-            {
-                // Writer closed — client disconnected; stop heartbeating.
-                break;
-            }
-        }
-    });
-
-    let result = handle_supervision_inner(
-        writer,
-        frame_rx,
-        &panes,
-        model,
-        state,
-        session_id,
-        &turn_counter,
-    )
-    .await;
-
-    // Stop the heartbeat before we write the resume hint + Done so those
-    // terminal frames are not interleaved with a ticking heartbeat.
-    // `abort()` only requests cancellation; awaiting the JoinHandle ensures
-    // the task has actually unwound (including releasing the writer mutex)
-    // before we go on to emit the final Done frame.  The JoinError we
-    // expect here is cancellation, not a panic — swallow it.
-    heartbeat_task.abort();
-    let _ = heartbeat_task.await;
-
-    // Unified resume hint + Done.  Inner no longer writes
-    // Response::Done itself; this wrapper writes the hint first (so
-    // clients still reading frames see it) and then the terminal Done
-    // frame.  Runs on every exit path (DONE, timeout, interrupt,
-    // model error, client disconnect, inner Err).  Best-effort:
-    // errors writing to an already-dying stream are swallowed.
-    {
-        let mut w = writer.lock().await;
-        if panes.iter().any(|t| t.tag.is_some()) {
-            let mut hint = String::from("\n[supervision] to resume any of these panes:\n");
-            for t in panes.iter() {
-                if let Some(tag) = t.tag.as_deref() {
-                    hint.push_str(&format!(
-                        "  pane {pid} (tag={tag})\n    continue task:  /claude --tag {tag}\n    reuse pane:     /claude --resume-pane {pid}\n",
-                        pid = t.pane_id,
-                    ));
-                }
-            }
-            let _ = write_frame(&mut *w, &Response::Text { chunk: hint }).await;
-        }
-        let _ = write_frame(&mut *w, &Response::Done).await;
-    }
-
-    // Best-effort cleanup: must run regardless of inner result so panes
-    // are not stranded Busy for up to LEASE_TTL_SECS (24 h).  Task
-    // leases released by `holder` identity — same outer-wrapper pattern
-    // as pane_lease / resource_lease, so every exit path (DONE, STEER,
-    // timeout, interrupt, model error, client disconnect, inner Err) is
-    // covered.
-    release_supervised_panes(&panes).await;
-    release_task_leases_for_holder(state, &holder).await;
-    result
-}
-
-/// Stable identifier stored as `task_notes.content` on the `kind='lease'`
-/// row so cleanup can find exactly the leases this supervision request
-/// owns.
-fn supervision_holder_id(
-    panes: &[crate::ipc::SupervisionTarget],
-    session_id: Option<&str>,
-) -> String {
-    if let Some(sid) = session_id {
-        return format!("supervision:{sid}");
-    }
-    // Fallback: first pane id.  Uniqueness is guaranteed inside a single
-    // live amaebi daemon because pane ids never repeat.
-    let first = panes
-        .first()
-        .map(|p| p.pane_id.as_str())
-        .unwrap_or("unknown");
-    format!("supervision:{first}")
-}
-
 /// Release every task lease held by `holder`, ignoring errors.  Runs in
 /// `spawn_blocking` because tasks.db is synchronous SQLite.
-async fn release_task_leases_for_holder(state: &Arc<DaemonState>, holder: &str) {
-    let state = Arc::clone(state);
+async fn release_task_leases_for_holder(state: &DaemonState, holder: &str) {
+    let tasks_db = Arc::clone(&state.tasks_db);
     let holder = holder.to_string();
     let _ = tokio::task::spawn_blocking(move || {
-        let guard = match state.tasks_db.lock() {
+        let guard = match tasks_db.lock() {
             Ok(g) => g,
             Err(_) => return,
         };
@@ -2371,834 +2120,310 @@ async fn release_task_leases_for_holder(state: &Arc<DaemonState>, holder: &str) 
     .await;
 }
 
-/// Render the task-notebook preamble for one supervision iteration.
-///
-/// Returns the empty string when no pane opted into the notebook, so
-/// supervision prompts for non-`--tag` invocations are bit-identical
-/// to before this PR.
-///
-/// On the first iteration (`is_first_turn = true`) this also writes a
-/// `desc` row for every notebook pane whose `task_description` is
-/// non-empty: this is how the CLI-supplied `<desc>` gets persisted for
-/// later resume (`/claude --tag foo` with no desc reads back the most
-/// recent row).
-async fn build_notebook_context(
-    state: &Arc<DaemonState>,
-    panes: &[crate::ipc::SupervisionTarget],
-    is_first_turn: bool,
-) -> String {
-    // Fast path: no notebook participation → empty preamble.
-    let any_notebook = panes
-        .iter()
-        .any(|p| p.tag.is_some() && p.repo_dir.is_some());
-    if !any_notebook {
-        return String::new();
-    }
-
-    let state_cl = Arc::clone(state);
-    let panes_cl: Vec<crate::ipc::SupervisionTarget> = panes.to_vec();
-    let rendered = tokio::task::spawn_blocking(move || -> Result<String> {
-        // Lazy-open the DB if no prior code path did.  Resume-pane launches
-        // skip the tag-acquisition block in `handle_claude_launch`, so on
-        // the first supervision turn for a resumed tagged pane the handle
-        // may still be `None` — which would silently drop this pane's own
-        // prior verdict/desc history from the notebook preamble.
-        // `ensure_tasks_db` is idempotent.
-        ensure_tasks_db(&state_cl)?;
-        let guard = state_cl
-            .tasks_db
-            .lock()
-            .map_err(|e| anyhow::anyhow!("tasks_db mutex poisoned: {e}"))?;
-        let Some(conn) = guard.as_ref() else {
-            return Ok(String::new());
+/// Release one specific `(repo_dir, tag)` task lease for `holder`.  Used by
+/// `release_held_entry` so multi-pane `/claude` launches (which share a
+/// single `supervision:{session_id}` holder but hold distinct `(repo_dir,
+/// tag)` keys) only free the one pane's lease, leaving siblings intact.
+async fn release_one_task_lease(state: &DaemonState, repo_dir: &str, tag: &str, holder: &str) {
+    let tasks_db = Arc::clone(&state.tasks_db);
+    let repo_dir = repo_dir.to_string();
+    let tag = tag.to_string();
+    let holder = holder.to_string();
+    let _ = tokio::task::spawn_blocking(move || {
+        let guard = match tasks_db.lock() {
+            Ok(g) => g,
+            Err(_) => return,
         };
-
-        // Group panes by (repo_dir, tag) so each tag contributes at most
-        // one notebook section (and at most one first-turn desc write).
-        // Multiple panes sharing a tag would otherwise inflate the
-        // prompt with duplicate sections and insert duplicate desc rows.
-        // Within a group we keep the first non-empty task_description
-        // as the canonical desc to record; the remaining panes are for
-        // lookup only.
-        let mut grouped: std::collections::BTreeMap<(String, String), String> =
-            std::collections::BTreeMap::new();
-        for p in &panes_cl {
-            let (Some(repo_dir), Some(tag)) = (p.repo_dir.as_deref(), p.tag.as_deref()) else {
-                continue;
-            };
-            let key = (repo_dir.to_string(), tag.to_string());
-            grouped
-                .entry(key)
-                .or_insert_with(|| p.task_description.clone());
+        let Some(conn) = guard.as_ref() else {
+            return;
+        };
+        if let Err(e) = tasks::release_lease(conn, &repo_dir, &tag, &holder) {
+            tracing::warn!(repo_dir, tag, holder, error = %e, "failed to release task lease");
         }
-
-        let mut out = String::new();
-        for ((repo_dir, tag), desc) in &grouped {
-            // First-turn desc persistence: record the CLI-supplied desc
-            // (if any) so later resumes can recover it.  Re-running with
-            // the same desc will create a duplicate row; harmless, the
-            // reader picks the most recent by timestamp anyway.
-            if is_first_turn && !desc.trim().is_empty() {
-                if let Err(e) = tasks::append_desc(conn, repo_dir, tag, desc) {
-                    tracing::warn!(tag, error = %e, "failed to persist task desc");
-                }
-            }
-
-            let latest = tasks::latest_desc(conn, repo_dir, tag)?
-                .unwrap_or_else(|| "(none recorded)".to_string());
-            let verdicts = tasks::recent_verdicts(conn, repo_dir, tag)?;
-
-            out.push_str(&format!("=== Task notebook for tag '{tag}' ===\n"));
-            out.push_str(&format!("Desc (most recent on record): {latest}\n"));
-            if verdicts.is_empty() {
-                out.push_str("No prior supervision verdicts for this tag.\n");
-            } else {
-                out.push_str(&format!(
-                    "Recent verdicts from prior supervision sessions ({}, oldest first):\n",
-                    verdicts.len()
-                ));
-                for v in &verdicts {
-                    out.push_str(&format!("  - {v}\n"));
-                }
-            }
-            out.push_str("=== End task notebook ===\n\n");
-        }
-        Ok(out)
-    })
-    .await
-    .unwrap_or_else(|e| Err(anyhow::anyhow!("notebook context task panicked: {e}")))
-    .unwrap_or_else(|e| {
-        tracing::warn!(error = %e, "failed to build notebook context");
-        String::new()
-    });
-    rendered
-}
-
-/// System prompt for the supervision LLM.  Extracted as a module-level
-/// constant so tests can assert its contents without rebuilding the whole
-/// supervision loop.
-///
-/// The wording is structured so the LLM's reading order matches the
-/// priority we want: drift is named as the primary failure mode; STEER
-/// is listed before WAIT/DONE; and the tie-break is explicitly "prefer
-/// STEER" rather than "default to WAIT" (a missed STEER costs hours, a
-/// stray STEER costs one keystroke).
-const SUPERVISION_SYSTEM_PROMPT: &str = concat!(
-    "You are supervising a Claude Code session executing a specific task in a ",
-    "tmux pane.  Your PRIMARY duty is to keep Claude on the task as stated.  ",
-    "Drift — switching approach, using a different resource, skipping a requirement, ",
-    "subtly redefining the goal — is the failure mode you must catch.  When drift ",
-    "appears, STEER immediately; do not wait for another turn to \"see if it self-corrects\".\n",
-    "\n",
-    "Each turn you see: the original task description (pinned at the top), any hard ",
-    "constraints, the last few verdicts you issued, and the current pane contents.  ",
-    "You respond with EXACTLY ONE of:\n",
-    "\n",
-    "STEER: <pane_id>: <message to send>\n",
-    "  Use STEER when ANY of the following holds:\n",
-    "  - Claude is at an idle prompt and asked a question or offered options — answer.\n",
-    "  - Claude's current action contradicts a hard constraint (wrong resource, wrong ",
-    "    container, wrong branch, forbidden command).  Name the specific constraint ",
-    "    in the STEER message.\n",
-    "  - Claude drifted from the task: switched approach without checking in, skipped ",
-    "    a requirement, reinterpreted the goal, or is working on a tangent.\n",
-    "  - Claude reports partial completion and the task description is not fully done.\n",
-    "  - Claude is stuck on an error and a concrete hint will unblock it.\n",
-    "  When in doubt between STEER and WAIT, prefer STEER — a wrong STEER costs one ",
-    "  keystroke, a missed STEER costs hours of wrong work.\n",
-    "\n",
-    "WAIT: <one sentence — what is Claude currently doing?>\n",
-    "  Use WAIT only when Claude is visibly, measurably making progress on the ORIGINAL ",
-    "  task, respecting hard constraints, and has not asked a question.  Long builds, ",
-    "  sim runs, and test executions are normal — WAIT is correct there.\n",
-    "\n",
-    "DONE: <paragraph summary of what was accomplished>\n",
-    "  The task is FULLY complete.  Require ALL of:\n",
-    "  1. Pane shows an explicit completion signal — a finished report, passing tests,\n",
-    "     a merged PR URL, 'done', '✓', 'all tests passed', or similar.\n",
-    "  2. That completion directly covers the task description given at session start\n",
-    "     (not a sub-step, not unrelated output).\n",
-    "  3. Claude is no longer working (idle prompt or returned to shell).\n",
-    "  An idle prompt alone is NOT sufficient — Claude may be waiting for user input ",
-    "  (prefer STEER) or may have been interrupted (prefer WAIT and re-check).\n",
-    "\n",
-    "Your response must start with STEER:, WAIT:, or DONE: — nothing else before it.",
-);
-
-/// Pure helper that formats the user message fed to the supervision LLM
-/// every turn.  Extracted from [`handle_supervision_inner`] so tests can
-/// exercise the prompt layout without standing up a full daemon loop.
-///
-/// Layout (top-to-bottom):
-///   1. `TASK — keep Claude focused on this:` with one line per pane.
-///      Pinned at byte 0 because LLM attention otherwise drifts to the
-///      long pane dumps.  The task is deliberately repeated inside each
-///      pane header further down.
-///   2. `HARD CONSTRAINTS` block (may be empty) from the pane's resource
-///      leases.
-///   3. Notebook context carried over from prior supervision sessions
-///      (may be empty).
-///   4. Recent verdict history (newest last) so the LLM can see whether
-///      its own prior STEERs landed.
-///   5. The last STEER in full, if one has been issued.
-///   6. The current pane snapshots.
-#[allow(clippy::too_many_arguments)] // the pieces are simple values from the loop;
-                                     // packaging them into a struct would just shift the verbosity one level without
-                                     // improving call-site readability.
-fn build_supervision_user_content(
-    task_lines: &[(String, String)],
-    hard_constraints: &str,
-    notebook_context: &str,
-    verdict_history: &std::collections::VecDeque<String>,
-    last_steer_full: Option<&str>,
-    pane_snapshots: &str,
-    turn: u64,
-    elapsed_mins: u64,
-) -> String {
-    let mut task_section = String::from("TASK — keep Claude focused on this:\n");
-    for (pane_id, desc) in task_lines {
-        // Task descriptions may be pasted multi-line input.  Flatten to a
-        // single line (escape newlines + CRs) so one pane stays on one
-        // line and the downstream section headers keep their column-0
-        // alignment.  See the verdict-history escape for the same reason.
-        let desc = desc
-            .replace("\r\n", "\\n")
-            .replace('\n', "\\n")
-            .replace('\r', "\\r");
-        task_section.push_str(&format!("  pane {pane_id}: {desc}\n"));
-    }
-
-    let verdict_history_block = if verdict_history.is_empty() {
-        "(none yet — this is the first check)".to_string()
-    } else {
-        let mut s = String::new();
-        for (i, v) in verdict_history.iter().enumerate() {
-            let age = verdict_history.len() - i;
-            let label = if age == 1 {
-                "last".to_string()
-            } else {
-                format!("{age} turns ago")
-            };
-            s.push_str(&format!("  [{label}] {}\n", v.trim()));
-        }
-        s
-    };
-
-    let last_steer_block = match last_steer_full {
-        // Newlines in the verdict were already escaped to `\n` upstream
-        // (see `verdict_single_line` in `handle_supervision_inner`) so the
-        // block stays one visible line — hence "escaped newlines" rather
-        // than "full text" in the header.
-        Some(s) => format!(
-            "Most recent STEER message (escaped newlines):\n  {}\n\n",
-            s.trim()
-        ),
-        None => String::new(),
-    };
-
-    // Assemble without source-indentation so every section header (TASK,
-    // HARD CONSTRAINTS, notebook context, verdict list, STEER carry-over,
-    // snapshot header) lands at column 0 in the LLM-facing output.
-    let mut out = task_section;
-    out.push('\n');
-    out.push_str(hard_constraints);
-    out.push_str(notebook_context);
-    out.push_str("Your recent verdicts this session (newest last):\n");
-    out.push_str(&verdict_history_block);
-    out.push('\n');
-    out.push_str(&last_steer_block);
-    out.push_str(&format!(
-        "Current pane snapshots (check #{turn}, elapsed {elapsed_mins}m):\n\n"
-    ));
-    out.push_str(pane_snapshots);
-    out
-}
-
-/// Render the hard constraints section for the supervision LLM.  For
-/// every supervised pane, if the pane currently holds one or more
-/// resource leases, render their `prompt_hint` under a section marked
-/// "HARD CONSTRAINTS".  Empty string when no pane has leases — the
-/// caller string-concats unconditionally.
-///
-/// Constraints are scoped per-pane so a supervised batch of two panes
-/// with different resources still sees each pane's own bindings.
-async fn render_hard_constraints(panes: &[crate::ipc::SupervisionTarget]) -> String {
-    let load_result = tokio::task::spawn_blocking(|| -> Result<_> {
-        let state = resource_lease::read_state()?;
-        let pool = resource_lease::load_pool()?;
-        Ok((state, pool))
     })
     .await;
-    // A load failure on either side (missing / malformed TOML, corrupted
-    // state JSON, mutex poisoning) is a **misconfiguration** we do not want
-    // supervision to silently ignore — the whole point of this section is
-    // to anchor hard constraints.  Surface a visible banner so the LLM
-    // knows the constraint set is unavailable, and log the error for ops.
-    let (state_map, pool) = match load_result {
-        Ok(Ok(pair)) => pair,
-        Ok(Err(e)) => {
-            tracing::warn!(error = %e, "supervision: failed to load hard constraints");
-            return "HARD CONSTRAINTS — failed to load; see daemon logs.\n\n".to_string();
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "supervision: hard-constraints loader task panicked");
-            return "HARD CONSTRAINTS — failed to load; see daemon logs.\n\n".to_string();
-        }
-    };
-    let mut out = String::new();
-    for target in panes {
-        // Collect leases whose `pane_id` matches this supervised pane AND
-        // are still effectively Busy.  `effective_status()` maps a Busy
-        // lease whose heartbeat is older than `LEASE_TTL_SECS` back to
-        // Idle — rendering such stale leases as active "HARD CONSTRAINTS"
-        // would anchor the LLM to a resource the task no longer actually
-        // holds, driving spurious STEERs.
-        let mut leases: Vec<_> = state_map
-            .values()
-            .filter(|l| l.pane_id.as_deref() == Some(&target.pane_id))
-            .filter(|l| l.effective_status() == resource_lease::ResourceStatus::Busy)
-            .cloned()
-            .collect();
-        if leases.is_empty() {
-            continue;
-        }
-        // HashMap iteration order is nondeterministic.  Sort by (name, class)
-        // so a pane with multiple resources renders the same block every
-        // turn; otherwise the LLM sees prompt churn for what is logically
-        // the same constraint set (see `dashboard.rs` for the same pattern).
-        leases.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.class.cmp(&b.class)));
-        let hint = resource_lease::render_prompt_hint(&leases, &pool);
-        if hint.trim().is_empty() {
-            continue;
-        }
-        if out.is_empty() {
-            out.push_str("HARD CONSTRAINTS — violations require an immediate STEER:\n");
-        }
-        out.push_str(&format!(
-            "  pane {}:\n{}\n",
-            target.pane_id,
-            hint.lines()
-                .map(|l| format!("    {l}"))
-                .collect::<Vec<_>>()
-                .join("\n")
-        ));
-    }
-    if !out.is_empty() {
-        out.push('\n');
-    }
-    out
 }
 
-/// How often `handle_supervision` emits a [`Response::Heartbeat`] frame on
-/// the supervision socket.  Chosen so a stuck daemon trips the client's
-/// 30-minute watchdog within ~30 minutes even on a pane that would
-/// otherwise produce no other frames (WAIT/STEER/DONE headers only land
-/// every `AMAEBI_SUPERVISION_INTERVAL_SECS`, defaulting to 5 minutes).
-const HEARTBEAT_INTERVAL_SECS: u64 = 10 * 60;
-
-/// Inner body of [`handle_supervision`]; see that function's doc for context.
+/// Idempotently release one held pane and return the data needed to build a
+/// `Response::TaskReleased`.  Returns `None` if the pane wasn't in
+/// `state.held[conn_id]` — safe to call twice (double-release no-op).
 ///
-/// Takes `panes` by reference so the outer wrapper retains ownership and can
-/// pass it to [`release_supervised_panes`] after this returns.  `turn_counter`
-/// is incremented on every iteration so the wrapper's heartbeat task can
-/// report the current turn number.
-async fn handle_supervision_inner(
-    writer: &Arc<tokio::sync::Mutex<tokio::net::unix::OwnedWriteHalf>>,
-    frame_rx: &mut tokio::sync::mpsc::Receiver<String>,
-    panes: &[crate::ipc::SupervisionTarget],
-    model: String,
-    state: &Arc<DaemonState>,
-    session_id: Option<String>,
-    turn_counter: &Arc<std::sync::atomic::AtomicU64>,
-) -> Result<()> {
-    // Notebook leases are acquired in `handle_claude_launch` BEFORE any
-    // pane/worktree/claude work so a tag-conflict rejection never
-    // leaves a real running session behind.  By the time supervision
-    // starts, the lease rows we'll use are already ours under the
-    // same holder id derived in the wrapper; cleanup still flows
-    // through `release_all_by_holder` there.
+/// Does NOT `tmux kill-pane`, terminate `claude`, or remove the worktree
+/// unless `clean_worktree` is true.  The design doc pins these invariants.
+///
+/// The caller decides what to do with the returned data — stream it to a
+/// live client or persist it to the inbox when no client is listening.
+/// Source of a release, used to tag the inbox report so readers can tell
+/// a normal completion apart from a socket-break drain.
+#[derive(Debug, Clone, Copy)]
+enum ReleaseReason {
+    /// LLM called `task_done` or user ran `/release`.
+    UserOrLlm,
+    /// Socket drop / chat crash — no live writer consumed the summary.
+    Abandoned,
+}
 
-    // Max time to wait between LLM checks.  Default 5 min; override with
-    // AMAEBI_SUPERVISION_INTERVAL_SECS.  This is the *ceiling*: each iteration
-    // actually waits for the pane to go idle (see `IDLE_SECS` below) so that
-    // the snapshot fed to the LLM is stable, and only falls back to the
-    // ceiling when Claude is continuously producing output.  The higher
-    // ceiling reduces supervision LLM cost when Claude is in a long
-    // compile / test / think phase where the pane barely changes for
-    // minutes at a time.
-    let poll_interval = tokio::time::Duration::from_secs(
-        std::env::var("AMAEBI_SUPERVISION_INTERVAL_SECS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(300u64) // 5 min
-            .max(1), // clamp to >= 1 s to prevent a tight loop
-    );
-    // How long a pane must be unchanged to be considered idle before
-    // triggering a supervision LLM call.  10 s is a deliberately loose
-    // threshold: short inter-tool-call pauses (2-5 s) during active work
-    // no longer trigger a supervision check, so the LLM only runs when
-    // Claude has genuinely paused (waiting for user input, finished,
-    // stuck on an error).  Reduces noise checks and LLM cost by ~70-80 %
-    // in typical sessions.
-    const IDLE_SECS: u64 = 10;
-    const IDLE_POLL_SECS: u64 = 2;
-
-    // Hard wall-clock limit before supervision gives up. Default matches the
-    // pane/resource lease TTL so supervision never outlives the leases it
-    // holds on; override with `AMAEBI_SUPERVISION_TIMEOUT_SECS`.  Pulling
-    // from the constant rather than a literal prevents the three TTL values
-    // from drifting out of sync on future bumps.
-    let max_duration = std::time::Duration::from_secs(
-        std::env::var("AMAEBI_SUPERVISION_TIMEOUT_SECS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(crate::pane_lease::LEASE_TTL_SECS),
-    );
-
-    const MAX_SUPERVISION_TOKENS: usize = 1024;
-
-    let supervision_start = std::time::Instant::now();
-    let deadline = supervision_start + max_duration;
-    let mut turn: u64 = 0;
-
-    // Verdicts from this supervision session, newest-last.  Bounded so
-    // we never leak memory on 10-h runs; the LLM sees up to N most
-    // recent entries each turn.
-    const VERDICT_HISTORY_LEN: usize = 5;
-    let mut verdict_history: std::collections::VecDeque<String> =
-        std::collections::VecDeque::with_capacity(VERDICT_HISTORY_LEN);
-    // Keep the most recent STEER in full so the LLM can judge whether
-    // Claude acted on it.  None until the first STEER is emitted.
-    let mut last_steer_full: Option<String> = None;
-
-    // Load skill files (SOUL.md, AGENTS.md, GPU_KERNEL.md) once and reuse
-    // across all supervision turns so the LLM has project context for
-    // higher-quality STEER decisions.
-    let skill_msgs = load_skill_messages().await;
-
-    loop {
-        // --- Check wall-clock deadline ---
-        if std::time::Instant::now() >= deadline {
-            let mut w = writer.lock().await;
-            write_frame(
-                &mut *w,
-                &Response::Text {
-                    chunk: format!(
-                        "[supervision] timeout after {:.1} hours; stopping\n",
-                        max_duration.as_secs_f64() / 3600.0
-                    ),
-                },
-            )
-            .await?;
-            // wrapper writes Response::Done after the resume hint
-            return Ok(());
-        }
-
-        // --- Interruptible wait-for-pane-idle (skip on first iteration) ---
-        // Instead of a blind fixed-interval sleep, wait until the first pane
-        // in the set has been stable for IDLE_SECS seconds, falling back to
-        // `poll_interval` as the hard ceiling if the pane stays active.  This
-        // guarantees the snapshot we feed to the LLM is not mid-render and
-        // that busy Claude sessions do not waste LLM calls on near-identical
-        // frames.  Client `Interrupt` frames still preempt the wait.
-        if turn > 0 {
-            let primary_pane = panes.first().map(|t| t.pane_id.clone()).unwrap_or_default();
-            let wait_fut = wait_for_pane_idle(
-                &primary_pane,
-                std::time::Duration::from_secs(IDLE_SECS),
-                poll_interval,
-                std::time::Duration::from_secs(IDLE_POLL_SECS),
+async fn release_held_entry(
+    state: &DaemonState,
+    conn_id: ConnId,
+    pane_id: &str,
+    clean_worktree: bool,
+    summary: Option<String>,
+    reason: ReleaseReason,
+) -> Option<crate::ipc::Response> {
+    // Take the TaskEntry out of the map up front.  Double-release finds
+    // nothing and returns None, the core idempotency guarantee.
+    //
+    // Poisoned mutex: recover the guard via `into_inner()` and log loudly
+    // rather than silently swallowing as a no-op.  A silent no-op here
+    // would strand pane + resource + task leases until their 24 h TTL,
+    // which is strictly worse than proceeding on a poisoned lock since
+    // every call-site under `state.held` is a short critical section
+    // that cannot corrupt the map it guards.
+    let entry = {
+        let mut held = state.held.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!(
+                pane_id,
+                conn_id,
+                "release_held_entry: state.held mutex was poisoned; recovering inner guard"
             );
-            tokio::pin!(wait_fut);
-            let interrupted = loop {
-                tokio::select! {
-                    biased;
-                    frame = frame_rx.recv() => {
-                        match frame {
-                            None => {
-                                // Client disconnected.
-                                return Ok(());
-                            }
-                            Some(line) => {
-                                if let Ok(Request::Interrupt { session_id: sid }) =
-                                    serde_json::from_str::<Request>(&line)
-                                {
-                                    if session_id
-                                        .as_deref()
-                                        .is_none_or(|expected| sid == expected)
-                                    {
-                                        break true;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    _ = &mut wait_fut => break false,
+            poisoned.into_inner()
+        });
+        let list = held.get_mut(&conn_id)?;
+        let pos = list.iter().position(|e| e.pane_id == pane_id)?;
+        let entry = list.swap_remove(pos);
+        if list.is_empty() {
+            held.remove(&conn_id);
+        }
+        entry
+    };
+
+    // Release leases — each helper is already idempotent on its own.
+    // `pane_lease::release_lease` takes an exclusive flock + does file I/O,
+    // so the upstream `pane_lease.rs` contract requires calling it from
+    // `spawn_blocking` when used from async.  Keeping it on the async
+    // runtime would stall other connections during release, particularly
+    // when a socket drop drains several panes at once.
+    {
+        let pane_owned = pane_id.to_string();
+        let pane_for_log = pane_id.to_string();
+        let res = tokio::task::spawn_blocking(move || pane_lease::release_lease(&pane_owned))
+            .await
+            .unwrap_or_else(|e| Err(anyhow::anyhow!("pane_lease release task panicked: {e}")));
+        if let Err(e) = res {
+            tracing::warn!(
+                pane_id = %pane_for_log,
+                error = %e,
+                "release_held_entry: pane_lease release failed"
+            );
+        }
+    }
+    let resources_freed: Vec<String> = match resource_lease::release_all_for_pane(pane_id).await {
+        Ok(list) => list,
+        Err(e) => {
+            tracing::warn!(pane_id, error = %e, "release_held_entry: resource_lease release failed");
+            entry.resources.clone()
+        }
+    };
+    // Release ONLY this pane's `(repo_dir, tag)` lease, not the whole
+    // holder.  A `/claude "A" "B"` launch holds two leases under the
+    // same `supervision:{session_id}` holder; a holder-wide release
+    // when task A finishes would wrongly free B's lease and allow a
+    // third invocation to acquire tag B while its pane is still
+    // running.
+    if let (Some(holder), Some(repo), Some(tag)) = (
+        entry.task_lease_holder.as_deref(),
+        entry.task_repo_dir.as_deref(),
+        entry.tag.as_deref(),
+    ) {
+        release_one_task_lease(state, repo, tag, holder).await;
+    }
+
+    // Capture pane tail (best-effort — don't fail the release if tmux is sick).
+    let pane_tail = capture_pane_tail(pane_id).await.unwrap_or_default();
+
+    // Worktree dirty flag — cheap git-porcelain query, tolerates missing dir.
+    let (worktree_path, worktree_dirty) = match entry.worktree.as_deref() {
+        Some(wt) => {
+            let dirty = worktree_is_dirty(wt).await;
+            (Some(wt.to_string_lossy().into_owned()), dirty)
+        }
+        None => (None, false),
+    };
+
+    // Opt-in worktree removal.  Default is preserve — the design doc makes
+    // --clean explicit because users routinely re-enter worktrees by cd'ing
+    // into them, and silent removal would be a footgun.
+    if clean_worktree {
+        if let Some(wt) = entry.worktree.as_deref() {
+            let wt_path = wt.to_path_buf();
+            let _ = tokio::task::spawn_blocking(move || {
+                let status = std::process::Command::new("git")
+                    .args(["worktree", "remove", "--force"])
+                    .arg(&wt_path)
+                    .status();
+                if let Err(e) = status {
+                    tracing::warn!(worktree = %wt_path.display(), error = %e, "git worktree remove failed");
                 }
-            };
-            if interrupted {
-                let mut w = writer.lock().await;
-                write_frame(
-                    &mut *w,
-                    &Response::Text {
-                        chunk: "[supervision] interrupted by user\n".into(),
-                    },
-                )
-                .await?;
-                // wrapper writes Response::Done after the resume hint
-                return Ok(());
+            })
+            .await;
+        }
+    }
+
+    // Archive to inbox for persistent audit.  Design contract
+    // (docs/design/claude-chat-takeover.md lines 146–150) says every
+    // release path lands in the inbox; `task_done`'s tool schema
+    // (src/tools.rs) explicitly advertises this to the LLM.  Skipped only
+    // when we lack a session_id OR task_description (synthetic test data
+    // etc.); real /claude launches always populate both.
+    if let (Some(sid), Some(desc)) = (&entry.session_id, &entry.task_description) {
+        let mut body = String::new();
+        match reason {
+            ReleaseReason::Abandoned => body.push_str("[abandoned]\n"),
+            ReleaseReason::UserOrLlm => body.push_str("[released]\n"),
+        }
+        if let Some(t) = &entry.tag {
+            body.push_str(&format!("tag: {t}\n"));
+        }
+        if let Some(wt) = &worktree_path {
+            body.push_str(&format!("worktree: {wt} (dirty={worktree_dirty})\n"));
+        }
+        if let Some(s) = &summary {
+            body.push_str(&format!("\nsummary:\n{s}\n"));
+        }
+        body.push_str("\n--- pane tail ---\n");
+        body.push_str(&pane_tail);
+        if let Ok(inbox) = InboxStore::open() {
+            if let Err(e) = inbox.save_report(sid, desc, &body) {
+                tracing::warn!(
+                    session_id = %sid,
+                    error = %e,
+                    "release_held_entry: inbox save_report failed"
+                );
             }
         }
+    }
 
-        turn += 1;
-        turn_counter.store(turn, std::sync::atomic::Ordering::Relaxed);
-        let elapsed_mins = supervision_start.elapsed().as_secs() / 60;
+    Some(crate::ipc::Response::TaskReleased {
+        pane_id: pane_id.to_string(),
+        resources_freed,
+        tag: entry.tag,
+        summary,
+        worktree_path,
+        worktree_dirty,
+        pane_tail,
+    })
+}
 
-        // --- Capture pane snapshots (full for LLM, tail for display) ---
-        struct PaneSnapshot {
-            pane_id: String,
-            task_description: String,
-            full_content: String, // sent to LLM
-            tail: String,         // last 8 lines shown to user
-        }
+/// Drain every TaskEntry held by `conn_id` and release each one.  Called
+/// from the outer `handle_connection` wrapper on every exit path — graceful
+/// Ctrl-D, abrupt socket break, unhandled inner error.
+///
+/// Inbox persistence happens inside `release_held_entry`; this wrapper
+/// only enumerates and tags the reason as `ReleaseReason::Abandoned` so
+/// the inbox report header reads `[abandoned]` instead of `[released]`.
+async fn drain_held_on_conn_exit(state: &DaemonState, conn_id: ConnId) {
+    let pane_ids: Vec<String> = {
+        let held = state.held.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!(
+                conn_id,
+                "drain_held_on_conn_exit: state.held mutex was poisoned; recovering to drain"
+            );
+            poisoned.into_inner()
+        });
+        held.get(&conn_id)
+            .map(|v| v.iter().map(|e| e.pane_id.clone()).collect())
+            .unwrap_or_default()
+    };
+    if pane_ids.is_empty() {
+        return;
+    }
+    tracing::info!(
+        conn_id,
+        count = pane_ids.len(),
+        "connection closed; draining held panes"
+    );
 
-        let mut snapshots: Vec<PaneSnapshot> = Vec::new();
-        for target in panes {
-            let pid = target.pane_id.clone();
-            let full = tokio::task::spawn_blocking(move || capture_pane_text(&pid))
-                .await
-                .unwrap_or_default();
-            // Last 8 non-empty lines for the user-visible tail.
-            let tail = full
-                .lines()
-                .filter(|l| !l.trim().is_empty())
-                .rev()
-                .take(8)
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-                .collect::<Vec<_>>()
-                .join("\n");
-            snapshots.push(PaneSnapshot {
-                pane_id: target.pane_id.clone(),
-                task_description: target.task_description.clone(),
-                full_content: full,
-                tail,
-            });
-        }
+    for pane_id in pane_ids {
+        let _ = release_held_entry(
+            state,
+            conn_id,
+            &pane_id,
+            false,
+            None,
+            ReleaseReason::Abandoned,
+        )
+        .await;
+    }
+}
 
-        // Print the check header + pane tails to the user before calling LLM.
-        {
-            let mut header = format!("\n[supervision +{elapsed_mins}m check #{turn}]\n");
-            for snap in &snapshots {
-                header.push_str(&format!(
-                    "  ┌─ pane {} — {}\n",
-                    snap.pane_id, snap.task_description
-                ));
-                for line in snap.tail.lines() {
-                    header.push_str(&format!("  │ {line}\n"));
-                }
-                header.push_str("  └─\n");
-            }
-            let mut w = writer.lock().await;
-            write_frame(&mut *w, &Response::Text { chunk: header }).await?;
-        }
+/// Capture the last `tmux capture-pane -p -t <pane>` snapshot.  Returns
+/// Ok(String) on success, Err otherwise — never panics.  Best-effort input
+/// for inbox archiving / TaskReleased frames; upstream callers always have
+/// a non-empty-string fallback.
+/// Maximum characters of pane_tail to archive per release.  Bounded because
+/// the tail is both streamed inside `Response::TaskReleased` frames and
+/// persisted to `inbox.db` on socket-break drains — an unbounded capture
+/// on a long-running `claude` session could easily be megabytes of
+/// scrollback.  Kept generous enough to cover typical rendered TUI output
+/// (20–40 KB) but not unbounded.
+const PANE_TAIL_MAX_CHARS: usize = 32_768;
 
-        // Security note: `snap.full_content` is the output of `capture_pane_text`,
-        // which captures the last 200 lines of the pane and then strips TUI
-        // chrome (dividers, status bar, empty `❯` prompt, bordered-panel rows).
-        // This bounds the amount of data sent to the LLM, but those lines
-        // could still contain secrets (e.g. env vars printed by a build
-        // script).  A future improvement could add redaction of common
-        // secret patterns.
-        let mut pane_snapshots = String::new();
-        for snap in &snapshots {
-            pane_snapshots.push_str(&format!(
-                "=== Pane {} — task: {} ===\n{}\n",
-                snap.pane_id, snap.task_description, snap.full_content
+async fn capture_pane_tail(pane_id: &str) -> Result<String> {
+    let pane = pane_id.to_string();
+    let raw = tokio::task::spawn_blocking(move || {
+        let out = std::process::Command::new("tmux")
+            // `-p` prints to stdout; bound the capture to the last ~200 lines
+            // of scrollback (`-S -200`) so the tail stays a reasonable size
+            // even on panes with days of history.
+            .args(["capture-pane", "-p", "-S", "-200", "-t"])
+            .arg(&pane)
+            .output()
+            .context("spawning tmux capture-pane")?;
+        if !out.status.success() {
+            return Err(anyhow::anyhow!(
+                "tmux capture-pane exited {}: {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr)
             ));
         }
+        Ok::<String, anyhow::Error>(String::from_utf8_lossy(&out.stdout).into_owned())
+    })
+    .await
+    .context("capture_pane_tail join")??;
 
-        // Render hard constraints from the pane's resource leases.  Each
-        // pane's own leases are pulled from resource-state.json; rendering
-        // reuses `resource_lease::render_prompt_hint` so the wording is
-        // identical to what lands in AGENTS.md.
-        let hard_constraints = render_hard_constraints(panes).await;
-
-        // Task notebook context (opt-in: only panes with tag + repo_dir).
-        // Read-only: per-turn fetch of recent verdicts and the tag's latest
-        // stored desc.  Rendered into a dedicated prompt section that is
-        // clearly labelled "from prior supervision sessions" so the LLM does
-        // not confuse it with in-session continuity (`verdict_history`).
-        // First-turn side effect: write `task_description` as a `desc` row
-        // so resumes without a CLI desc can find it.
-        let notebook_context = build_notebook_context(state, panes, turn == 1).await;
-
-        let task_lines: Vec<(String, String)> = snapshots
-            .iter()
-            .map(|s| (s.pane_id.clone(), s.task_description.clone()))
-            .collect();
-
-        let user_content = build_supervision_user_content(
-            &task_lines,
-            &hard_constraints,
-            &notebook_context,
-            &verdict_history,
-            last_steer_full.as_deref(),
-            &pane_snapshots,
-            turn,
-            elapsed_mins,
-        );
-
-        let mut messages = vec![Message::system(SUPERVISION_SYSTEM_PROMPT)];
-        // Inject SOUL.md / AGENTS.md etc. right after the system message
-        // so the supervision LLM has full project context.
-        splice_skill_messages(&mut messages, skill_msgs.clone());
-        messages.push(Message::user(user_content));
-
-        // --- Drain any pending interrupts before invoking the model ---
-        // The model call is short (240 tokens max) so mid-call interrupts
-        // are not critical; they will be handled at the next sleep interval.
-        while let Ok(line) = frame_rx.try_recv() {
-            if let Ok(Request::Interrupt { session_id: isid }) =
-                serde_json::from_str::<Request>(&line)
-            {
-                if session_id
-                    .as_deref()
-                    .is_none_or(|expected| isid == expected)
-                {
-                    let mut w = writer.lock().await;
-                    write_frame(
-                        &mut *w,
-                        &Response::Text {
-                            chunk: "[supervision] interrupted\n".into(),
-                        },
-                    )
-                    .await?;
-                    // wrapper writes Response::Done after the resume hint
-                    return Ok(());
-                }
-            }
+    // Secondary byte-level bound in case a pane is very wide / packed.
+    // Truncate to char boundary to keep `str` invariants intact.
+    if raw.len() > PANE_TAIL_MAX_CHARS {
+        let mut end = PANE_TAIL_MAX_CHARS;
+        while end > 0 && !raw.is_char_boundary(end) {
+            end -= 1;
         }
-
-        // --- Invoke model (no tools) ---
-        // Use sink() so the raw LLM tokens are NOT streamed to the client.
-        // We write our own formatted one-line status after parsing the response.
-        //
-        // Enable 1-hour prompt caching.  Covers only the system-level
-        // blocks — `SUPERVISION_SYSTEM_PROMPT` plus the skill messages
-        // (SOUL.md / AGENTS.md) injected just above — which are resent
-        // unchanged on every tick for up to the lease TTL (24 h by
-        // default).  The per-tick task desc / hard constraints /
-        // notebook / pane snapshots live in the user-role message and
-        // are NOT cached (they vary every turn by design).  On a cache
-        // hit Bedrock charges the cached-read rate (~10% of uncached
-        // input) for the system prefix.
-        let response_text = {
-            let mut sink = tokio::io::sink();
-            match invoke_model_with_cache(
-                state,
-                &model,
-                &messages,
-                &[],
-                MAX_SUPERVISION_TOKENS,
-                Some(crate::bedrock::CacheTtl::OneHour),
-                &mut sink,
-            )
-            .await
-            {
-                Ok(r) => {
-                    if r.cache_read_tokens.is_some() || r.cache_write_tokens.is_some() {
-                        tracing::debug!(
-                            cache_read = ?r.cache_read_tokens,
-                            cache_write = ?r.cache_write_tokens,
-                            prompt_tokens = r.prompt_tokens,
-                            "supervision: prompt-cache usage"
-                        );
-                    }
-                    r.text
-                }
-                Err(e) => {
-                    let mut w = writer.lock().await;
-                    write_frame(
-                        &mut *w,
-                        &Response::Error {
-                            message: format!("[supervision] model error: {e:#}"),
-                        },
-                    )
-                    .await?;
-                    return Ok(());
-                }
-            }
-        };
-
-        let trimmed = response_text.trim();
-
-        // --- Parse response and act ---
-        // `steer_dispatched` is true only when the parsed STEER was valid
-        // and actually sent into a pane — so the next turn's carry-over
-        // (`last_steer_full`) reflects a message claude really saw.
-        // Malformed / unknown-pane STEERs leave `last_steer_full` alone.
-        let mut steer_dispatched = false;
-        let verdict_line = if trimmed.starts_with("DONE:") || trimmed == "DONE" {
-            let summary = trimmed.strip_prefix("DONE:").unwrap_or("").trim();
-            let mut w = writer.lock().await;
-            write_frame(
-                &mut *w,
-                &Response::Text {
-                    chunk: format!("  → DONE\n\n{summary}\n"),
-                },
-            )
-            .await?;
-            // wrapper writes Response::Done after the resume hint
-            return Ok(());
-        } else if let Some(rest) = trimmed.strip_prefix("STEER:") {
-            if let Some((pane_id_raw, message)) = rest.trim().split_once(':') {
-                let pane_id = pane_id_raw.trim().to_owned();
-                let message = message.trim().to_owned();
-                let is_valid_pane = panes.iter().any(|t| t.pane_id == pane_id);
-                if !pane_id.is_empty() && !message.is_empty() && is_valid_pane {
-                    let pid = pane_id.clone();
-                    let msg = message.clone();
-                    // `send_pane_keys` returns `true` only when both the
-                    // text injection and the trailing Enter succeeded at
-                    // tmux.  We also guard against JoinError (panic /
-                    // cancel) by pattern-matching the JoinHandle result.
-                    // Either failure leaves `steer_dispatched = false` so
-                    // next turn does not claim claude received a message
-                    // that never actually arrived.
-                    match tokio::task::spawn_blocking(move || send_pane_keys(&pid, &msg)).await {
-                        Ok(true) => {
-                            steer_dispatched = true;
-                        }
-                        Ok(false) => {
-                            tracing::warn!(
-                                pane_id = %pane_id,
-                                "tmux send-keys reported failure; treating STEER as undelivered"
-                            );
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                pane_id = %pane_id,
-                                error = %e,
-                                "send_pane_keys task failed; treating STEER as undelivered"
-                            );
-                        }
-                    }
-                    // Keep the `STEER: <pane>: <msg>` shape exactly as the
-                    // parser (and system prompt) expect, so when this line
-                    // is echoed back via `verdict_history` / `last_steer_full`
-                    // next turn the LLM is primed with the same grammar it
-                    // must emit.  A `STEER %X: ...` (no colon after STEER)
-                    // would be mis-parsed as WAIT on the next round-trip.
-                    format!("  → STEER: {pane_id}: {message}\n")
-                } else if !pane_id.is_empty() && !message.is_empty() && !is_valid_pane {
-                    format!("  → STEER: {pane_id} (unknown pane, ignored)\n")
-                } else {
-                    "  → STEER: (malformed response)\n".to_string()
-                }
-            } else {
-                "  → STEER: (malformed response)\n".to_string()
-            }
-        } else {
-            // WAIT: <note> or bare WAIT
-            let note = trimmed.strip_prefix("WAIT:").unwrap_or("").trim();
-            if note.is_empty() {
-                "  → WAIT\n".to_string()
-            } else {
-                format!("  → WAIT: {note}\n")
-            }
-        };
-        // Remember this verdict (minus the display prefix) so the next
-        // iteration can pass it back into the user prompt.  `verdict_line`
-        // starts with "  → " and ends with "\n"; strip both for a compact
-        // one-line carry-over.
-        let verdict_compact = verdict_line
-            .trim_start_matches("  → ")
-            .trim_end_matches('\n')
-            .to_string();
-        // The verdict_history rendering uses one line per entry; an
-        // embedded `\n` (possible when a STEER message spans multiple
-        // lines — parser doesn't reject them) would break the `[last] …`
-        // / `[N turns ago] …` table shape and push downstream section
-        // headers off column 0.  Escape newlines to a visible `\n` so
-        // the LLM still sees the content but the layout is preserved.
-        let verdict_single_line = verdict_compact.replace('\n', "\\n");
-        if verdict_history.len() >= VERDICT_HISTORY_LEN {
-            verdict_history.pop_front();
-        }
-        verdict_history.push_back(verdict_single_line.clone());
-        // Only stash the full text when the STEER was actually dispatched.
-        // `steer_dispatched` stays false for "unknown pane, ignored" and
-        // "malformed response" variants so the next turn's prompt does not
-        // claim claude received something it never did.  Use the escaped
-        // single-line form for the same layout-protection reason.
-        if steer_dispatched {
-            last_steer_full = Some(verdict_single_line);
-        }
-
-        // Persist verdict to task notebook (best-effort, once per unique
-        // `(repo_dir, tag)`).  Deduped because multiple panes sharing a
-        // tag (user `--tag foo` for a multi-task launch) would otherwise
-        // append duplicate rows for a single supervision turn.  Failures
-        // (panic OR SQLite Err) are logged but must not break the loop —
-        // notebook is auxiliary to the live verdict decision.
-        let mut verdict_targets: std::collections::HashSet<(String, String)> =
-            std::collections::HashSet::new();
-        for target in panes.iter() {
-            if let (Some(repo_dir), Some(tag)) = (target.repo_dir.as_deref(), target.tag.as_deref())
-            {
-                verdict_targets.insert((repo_dir.to_string(), tag.to_string()));
-            }
-        }
-        for (repo_dir, tag) in verdict_targets {
-            let state_cl = Arc::clone(state);
-            let verdict = verdict_compact.clone();
-            let repo_dir_log = repo_dir.clone();
-            let tag_log = tag.clone();
-            match tokio::task::spawn_blocking(move || -> Result<()> {
-                // Lazy-open the DB if no prior code path did.  Resume-pane
-                // launches skip the tag-acquisition block in
-                // `handle_claude_launch` that normally opens it, so when a
-                // resumed pane produces the first verdict the handle may
-                // still be `None`.  `ensure_tasks_db` is idempotent.
-                ensure_tasks_db(&state_cl)?;
-                let guard = state_cl
-                    .tasks_db
-                    .lock()
-                    .map_err(|e| anyhow::anyhow!("tasks_db mutex poisoned: {e}"))?;
-                let conn = guard
-                    .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("tasks_db not initialised"))?;
-                tasks::append_verdict(conn, &repo_dir, &tag, &verdict)
-            })
-            .await
-            {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => tracing::warn!(
-                    error = %e,
-                    repo_dir = %repo_dir_log,
-                    tag = %tag_log,
-                    "failed to persist verdict"
-                ),
-                Err(e) => tracing::warn!(
-                    error = %e,
-                    repo_dir = %repo_dir_log,
-                    tag = %tag_log,
-                    "verdict persist task panicked"
-                ),
-            }
-        }
-
-        let mut w = writer.lock().await;
-        write_frame(
-            &mut *w,
-            &Response::Text {
-                chunk: verdict_line,
-            },
-        )
-        .await?;
+        let mut out = raw[..end].to_string();
+        out.push_str("\n…[pane_tail truncated]");
+        return Ok(out);
     }
+    Ok(raw)
+}
+
+/// True if the worktree at `path` has any uncommitted changes (tracked,
+/// untracked, or staged).  Falls back to `false` on any failure so a
+/// missing worktree doesn't make release lie.
+async fn worktree_is_dirty(path: &std::path::Path) -> bool {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&path)
+            .args(["status", "--short"])
+            .output();
+        match out {
+            Ok(o) if o.status.success() => !o.stdout.is_empty(),
+            _ => false,
+        }
+    })
+    .await
+    .unwrap_or(false)
 }
 
 /// Create a git worktree at `~/.amaebi/worktrees/<repo-name>/<tag>-<uuid8>`
@@ -3734,6 +2959,7 @@ async fn handle_retrieve_context(
 ///
 /// Returns `ConnAction::Break` when the client disconnects during the loop or
 /// when authentication fails.
+#[allow(clippy::too_many_arguments)]
 async fn handle_resume_request(
     state: &Arc<DaemonState>,
     writer: &Arc<tokio::sync::Mutex<tokio::net::unix::OwnedWriteHalf>>,
@@ -3742,6 +2968,7 @@ async fn handle_resume_request(
     tmux_pane: Option<String>,
     model: String,
     session_id: String,
+    conn_id: ConnId,
 ) -> Result<ConnAction> {
     tracing::info!(model = %model, session_id = %session_id, prompt_len = prompt.len(), "received resume request");
     let _resume_session_guard = match claim_session(&state.active_sessions, &session_id) {
@@ -3783,8 +3010,16 @@ async fn handle_resume_request(
         &model,
     );
     inject_skill_files(&mut messages).await;
-    let Some(result) =
-        drive_agentic_loop(state, writer, conn_state, &session_id, messages, &model).await
+    let Some(result) = drive_agentic_loop(
+        state,
+        writer,
+        conn_state,
+        &session_id,
+        messages,
+        &model,
+        conn_id,
+    )
+    .await
     else {
         return Ok(ConnAction::Break);
     };
@@ -3835,6 +3070,7 @@ async fn handle_chat_request(
     tmux_pane: Option<String>,
     model: String,
     session_id: Option<String>,
+    conn_id: ConnId,
 ) -> Result<ConnAction> {
     tracing::info!(pane = ?tmux_pane, model = %model, prompt_len = prompt.len(), "received chat request");
     let sid = session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
@@ -3947,8 +3183,16 @@ async fn handle_chat_request(
         }
         None => model,
     };
-    let Some(loop_result) =
-        drive_agentic_loop(state, writer, conn_state, &sid, messages, &effective_model).await
+    let Some(loop_result) = drive_agentic_loop(
+        state,
+        writer,
+        conn_state,
+        &sid,
+        messages,
+        &effective_model,
+        conn_id,
+    )
+    .await
     else {
         return Ok(ConnAction::Break);
     };
@@ -5196,6 +4440,80 @@ const LARGE_TOOL_RESULT_CHARS: usize = 50_000;
 /// `stream_chat` retries 5xx, 429, and transport errors internally up to its
 /// `MAX_RETRIES`, but those errors can still surface here if retries are
 /// exhausted or if a non-retryable error occurs.
+///
+/// Return the list of `pane_id`s currently held by `conn_id`, or `None` when
+/// `held` is empty — the caller uses `None` to mean "no pane-alive invariant
+/// applies to this turn" and skip the reminder entirely.  Poisoned mutex:
+/// recover the guard and log, since missing the reminder on a single turn
+/// is a live-safety issue (LLM might stop responding with tools) but still
+/// better than hanging the whole chat on a `.lock().ok()?` that would
+/// produce None.  The 24 h TTL also protects lease correctness.
+fn pane_alive_held_panes(state: &DaemonState, conn_id: ConnId) -> Option<Vec<String>> {
+    let held = state.held.lock().unwrap_or_else(|poisoned| {
+        tracing::warn!(
+            conn_id,
+            "pane_alive_held_panes: state.held mutex was poisoned; recovering so reminder still injects"
+        );
+        poisoned.into_inner()
+    });
+    let list = held.get(&conn_id)?;
+    if list.is_empty() {
+        return None;
+    }
+    Some(list.iter().map(|e| e.pane_id.clone()).collect())
+}
+
+/// Build the pane-alive reminder text injected at the tail of `messages`
+/// just before each model call while the connection still owns any
+/// `/claude` pane.  Names the live pane ids so the LLM can ground its
+/// next tool call in real state rather than invented pane numbers.
+fn format_pane_alive_reminder(pane_ids: &[String]) -> String {
+    let pane_list = pane_ids.join(", ");
+    format!(
+        "[pane-alive invariant]\n\
+         You currently own the following /claude pane(s): {pane_list}.\n\
+         \n\
+         **You are a SUPERVISOR, not the executor.**  Each pane has Claude \
+         Code already running inside it with the user's task description \
+         already injected; Claude is doing the work.  Your job is to watch \
+         Claude, nudge it when needed, and declare done when verified.  \
+         Do NOT use `shell_command`, `edit_file`, `read_file`, or similar \
+         tools to do the task yourself — that bypasses Claude entirely and \
+         produces a parallel answer the user did not ask for.  If you need \
+         to look at worktree state, prefer `tmux_capture_pane` (watch what \
+         Claude sees / does) over running your own shell; only fall back to \
+         `shell_command` for meta-observations Claude cannot report (e.g. \
+         verifying that a file Claude claims to have written really exists).\n\
+         \n\
+         While any of these panes is alive, you MUST call at least one tool \
+         in every turn — do NOT reply with text only.\n\
+         \n\
+         Your supervision vocabulary:\n\
+         - `tmux_capture_pane` — read the pane to see what Claude is doing.\n\
+         - `tmux_wait` — pause until the pane falls idle.  This is the \
+         correct way to \"wait and see\"; a text reply saying \"I'll wait\" \
+         is forbidden.\n\
+         - `tmux_send_text` — paste a correction / new instruction into \
+         Claude (e.g. \"try the other branch\", \"also run the benchmarks\").  \
+         This is how you STEER Claude without killing and restarting.\n\
+         - `tmux_send_key` — single control keys: `Escape` to cancel \
+         Claude's in-progress edit, `C-c` to interrupt, arrow keys / `q` to \
+         dismiss UI.  Use this when Claude is stuck in a modal dialog or \
+         needs to be cancelled mid-stream.  Do NOT use it for text — that \
+         is `tmux_send_text`.\n\
+         - `task_done` — declare the task goal verified and release the \
+         pane.  This is the ONLY way to exit supervision cleanly.\n\
+         \n\
+         `task_done` requires `pane_id` + a short `summary` of what Claude \
+         accomplished.  Only call it AFTER you have actually observed \
+         Claude's output (via `tmux_capture_pane`) and judged the work \
+         complete — do not call it on the first turn just to exit.  Once \
+         ALL panes are released, this reminder disappears and you can \
+         reply with plain text again."
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_agentic_loop<W>(
     state: &DaemonState,
     model: &str,
@@ -5204,6 +4522,7 @@ pub(crate) async fn run_agentic_loop<W>(
     steer_rx: &mut tokio::sync::mpsc::Receiver<Option<String>>,
     include_spawn_agent: bool,
     session_id: Option<&str>,
+    conn_id: Option<ConnId>,
 ) -> Result<(String, usize, Vec<Message>, String)>
 where
     W: AsyncWriteExt + Unpin,
@@ -5339,6 +4658,18 @@ where
                 "auto-switching to AMAEBI_TOOL_MODEL for tool-execution turn"
             );
         }
+        // Pane-alive reminder: when this connection holds /claude panes
+        // (docs/design/claude-chat-takeover.md), every LLM turn MUST call at
+        // least one tool until the pane is released.  Injected ephemerally as
+        // an extra system message at the tail of `messages` for just this turn
+        // so it applies only while the invariant is live — never persisted to
+        // history, never bloats later compactions.  Removed immediately after
+        // `invoke_model_with_cache` returns.
+        let pane_alive_injected: Option<Vec<String>> =
+            conn_id.and_then(|cid| pane_alive_held_panes(state, cid));
+        if let Some(held_panes) = &pane_alive_injected {
+            messages.push(Message::system(format_pane_alive_reminder(held_panes)));
+        }
         // Enable 5-minute prompt caching.  Covers only the system-level
         // blocks — the base system prompt plus any skill messages
         // (SOUL.md / AGENTS.md) injected by `inject_skill_files`.
@@ -5349,7 +4680,7 @@ where
         // 5-minute TTL matches typical idle gaps between user turns;
         // going longer wastes cache capacity on sessions that won't
         // continue.
-        let resp = invoke_model_with_cache(
+        let resp_result = invoke_model_with_cache(
             state,
             invoke_with,
             &messages,
@@ -5358,7 +4689,15 @@ where
             Some(crate::bedrock::CacheTtl::FiveMinutes),
             writer,
         )
-        .await?;
+        .await;
+        // Pop the pane-alive reminder BEFORE the `?` propagation — an
+        // early-return path (transport error, 5xx, retry exhaustion)
+        // must not leak the ephemeral reminder into the persisted
+        // history / next compaction.
+        if pane_alive_injected.is_some() {
+            let _ = messages.pop();
+        }
+        let resp = resp_result?;
         if resp.cache_read_tokens.is_some() || resp.cache_write_tokens.is_some() {
             tracing::debug!(
                 cache_read = ?resp.cache_read_tokens,
@@ -5383,6 +4722,23 @@ where
             tools_were_used,
             "model turn complete"
         );
+
+        // Diagnostic: if the LLM ended a turn without any tool call while
+        // this connection still holds /claude panes, that's a prompt
+        // violation (the pane-alive invariant injected above says otherwise).
+        // Warn for debugging but take NO action — escalation would put
+        // judgement back into Rust, which the design doc forbids.
+        if matches!(resp.finish_reason, FinishReason::Stop) && resp.tool_calls.is_empty() {
+            if let Some(cid) = conn_id {
+                if let Some(held) = pane_alive_held_panes(state, cid) {
+                    tracing::warn!(
+                        conn_id = cid,
+                        held_panes = ?held,
+                        "agentic loop turn ended with no tool call while panes held — prompt violation"
+                    );
+                }
+            }
+        }
 
         match resp.finish_reason {
             FinishReason::Stop | FinishReason::Length => {
@@ -5924,6 +5280,19 @@ where
                             None
                         };
 
+                        // Snapshot task_done args before they're consumed by execute —
+                        // the post-op release path below needs them once the tool
+                        // echo has gone into messages.  Extracted even when conn_id
+                        // is None so validation errors surface the usual way.
+                        let task_done_args: Option<(String, String)> = if tc.name == "task_done" {
+                            match (args["pane_id"].as_str(), args["summary"].as_str()) {
+                                (Some(p), Some(s)) => Some((p.to_string(), s.to_string())),
+                                _ => None,
+                            }
+                        } else {
+                            None
+                        };
+
                         let result = match state.executor.execute(&tc.name, args).await {
                             Ok(output) => {
                                 tracing::debug!(
@@ -5962,6 +5331,31 @@ where
                         };
 
                         messages.push(Message::tool_result(&tc.id, result));
+
+                        // task_done post-op: the tool body is a pure echo, so the
+                        // actual release of leases and TaskReleased streaming
+                        // happens here.  Runs only when a live conn holds panes
+                        // (SubmitDetach / cron have conn_id=None and no held
+                        // entries, so the release would be a no-op anyway).
+                        if let (Some((pane_id, summary)), Some(cid)) = (task_done_args, conn_id) {
+                            if let Some(released) = release_held_entry(
+                                state,
+                                cid,
+                                &pane_id,
+                                false,
+                                Some(summary),
+                                ReleaseReason::UserOrLlm,
+                            )
+                            .await
+                            {
+                                // Stream the released data to the live chat so the
+                                // user sees the summary + pane tail + worktree
+                                // status without a separate inbox round-trip.
+                                // Best-effort: ignore write errors — a dying writer
+                                // is handled by the outer drain on conn exit.
+                                let _ = write_frame(writer, &released).await;
+                            }
+                        }
                     }
 
                     // If the user injected a steer mid-chain, push placeholder
@@ -6311,6 +5705,7 @@ async fn run_cron_job(state: Arc<DaemonState>, job: &cron::CronJob) {
         &mut steer_rx,
         true,
         Some(&session_id),
+        None, // cron: no client conn, no panes held
     )
     .await;
 
@@ -6374,6 +5769,8 @@ mod tests {
             active_sessions: Arc::new(Mutex::new(HashSet::new())),
             user_aliases: Arc::new(std::collections::HashMap::new()),
             tasks_db: Arc::new(Mutex::new(None)),
+            conn_id_counter: Arc::new(AtomicU64::new(1)),
+            held: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -7939,88 +7336,6 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // release_supervised_panes tests
-    // ------------------------------------------------------------------
-
-    /// `release_supervised_panes` must flip a Busy pane to Idle and clear its
-    /// task/session fields while preserving `has_claude` and `worktree` so the
-    /// next `/claude` invocation can reuse the same Claude Code session via
-    /// the tier-1 reuse path (inject task into existing claude).  Without this
-    /// call, the pane would stay Busy until `LEASE_TTL_SECS` (24 h) and a
-    /// second `/claude` would appear stuck.
-    #[tokio::test]
-    async fn release_supervised_panes_unlocks_pane_and_preserves_reuse_fields() {
-        let _guard = crate::test_utils::with_temp_home();
-
-        let worktree = "/tmp/fake-worktree/task1";
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system clock before UNIX epoch")
-            .as_secs();
-        let seed = pane_lease::PaneLease {
-            pane_id: "%7".to_string(),
-            window_id: "@3".to_string(),
-            status: pane_lease::PaneStatus::Busy,
-            tag: Some("task-abc".to_string()),
-            session_id: Some("sess-xyz".to_string()),
-            worktree: Some(worktree.to_string()),
-            heartbeat_at: now,
-            has_claude: true,
-            task_description: None,
-        };
-        pane_lease::seed_state_for_test(seed).expect("seed pane state");
-
-        let panes = vec![crate::ipc::SupervisionTarget {
-            pane_id: "%7".to_string(),
-            task_description: "do the thing".to_string(),
-            tag: None,
-            repo_dir: None,
-        }];
-        release_supervised_panes(&panes).await;
-
-        let state = pane_lease::read_state().expect("read pane state after release");
-        let lease = state.get("%7").expect("pane %7 still tracked");
-        assert_eq!(
-            lease.status,
-            pane_lease::PaneStatus::Idle,
-            "raw status must be flipped to Idle by release (not just TTL-expired)"
-        );
-        assert_eq!(
-            lease.effective_status(),
-            pane_lease::PaneStatus::Idle,
-            "pane must be Idle after release"
-        );
-        assert!(
-            lease.has_claude,
-            "has_claude must be preserved so tier-1 reuse can match"
-        );
-        assert_eq!(
-            lease.worktree.as_deref(),
-            Some(worktree),
-            "worktree must be preserved so tier-1 reuse can match"
-        );
-        assert!(lease.tag.is_none(), "tag must be cleared");
-        assert!(lease.session_id.is_none(), "session_id must be cleared");
-    }
-
-    /// Releasing a target that does not exist in the state must not panic or
-    /// return an error — release is best-effort and must never mask an inner
-    /// supervision result.
-    #[tokio::test]
-    async fn release_supervised_panes_is_noop_for_missing_pane() {
-        let _guard = crate::test_utils::with_temp_home();
-        let panes = vec![crate::ipc::SupervisionTarget {
-            pane_id: "%999".to_string(),
-            task_description: "nonexistent".to_string(),
-            tag: None,
-            repo_dir: None,
-        }];
-        release_supervised_panes(&panes).await;
-        let state = pane_lease::read_state().expect("read pane state");
-        assert!(state.get("%999").is_none(), "no pane should be created");
-    }
-
-    // ------------------------------------------------------------------
     // handle_claude_launch --resume-pane error-path tests
     //
     // These tests cover the "description omitted" resume-pane lookup:
@@ -8079,7 +7394,7 @@ mod tests {
             resource_timeout_secs: None,
         };
         let state = test_minimal_daemon_state();
-        handle_claude_launch(&writer, vec![task], None, None, &state)
+        handle_claude_launch(&writer, vec![task], None, None, &state, 0)
             .await
             .expect("launch returns ok even on per-task error");
         drop(writer);
@@ -8141,7 +7456,7 @@ mod tests {
             resource_timeout_secs: None,
         };
         let state = test_minimal_daemon_state();
-        handle_claude_launch(&writer, vec![task], None, None, &state)
+        handle_claude_launch(&writer, vec![task], None, None, &state, 0)
             .await
             .expect("launch returns ok even on per-task error");
         drop(writer);
@@ -8208,7 +7523,7 @@ mod tests {
             resource_timeout_secs: None,
         };
         let state = test_minimal_daemon_state();
-        handle_claude_launch(&writer, vec![task], None, None, &state)
+        handle_claude_launch(&writer, vec![task], None, None, &state, 0)
             .await
             .expect("launch returns ok even on per-task error");
         drop(writer);
@@ -8338,6 +7653,8 @@ mod tests {
             active_sessions: Arc::new(Mutex::new(HashSet::new())),
             user_aliases: Arc::new(std::collections::HashMap::new()),
             tasks_db: Arc::new(Mutex::new(None)),
+            conn_id_counter: Arc::new(AtomicU64::new(1)),
+            held: Arc::new(Mutex::new(HashMap::new())),
         });
 
         // "sid-quarantined" has no entry in the empty sessions.json under
@@ -8348,149 +7665,6 @@ mod tests {
             summaries.is_empty(),
             "load_session_state must not read sentinel rows back; got {summaries:?}"
         );
-    }
-
-    // ------------------------------------------------------------------
-    // TUI chrome stripping
-    //
-    // Fixtures modelled on real `tmux capture-pane` output of Claude Code
-    // TUIs.  The guiding invariant is asymmetric: missing a chrome line
-    // is merely noisy; eating a real-output line silently drops signal
-    // from the supervisor LLM's view, which is strictly worse.
-    // ------------------------------------------------------------------
-
-    #[test]
-    fn chrome_divider_line_is_stripped() {
-        assert!(is_tui_chrome_line(
-            "────────────────────────────────────────"
-        ));
-        // Heavy-weight divider variant.
-        assert!(is_tui_chrome_line("━━━━━━━━━━━━━━"));
-        // Indentation inside the divider line is tolerated.
-        assert!(is_tui_chrome_line("    ──────────────    "));
-    }
-
-    #[test]
-    fn chrome_short_dash_run_is_not_stripped() {
-        // Three dashes could be a real `---` separator or a command-line
-        // flag echo (`--help`).  The 10-char threshold prevents collateral.
-        assert!(!is_tui_chrome_line("---"));
-        assert!(!is_tui_chrome_line("────────")); // 8 chars, below threshold
-    }
-
-    #[test]
-    fn chrome_status_bar_is_stripped() {
-        assert!(is_tui_chrome_line(
-            "  ⏵⏵ bypass permissions on · 1 shell · esc to interrupt · ctrl+t to hide tasks · ↓ to manage"
-        ));
-        assert!(is_tui_chrome_line("  ⏵⏵ bypass permissions on"));
-        // Matched via the `esc to interrupt` substring (covers Claude Code
-        // hint rows that don't start with the bypass banner).
-        assert!(is_tui_chrome_line("  ↑/↓ navigate · esc to interrupt"));
-    }
-
-    #[test]
-    fn chrome_empty_prompt_cursor_is_stripped() {
-        assert!(is_tui_chrome_line("❯"));
-        assert!(is_tui_chrome_line("   ❯   "));
-    }
-
-    #[test]
-    fn chrome_empty_prompt_with_content_is_preserved() {
-        // A populated prompt is real user/Claude input — must not be eaten.
-        assert!(!is_tui_chrome_line("❯ what's the benchmark result?"));
-        assert!(!is_tui_chrome_line("❯ ls -la"));
-    }
-
-    #[test]
-    fn chrome_pure_border_line_is_stripped() {
-        // Empty middle of a bordered box, e.g. rendered by Claude Code's
-        // input/output panels.
-        assert!(is_tui_chrome_line("│                                   │"));
-        assert!(is_tui_chrome_line("╭───────────────╮"));
-        assert!(is_tui_chrome_line("╰───────────────╯"));
-    }
-
-    #[test]
-    fn chrome_log_with_pipe_separator_is_preserved() {
-        // Real log lines often use `│` as a visual separator; they contain
-        // non-border text so the all-border check rejects them.
-        assert!(!is_tui_chrome_line("2026-04-25 14:22 │ INFO │ build done"));
-        assert!(!is_tui_chrome_line("│ Build │ OK"));
-    }
-
-    #[test]
-    fn chrome_checkmark_progress_rows_are_preserved() {
-        // The ✔ rows in a Claude Code task list are *content*, not chrome.
-        // Regression for the supervision screenshot the user reported.
-        assert!(!is_tui_chrome_line("     ✔ A2: causal + paged combined"));
-        assert!(!is_tui_chrome_line(
-            "     ✔ Baseline perf (hd=128 fp16 GQA) before changes"
-        ));
-        assert!(!is_tui_chrome_line("      … +1 completed"));
-    }
-
-    #[test]
-    fn chrome_shell_prompt_and_errors_are_preserved() {
-        assert!(!is_tui_chrome_line("syk@host:/repo$ ls"));
-        assert!(!is_tui_chrome_line("error: lint failed at line 10"));
-        assert!(!is_tui_chrome_line("A1: 1.3× speedup"));
-    }
-
-    #[test]
-    fn strip_tui_chrome_on_real_supervision_screenshot() {
-        // Reproduces the pane snapshot the user pasted: a task header, a
-        // list of ✔ completions, a divider, an empty ❯ prompt, another
-        // divider, and the status bar.  Only the task + ✔ lines + the
-        // `… +N completed` summary should survive; dividers, the empty
-        // prompt, and the status bar must be filtered out.
-        let raw = "\
-继续fmha4_paged的功能迁移，根据ROADMAP.md一个一个功能往fmha4_paged加。每个功能加完要确保性能不掉，精度准确。
-     ✔ A2: causal + paged combined
-     ✔ Baseline perf (hd=128 fp16 GQA) before changes
-     ✔ A1: hd=64 vrow fallback port
-      … +1 completed
-
-────────────────────────────────────────────────────────────────────────────────────────────────────────
-❯
-
-────────────────────────────────────────────────────────────────────────────────────────────────────────
-  ⏵⏵ bypass permissions on · 1 shell · esc to interrupt · ctrl+t to hide tasks · ↓ to manage
-";
-        let cleaned = strip_tui_chrome(raw);
-        // Content lines all survive.
-        assert!(cleaned.contains("继续fmha4_paged的功能迁移"));
-        assert!(cleaned.contains("✔ A2: causal + paged combined"));
-        assert!(cleaned.contains("✔ Baseline perf"));
-        assert!(cleaned.contains("✔ A1: hd=64 vrow fallback port"));
-        assert!(cleaned.contains("… +1 completed"));
-        // Chrome lines removed.
-        assert!(
-            !cleaned.contains("────────────────────────────────────────────────────────────────"),
-            "divider must be stripped"
-        );
-        assert!(
-            !cleaned.contains("bypass permissions"),
-            "status bar must be stripped"
-        );
-        // Empty prompt `❯` line is gone but blank lines around it stay.
-        let has_lone_caret = cleaned.lines().any(|l| l.trim() == "❯");
-        assert!(!has_lone_caret, "empty ❯ prompt must be stripped");
-    }
-
-    #[test]
-    fn strip_tui_chrome_preserves_blank_lines() {
-        // Blank lines carry structure (paragraph breaks, shell idle); we
-        // keep them so downstream trimming / tail extraction sees the
-        // same line-count boundaries as the original capture.
-        let raw = "line one\n\nline two\n\n\nline three\n";
-        let cleaned = strip_tui_chrome(raw);
-        assert_eq!(cleaned, "line one\n\nline two\n\n\nline three");
-    }
-
-    #[test]
-    fn strip_tui_chrome_empty_input() {
-        assert_eq!(strip_tui_chrome(""), "");
     }
 
     // ------------------------------------------------------------------
@@ -8516,25 +7690,6 @@ mod tests {
             metadata: std::collections::HashMap::new(),
             env: std::collections::HashMap::new(),
             prompt_hint: Some(hint.to_string()),
-        }
-    }
-
-    // ------------------------------------------------------------------
-    // Supervision prompt shape tests
-    //
-    // These tests cover the structural contract of the user content fed to
-    // the supervision LLM every turn: task pinned at byte 0, hard
-    // constraints block derived from the pane's resource leases, verdict
-    // history rendered in newest-last order, and the last STEER message
-    // carried forward verbatim.
-    // ------------------------------------------------------------------
-
-    fn supervision_test_target(pane_id: &str, desc: &str) -> crate::ipc::SupervisionTarget {
-        crate::ipc::SupervisionTarget {
-            pane_id: pane_id.to_string(),
-            task_description: desc.to_string(),
-            tag: None,
-            repo_dir: None,
         }
     }
 
@@ -8644,178 +7799,6 @@ mod tests {
         assert!(!dir.path().join("AGENTS.md").exists());
     }
 
-    #[test]
-    fn supervision_prompt_contains_pinned_task_section() {
-        let task_lines = vec![(
-            "%5".to_string(),
-            "implement feature X on sim-9900".to_string(),
-        )];
-        let history: std::collections::VecDeque<String> = std::collections::VecDeque::new();
-        let out = build_supervision_user_content(
-            &task_lines,
-            "",
-            "",
-            &history,
-            None,
-            "=== Pane %5 ===\nidle\n",
-            1,
-            0,
-        );
-        assert!(
-            out.starts_with("TASK — keep Claude focused on this:\n"),
-            "user content must start with the pinned task header, got: {out:?}"
-        );
-        assert!(
-            out.contains("implement feature X on sim-9900"),
-            "task description must appear in the pinned section, got: {out:?}"
-        );
-        assert!(
-            out.contains("pane %5:"),
-            "pinned section must list the pane id, got: {out:?}"
-        );
-    }
-
-    #[test]
-    fn supervision_prompt_verdict_history_renders_multiple_lines() {
-        let task_lines = vec![("%5".to_string(), "task".to_string())];
-        let mut history = std::collections::VecDeque::new();
-        history.push_back("WAIT: building".to_string());
-        // Use the real on-wire shape the parser emits (`STEER: <pane>: …`
-        // with the leading colon) so the test catches future drift if the
-        // verdict format or parser prefix diverge.
-        history.push_back("STEER: %5: use sim-9900".to_string());
-        history.push_back("WAIT: now on sim-9900".to_string());
-        let out = build_supervision_user_content(&task_lines, "", "", &history, None, "snap", 4, 3);
-        assert!(
-            out.contains("[last] WAIT: now on sim-9900"),
-            "newest verdict must be labelled [last], got: {out:?}"
-        );
-        assert!(
-            out.contains("[2 turns ago] STEER: %5: use sim-9900"),
-            "second-newest verdict must be labelled [2 turns ago], got: {out:?}"
-        );
-        assert!(
-            out.contains("[3 turns ago] WAIT: building"),
-            "oldest verdict must be labelled [3 turns ago], got: {out:?}"
-        );
-    }
-
-    #[test]
-    fn supervision_prompt_last_steer_block_shows_full_text() {
-        let task_lines = vec![("%5".to_string(), "task".to_string())];
-        let history: std::collections::VecDeque<String> = std::collections::VecDeque::new();
-        // Matches the real on-wire `STEER: <pane>: …` shape emitted by
-        // `handle_supervision_inner`.
-        let steer = "STEER: %5: stop — you are using sim-9903 but the \
-                     task says sim-9900; rerun with the correct port";
-        let out = build_supervision_user_content(
-            &task_lines,
-            "",
-            "",
-            &history,
-            Some(steer),
-            "snap",
-            2,
-            1,
-        );
-        assert!(
-            out.contains("Most recent STEER message (escaped newlines):"),
-            "missing STEER carry-over header, got: {out:?}"
-        );
-        assert!(
-            out.contains("rerun with the correct port"),
-            "full STEER text must appear verbatim, got: {out:?}"
-        );
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn supervision_prompt_no_constraints_when_no_leases() {
-        let _guard = crate::test_utils::with_temp_home();
-        let panes = vec![supervision_test_target("%5", "do the thing")];
-        let out = render_hard_constraints(&panes).await;
-        assert!(
-            out.is_empty(),
-            "no leases for this pane → empty constraints block, got: {out:?}"
-        );
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn supervision_prompt_hard_constraints_includes_resource_hint() {
-        let _guard = crate::test_utils::with_temp_home();
-
-        // Seed a pool file with a named resource that has a prompt_hint.
-        let pool_path = crate::auth::amaebi_home()
-            .expect("home")
-            .join("resources.toml");
-        std::fs::create_dir_all(pool_path.parent().unwrap()).expect("mkdir");
-        std::fs::write(
-            &pool_path,
-            r#"
-[[resource]]
-name = "sim-9900"
-class = "simulator"
-metadata = { port = "9900" }
-prompt_hint = "use sim-9900 (port {port}) only"
-"#,
-        )
-        .expect("write pool");
-
-        // Acquire the resource on %5 so the state file records a lease
-        // whose pane_id matches our supervised pane.  This uses the real
-        // resource_lease path, which also respects the flock.
-        let _leases = resource_lease::acquire_all(
-            &[resource_lease::ResourceRequest::Named("sim-9900".into())],
-            resource_lease::Holder {
-                pane_id: "%5".into(),
-                tag: "t".into(),
-                session_id: "s".into(),
-            },
-            resource_lease::WaitPolicy::Nowait,
-        )
-        .await
-        .expect("acquire");
-
-        let panes = vec![supervision_test_target("%5", "do the thing")];
-        let out = render_hard_constraints(&panes).await;
-
-        assert!(
-            out.contains("HARD CONSTRAINTS"),
-            "constraints section missing, got: {out:?}"
-        );
-        assert!(
-            out.contains("pane %5:"),
-            "constraints must be scoped per pane, got: {out:?}"
-        );
-        assert!(
-            out.contains("use sim-9900 (port 9900) only"),
-            "rendered prompt_hint must be included verbatim, got: {out:?}"
-        );
-    }
-
-    // ------------------------------------------------------------------
-    // supervision default timeout regression
-    // ------------------------------------------------------------------
-
-    #[test]
-    #[serial_test::serial]
-    fn supervision_default_timeout_matches_lease_ttl() {
-        // Regression: the default supervision timeout must match every lease
-        // TTL supervision holds on (pane, resource, task notebook) so the
-        // loop never outlives its own bookkeeping.  The test derives the
-        // expected value from the TTL constant rather than a literal, so
-        // bumping lease TTL on a future PR does not require touching this
-        // test — only the three constants need to stay equal.
-        std::env::remove_var("AMAEBI_SUPERVISION_TIMEOUT_SECS");
-        let lease_ttl_secs = crate::pane_lease::LEASE_TTL_SECS;
-        let default_secs: u64 = std::env::var("AMAEBI_SUPERVISION_TIMEOUT_SECS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(lease_ttl_secs);
-        assert_eq!(default_secs, lease_ttl_secs);
-        assert_eq!(crate::resource_lease::LEASE_TTL_SECS, lease_ttl_secs);
-        assert_eq!(crate::tasks::LEASE_TTL_SECS as u64, lease_ttl_secs);
-    }
-
     /// Regression: the supervision verdict-persist path must lazy-open
     /// `tasks.db` when the daemon only ever served resume-pane launches
     /// (which skip the tag-acquisition block that normally opens it).
@@ -8839,5 +7822,103 @@ prompt_hint = "use sim-9900 (port {port}) only"
 
         ensure_tasks_db(&state).expect("second ensure_tasks_db is a no-op");
         assert!(state.tasks_db.lock().unwrap().is_some());
+    }
+
+    /// Direct-insert a TaskEntry (bypassing handle_claude_launch) and
+    /// confirm release_held_entry:
+    /// 1. returns Some(TaskReleased) on first call,
+    /// 2. removes the entry from state.held,
+    /// 3. returns None on the second call (idempotent).
+    #[tokio::test]
+    async fn release_held_entry_is_idempotent() {
+        let _guard = crate::test_utils::with_temp_home();
+        let state = test_minimal_daemon_state();
+        let conn_id: ConnId = 42;
+        state
+            .held
+            .lock()
+            .unwrap()
+            .entry(conn_id)
+            .or_default()
+            .push(TaskEntry {
+                pane_id: "%pretend".into(),
+                resources: vec!["xesim-dummy".into()],
+                worktree: None,
+                tag: Some("test-tag".into()),
+                task_repo_dir: None,
+                task_lease_holder: None,
+                session_id: Some("sid-test".into()),
+                task_description: Some("do the thing".into()),
+                created_at: Instant::now(),
+            });
+
+        let first = release_held_entry(
+            &state,
+            conn_id,
+            "%pretend",
+            false,
+            None,
+            ReleaseReason::UserOrLlm,
+        )
+        .await;
+        assert!(
+            matches!(&first, Some(crate::ipc::Response::TaskReleased { pane_id, .. }) if pane_id == "%pretend")
+        );
+        assert!(
+            state.held.lock().unwrap().get(&conn_id).is_none(),
+            "held entry should be removed after first release"
+        );
+
+        let second = release_held_entry(
+            &state,
+            conn_id,
+            "%pretend",
+            false,
+            None,
+            ReleaseReason::UserOrLlm,
+        )
+        .await;
+        assert!(second.is_none(), "double-release must be a no-op");
+    }
+
+    /// A TaskEntry for a different pane on the same conn stays put when we
+    /// release one of them.  Guards against accidentally clobbering the
+    /// whole per-conn vector.
+    #[tokio::test]
+    async fn release_held_entry_leaves_sibling_entries_untouched() {
+        let _guard = crate::test_utils::with_temp_home();
+        let state = test_minimal_daemon_state();
+        let conn_id: ConnId = 7;
+        {
+            let mut held = state.held.lock().unwrap();
+            let list = held.entry(conn_id).or_default();
+            for pid in ["%a", "%b", "%c"] {
+                list.push(TaskEntry {
+                    pane_id: pid.into(),
+                    resources: vec![],
+                    worktree: None,
+                    tag: None,
+                    task_repo_dir: None,
+                    task_lease_holder: None,
+                    session_id: None,
+                    task_description: None,
+                    created_at: Instant::now(),
+                });
+            }
+        }
+
+        let _ =
+            release_held_entry(&state, conn_id, "%b", false, None, ReleaseReason::UserOrLlm).await;
+        let remaining: Vec<String> = state
+            .held
+            .lock()
+            .unwrap()
+            .get(&conn_id)
+            .map(|v| v.iter().map(|e| e.pane_id.clone()).collect())
+            .unwrap_or_default();
+        assert_eq!(remaining.len(), 2);
+        assert!(remaining.contains(&"%a".to_string()));
+        assert!(remaining.contains(&"%c".to_string()));
+        assert!(!remaining.contains(&"%b".to_string()));
     }
 }

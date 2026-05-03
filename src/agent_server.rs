@@ -279,6 +279,7 @@ impl acp::Agent for AmaebiAgent {
                 &mut steer_rx,
                 true,
                 None,
+                None, // ACP session: no /claude panes in scope
             )
             .await
             .map(|(text, tokens, _messages, _model)| (text, tokens)) // discard messages Vec
@@ -341,10 +342,10 @@ impl acp::Agent for AmaebiAgent {
                     // ACP mode never sends ClaudeLaunch/GenerateTag.
                     tracing::debug!("unexpected pane/tag scheduler response in ACP mode");
                 }
-                Response::Heartbeat { .. } => {
-                    // ACP mode never runs supervision; explicit arm keeps
-                    // future enum additions a compile error.
-                    tracing::debug!("unexpected Heartbeat in ACP mode");
+                Response::TaskReleased { .. } => {
+                    // ACP mode never issues Request::ClaudeRelease; explicit
+                    // arm keeps future enum additions a compile error.
+                    tracing::debug!("unexpected TaskReleased in ACP mode");
                 }
             }
         }

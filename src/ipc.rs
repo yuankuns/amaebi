@@ -61,19 +61,17 @@ pub struct TaskSpec {
     pub resource_timeout_secs: Option<u64>,
 }
 
-/// A single pane+task pair for supervision.
+/// Target selector for [`Request::ClaudeRelease`].
+///
+/// A release request either names a single pane by id, or asks the daemon
+/// to release every pane currently held by this connection.
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
-pub struct SupervisionTarget {
-    pub pane_id: String,
-    pub task_description: String,
-    /// Notebook tag — carried from [`TaskSpec::tag`].  `None` disables
-    /// the notebook path for this pane (e.g. legacy client).
-    #[serde(default)]
-    pub tag: Option<String>,
-    /// Canonicalized `client_cwd` at the time the task was launched.
-    /// Used together with `tag` as the notebook lookup key.
-    #[serde(default)]
-    pub repo_dir: Option<String>,
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ClaudeReleaseTarget {
+    /// Release a single pane by tmux pane id (e.g. `"%54"`).
+    Pane { pane_id: String },
+    /// Release every pane held by this connection.
+    All,
 }
 
 /// A message sent from the client to the daemon over the Unix socket.
@@ -183,15 +181,14 @@ pub enum Request {
         /// Chat session UUID issuing this launch.  Used together with
         /// `repo_dir` to acquire the notebook lease up front — rejecting a
         /// tag conflict BEFORE allocating panes or starting `claude`.
-        /// Matches the `session_id` the client will later send on
-        /// [`Request::SupervisePanes`] so the holder id is stable across
-        /// both phases (cleanup in `handle_supervision` releases by
-        /// that same holder).
+        /// Matches the `session_id` the client carries into the
+        /// subsequent [`Request::Chat`] so the holder id is stable across
+        /// launch + chat-takeover supervision
+        /// (`docs/design/claude-chat-takeover.md`).
         #[serde(default)]
         session_id: Option<String>,
         /// Canonicalised repo directory for this launch.  Keyed with
-        /// each task's `tag` to form the notebook lease key.  Must match
-        /// the `repo_dir` on the corresponding [`SupervisionTarget`].
+        /// each task's `tag` to form the notebook lease key.
         #[serde(default)]
         repo_dir: Option<String>,
     },
@@ -207,12 +204,15 @@ pub enum Request {
         description: String,
         repo_dir: String,
     },
-    /// Supervise tmux panes where Claude is executing tasks.
-    /// The daemon runs a Rust polling loop: capture pane → LLM analysis → act.
-    SupervisePanes {
-        panes: Vec<SupervisionTarget>,
-        model: String,
-        session_id: Option<String>,
+    /// Release amaebi's ownership of a pane (or all panes held by this connection).
+    /// Does NOT kill the pane, terminate the `claude` process, or remove the worktree
+    /// (unless `clean_worktree` is true).  Handler in `handle_claude_release`.
+    ClaudeRelease {
+        target: ClaudeReleaseTarget,
+        #[serde(default)]
+        clean_worktree: bool,
+        #[serde(default)]
+        summary: Option<String>,
     },
 }
 
@@ -280,6 +280,20 @@ pub enum Response {
         pane_id: String,
         /// amaebi session UUID for the new chat session running in the pane.
         session_id: String,
+        /// Absolute path to the git worktree the task is running in, or
+        /// `None` when worktree isolation is off (auto-creation failed or
+        /// the caller opted out).  Carried here so the client can fold it
+        /// into the synthesised `[launched]` user turn; see
+        /// `docs/design/claude-chat-takeover.md` (PR B/F).
+        /// `#[serde(default)]` keeps older clients compatible with newer
+        /// daemons that emit this field.
+        #[serde(default)]
+        worktree: Option<String>,
+        /// Resolved resource names acquired for this pane, in canonical
+        /// `resource_lease` ordering.  Empty when `--resource` was not
+        /// passed.  Added alongside `worktree` for the same reason.
+        #[serde(default)]
+        resources: Vec<String>,
     },
     /// The LLM called the `switch_model` tool and the active model changed.
     ///
@@ -295,14 +309,17 @@ pub enum Response {
     },
     /// Reply to [`Request::GenerateTag`] carrying the resolved tag.
     TagGenerated { tag: String },
-    /// Daemon-side liveness signal emitted every `HEARTBEAT_INTERVAL_SECS`
-    /// by the heartbeat task spawned in `handle_supervision` (the wrapper,
-    /// not `handle_supervision_inner`, so cancellation is guaranteed on
-    /// every exit path).  Carries (elapsed supervision seconds, current
-    /// turn number) so a stuck pane can be diagnosed even when no
-    /// WAIT/STEER/DONE was produced recently.  The client treats any
-    /// heartbeat as a watchdog reset; rendering it is optional.
-    Heartbeat { elapsed_secs: u64, turn: u64 },
+    /// Emitted when a pane is released via task_done, /release, socket break, or chat exit.
+    /// One frame per released pane, followed by [`Response::Done`].
+    TaskReleased {
+        pane_id: String,
+        resources_freed: Vec<String>,
+        tag: Option<String>,
+        summary: Option<String>,
+        worktree_path: Option<String>,
+        worktree_dirty: bool,
+        pane_tail: String,
+    },
     /// The [`Request::ClaudeLaunch`] was rejected because adding the requested
     /// panes would exceed the configured maximum.
     CapacityError {
@@ -614,7 +631,7 @@ mod tests {
             r#"{"type":"pane_assigned","tag":"pr-1","pane_id":"%3","session_id":"uuid-abc"}"#,
             r#"{"type":"capacity_error","requested":3,"max_panes":16,"current_busy":14}"#,
             r#"{"type":"model_switched","model":"bedrock/claude-opus-4.7"}"#,
-            r#"{"type":"heartbeat","elapsed_secs":600,"turn":2}"#,
+            r#"{"type":"task_released","pane_id":"%54","resources_freed":[],"tag":null,"summary":null,"worktree_path":null,"worktree_dirty":false,"pane_tail":""}"#,
         ];
         for frame in frames {
             let r: Response = serde_json::from_str(frame).unwrap();
@@ -632,7 +649,7 @@ mod tests {
                     | Response::PaneAssigned { .. }
                     | Response::CapacityError { .. }
                     | Response::ModelSwitched { .. }
-                    | Response::Heartbeat { .. }
+                    | Response::TaskReleased { .. }
             ));
         }
     }
@@ -744,35 +761,6 @@ mod tests {
     }
 
     #[test]
-    fn supervision_target_task_notebook_fields_absent_deserialize_as_none() {
-        // SupervisionTarget gained two new fields for the task notebook.
-        // Legacy payloads (pre-task-notebook PR) must still deserialise.
-        let legacy = r#"{"pane_id":"%3","task_description":"old task"}"#;
-        let back: SupervisionTarget = serde_json::from_str(legacy).expect("legacy must parse");
-        assert!(back.tag.is_none());
-        assert!(back.repo_dir.is_none());
-    }
-
-    #[test]
-    fn supervision_target_round_trips_with_task_notebook_fields() {
-        let t = SupervisionTarget {
-            pane_id: "%3".into(),
-            task_description: "do the thing".into(),
-            tag: Some("kernel-opt".into()),
-            repo_dir: Some("/home/me/proj".into()),
-        };
-        let json = serde_json::to_string(&t).unwrap();
-        // Pin the wire field names.
-        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(v["tag"], "kernel-opt");
-        assert_eq!(v["repo_dir"], "/home/me/proj");
-
-        let back: SupervisionTarget = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.tag.as_deref(), Some("kernel-opt"));
-        assert_eq!(back.repo_dir.as_deref(), Some("/home/me/proj"));
-    }
-
-    #[test]
     fn request_claude_launch_round_trip() {
         let req = Request::ClaudeLaunch {
             tasks: vec![
@@ -823,45 +811,13 @@ mod tests {
     }
 
     #[test]
-    fn request_supervise_panes_round_trip() {
-        let req = Request::SupervisePanes {
-            panes: vec![SupervisionTarget {
-                pane_id: "%3".into(),
-                task_description: "implement feature X".into(),
-                tag: None,
-                repo_dir: None,
-            }],
-            model: "gpt-4o".into(),
-            session_id: Some("uuid-abc".into()),
-        };
-        let json = serde_json::to_string(&req).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(v["type"], "supervise_panes");
-        assert_eq!(v["panes"][0]["pane_id"], "%3");
-        assert_eq!(v["model"], "gpt-4o");
-        assert_eq!(v["session_id"], "uuid-abc");
-
-        let back: Request = serde_json::from_str(&json).unwrap();
-        let Request::SupervisePanes {
-            panes,
-            model,
-            session_id,
-        } = back
-        else {
-            panic!("expected SupervisePanes");
-        };
-        assert_eq!(panes.len(), 1);
-        assert_eq!(panes[0].pane_id, "%3");
-        assert_eq!(model, "gpt-4o");
-        assert_eq!(session_id.as_deref(), Some("uuid-abc"));
-    }
-
-    #[test]
     fn response_pane_assigned_round_trip() {
         let r = Response::PaneAssigned {
             tag: "pr-123".into(),
             pane_id: "%3".into(),
             session_id: "uuid-xyz".into(),
+            worktree: Some("/home/u/.amaebi/worktrees/amaebi/pr-123-ab12cd34".into()),
+            resources: vec!["xesim-9902".into(), "xesim-9903".into()],
         };
         let json = serde_json::to_string(&r).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -869,30 +825,63 @@ mod tests {
         assert_eq!(v["tag"], "pr-123");
         assert_eq!(v["pane_id"], "%3");
         assert_eq!(v["session_id"], "uuid-xyz");
+        assert_eq!(
+            v["worktree"],
+            "/home/u/.amaebi/worktrees/amaebi/pr-123-ab12cd34"
+        );
+        assert_eq!(v["resources"][0], "xesim-9902");
+        assert_eq!(v["resources"][1], "xesim-9903");
 
         let back: Response = serde_json::from_str(&json).unwrap();
-        assert!(matches!(back, Response::PaneAssigned { .. }));
+        let Response::PaneAssigned {
+            tag,
+            pane_id,
+            session_id,
+            worktree,
+            resources,
+        } = back
+        else {
+            panic!("expected PaneAssigned");
+        };
+        assert_eq!(tag, "pr-123");
+        assert_eq!(pane_id, "%3");
+        assert_eq!(session_id, "uuid-xyz");
+        assert_eq!(
+            worktree.as_deref(),
+            Some("/home/u/.amaebi/worktrees/amaebi/pr-123-ab12cd34")
+        );
+        assert_eq!(resources, vec!["xesim-9902", "xesim-9903"]);
     }
 
+    /// A daemon that predates PR B emits `PaneAssigned` frames without
+    /// `worktree` / `resources`.  Deserialising such a frame must still
+    /// succeed and land on the documented defaults, so a newer client can
+    /// talk to an older daemon without `serde` erroring on the missing
+    /// fields.
     #[test]
-    fn response_heartbeat_round_trip() {
-        let r = Response::Heartbeat {
-            elapsed_secs: 123,
-            turn: 7,
+    fn response_pane_assigned_defaults_when_old_format() {
+        let legacy = r#"{
+            "type": "pane_assigned",
+            "tag": "pr-123",
+            "pane_id": "%3",
+            "session_id": "uuid-xyz"
+        }"#;
+        let back: Response = serde_json::from_str(legacy).unwrap();
+        let Response::PaneAssigned {
+            tag,
+            pane_id,
+            session_id,
+            worktree,
+            resources,
+        } = back
+        else {
+            panic!("expected PaneAssigned");
         };
-        let s = serde_json::to_string(&r).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
-        assert_eq!(v["type"], "heartbeat");
-        assert_eq!(v["elapsed_secs"], 123);
-        assert_eq!(v["turn"], 7);
-        let back: Response = serde_json::from_str(&s).unwrap();
-        assert!(matches!(
-            back,
-            Response::Heartbeat {
-                elapsed_secs: 123,
-                turn: 7
-            }
-        ));
+        assert_eq!(tag, "pr-123");
+        assert_eq!(pane_id, "%3");
+        assert_eq!(session_id, "uuid-xyz");
+        assert_eq!(worktree, None);
+        assert!(resources.is_empty());
     }
 
     #[test]
@@ -926,6 +915,131 @@ mod tests {
         assert!(s.ends_with('\n'), "frame must end with newline");
         let v: serde_json::Value = serde_json::from_str(s.trim_end()).unwrap();
         assert_eq!(v["type"], "done");
+    }
+
+    // ---- ClaudeRelease / TaskReleased ------------------------------------
+
+    #[test]
+    fn claude_release_pane_roundtrip() {
+        let req = Request::ClaudeRelease {
+            target: ClaudeReleaseTarget::Pane {
+                pane_id: "%54".into(),
+            },
+            clean_worktree: true,
+            summary: Some("all green".into()),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["type"], "claude_release");
+        assert_eq!(v["target"]["kind"], "pane");
+        assert_eq!(v["target"]["pane_id"], "%54");
+        assert_eq!(v["clean_worktree"], true);
+        assert_eq!(v["summary"], "all green");
+
+        let back: Request = serde_json::from_str(&json).unwrap();
+        let Request::ClaudeRelease {
+            target,
+            clean_worktree,
+            summary,
+        } = back
+        else {
+            panic!("expected ClaudeRelease");
+        };
+        let ClaudeReleaseTarget::Pane { pane_id } = target else {
+            panic!("expected Pane target");
+        };
+        assert_eq!(pane_id, "%54");
+        assert!(clean_worktree);
+        assert_eq!(summary.as_deref(), Some("all green"));
+    }
+
+    #[test]
+    fn claude_release_all_roundtrip() {
+        let req = Request::ClaudeRelease {
+            target: ClaudeReleaseTarget::All,
+            clean_worktree: false,
+            summary: None,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["type"], "claude_release");
+        assert_eq!(v["target"]["kind"], "all");
+
+        let back: Request = serde_json::from_str(&json).unwrap();
+        let Request::ClaudeRelease {
+            target,
+            clean_worktree,
+            summary,
+        } = back
+        else {
+            panic!("expected ClaudeRelease");
+        };
+        assert!(matches!(target, ClaudeReleaseTarget::All));
+        assert!(!clean_worktree);
+        assert!(summary.is_none());
+    }
+
+    #[test]
+    fn claude_release_deserializes_without_optional_fields() {
+        // Minimal payload: `clean_worktree` and `summary` are
+        // `#[serde(default)]` so clients may omit them.
+        let json = r#"{"type":"claude_release","target":{"kind":"all"}}"#;
+        let back: Request = serde_json::from_str(json).expect("minimal payload must parse");
+        let Request::ClaudeRelease {
+            target,
+            clean_worktree,
+            summary,
+        } = back
+        else {
+            panic!("expected ClaudeRelease");
+        };
+        assert!(matches!(target, ClaudeReleaseTarget::All));
+        assert!(!clean_worktree);
+        assert!(summary.is_none());
+    }
+
+    #[test]
+    fn task_released_roundtrip() {
+        let r = Response::TaskReleased {
+            pane_id: "%54".into(),
+            resources_freed: vec!["xesim-9902".into()],
+            tag: Some("kernel-opt".into()),
+            summary: Some("ok".into()),
+            worktree_path: Some("/tmp/x".into()),
+            worktree_dirty: true,
+            pane_tail: "$ echo done\n".into(),
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["type"], "task_released");
+        assert_eq!(v["pane_id"], "%54");
+        assert_eq!(v["resources_freed"], serde_json::json!(["xesim-9902"]));
+        assert_eq!(v["tag"], "kernel-opt");
+        assert_eq!(v["summary"], "ok");
+        assert_eq!(v["worktree_path"], "/tmp/x");
+        assert_eq!(v["worktree_dirty"], true);
+        assert_eq!(v["pane_tail"], "$ echo done\n");
+
+        let back: Response = serde_json::from_str(&json).unwrap();
+        let Response::TaskReleased {
+            pane_id,
+            resources_freed,
+            tag,
+            summary,
+            worktree_path,
+            worktree_dirty,
+            pane_tail,
+        } = back
+        else {
+            panic!("expected TaskReleased");
+        };
+        assert_eq!(pane_id, "%54");
+        assert_eq!(resources_freed, vec!["xesim-9902".to_string()]);
+        assert_eq!(tag.as_deref(), Some("kernel-opt"));
+        assert_eq!(summary.as_deref(), Some("ok"));
+        assert_eq!(worktree_path.as_deref(), Some("/tmp/x"));
+        assert!(worktree_dirty);
+        assert_eq!(pane_tail, "$ echo done\n");
     }
 
     #[tokio::test]
