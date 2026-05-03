@@ -660,6 +660,10 @@ async fn spawn_agent(args: serde_json::Value, ctx: &SpawnContext) -> Result<Stri
         // persistence is the parent supervision's concern, and children
         // don't run supervision themselves.
         tasks_db: Arc::new(std::sync::Mutex::new(None)),
+        // Children don't hold /claude panes — /claude goes through the
+        // parent daemon.  Fresh empty structures are cheap.
+        conn_id_counter: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+        held: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
     };
 
     let messages = vec![

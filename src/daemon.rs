@@ -1,7 +1,9 @@
 use anyhow::{Context, Result};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
@@ -126,6 +128,35 @@ const MAX_CONSECUTIVE_COMPACT_FAILURES: u32 = 3;
 const COMPACT_SUMMARY_MAX_TOKENS: usize = 2_048;
 
 /// State shared across all concurrent client connections via `Arc`.
+/// Per-connection identifier allocated when a client first connects.  Used
+/// as the key into `DaemonState::held` so a socket break releases exactly
+/// the panes this connection owned.
+pub type ConnId = u64;
+
+/// Record of a single `/claude` pane whose ownership is held by a live
+/// client connection.  Dropped (and its leases released) when the LLM
+/// calls `task_done`, the user runs `/release`, the chat process exits
+/// cleanly, or the socket drops abnormally.
+#[derive(Debug, Clone)]
+pub struct TaskEntry {
+    pub pane_id: String,
+    pub resources: Vec<String>,
+    pub worktree: Option<PathBuf>,
+    pub tag: Option<String>,
+    /// Holder id passed to `release_task_leases_for_holder` on cleanup —
+    /// matches the `supervision:{session_id}` format that
+    /// `handle_claude_launch` uses when acquiring the notebook lease.
+    pub task_lease_holder: Option<String>,
+    /// Session UUID for inbox writes when release happens without a live
+    /// client to stream the result to (socket break, chat exit).
+    pub session_id: Option<String>,
+    /// The original `--tag "…"` description text, or the resume-pane
+    /// fallback, used as the inbox report's task description.
+    pub task_description: Option<String>,
+    #[allow(dead_code)] // consumed by dashboards / telemetry in a later PR
+    pub created_at: Instant,
+}
+
 pub struct DaemonState {
     pub http: reqwest::Client,
     pub tokens: Arc<TokenCache>,
@@ -166,6 +197,12 @@ pub struct DaemonState {
     /// Lazy-initialised — the first `/claude --tag <tag>` request opens
     /// it; invocations without `--tag` never touch the file.
     pub tasks_db: Arc<Mutex<Option<rusqlite::Connection>>>,
+    /// Monotonic counter for `ConnId` allocation in `handle_connection`.
+    pub conn_id_counter: Arc<AtomicU64>,
+    /// Per-connection panes currently held by amaebi.  Socket close drains
+    /// and releases; `task_done` / `/release` remove individual entries.
+    /// See `docs/design/claude-chat-takeover.md`.
+    pub held: Arc<Mutex<HashMap<ConnId, Vec<TaskEntry>>>>,
 }
 
 impl DaemonState {
@@ -211,6 +248,8 @@ impl DaemonState {
             active_sessions,
             user_aliases,
             tasks_db: Arc::new(Mutex::new(None)),
+            conn_id_counter: Arc::new(AtomicU64::new(1)),
+            held: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 }
@@ -665,6 +704,22 @@ async fn resolve_session_dir(session_id: &str) -> String {
 // ---------------------------------------------------------------------------
 
 async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Result<()> {
+    let conn_id: ConnId = state.conn_id_counter.fetch_add(1, Ordering::Relaxed);
+    let result = handle_connection_inner(stream, &state, conn_id).await;
+
+    // Drain any panes still held by this connection — graceful exit, Ctrl-D,
+    // socket break, or an unhandled error all land here.  The design doc
+    // (`docs/design/claude-chat-takeover.md`) promises immediate release on
+    // connection drop, with 24 h TTL as a disaster backstop.
+    drain_held_on_conn_exit(&state, conn_id).await;
+    result
+}
+
+async fn handle_connection_inner(
+    stream: UnixStream,
+    state: &Arc<DaemonState>,
+    conn_id: ConnId,
+) -> Result<()> {
     let (owned_reader, owned_writer) = stream.into_split();
 
     // Shared writer — the agentic-loop task holds the lock during generation;
@@ -896,7 +951,7 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                 session_id,
                 repo_dir,
             } => {
-                handle_claude_launch(&writer, tasks, session_id, repo_dir, &state).await?;
+                handle_claude_launch(&writer, tasks, session_id, repo_dir, &state, conn_id).await?;
             }
 
             Request::GenerateTag {
@@ -1058,6 +1113,7 @@ async fn handle_claude_launch(
     session_id: Option<String>,
     repo_dir: Option<String>,
     state: &Arc<DaemonState>,
+    conn_id: ConnId,
 ) -> Result<()> {
     if tasks.is_empty() {
         let mut w = writer.lock().await;
@@ -1911,6 +1967,19 @@ async fn handle_claude_launch(
         // `[launched]` user turn without a second round-trip
         // (`docs/design/claude-chat-takeover.md`, PR B/F).
         let resources: Vec<String> = resource_leases.iter().map(|r| r.name.clone()).collect();
+        let entry = TaskEntry {
+            pane_id: pane_id.clone(),
+            resources: resources.clone(),
+            worktree: worktree.as_deref().map(PathBuf::from),
+            tag: Some(task.tag.clone()),
+            task_lease_holder: lease_holder.clone(),
+            session_id: Some(session_id.clone()),
+            task_description: Some(raw_desc.clone()),
+            created_at: Instant::now(),
+        };
+        if let Ok(mut held) = state.held.lock() {
+            held.entry(conn_id).or_default().push(entry);
+        }
         let mut w = writer.lock().await;
         write_frame(
             &mut *w,
@@ -2388,6 +2457,202 @@ async fn release_task_leases_for_holder(state: &Arc<DaemonState>, holder: &str) 
         }
     })
     .await;
+}
+
+/// Idempotently release one held pane and return the data needed to build a
+/// `Response::TaskReleased`.  Returns `None` if the pane wasn't in
+/// `state.held[conn_id]` — safe to call twice (double-release no-op).
+///
+/// Does NOT `tmux kill-pane`, terminate `claude`, or remove the worktree
+/// unless `clean_worktree` is true.  The design doc pins these invariants.
+///
+/// The caller decides what to do with the returned data — stream it to a
+/// live client or persist it to the inbox when no client is listening.
+async fn release_held_entry(
+    state: &Arc<DaemonState>,
+    conn_id: ConnId,
+    pane_id: &str,
+    clean_worktree: bool,
+    summary: Option<String>,
+) -> Option<crate::ipc::Response> {
+    // Take the TaskEntry out of the map up front.  Double-release finds
+    // nothing and returns None, the core idempotency guarantee.
+    let entry = {
+        let mut held = state.held.lock().ok()?;
+        let list = held.get_mut(&conn_id)?;
+        let pos = list.iter().position(|e| e.pane_id == pane_id)?;
+        let entry = list.swap_remove(pos);
+        if list.is_empty() {
+            held.remove(&conn_id);
+        }
+        entry
+    };
+
+    // Release leases — each helper is already idempotent on its own.
+    if let Err(e) = pane_lease::release_lease(pane_id) {
+        tracing::warn!(pane_id, error = %e, "release_held_entry: pane_lease release failed");
+    }
+    let resources_freed: Vec<String> = match resource_lease::release_all_for_pane(pane_id).await {
+        Ok(list) => list,
+        Err(e) => {
+            tracing::warn!(pane_id, error = %e, "release_held_entry: resource_lease release failed");
+            entry.resources.clone()
+        }
+    };
+    if let Some(holder) = entry.task_lease_holder.as_deref() {
+        release_task_leases_for_holder(state, holder).await;
+    }
+
+    // Capture pane tail (best-effort — don't fail the release if tmux is sick).
+    let pane_tail = capture_pane_tail(pane_id).await.unwrap_or_default();
+
+    // Worktree dirty flag — cheap git-porcelain query, tolerates missing dir.
+    let (worktree_path, worktree_dirty) = match entry.worktree.as_deref() {
+        Some(wt) => {
+            let dirty = worktree_is_dirty(wt).await;
+            (Some(wt.to_string_lossy().into_owned()), dirty)
+        }
+        None => (None, false),
+    };
+
+    // Opt-in worktree removal.  Default is preserve — the design doc makes
+    // --clean explicit because users routinely re-enter worktrees by cd'ing
+    // into them, and silent removal would be a footgun.
+    if clean_worktree {
+        if let Some(wt) = entry.worktree.as_deref() {
+            let wt_path = wt.to_path_buf();
+            let _ = tokio::task::spawn_blocking(move || {
+                let status = std::process::Command::new("git")
+                    .args(["worktree", "remove", "--force"])
+                    .arg(&wt_path)
+                    .status();
+                if let Err(e) = status {
+                    tracing::warn!(worktree = %wt_path.display(), error = %e, "git worktree remove failed");
+                }
+            })
+            .await;
+        }
+    }
+
+    Some(crate::ipc::Response::TaskReleased {
+        pane_id: pane_id.to_string(),
+        resources_freed,
+        tag: entry.tag,
+        summary,
+        worktree_path,
+        worktree_dirty,
+        pane_tail,
+    })
+}
+
+/// Drain every TaskEntry held by `conn_id` and release each one.  Called
+/// from the outer `handle_connection` wrapper on every exit path — graceful
+/// Ctrl-D, abrupt socket break, unhandled inner error.
+///
+/// There's no live writer on this path, so results are archived to the
+/// inbox as `[abandoned]` reports.  An `.ok()` on the inbox write keeps a
+/// sick DB from masking the actual release outcome.
+async fn drain_held_on_conn_exit(state: &Arc<DaemonState>, conn_id: ConnId) {
+    let pane_ids: Vec<String> = match state.held.lock() {
+        Ok(h) => h
+            .get(&conn_id)
+            .map(|v| v.iter().map(|e| e.pane_id.clone()).collect())
+            .unwrap_or_default(),
+        Err(_) => return,
+    };
+    if pane_ids.is_empty() {
+        return;
+    }
+    tracing::info!(
+        conn_id,
+        count = pane_ids.len(),
+        "connection closed; draining held panes"
+    );
+
+    for pane_id in pane_ids {
+        // Grab session_id + task_description BEFORE the release removes
+        // the TaskEntry — the caller-side inbox write needs both.
+        let (session_id, task_description) = state
+            .held
+            .lock()
+            .ok()
+            .and_then(|h| {
+                h.get(&conn_id)
+                    .and_then(|v| v.iter().find(|e| e.pane_id == pane_id))
+                    .map(|e| (e.session_id.clone(), e.task_description.clone()))
+            })
+            .unwrap_or((None, None));
+
+        let released = release_held_entry(state, conn_id, &pane_id, false, None).await;
+        if let Some(crate::ipc::Response::TaskReleased {
+            pane_tail,
+            worktree_dirty,
+            worktree_path,
+            tag,
+            ..
+        }) = released
+        {
+            if let (Some(sid), Some(desc)) = (session_id, task_description) {
+                let mut body = String::from("[abandoned]\n");
+                if let Some(t) = &tag {
+                    body.push_str(&format!("tag: {t}\n"));
+                }
+                if let Some(wt) = &worktree_path {
+                    body.push_str(&format!("worktree: {wt} (dirty={worktree_dirty})\n"));
+                }
+                body.push_str("\n--- pane tail ---\n");
+                body.push_str(&pane_tail);
+                if let Ok(inbox) = InboxStore::open() {
+                    let _ = inbox.save_report(&sid, &desc, &body);
+                }
+            }
+        }
+    }
+}
+
+/// Capture the last `tmux capture-pane -p -t <pane>` snapshot.  Returns
+/// Ok(String) on success, Err otherwise — never panics.  Best-effort input
+/// for inbox archiving / TaskReleased frames; upstream callers always have
+/// a non-empty-string fallback.
+async fn capture_pane_tail(pane_id: &str) -> Result<String> {
+    let pane = pane_id.to_string();
+    tokio::task::spawn_blocking(move || {
+        let out = std::process::Command::new("tmux")
+            .args(["capture-pane", "-p", "-t"])
+            .arg(&pane)
+            .output()
+            .context("spawning tmux capture-pane")?;
+        if !out.status.success() {
+            return Err(anyhow::anyhow!(
+                "tmux capture-pane exited {}: {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr)
+            ));
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    })
+    .await
+    .context("capture_pane_tail join")?
+}
+
+/// True if the worktree at `path` has any uncommitted changes (tracked,
+/// untracked, or staged).  Falls back to `false` on any failure so a
+/// missing worktree doesn't make release lie.
+async fn worktree_is_dirty(path: &std::path::Path) -> bool {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&path)
+            .args(["status", "--short"])
+            .output();
+        match out {
+            Ok(o) if o.status.success() => !o.stdout.is_empty(),
+            _ => false,
+        }
+    })
+    .await
+    .unwrap_or(false)
 }
 
 /// Render the task-notebook preamble for one supervision iteration.
@@ -6393,6 +6658,8 @@ mod tests {
             active_sessions: Arc::new(Mutex::new(HashSet::new())),
             user_aliases: Arc::new(std::collections::HashMap::new()),
             tasks_db: Arc::new(Mutex::new(None)),
+            conn_id_counter: Arc::new(AtomicU64::new(1)),
+            held: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -8098,7 +8365,7 @@ mod tests {
             resource_timeout_secs: None,
         };
         let state = test_minimal_daemon_state();
-        handle_claude_launch(&writer, vec![task], None, None, &state)
+        handle_claude_launch(&writer, vec![task], None, None, &state, 0)
             .await
             .expect("launch returns ok even on per-task error");
         drop(writer);
@@ -8160,7 +8427,7 @@ mod tests {
             resource_timeout_secs: None,
         };
         let state = test_minimal_daemon_state();
-        handle_claude_launch(&writer, vec![task], None, None, &state)
+        handle_claude_launch(&writer, vec![task], None, None, &state, 0)
             .await
             .expect("launch returns ok even on per-task error");
         drop(writer);
@@ -8227,7 +8494,7 @@ mod tests {
             resource_timeout_secs: None,
         };
         let state = test_minimal_daemon_state();
-        handle_claude_launch(&writer, vec![task], None, None, &state)
+        handle_claude_launch(&writer, vec![task], None, None, &state, 0)
             .await
             .expect("launch returns ok even on per-task error");
         drop(writer);
@@ -8357,6 +8624,8 @@ mod tests {
             active_sessions: Arc::new(Mutex::new(HashSet::new())),
             user_aliases: Arc::new(std::collections::HashMap::new()),
             tasks_db: Arc::new(Mutex::new(None)),
+            conn_id_counter: Arc::new(AtomicU64::new(1)),
+            held: Arc::new(Mutex::new(HashMap::new())),
         });
 
         // "sid-quarantined" has no entry in the empty sessions.json under
@@ -8858,5 +9127,84 @@ prompt_hint = "use sim-9900 (port {port}) only"
 
         ensure_tasks_db(&state).expect("second ensure_tasks_db is a no-op");
         assert!(state.tasks_db.lock().unwrap().is_some());
+    }
+
+    /// Direct-insert a TaskEntry (bypassing handle_claude_launch) and
+    /// confirm release_held_entry:
+    /// 1. returns Some(TaskReleased) on first call,
+    /// 2. removes the entry from state.held,
+    /// 3. returns None on the second call (idempotent).
+    #[tokio::test]
+    async fn release_held_entry_is_idempotent() {
+        let _guard = crate::test_utils::with_temp_home();
+        let state = test_minimal_daemon_state();
+        let conn_id: ConnId = 42;
+        state
+            .held
+            .lock()
+            .unwrap()
+            .entry(conn_id)
+            .or_default()
+            .push(TaskEntry {
+                pane_id: "%pretend".into(),
+                resources: vec!["xesim-dummy".into()],
+                worktree: None,
+                tag: Some("test-tag".into()),
+                task_lease_holder: None,
+                session_id: Some("sid-test".into()),
+                task_description: Some("do the thing".into()),
+                created_at: Instant::now(),
+            });
+
+        let first = release_held_entry(&state, conn_id, "%pretend", false, None).await;
+        assert!(
+            matches!(&first, Some(crate::ipc::Response::TaskReleased { pane_id, .. }) if pane_id == "%pretend")
+        );
+        assert!(
+            state.held.lock().unwrap().get(&conn_id).is_none(),
+            "held entry should be removed after first release"
+        );
+
+        let second = release_held_entry(&state, conn_id, "%pretend", false, None).await;
+        assert!(second.is_none(), "double-release must be a no-op");
+    }
+
+    /// A TaskEntry for a different pane on the same conn stays put when we
+    /// release one of them.  Guards against accidentally clobbering the
+    /// whole per-conn vector.
+    #[tokio::test]
+    async fn release_held_entry_leaves_sibling_entries_untouched() {
+        let _guard = crate::test_utils::with_temp_home();
+        let state = test_minimal_daemon_state();
+        let conn_id: ConnId = 7;
+        {
+            let mut held = state.held.lock().unwrap();
+            let list = held.entry(conn_id).or_default();
+            for pid in ["%a", "%b", "%c"] {
+                list.push(TaskEntry {
+                    pane_id: pid.into(),
+                    resources: vec![],
+                    worktree: None,
+                    tag: None,
+                    task_lease_holder: None,
+                    session_id: None,
+                    task_description: None,
+                    created_at: Instant::now(),
+                });
+            }
+        }
+
+        let _ = release_held_entry(&state, conn_id, "%b", false, None).await;
+        let remaining: Vec<String> = state
+            .held
+            .lock()
+            .unwrap()
+            .get(&conn_id)
+            .map(|v| v.iter().map(|e| e.pane_id.clone()).collect())
+            .unwrap_or_default();
+        assert_eq!(remaining.len(), 2);
+        assert!(remaining.contains(&"%a".to_string()));
+        assert!(remaining.contains(&"%c".to_string()));
+        assert!(!remaining.contains(&"%b".to_string()));
     }
 }
