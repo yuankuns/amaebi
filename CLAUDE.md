@@ -14,14 +14,15 @@
 - Do not push code if `cargo fmt --check` or `cargo clippy` fails. GitHub Actions CI will reject it.
 
 ## Versioning
-- `Cargo.toml` `version` is calendar-versioned `YYYY.M.N` (no leading zeros on `M`/`N`).  The version is computed from the git history of the checked-out branch (HEAD) — on a PR branch that includes the PR's own commits, on `master` it is the master history.  Rule:
-  - `YYYY` / `M` = year and month of the latest **non-merge** commit on HEAD
-  - `N` = count of `feat(...)` / `fix(...)` / `docs(...)` commits on HEAD within the current `(YYYY, M)` month
-  - Other prefixes (`refactor`, `chore`, `test`, `revert`, `spike`, etc.) do not bump `N`
-  - Merge commits are detected by **topology** (2+ parents, not by subject text) and are skipped entirely — they neither bump `N` nor advance `(YYYY, M)`.  This matters because GitHub's PR CI runs against a synthetic `refs/pull/<N>/merge` merge commit whose committer date is "now in UTC"; without skipping by topology, a PR that ran even a second into a new month would roll the calver into a month no real commit on the branch belongs to.
-  - A new month automatically resets `N` to 0 (and increments to 1 on the first qualifying commit of the month)
-- Each PR author bumps `Cargo.toml` in the PR itself so it matches what master will look like after the PR lands.  Run `scripts/next-version.sh` to see what the version should be, then edit `Cargo.toml`.
-- CI runs `scripts/next-version.sh --check` on every PR and red-fails if `Cargo.toml` disagrees with what the commit history implies.
+- `Cargo.toml` `version` is calendar-versioned `YYYY.M.N` (no leading zeros on `M`/`N`).
+- The version is validated **per-commit** by comparing HEAD's `Cargo.toml` to HEAD's first-non-merge parent's `Cargo.toml`.  Rule:
+  - `YYYY` / `M` = year and month of HEAD's committer date.
+  - `N` = parent's `N` + 1 when HEAD is a qualifying commit (`feat(…)` / `feat:` / `fix(…)` / `fix:` / `docs(…)` / `docs:`) AND HEAD lands in the same `(YYYY, M)` as the parent.
+  - `N` = parent's `N` (no bump) for non-qualifying prefixes (`refactor`, `chore`, `test`, `revert`, `spike`, …) in the same month.
+  - Month rollover: when HEAD's `(YYYY, M)` differs from the parent's, `N` resets to `1` (qualifying) or `0` (non-qualifying), regardless of where the parent stood.  Squash-merge "跳号" gaps (e.g. master jumps from `.2` → `.13` in a single merge) are therefore tolerated — only neighbor-to-neighbor deltas are validated, not the absolute count.
+  - Merge commits (2+ parents) are transparent: `--check` walks down via `^2` (GitHub PR convention: `^2` is the incoming branch) to the first non-merge ancestor and validates THAT commit's `Cargo.toml` against its own parent's `Cargo.toml` + delta.  Handles GitHub's synthetic `refs/pull/<N>/merge` commits.
+- Each PR author bumps `Cargo.toml` in the commit that introduces qualifying changes.  Run `scripts/next-version.sh` (no flag) to print the expected value for HEAD; run with `--check` to pass/fail.
+- CI runs `scripts/next-version.sh --check` on every PR and red-fails if HEAD's `Cargo.toml` disagrees with parent + delta.
 
 ## Architecture
 - SQLite is the source of truth for `memory_db`, `inbox.db`, and `cron.db`. Do not use `.jsonl` or `.json` files for state storage. Avoid `tempfile` atomic writes for data that belongs in SQLite.
