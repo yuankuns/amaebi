@@ -5574,6 +5574,47 @@ const LARGE_TOOL_RESULT_CHARS: usize = 50_000;
 /// `MAX_RETRIES`, but those errors can still surface here if retries are
 /// exhausted or if a non-retryable error occurs.
 #[allow(clippy::too_many_arguments)]
+/// Return the list of `pane_id`s currently held by `conn_id`, or `None` when
+/// `held` is empty — the caller uses `None` to mean "no pane-alive invariant
+/// applies to this turn" and skip the reminder entirely.  Poisoned mutex is
+/// treated as "no held panes" (fail-open) so a corrupted lock state cannot
+/// stall the chat; the 24 h TTL still protects lease correctness.
+fn pane_alive_held_panes(state: &DaemonState, conn_id: ConnId) -> Option<Vec<String>> {
+    let held = state.held.lock().ok()?;
+    let list = held.get(&conn_id)?;
+    if list.is_empty() {
+        return None;
+    }
+    Some(list.iter().map(|e| e.pane_id.clone()).collect())
+}
+
+/// Build the pane-alive reminder text injected at the tail of `messages`
+/// just before each model call while the connection still owns any
+/// `/claude` pane.  Names the live pane ids so the LLM can ground its
+/// next tool call in real state rather than invented pane numbers.
+fn format_pane_alive_reminder(pane_ids: &[String]) -> String {
+    let pane_list = pane_ids.join(", ");
+    format!(
+        "[pane-alive invariant]\n\
+         You currently own the following /claude pane(s): {pane_list}.\n\
+         While any of these panes is alive, you MUST call at least one tool \
+         in every turn — do NOT reply with text only.\n\
+         Your vocabulary:\n\
+         - `tmux_wait` — pause until the pane falls idle (the correct way to \
+         \"wait and see\", not a text reply saying you will wait).\n\
+         - `tmux_capture_pane` / `shell_command` — inspect the pane or the \
+         worktree.\n\
+         - `tmux_send_text` / `tmux_send_key` — intervene (paste, ESC, Ctrl-C, \
+         arrow keys, etc.).\n\
+         - `task_done` — declare the task goal verified and release the pane.\n\
+         `task_done` is the ONLY way to exit supervision — do not just stop \
+         responding.  If you need to signal completion, call `task_done` with \
+         `pane_id` and a short `summary`.  Once ALL panes are released, this \
+         reminder goes away and you can reply with plain text again."
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_agentic_loop<W>(
     state: &DaemonState,
     model: &str,
@@ -5718,6 +5759,18 @@ where
                 "auto-switching to AMAEBI_TOOL_MODEL for tool-execution turn"
             );
         }
+        // Pane-alive reminder: when this connection holds /claude panes
+        // (docs/design/claude-chat-takeover.md), every LLM turn MUST call at
+        // least one tool until the pane is released.  Injected ephemerally as
+        // an extra system message at the tail of `messages` for just this turn
+        // so it applies only while the invariant is live — never persisted to
+        // history, never bloats later compactions.  Removed immediately after
+        // `invoke_model_with_cache` returns.
+        let pane_alive_injected: Option<Vec<String>> =
+            conn_id.and_then(|cid| pane_alive_held_panes(state, cid));
+        if let Some(held_panes) = &pane_alive_injected {
+            messages.push(Message::system(format_pane_alive_reminder(held_panes)));
+        }
         // Enable 5-minute prompt caching.  Covers only the system-level
         // blocks — the base system prompt plus any skill messages
         // (SOUL.md / AGENTS.md) injected by `inject_skill_files`.
@@ -5738,6 +5791,11 @@ where
             writer,
         )
         .await?;
+        // Pop the pane-alive reminder if we injected one, so it doesn't
+        // persist into history / compaction / subsequent turns.
+        if pane_alive_injected.is_some() {
+            let _ = messages.pop();
+        }
         if resp.cache_read_tokens.is_some() || resp.cache_write_tokens.is_some() {
             tracing::debug!(
                 cache_read = ?resp.cache_read_tokens,
@@ -5762,6 +5820,23 @@ where
             tools_were_used,
             "model turn complete"
         );
+
+        // Diagnostic: if the LLM ended a turn without any tool call while
+        // this connection still holds /claude panes, that's a prompt
+        // violation (the pane-alive invariant injected above says otherwise).
+        // Warn for debugging but take NO action — escalation would put
+        // judgement back into Rust, which the design doc forbids.
+        if matches!(resp.finish_reason, FinishReason::Stop) && resp.tool_calls.is_empty() {
+            if let Some(cid) = conn_id {
+                if let Some(held) = pane_alive_held_panes(state, cid) {
+                    tracing::warn!(
+                        conn_id = cid,
+                        held_panes = ?held,
+                        "agentic loop turn ended with no tool call while panes held — prompt violation"
+                    );
+                }
+            }
+        }
 
         match resp.finish_reason {
             FinishReason::Stop | FinishReason::Length => {
