@@ -705,7 +705,7 @@ async fn resolve_session_dir(session_id: &str) -> String {
 
 async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Result<()> {
     let conn_id: ConnId = state.conn_id_counter.fetch_add(1, Ordering::Relaxed);
-    let result = handle_connection_inner(stream, &state, conn_id).await;
+    let result = handle_connection_inner(stream, state.clone(), conn_id).await;
 
     // Drain any panes still held by this connection — graceful exit, Ctrl-D,
     // socket break, or an unhandled error all land here.  The design doc
@@ -717,7 +717,7 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
 
 async fn handle_connection_inner(
     stream: UnixStream,
-    state: &Arc<DaemonState>,
+    state: Arc<DaemonState>,
     conn_id: ConnId,
 ) -> Result<()> {
     let (owned_reader, owned_writer) = stream.into_split();
@@ -862,6 +862,7 @@ async fn handle_connection_inner(
                         &mut steer_rx,
                         true,
                         Some(&sid),
+                        None, // SubmitDetach: background task, no live conn → no panes to hold
                     )
                     .await
                     {
@@ -907,6 +908,7 @@ async fn handle_connection_inner(
                     tmux_pane,
                     model,
                     session_id,
+                    conn_id,
                 )
                 .await?
                 {
@@ -938,6 +940,7 @@ async fn handle_connection_inner(
                     tmux_pane,
                     model,
                     session_id,
+                    conn_id,
                 )
                 .await?
                 {
@@ -976,15 +979,13 @@ async fn handle_connection_inner(
 
             // Handler landing in PR C3.  For PR C1 we just surface a clear
             // error so a misdirected frame doesn't get silently dropped.
-            Request::ClaudeRelease { .. } => {
-                let mut w = writer.lock().await;
-                write_frame(
-                    &mut *w,
-                    &Response::Error {
-                        message: "claude_release handler not yet implemented (PR C3)".into(),
-                    },
-                )
-                .await?;
+            Request::ClaudeRelease {
+                target,
+                clean_worktree,
+                summary,
+            } => {
+                handle_claude_release(&writer, &state, conn_id, target, clean_worktree, summary)
+                    .await?;
             }
         }
     }
@@ -1032,6 +1033,7 @@ async fn drive_agentic_loop(
     expected_sid: &str,
     messages: Vec<Message>,
     model: &str,
+    conn_id: ConnId,
 ) -> Option<anyhow::Result<(String, usize, Vec<Message>, String)>> {
     let (steer_tx, mut steer_rx) = tokio::sync::mpsc::channel::<Option<String>>(16);
     let writer_loop = Arc::clone(writer);
@@ -1048,6 +1050,7 @@ async fn drive_agentic_loop(
             &mut steer_rx,
             true,
             Some(&sid_loop),
+            Some(conn_id),
         )
         .await
     });
@@ -1095,6 +1098,77 @@ async fn drive_agentic_loop(
 // ---------------------------------------------------------------------------
 // Sub-handlers — one per Request variant
 // ---------------------------------------------------------------------------
+
+/// Handle `Request::ClaudeRelease`: user-initiated release of one or all
+/// panes held by this connection.  Streams one `TaskReleased` per released
+/// pane followed by `Response::Done`.  Unknown pane ids (e.g. a stale tag
+/// the user typed) stream an `Error` frame for that pane but do not abort
+/// the batch.
+async fn handle_claude_release(
+    writer: &Arc<tokio::sync::Mutex<tokio::net::unix::OwnedWriteHalf>>,
+    state: &Arc<DaemonState>,
+    conn_id: ConnId,
+    target: crate::ipc::ClaudeReleaseTarget,
+    clean_worktree: bool,
+    summary: Option<String>,
+) -> Result<()> {
+    let pane_ids: Vec<String> = match target {
+        crate::ipc::ClaudeReleaseTarget::Pane { pane_id } => vec![pane_id],
+        crate::ipc::ClaudeReleaseTarget::All => state
+            .held
+            .lock()
+            .ok()
+            .and_then(|h| {
+                h.get(&conn_id)
+                    .map(|v| v.iter().map(|e| e.pane_id.clone()).collect())
+            })
+            .unwrap_or_default(),
+    };
+
+    if pane_ids.is_empty() {
+        let mut w = writer.lock().await;
+        write_frame(
+            &mut *w,
+            &Response::Error {
+                message: "no panes currently held by this connection".into(),
+            },
+        )
+        .await?;
+        write_frame(&mut *w, &Response::Done).await?;
+        return Ok(());
+    }
+
+    for (i, pane_id) in pane_ids.iter().enumerate() {
+        // `summary` from a single /release %pane applies to THAT pane only.
+        // /release all leaves summary empty (user shouldn't mass-assign one).
+        let this_summary = if pane_ids.len() == 1 {
+            summary.clone()
+        } else {
+            None
+        };
+        let _ = i;
+        match release_held_entry(state, conn_id, pane_id, clean_worktree, this_summary).await {
+            Some(frame) => {
+                let mut w = writer.lock().await;
+                write_frame(&mut *w, &frame).await?;
+            }
+            None => {
+                let mut w = writer.lock().await;
+                write_frame(
+                    &mut *w,
+                    &Response::Error {
+                        message: format!("pane {pane_id} not held by this connection"),
+                    },
+                )
+                .await?;
+            }
+        }
+    }
+
+    let mut w = writer.lock().await;
+    write_frame(&mut *w, &Response::Done).await?;
+    Ok(())
+}
 
 /// Handle `Request::ClaudeLaunch`: assign tmux panes and launch `claude`
 /// (Claude Code CLI) sessions for each task.
@@ -2441,11 +2515,11 @@ fn supervision_holder_id(
 
 /// Release every task lease held by `holder`, ignoring errors.  Runs in
 /// `spawn_blocking` because tasks.db is synchronous SQLite.
-async fn release_task_leases_for_holder(state: &Arc<DaemonState>, holder: &str) {
-    let state = Arc::clone(state);
+async fn release_task_leases_for_holder(state: &DaemonState, holder: &str) {
+    let tasks_db = Arc::clone(&state.tasks_db);
     let holder = holder.to_string();
     let _ = tokio::task::spawn_blocking(move || {
-        let guard = match state.tasks_db.lock() {
+        let guard = match tasks_db.lock() {
             Ok(g) => g,
             Err(_) => return,
         };
@@ -2469,7 +2543,7 @@ async fn release_task_leases_for_holder(state: &Arc<DaemonState>, holder: &str) 
 /// The caller decides what to do with the returned data — stream it to a
 /// live client or persist it to the inbox when no client is listening.
 async fn release_held_entry(
-    state: &Arc<DaemonState>,
+    state: &DaemonState,
     conn_id: ConnId,
     pane_id: &str,
     clean_worktree: bool,
@@ -2552,7 +2626,7 @@ async fn release_held_entry(
 /// There's no live writer on this path, so results are archived to the
 /// inbox as `[abandoned]` reports.  An `.ok()` on the inbox write keeps a
 /// sick DB from masking the actual release outcome.
-async fn drain_held_on_conn_exit(state: &Arc<DaemonState>, conn_id: ConnId) {
+async fn drain_held_on_conn_exit(state: &DaemonState, conn_id: ConnId) {
     let pane_ids: Vec<String> = match state.held.lock() {
         Ok(h) => h
             .get(&conn_id)
@@ -4018,6 +4092,7 @@ async fn handle_retrieve_context(
 ///
 /// Returns `ConnAction::Break` when the client disconnects during the loop or
 /// when authentication fails.
+#[allow(clippy::too_many_arguments)]
 async fn handle_resume_request(
     state: &Arc<DaemonState>,
     writer: &Arc<tokio::sync::Mutex<tokio::net::unix::OwnedWriteHalf>>,
@@ -4026,6 +4101,7 @@ async fn handle_resume_request(
     tmux_pane: Option<String>,
     model: String,
     session_id: String,
+    conn_id: ConnId,
 ) -> Result<ConnAction> {
     tracing::info!(model = %model, session_id = %session_id, prompt_len = prompt.len(), "received resume request");
     let _resume_session_guard = match claim_session(&state.active_sessions, &session_id) {
@@ -4067,8 +4143,16 @@ async fn handle_resume_request(
         &model,
     );
     inject_skill_files(&mut messages).await;
-    let Some(result) =
-        drive_agentic_loop(state, writer, conn_state, &session_id, messages, &model).await
+    let Some(result) = drive_agentic_loop(
+        state,
+        writer,
+        conn_state,
+        &session_id,
+        messages,
+        &model,
+        conn_id,
+    )
+    .await
     else {
         return Ok(ConnAction::Break);
     };
@@ -4119,6 +4203,7 @@ async fn handle_chat_request(
     tmux_pane: Option<String>,
     model: String,
     session_id: Option<String>,
+    conn_id: ConnId,
 ) -> Result<ConnAction> {
     tracing::info!(pane = ?tmux_pane, model = %model, prompt_len = prompt.len(), "received chat request");
     let sid = session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
@@ -4231,8 +4316,16 @@ async fn handle_chat_request(
         }
         None => model,
     };
-    let Some(loop_result) =
-        drive_agentic_loop(state, writer, conn_state, &sid, messages, &effective_model).await
+    let Some(loop_result) = drive_agentic_loop(
+        state,
+        writer,
+        conn_state,
+        &sid,
+        messages,
+        &effective_model,
+        conn_id,
+    )
+    .await
     else {
         return Ok(ConnAction::Break);
     };
@@ -5480,6 +5573,7 @@ const LARGE_TOOL_RESULT_CHARS: usize = 50_000;
 /// `stream_chat` retries 5xx, 429, and transport errors internally up to its
 /// `MAX_RETRIES`, but those errors can still surface here if retries are
 /// exhausted or if a non-retryable error occurs.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_agentic_loop<W>(
     state: &DaemonState,
     model: &str,
@@ -5488,6 +5582,7 @@ pub(crate) async fn run_agentic_loop<W>(
     steer_rx: &mut tokio::sync::mpsc::Receiver<Option<String>>,
     include_spawn_agent: bool,
     session_id: Option<&str>,
+    conn_id: Option<ConnId>,
 ) -> Result<(String, usize, Vec<Message>, String)>
 where
     W: AsyncWriteExt + Unpin,
@@ -6208,6 +6303,19 @@ where
                             None
                         };
 
+                        // Snapshot task_done args before they're consumed by execute —
+                        // the post-op release path below needs them once the tool
+                        // echo has gone into messages.  Extracted even when conn_id
+                        // is None so validation errors surface the usual way.
+                        let task_done_args: Option<(String, String)> = if tc.name == "task_done" {
+                            match (args["pane_id"].as_str(), args["summary"].as_str()) {
+                                (Some(p), Some(s)) => Some((p.to_string(), s.to_string())),
+                                _ => None,
+                            }
+                        } else {
+                            None
+                        };
+
                         let result = match state.executor.execute(&tc.name, args).await {
                             Ok(output) => {
                                 tracing::debug!(
@@ -6246,6 +6354,24 @@ where
                         };
 
                         messages.push(Message::tool_result(&tc.id, result));
+
+                        // task_done post-op: the tool body is a pure echo, so the
+                        // actual release of leases and TaskReleased streaming
+                        // happens here.  Runs only when a live conn holds panes
+                        // (SubmitDetach / cron have conn_id=None and no held
+                        // entries, so the release would be a no-op anyway).
+                        if let (Some((pane_id, summary)), Some(cid)) = (task_done_args, conn_id) {
+                            if let Some(released) =
+                                release_held_entry(state, cid, &pane_id, false, Some(summary)).await
+                            {
+                                // Stream the released data to the live chat so the
+                                // user sees the summary + pane tail + worktree
+                                // status without a separate inbox round-trip.
+                                // Best-effort: ignore write errors — a dying writer
+                                // is handled by the outer drain on conn exit.
+                                let _ = write_frame(writer, &released).await;
+                            }
+                        }
                     }
 
                     // If the user injected a steer mid-chain, push placeholder
@@ -6595,6 +6721,7 @@ async fn run_cron_job(state: Arc<DaemonState>, job: &cron::CronJob) {
         &mut steer_rx,
         true,
         Some(&session_id),
+        None, // cron: no client conn, no panes held
     )
     .await;
 

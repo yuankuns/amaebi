@@ -279,6 +279,7 @@ impl acp::Agent for AmaebiAgent {
                 &mut steer_rx,
                 true,
                 None,
+                None, // ACP session: no /claude panes in scope
             )
             .await
             .map(|(text, tokens, _messages, _model)| (text, tokens)) // discard messages Vec
