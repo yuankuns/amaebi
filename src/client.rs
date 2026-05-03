@@ -897,6 +897,12 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
                         // additions still force a compile error here.
                         tracing::debug!("ignoring Heartbeat outside supervision loop");
                     }
+                    Response::TaskReleased { .. } => {
+                        // Emitted by the PR C3 handler.  The chat-side render
+                        // arm lands in PR C3/C4; for now keep an explicit arm
+                        // so future enum additions still force a compile error.
+                        tracing::debug!("ignoring TaskReleased (handler lands in PR C3)");
+                    }
                 }
             }
 
@@ -1904,6 +1910,13 @@ pub async fn run_resume(
                         // Supervision-only frame; never emitted on the
                         // Resume path.
                         tracing::debug!("ignoring Heartbeat outside supervision loop");
+                    }
+                    Response::TaskReleased { .. } => {
+                        // Emitted by the PR C3 handler.  The Resume-side
+                        // render arm lands in PR C3/C4; for now keep an
+                        // explicit arm so future enum additions still force
+                        // a compile error.
+                        tracing::debug!("ignoring TaskReleased (handler lands in PR C3)");
                     }
                 }
             }
