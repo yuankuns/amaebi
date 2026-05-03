@@ -197,6 +197,102 @@ fn render_markdown(text: &str) -> String {
     }
 }
 
+/// Accumulates streamed assistant text and renders the most recent
+/// markdown checklist as a stderr progress line.
+///
+/// The LLM is instructed (see `format_pane_alive_reminder` in daemon.rs)
+/// to rewrite its plan on every status change using `- [ ]` / `- [x]`
+/// markers.  We watch the text buffer, find the last contiguous run of
+/// checklist lines, count done vs. total, and emit a `\r[3/5 done]`
+/// status line so the user sees progress without scroll.
+///
+/// Intentionally tolerant — malformed or partial checklists reduce to
+/// "no progress update this tick" rather than crash.  Emits only when
+/// (done, total) changes across renders so the stderr line doesn't flap.
+#[derive(Default)]
+struct PlanProgressTracker {
+    buf: String,
+    last_emitted: Option<(usize, usize)>,
+}
+
+impl PlanProgressTracker {
+    fn push(&mut self, chunk: &str) {
+        self.buf.push_str(chunk);
+    }
+
+    /// Extract (done, total) for the most recent contiguous checklist in
+    /// `buf`.  "Recent" = the last run of `- [ ]` / `- [x]` lines,
+    /// separated from prior runs by any non-checklist line.  Handles
+    /// leading indentation (nested bullets) and case-insensitive `[X]`.
+    fn latest_progress(&self) -> Option<(usize, usize)> {
+        let mut current: Option<(usize, usize)> = None;
+        let mut latest: Option<(usize, usize)> = None;
+        for line in self.buf.lines() {
+            let trimmed = line.trim_start();
+            let is_checklist_item = trimmed.starts_with("- [ ]")
+                || trimmed.starts_with("- [x]")
+                || trimmed.starts_with("- [X]");
+            if is_checklist_item {
+                let done = if trimmed.starts_with("- [x]") || trimmed.starts_with("- [X]") {
+                    1
+                } else {
+                    0
+                };
+                let (cd, ct) = current.unwrap_or((0, 0));
+                current = Some((cd + done, ct + 1));
+            } else if !trimmed.is_empty() {
+                // Non-checklist non-blank line terminates the current run.
+                if current.is_some() {
+                    latest = current.take();
+                }
+            }
+            // Blank lines inside a checklist are tolerated (some models
+            // add them between items).
+        }
+        // `current` may still hold the final run if the buffer ended on
+        // a checklist line.  That one wins — it's the latest.
+        current.or(latest)
+    }
+
+    /// Emit a stderr progress line IF `latest_progress` has changed.
+    /// Best-effort; write errors are swallowed.
+    async fn render_if_changed<W>(&mut self, err: &mut W)
+    where
+        W: tokio::io::AsyncWriteExt + Unpin,
+    {
+        let Some((done, total)) = self.latest_progress() else {
+            return;
+        };
+        if total == 0 {
+            return;
+        }
+        if self.last_emitted == Some((done, total)) {
+            return;
+        }
+        self.last_emitted = Some((done, total));
+        // `\r` anchors the line at column 0 so subsequent renders
+        // overwrite in place; final `\n` intentionally omitted.
+        // `\x1b[K` clears to end-of-line so a shorter new line doesn't
+        // leave stale glyphs from the previous render.
+        let line = format!("\r\x1b[K[plan {done}/{total} done]");
+        let _ = err.write_all(line.as_bytes()).await;
+        let _ = err.flush().await;
+    }
+
+    /// Emit a final newline on stderr so the stream moves off the
+    /// progress line before the next chat `>` prompt.  Called once per
+    /// completed turn.  No-op when nothing was ever emitted.
+    async fn finish<W>(&mut self, err: &mut W)
+    where
+        W: tokio::io::AsyncWriteExt + Unpin,
+    {
+        if self.last_emitted.is_some() {
+            let _ = err.write_all(b"\n").await;
+            let _ = err.flush().await;
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Slash command parsing
 // ---------------------------------------------------------------------------
@@ -1176,6 +1272,11 @@ pub async fn run_chat_loop(
     // streaming output does not interleave with user input.
     let mut steer_text_buf: Vec<String> = Vec::new();
     let mut md_buf = MarkdownBuffer::default();
+    // Plan progress tracker — separate from md_buf because its input is
+    // raw chunks (pre-markdown-render), per-turn not per-session, and its
+    // output goes to stderr not stdout.  A fresh tracker is installed on
+    // every new turn inside the stream loop below.
+    let mut plan_tracker = PlanProgressTracker::default();
 
     'session: loop {
         let prompt = match next_prompt.take() {
@@ -1551,6 +1652,13 @@ pub async fn run_chat_loop(
                                 steer_text_buf.push(chunk);
                             } else {
                                 md_buf.push(&chunk);
+                                // Feed raw chunk (not the markdown-rendered
+                                // output) to the plan tracker so checklist
+                                // markers survive intact.  Emits a stderr
+                                // `[plan N/M done]` line on progress change.
+                                plan_tracker.push(&chunk);
+                                let mut err = tokio::io::stderr();
+                                plan_tracker.render_if_changed(&mut err).await;
                                 while let Some(ready) = md_buf.flush_if_ready() {
                                     let out = render_markdown(&ready);
                                     stdout.write_all(out.as_bytes()).await?;
@@ -1571,6 +1679,12 @@ pub async fn run_chat_loop(
                             }
                             stdout.write_all(b"\n").await?;
                             stdout.flush().await?;
+                            // Move the cursor off the plan status line (if
+                            // one was emitted) and reset the tracker for
+                            // the next turn.
+                            let mut err = tokio::io::stderr();
+                            plan_tracker.finish(&mut err).await;
+                            plan_tracker = PlanProgressTracker::default();
                             break;
                         }
                         Response::Error { message } => {
@@ -4194,5 +4308,73 @@ mod tests {
         let dirty = format_task_released("%54", &[], None, None, Some("/path"), true, "");
         assert!(clean.contains("worktree=/path\n") || clean.contains("worktree=/path "));
         assert!(dirty.contains("worktree=/path (dirty)"));
+    }
+
+    // ------------------------------------------------------------------
+    // PlanProgressTracker
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn plan_tracker_empty_returns_none() {
+        let t = PlanProgressTracker::default();
+        assert!(t.latest_progress().is_none());
+    }
+
+    #[test]
+    fn plan_tracker_all_pending() {
+        let mut t = PlanProgressTracker::default();
+        t.push("- [ ] Step 1\n- [ ] Step 2\n- [ ] Step 3\n");
+        assert_eq!(t.latest_progress(), Some((0, 3)));
+    }
+
+    #[test]
+    fn plan_tracker_mixed_done() {
+        let mut t = PlanProgressTracker::default();
+        t.push("- [x] Step 1\n- [X] Step 2\n- [ ] Step 3\n");
+        assert_eq!(t.latest_progress(), Some((2, 3)));
+    }
+
+    #[test]
+    fn plan_tracker_picks_latest_run() {
+        // First checklist (superseded) + narrative line + second checklist.
+        let mut t = PlanProgressTracker::default();
+        t.push("- [ ] old step A\n- [ ] old step B\n");
+        t.push("Here is my revised plan:\n");
+        t.push("- [x] new step 1\n- [ ] new step 2\n");
+        assert_eq!(t.latest_progress(), Some((1, 2)));
+    }
+
+    #[test]
+    fn plan_tracker_indented_bullets_count() {
+        let mut t = PlanProgressTracker::default();
+        t.push("  - [ ] indented step\n    - [x] deeper step\n");
+        assert_eq!(t.latest_progress(), Some((1, 2)));
+    }
+
+    #[test]
+    fn plan_tracker_tolerates_blank_lines_inside_run() {
+        let mut t = PlanProgressTracker::default();
+        t.push("- [x] Step 1\n\n- [x] Step 2\n\n- [ ] Step 3\n");
+        assert_eq!(t.latest_progress(), Some((2, 3)));
+    }
+
+    #[test]
+    fn plan_tracker_non_checklist_resets_run() {
+        // A narrative sentence between two checklist blocks must make the
+        // SECOND block win — we want the most recent plan, not a merged
+        // count of both.
+        let mut t = PlanProgressTracker::default();
+        t.push("- [x] A\n- [x] B\n- [x] C\n");
+        t.push("Revised plan below:\n");
+        t.push("- [ ] X\n- [ ] Y\n");
+        assert_eq!(t.latest_progress(), Some((0, 2)));
+    }
+
+    #[test]
+    fn plan_tracker_no_checklist_markers_returns_none() {
+        let mut t = PlanProgressTracker::default();
+        t.push("Just some prose without any checklist in it.\n");
+        t.push("Maybe a bullet - no brackets.\n");
+        assert!(t.latest_progress().is_none());
     }
 }

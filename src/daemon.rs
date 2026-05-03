@@ -4740,7 +4740,28 @@ fn format_pane_alive_reminder(pane_ids: &[String]) -> String {
          Claude's output (via `tmux_capture_pane`) and judged the work \
          complete — do not call it on the first turn just to exit.  Once \
          ALL panes are released, this reminder disappears and you can \
-         reply with plain text again."
+         reply with plain text again.\n\
+         \n\
+         **Multi-step plan (≥3 steps).**  For tasks with three or more \
+         distinct steps, maintain a plan as a markdown checklist inside \
+         your text reply (NOT in a tool call):\n\
+         \n\
+         ```\n\
+         - [ ] Step 1 description\n\
+         - [ ] Step 2 description\n\
+         - [x] Step 3 description (done)\n\
+         ```\n\
+         \n\
+         Rewrite the WHOLE checklist on every turn that changes status — \
+         do not diff, do not output just the changed line.  Use `[ ]` for \
+         pending / in-progress and `[x]` for completed.  The client picks \
+         up the most recent complete checklist and renders a live \
+         progress indicator for the user; emitting only a partial list \
+         will confuse the indicator.  Put the final state of the \
+         checklist in your `task_done` summary so the inbox archive \
+         captures it.  For trivial single-step tasks (a one-line echo, a \
+         single file edit) skip the checklist entirely — the overhead \
+         isn't worth it."
     )
 }
 
