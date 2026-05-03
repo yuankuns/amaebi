@@ -1,8 +1,10 @@
 # /claude chat-takeover — design contract
 
-Status: **agreed 2026-04-30 / 2026-05-02, not yet implemented.**
-This document is the frozen contract for a multi-PR refactor (PRs B–F below).
-Implementation PRs reference this file instead of re-arguing the decisions.
+Status: **implemented in a single PR (2026-05-02).**  The original multi-PR
+plan (B–F below) was consolidated into PR #153 after the first set of
+split PRs turned out to add review overhead without parallelism benefit.
+This document stays as the frozen contract; follow-up changes reference
+these decisions instead of re-arguing them.
 
 ## Problem
 

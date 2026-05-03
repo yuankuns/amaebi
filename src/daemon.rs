@@ -1102,15 +1102,22 @@ async fn handle_claude_release(
 ) -> Result<()> {
     let pane_ids: Vec<String> = match target {
         crate::ipc::ClaudeReleaseTarget::Pane { pane_id } => vec![pane_id],
-        crate::ipc::ClaudeReleaseTarget::All => state
-            .held
-            .lock()
-            .ok()
-            .and_then(|h| {
-                h.get(&conn_id)
-                    .map(|v| v.iter().map(|e| e.pane_id.clone()).collect())
-            })
-            .unwrap_or_default(),
+        crate::ipc::ClaudeReleaseTarget::All => {
+            // Poisoned mutex: recover the guard rather than silently
+            // dropping the release list, matching the pattern used by
+            // release_held_entry / drain_held_on_conn_exit /
+            // pane_alive_held_panes.
+            let held = state.held.lock().unwrap_or_else(|poisoned| {
+                tracing::warn!(
+                    conn_id,
+                    "handle_claude_release: state.held mutex was poisoned; recovering for /release all"
+                );
+                poisoned.into_inner()
+            });
+            held.get(&conn_id)
+                .map(|v| v.iter().map(|e| e.pane_id.clone()).collect())
+                .unwrap_or_default()
+        }
     };
 
     if pane_ids.is_empty() {
@@ -1134,7 +1141,16 @@ async fn handle_claude_release(
         } else {
             None
         };
-        match release_held_entry(state, conn_id, pane_id, clean_worktree, this_summary).await {
+        match release_held_entry(
+            state,
+            conn_id,
+            pane_id,
+            clean_worktree,
+            this_summary,
+            ReleaseReason::UserOrLlm,
+        )
+        .await
+        {
             Some(frame) => {
                 let mut w = writer.lock().await;
                 write_frame(&mut *w, &frame).await?;
@@ -2097,12 +2113,23 @@ async fn release_task_leases_for_holder(state: &DaemonState, holder: &str) {
 ///
 /// The caller decides what to do with the returned data — stream it to a
 /// live client or persist it to the inbox when no client is listening.
+/// Source of a release, used to tag the inbox report so readers can tell
+/// a normal completion apart from a socket-break drain.
+#[derive(Debug, Clone, Copy)]
+enum ReleaseReason {
+    /// LLM called `task_done` or user ran `/release`.
+    UserOrLlm,
+    /// Socket drop / chat crash — no live writer consumed the summary.
+    Abandoned,
+}
+
 async fn release_held_entry(
     state: &DaemonState,
     conn_id: ConnId,
     pane_id: &str,
     clean_worktree: bool,
     summary: Option<String>,
+    reason: ReleaseReason,
 ) -> Option<crate::ipc::Response> {
     // Take the TaskEntry out of the map up front.  Double-release finds
     // nothing and returns None, the core idempotency guarantee.
@@ -2132,8 +2159,24 @@ async fn release_held_entry(
     };
 
     // Release leases — each helper is already idempotent on its own.
-    if let Err(e) = pane_lease::release_lease(pane_id) {
-        tracing::warn!(pane_id, error = %e, "release_held_entry: pane_lease release failed");
+    // `pane_lease::release_lease` takes an exclusive flock + does file I/O,
+    // so the upstream `pane_lease.rs` contract requires calling it from
+    // `spawn_blocking` when used from async.  Keeping it on the async
+    // runtime would stall other connections during release, particularly
+    // when a socket drop drains several panes at once.
+    {
+        let pane_owned = pane_id.to_string();
+        let pane_for_log = pane_id.to_string();
+        let res = tokio::task::spawn_blocking(move || pane_lease::release_lease(&pane_owned))
+            .await
+            .unwrap_or_else(|e| Err(anyhow::anyhow!("pane_lease release task panicked: {e}")));
+        if let Err(e) = res {
+            tracing::warn!(
+                pane_id = %pane_for_log,
+                error = %e,
+                "release_held_entry: pane_lease release failed"
+            );
+        }
     }
     let resources_freed: Vec<String> = match resource_lease::release_all_for_pane(pane_id).await {
         Ok(list) => list,
@@ -2177,6 +2220,40 @@ async fn release_held_entry(
         }
     }
 
+    // Archive to inbox for persistent audit.  Design contract
+    // (docs/design/claude-chat-takeover.md lines 146–150) says every
+    // release path lands in the inbox; `task_done`'s tool schema
+    // (src/tools.rs) explicitly advertises this to the LLM.  Skipped only
+    // when we lack a session_id OR task_description (synthetic test data
+    // etc.); real /claude launches always populate both.
+    if let (Some(sid), Some(desc)) = (&entry.session_id, &entry.task_description) {
+        let mut body = String::new();
+        match reason {
+            ReleaseReason::Abandoned => body.push_str("[abandoned]\n"),
+            ReleaseReason::UserOrLlm => body.push_str("[released]\n"),
+        }
+        if let Some(t) = &entry.tag {
+            body.push_str(&format!("tag: {t}\n"));
+        }
+        if let Some(wt) = &worktree_path {
+            body.push_str(&format!("worktree: {wt} (dirty={worktree_dirty})\n"));
+        }
+        if let Some(s) = &summary {
+            body.push_str(&format!("\nsummary:\n{s}\n"));
+        }
+        body.push_str("\n--- pane tail ---\n");
+        body.push_str(&pane_tail);
+        if let Ok(inbox) = InboxStore::open() {
+            if let Err(e) = inbox.save_report(sid, desc, &body) {
+                tracing::warn!(
+                    session_id = %sid,
+                    error = %e,
+                    "release_held_entry: inbox save_report failed"
+                );
+            }
+        }
+    }
+
     Some(crate::ipc::Response::TaskReleased {
         pane_id: pane_id.to_string(),
         resources_freed,
@@ -2192,9 +2269,9 @@ async fn release_held_entry(
 /// from the outer `handle_connection` wrapper on every exit path — graceful
 /// Ctrl-D, abrupt socket break, unhandled inner error.
 ///
-/// There's no live writer on this path, so results are archived to the
-/// inbox as `[abandoned]` reports.  An `.ok()` on the inbox write keeps a
-/// sick DB from masking the actual release outcome.
+/// Inbox persistence happens inside `release_held_entry`; this wrapper
+/// only enumerates and tags the reason as `ReleaseReason::Abandoned` so
+/// the inbox report header reads `[abandoned]` instead of `[released]`.
 async fn drain_held_on_conn_exit(state: &DaemonState, conn_id: ConnId) {
     let pane_ids: Vec<String> = {
         let held = state.held.lock().unwrap_or_else(|poisoned| {
@@ -2218,49 +2295,15 @@ async fn drain_held_on_conn_exit(state: &DaemonState, conn_id: ConnId) {
     );
 
     for pane_id in pane_ids {
-        // Grab session_id + task_description BEFORE the release removes
-        // the TaskEntry — the caller-side inbox write needs both.
-        // Poisoned mutex: recover the guard so the inbox write still
-        // captures what it can.
-        let (session_id, task_description) = {
-            let held = state.held.lock().unwrap_or_else(|poisoned| {
-                tracing::warn!(
-                    conn_id,
-                    pane_id = %pane_id,
-                    "drain_held_on_conn_exit: state.held mutex was poisoned; recovering for inbox metadata lookup"
-                );
-                poisoned.into_inner()
-            });
-            held.get(&conn_id)
-                .and_then(|v| v.iter().find(|e| e.pane_id == pane_id))
-                .map(|e| (e.session_id.clone(), e.task_description.clone()))
-                .unwrap_or((None, None))
-        };
-
-        let released = release_held_entry(state, conn_id, &pane_id, false, None).await;
-        if let Some(crate::ipc::Response::TaskReleased {
-            pane_tail,
-            worktree_dirty,
-            worktree_path,
-            tag,
-            ..
-        }) = released
-        {
-            if let (Some(sid), Some(desc)) = (session_id, task_description) {
-                let mut body = String::from("[abandoned]\n");
-                if let Some(t) = &tag {
-                    body.push_str(&format!("tag: {t}\n"));
-                }
-                if let Some(wt) = &worktree_path {
-                    body.push_str(&format!("worktree: {wt} (dirty={worktree_dirty})\n"));
-                }
-                body.push_str("\n--- pane tail ---\n");
-                body.push_str(&pane_tail);
-                if let Ok(inbox) = InboxStore::open() {
-                    let _ = inbox.save_report(&sid, &desc, &body);
-                }
-            }
-        }
+        let _ = release_held_entry(
+            state,
+            conn_id,
+            &pane_id,
+            false,
+            None,
+            ReleaseReason::Abandoned,
+        )
+        .await;
     }
 }
 
@@ -5245,8 +5288,15 @@ where
                         // (SubmitDetach / cron have conn_id=None and no held
                         // entries, so the release would be a no-op anyway).
                         if let (Some((pane_id, summary)), Some(cid)) = (task_done_args, conn_id) {
-                            if let Some(released) =
-                                release_held_entry(state, cid, &pane_id, false, Some(summary)).await
+                            if let Some(released) = release_held_entry(
+                                state,
+                                cid,
+                                &pane_id,
+                                false,
+                                Some(summary),
+                                ReleaseReason::UserOrLlm,
+                            )
+                            .await
                             {
                                 // Stream the released data to the live chat so the
                                 // user sees the summary + pane tail + worktree
@@ -7751,7 +7801,15 @@ mod tests {
                 created_at: Instant::now(),
             });
 
-        let first = release_held_entry(&state, conn_id, "%pretend", false, None).await;
+        let first = release_held_entry(
+            &state,
+            conn_id,
+            "%pretend",
+            false,
+            None,
+            ReleaseReason::UserOrLlm,
+        )
+        .await;
         assert!(
             matches!(&first, Some(crate::ipc::Response::TaskReleased { pane_id, .. }) if pane_id == "%pretend")
         );
@@ -7760,7 +7818,15 @@ mod tests {
             "held entry should be removed after first release"
         );
 
-        let second = release_held_entry(&state, conn_id, "%pretend", false, None).await;
+        let second = release_held_entry(
+            &state,
+            conn_id,
+            "%pretend",
+            false,
+            None,
+            ReleaseReason::UserOrLlm,
+        )
+        .await;
         assert!(second.is_none(), "double-release must be a no-op");
     }
 
@@ -7789,7 +7855,8 @@ mod tests {
             }
         }
 
-        let _ = release_held_entry(&state, conn_id, "%b", false, None).await;
+        let _ =
+            release_held_entry(&state, conn_id, "%b", false, None, ReleaseReason::UserOrLlm).await;
         let remaining: Vec<String> = state
             .held
             .lock()
