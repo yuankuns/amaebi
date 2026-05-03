@@ -346,6 +346,11 @@ impl acp::Agent for AmaebiAgent {
                     // future enum additions a compile error.
                     tracing::debug!("unexpected Heartbeat in ACP mode");
                 }
+                Response::TaskReleased { .. } => {
+                    // ACP mode never issues Request::ClaudeRelease; explicit
+                    // arm keeps future enum additions a compile error.
+                    tracing::debug!("unexpected TaskReleased in ACP mode");
+                }
             }
         }
 

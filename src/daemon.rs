@@ -918,6 +918,19 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                 handle_supervision(&writer, &mut frame_rx, panes, model, &state, session_id)
                     .await?;
             }
+
+            // Handler landing in PR C3.  For PR C1 we just surface a clear
+            // error so a misdirected frame doesn't get silently dropped.
+            Request::ClaudeRelease { .. } => {
+                let mut w = writer.lock().await;
+                write_frame(
+                    &mut *w,
+                    &Response::Error {
+                        message: "claude_release handler not yet implemented (PR C3)".into(),
+                    },
+                )
+                .await?;
+            }
         }
     }
 

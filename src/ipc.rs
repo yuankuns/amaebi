@@ -61,6 +61,19 @@ pub struct TaskSpec {
     pub resource_timeout_secs: Option<u64>,
 }
 
+/// Target selector for [`Request::ClaudeRelease`].
+///
+/// A release request either names a single pane by id, or asks the daemon
+/// to release every pane currently held by this connection.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ClaudeReleaseTarget {
+    /// Release a single pane by tmux pane id (e.g. `"%54"`).
+    Pane { pane_id: String },
+    /// Release every pane held by this connection.
+    All,
+}
+
 /// A single pane+task pair for supervision.
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct SupervisionTarget {
@@ -214,6 +227,16 @@ pub enum Request {
         model: String,
         session_id: Option<String>,
     },
+    /// Release amaebi's ownership of a pane (or all panes held by this connection).
+    /// Does NOT kill the pane, terminate the `claude` process, or remove the worktree
+    /// (unless `clean_worktree` is true).  Handler added in PR C3.
+    ClaudeRelease {
+        target: ClaudeReleaseTarget,
+        #[serde(default)]
+        clean_worktree: bool,
+        #[serde(default)]
+        summary: Option<String>,
+    },
 }
 
 /// A single frame streamed from the daemon back to the client.
@@ -303,6 +326,17 @@ pub enum Response {
     /// WAIT/STEER/DONE was produced recently.  The client treats any
     /// heartbeat as a watchdog reset; rendering it is optional.
     Heartbeat { elapsed_secs: u64, turn: u64 },
+    /// Emitted when a pane is released via task_done, /release, socket break, or chat exit.
+    /// One frame per released pane, followed by [`Response::Done`].
+    TaskReleased {
+        pane_id: String,
+        resources_freed: Vec<String>,
+        tag: Option<String>,
+        summary: Option<String>,
+        worktree_path: Option<String>,
+        worktree_dirty: bool,
+        pane_tail: String,
+    },
     /// The [`Request::ClaudeLaunch`] was rejected because adding the requested
     /// panes would exceed the configured maximum.
     CapacityError {
@@ -615,6 +649,7 @@ mod tests {
             r#"{"type":"capacity_error","requested":3,"max_panes":16,"current_busy":14}"#,
             r#"{"type":"model_switched","model":"bedrock/claude-opus-4.7"}"#,
             r#"{"type":"heartbeat","elapsed_secs":600,"turn":2}"#,
+            r#"{"type":"task_released","pane_id":"%54","resources_freed":[],"tag":null,"summary":null,"worktree_path":null,"worktree_dirty":false,"pane_tail":""}"#,
         ];
         for frame in frames {
             let r: Response = serde_json::from_str(frame).unwrap();
@@ -633,6 +668,7 @@ mod tests {
                     | Response::CapacityError { .. }
                     | Response::ModelSwitched { .. }
                     | Response::Heartbeat { .. }
+                    | Response::TaskReleased { .. }
             ));
         }
     }
@@ -926,6 +962,131 @@ mod tests {
         assert!(s.ends_with('\n'), "frame must end with newline");
         let v: serde_json::Value = serde_json::from_str(s.trim_end()).unwrap();
         assert_eq!(v["type"], "done");
+    }
+
+    // ---- ClaudeRelease / TaskReleased ------------------------------------
+
+    #[test]
+    fn claude_release_pane_roundtrip() {
+        let req = Request::ClaudeRelease {
+            target: ClaudeReleaseTarget::Pane {
+                pane_id: "%54".into(),
+            },
+            clean_worktree: true,
+            summary: Some("all green".into()),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["type"], "claude_release");
+        assert_eq!(v["target"]["kind"], "pane");
+        assert_eq!(v["target"]["pane_id"], "%54");
+        assert_eq!(v["clean_worktree"], true);
+        assert_eq!(v["summary"], "all green");
+
+        let back: Request = serde_json::from_str(&json).unwrap();
+        let Request::ClaudeRelease {
+            target,
+            clean_worktree,
+            summary,
+        } = back
+        else {
+            panic!("expected ClaudeRelease");
+        };
+        let ClaudeReleaseTarget::Pane { pane_id } = target else {
+            panic!("expected Pane target");
+        };
+        assert_eq!(pane_id, "%54");
+        assert!(clean_worktree);
+        assert_eq!(summary.as_deref(), Some("all green"));
+    }
+
+    #[test]
+    fn claude_release_all_roundtrip() {
+        let req = Request::ClaudeRelease {
+            target: ClaudeReleaseTarget::All,
+            clean_worktree: false,
+            summary: None,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["type"], "claude_release");
+        assert_eq!(v["target"]["kind"], "all");
+
+        let back: Request = serde_json::from_str(&json).unwrap();
+        let Request::ClaudeRelease {
+            target,
+            clean_worktree,
+            summary,
+        } = back
+        else {
+            panic!("expected ClaudeRelease");
+        };
+        assert!(matches!(target, ClaudeReleaseTarget::All));
+        assert!(!clean_worktree);
+        assert!(summary.is_none());
+    }
+
+    #[test]
+    fn claude_release_deserializes_without_optional_fields() {
+        // Minimal payload: `clean_worktree` and `summary` are
+        // `#[serde(default)]` so clients may omit them.
+        let json = r#"{"type":"claude_release","target":{"kind":"all"}}"#;
+        let back: Request = serde_json::from_str(json).expect("minimal payload must parse");
+        let Request::ClaudeRelease {
+            target,
+            clean_worktree,
+            summary,
+        } = back
+        else {
+            panic!("expected ClaudeRelease");
+        };
+        assert!(matches!(target, ClaudeReleaseTarget::All));
+        assert!(!clean_worktree);
+        assert!(summary.is_none());
+    }
+
+    #[test]
+    fn task_released_roundtrip() {
+        let r = Response::TaskReleased {
+            pane_id: "%54".into(),
+            resources_freed: vec!["xesim-9902".into()],
+            tag: Some("kernel-opt".into()),
+            summary: Some("ok".into()),
+            worktree_path: Some("/tmp/x".into()),
+            worktree_dirty: true,
+            pane_tail: "$ echo done\n".into(),
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["type"], "task_released");
+        assert_eq!(v["pane_id"], "%54");
+        assert_eq!(v["resources_freed"], serde_json::json!(["xesim-9902"]));
+        assert_eq!(v["tag"], "kernel-opt");
+        assert_eq!(v["summary"], "ok");
+        assert_eq!(v["worktree_path"], "/tmp/x");
+        assert_eq!(v["worktree_dirty"], true);
+        assert_eq!(v["pane_tail"], "$ echo done\n");
+
+        let back: Response = serde_json::from_str(&json).unwrap();
+        let Response::TaskReleased {
+            pane_id,
+            resources_freed,
+            tag,
+            summary,
+            worktree_path,
+            worktree_dirty,
+            pane_tail,
+        } = back
+        else {
+            panic!("expected TaskReleased");
+        };
+        assert_eq!(pane_id, "%54");
+        assert_eq!(resources_freed, vec!["xesim-9902".to_string()]);
+        assert_eq!(tag.as_deref(), Some("kernel-opt"));
+        assert_eq!(summary.as_deref(), Some("ok"));
+        assert_eq!(worktree_path.as_deref(), Some("/tmp/x"));
+        assert!(worktree_dirty);
+        assert_eq!(pane_tail, "$ echo done\n");
     }
 
     #[tokio::test]
