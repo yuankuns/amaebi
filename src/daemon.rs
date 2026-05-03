@@ -4694,8 +4694,30 @@ fn format_pane_alive_reminder(pane_ids: &[String]) -> String {
          `shell_command` for meta-observations Claude cannot report (e.g. \
          verifying that a file Claude claims to have written really exists).\n\
          \n\
-         While any of these panes is alive, you MUST call at least one tool \
-         in every turn — do NOT reply with text only.\n\
+         **Make decisions; do not bounce them to the user.**  When Claude \
+         is ambiguous, stuck, or offers multiple paths (\"should I use A \
+         or B?\", \"three options: (1) … (2) … (3) …\"), YOU pick one and \
+         steer Claude via `tmux_send_text`.  Sentences to the user like \
+         \"三条路给你选 A/B/C...\" / \"which approach do you want?\" / \
+         \"let me know\" / \"which should I pick?\" break the supervision \
+         loop's whole point (autonomous forward motion) and force the user \
+         to babysit.  The user has a steer channel (Ctrl-C + correction) \
+         to override you at any time; your default is to commit and \
+         proceed, not to pause for approval.  The ONLY legitimate reasons \
+         to escalate to the user via a text-only reply are: (a) missing \
+         external credentials that you cannot obtain; (b) an unanswerable \
+         factual question about the user's intent that no amount of pane \
+         observation can resolve; or (c) Claude is about to take a \
+         destructive action you are unsure the user wants.  In exactly \
+         those three cases, a text-only reply is allowed (this is a \
+         narrow, named exception to the one-tool-per-turn rule below).  \
+         A menu of plausible technical alternatives is NOT a hard blocker \
+         — pick one using the task description + what you've seen in the \
+         pane so far.\n\
+         \n\
+         While any of these panes is alive, you MUST call at least one \
+         tool in every turn — do NOT reply with text only, except for the \
+         three named escalation cases above.\n\
          \n\
          Your supervision vocabulary:\n\
          - `tmux_capture_pane` — read the pane to see what Claude is doing.\n\
@@ -8031,6 +8053,113 @@ mod tests {
 
         ensure_tasks_db(&state).expect("second ensure_tasks_db is a no-op");
         assert!(state.tasks_db.lock().unwrap().is_some());
+    }
+
+    // ------------------------------------------------------------------
+    // format_pane_alive_reminder — prompt-shape anchors
+    //
+    // These tests pin load-bearing pieces of `format_pane_alive_reminder`
+    // so a future reorganization of the prompt cannot silently drop one.
+    // Each piece below corresponds to a behavior regression observed in
+    // manual testing when the clause was absent:
+    //
+    //   1. `pane_alive_reminder_names_held_panes` — pane ids must show
+    //      up so the LLM grounds its next tool call in real state.
+    //   2. `pane_alive_reminder_declares_supervisor_not_executor` — if
+    //      missing, LLM runs `shell_command`/`edit_file` to do the task
+    //      itself instead of steering Claude (observed 2026-05-02).
+    //   3. `pane_alive_reminder_forbids_bouncing_decisions_to_user` —
+    //      if missing, LLM emits "三条路给你选 A/B/C..." and waits on
+    //      the user instead of deciding and steering (observed
+    //      2026-05-03; this PR's primary fix).
+    //   4. `pane_alive_reminder_requires_tool_every_turn` — if missing,
+    //      LLM returns text-only replies and the chat agentic loop
+    //      exits back to the user prompt while the pane is still held.
+    //   5. `pane_alive_reminder_lists_all_five_supervision_tools` —
+    //      concrete tool names the LLM is allowed to call; missing any
+    //      has led to LLM inventing tool-name typos
+    //      (`tmux_send_keys` plural, etc.).
+    //
+    // We anchor on exact phrasing because soft paraphrases (e.g. "must
+    // call a tool" without "at least one in every turn") measurably
+    // weaken the constraint across multiple LLM families.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn pane_alive_reminder_names_held_panes() {
+        let r = format_pane_alive_reminder(&["%54".into(), "%57".into()]);
+        assert!(r.contains("%54"));
+        assert!(r.contains("%57"));
+    }
+
+    #[test]
+    fn pane_alive_reminder_declares_supervisor_not_executor() {
+        let r = format_pane_alive_reminder(&["%54".into()]);
+        assert!(
+            r.contains("SUPERVISOR, not the executor"),
+            "prompt must pin the supervisor identity — regressed to executor \
+             mode would cause LLM to run `shell_command` instead of steering Claude"
+        );
+    }
+
+    #[test]
+    fn pane_alive_reminder_forbids_bouncing_decisions_to_user() {
+        // Regression guard: observed 2026-05-03 that the supervisor LLM
+        // repeatedly posed "三条路给你选 A/B/C" questions to the user
+        // instead of picking one and steering Claude.  Prompt must keep
+        // the autonomy clause that says "pick one, don't ask".
+        let r = format_pane_alive_reminder(&["%54".into()]);
+        assert!(
+            r.contains("Make decisions; do not bounce them to the user"),
+            "prompt must keep the autonomy clause — regressed prompt will \
+             let the supervisor block on user input for every ambiguity"
+        );
+        // The examples of bad question patterns must also be kept; they
+        // give the LLM concrete anti-patterns to match against its own
+        // draft reply before emitting.
+        assert!(
+            r.contains("which approach do you want"),
+            "concrete anti-pattern example must remain"
+        );
+    }
+
+    #[test]
+    fn pane_alive_reminder_requires_tool_every_turn() {
+        // The tool-call-every-turn invariant is the mechanical enforcement
+        // that backs up the prompt-level "don't reply with text only" rule.
+        let r = format_pane_alive_reminder(&["%54".into()]);
+        assert!(r.contains("MUST call at least one tool in every turn"));
+    }
+
+    #[test]
+    fn pane_alive_reminder_lists_all_five_supervision_tools() {
+        // Restrict the search to the "Your supervision vocabulary:"
+        // section so a tool name mentioned in an earlier clause (e.g.
+        // `tmux_send_text` cited in the autonomy directive) doesn't
+        // silently cover for a removed vocabulary bullet.  Anchor on
+        // the exact bullet format `- \`<tool>\` —` so renaming a tool
+        // without updating the vocabulary row also fails the test.
+        let r = format_pane_alive_reminder(&["%54".into()]);
+        let vocab_start = r
+            .find("Your supervision vocabulary:")
+            .expect("prompt must contain the supervision vocabulary header");
+        let vocab = &r[vocab_start..];
+        for tool in [
+            "tmux_capture_pane",
+            "tmux_wait",
+            "tmux_send_text",
+            "tmux_send_key",
+            "task_done",
+        ] {
+            let bullet = format!("- `{tool}` —");
+            assert!(
+                vocab.contains(&bullet),
+                "supervision vocabulary missing bullet `{bullet}`; \
+                 search scope was the substring after `Your supervision \
+                 vocabulary:` so earlier mentions of the tool name don't \
+                 cover for a missing vocabulary row"
+            );
+        }
     }
 
     /// Direct-insert a TaskEntry (bypassing handle_claude_launch) and
