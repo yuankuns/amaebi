@@ -1009,12 +1009,6 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
                     Response::ModelSwitched { .. } => {
                         // ask mode has no persistent model variable to update.
                     }
-                    Response::Heartbeat { .. } => {
-                        // Supervision-only frame; never emitted on the Chat
-                        // path but keep an explicit arm so future enum
-                        // additions still force a compile error here.
-                        tracing::debug!("ignoring Heartbeat outside supervision loop");
-                    }
                     Response::TaskReleased {
                         pane_id,
                         resources_freed,
@@ -1299,10 +1293,17 @@ pub async fn run_chat_loop(
                 req_line.push('\n');
                 write_half.write_all(req_line.as_bytes()).await?;
 
-                // Collect (pane_id, task_description) for supervision.
-                // (pane_id, description, tag_tag) per launched pane.
-                // (pane_id, description, tag) per launched pane.
-                let mut launched: Vec<(String, String, String)> = Vec::new();
+                // Collect one launched block per pane so the synthesised user
+                // turn below carries the exact context the LLM needs to start
+                // supervising without any additional round-trip.
+                struct Launched {
+                    pane_id: String,
+                    description: String,
+                    tag: String,
+                    worktree: Option<String>,
+                    resources: Vec<String>,
+                }
+                let mut launched: Vec<Launched> = Vec::new();
 
                 loop {
                     let line = lines.next_line().await.context("reading daemon response")?;
@@ -1320,15 +1321,22 @@ pub async fn run_chat_loop(
                             tag,
                             pane_id,
                             session_id: sid,
-                            ..
+                            worktree,
+                            resources,
                         } => {
                             let msg = format!("[pane {pane_id}] tag={tag} → session {sid}\n");
                             stdout.write_all(msg.as_bytes()).await?;
-                            let desc = task_descriptions
+                            let description = task_descriptions
                                 .get(&tag)
                                 .cloned()
                                 .unwrap_or_else(|| tag.clone());
-                            launched.push((pane_id, desc, tag));
+                            launched.push(Launched {
+                                pane_id,
+                                description,
+                                tag,
+                                worktree,
+                                resources,
+                            });
                         }
                         Response::CapacityError {
                             requested,
@@ -1348,169 +1356,35 @@ pub async fn run_chat_loop(
                 }
                 stdout.flush().await?;
 
-                // If panes were successfully launched, send a SupervisePanes request
-                // to the daemon so it runs a Rust polling loop instead of asking the
-                // LLM to keep looping via an injected prompt.
+                // Synthesise a single user turn that concatenates the
+                // original task description(s) with a `[launched]` block per
+                // pane (pane_id + worktree + resources + tag).  The LLM owns
+                // the supervision loop from here — docs/design/claude-chat-
+                // takeover.md pins the contract.  The synthesised prompt is
+                // also echoed to the terminal so the human sees what the LLM
+                // sees.
                 if !launched.is_empty() {
-                    let supervise_req = Request::SupervisePanes {
-                        panes: launched
-                            .iter()
-                            .map(|(pid, desc, tag)| crate::ipc::SupervisionTarget {
-                                pane_id: pid.clone(),
-                                task_description: desc.clone(),
-                                tag: Some(tag.clone()),
-                                repo_dir: invocation_repo_dir.clone(),
-                            })
-                            .collect(),
-                        model: model.clone(),
-                        session_id: Some(session_id.clone()),
-                    };
-                    let mut req_line = serde_json::to_string(&supervise_req)?;
-                    req_line.push('\n');
-                    write_half.write_all(req_line.as_bytes()).await?;
-
-                    // Stream supervision output exactly like a Chat response.
-                    // There is no client-side business timeout — supervision
-                    // length is a daemon concept (`AMAEBI_SUPERVISION_TIMEOUT_SECS`,
-                    // default 24 h) and mirroring it here via an env var would
-                    // silently desync whenever client + daemon run in different
-                    // shells.  Instead the client runs a 30-min watchdog: if
-                    // the daemon stops sending ANY frame (text, heartbeat,
-                    // done), assume it's stuck and end the session so the TUI
-                    // does not hang forever.  The daemon emits `Heartbeat`
-                    // every 10 min (see `HEARTBEAT_INTERVAL_SECS` in daemon.rs)
-                    // so a normal supervision — which sleeps ~5 min between
-                    // LLM calls — always has at most a 10-min frame gap.
-                    const WATCHDOG_INTERVAL_SECS: u64 = 30 * 60;
-                    // Pinned (not per-iteration) so a heartbeat arriving
-                    // during the 5 s drain does not push the deadline back —
-                    // we promise the user a bounded wait after Ctrl-C.
-                    let mut interrupt_drain_deadline: Option<tokio::time::Instant> = None;
-                    'supervision: loop {
-                        // Recomputed every iteration: any arriving frame (or
-                        // sigint) re-enters the loop and resets the watchdog.
-                        let watchdog_at = tokio::time::Instant::now()
-                            + Duration::from_secs(WATCHDOG_INTERVAL_SECS);
-                        let interrupt_sent = interrupt_drain_deadline.is_some();
-                        // Fallback to `watchdog_at` when the arm is disabled so
-                        // `sleep_until` still receives a valid Instant.
-                        let interrupt_drain_at = interrupt_drain_deadline.unwrap_or(watchdog_at);
-                        tokio::select! {
-                            biased;
-
-                            _ = sigint.recv(), if !interrupt_sent => {
-                                let interrupt_req = Request::Interrupt { session_id: session_id.clone() };
-                                if let Ok(mut frame) = serde_json::to_string(&interrupt_req) {
-                                    frame.push('\n');
-                                    let _ = write_half.write_all(frame.as_bytes()).await;
-                                }
-                                interrupt_drain_deadline = Some(
-                                    tokio::time::Instant::now() + Duration::from_secs(5),
-                                );
-                                // Continue looping to drain remaining frames.
-                            }
-
-                            _ = tokio::time::sleep_until(interrupt_drain_at), if interrupt_sent => {
-                                // Post-interrupt 5 s drain: daemon should have
-                                // responded with Done by now; if not, give up
-                                // cleanly so the socket does not stay half-
-                                // alive for another Chat request (which would
-                                // desync the frame protocol).
-                                if let Some(remaining) = md_buf.flush_all() {
-                                    let out = render_markdown(&remaining);
-                                    stdout.write_all(out.as_bytes()).await?;
-                                }
-                                stdout
-                                    .write_all(b"[supervision] daemon did not stop within 5 s after interrupt; ending session.\n")
-                                    .await?;
-                                stdout.flush().await?;
-                                break 'session;
-                            }
-
-                            _ = tokio::time::sleep_until(watchdog_at), if !interrupt_sent => {
-                                // 30 min without any frame — treat daemon as
-                                // stuck (process alive but supervision task
-                                // deadlocked, etc.) and end the session.
-                                if let Some(remaining) = md_buf.flush_all() {
-                                    let out = render_markdown(&remaining);
-                                    stdout.write_all(out.as_bytes()).await?;
-                                }
-                                stdout
-                                    .write_all(b"[supervision] no frames from daemon for 30 min; assuming stuck daemon and ending session.\n")
-                                    .await?;
-                                stdout.flush().await?;
-                                break 'session;
-                            }
-
-                            line = lines.next_line() => {
-                                let line = line.context("reading supervision response")?;
-                                let Some(line) = line else { break 'session };
-                                let resp: Response = serde_json::from_str(&line)?;
-                                match resp {
-                                    Response::Text { chunk } => {
-                                        md_buf.push(&chunk);
-                                        while let Some(ready) = md_buf.flush_if_ready() {
-                                            let out = render_markdown(&ready);
-                                            stdout.write_all(out.as_bytes()).await?;
-                                            stdout.flush().await?;
-                                        }
-                                    }
-                                    Response::Heartbeat { elapsed_secs, turn } => {
-                                        // Status line on stderr so it never
-                                        // interleaves with streamed stdout
-                                        // markdown.  Overwrites itself with `\r`
-                                        // so scrollback stays clean — the
-                                        // 5-min WAIT/STEER/DONE headers are
-                                        // already there for history.
-                                        let mins = elapsed_secs / 60;
-                                        let hours = mins / 60;
-                                        let rem_mins = mins % 60;
-                                        let msg = if hours > 0 {
-                                            format!(
-                                                "\r[supervision alive — turn #{turn}, {hours}h{rem_mins}m elapsed]"
-                                            )
-                                        } else {
-                                            format!(
-                                                "\r[supervision alive — turn #{turn}, {mins}m elapsed]"
-                                            )
-                                        };
-                                        let _ = tokio::io::stderr().write_all(msg.as_bytes()).await;
-                                        let _ = tokio::io::stderr().flush().await;
-                                        // Fall through — next select! iteration
-                                        // recomputes `watchdog_at`, so receiving
-                                        // this heartbeat resets the watchdog.
-                                    }
-                                    Response::Done => {
-                                        if let Some(remaining) = md_buf.flush_all() {
-                                            let out = render_markdown(&remaining);
-                                            stdout.write_all(out.as_bytes()).await?;
-                                        }
-                                        stdout.write_all(b"\n").await?;
-                                        stdout.flush().await?;
-                                        break 'supervision;
-                                    }
-                                    Response::Error { message } => {
-                                        if let Some(remaining) = md_buf.flush_all() {
-                                            let out = render_markdown(&remaining);
-                                            stdout.write_all(out.as_bytes()).await?;
-                                        }
-                                        stdout.write_all(message.as_bytes()).await?;
-                                        stdout.write_all(b"\n").await?;
-                                        stdout.flush().await?;
-                                        break 'supervision;
-                                    }
-                                    _ => {}
-                                }
-                            }
+                    let mut synth = String::new();
+                    for l in &launched {
+                        if !synth.is_empty() {
+                            synth.push_str("\n\n---\n\n");
                         }
-                    }
-                    // Flush any remaining markdown (e.g. timeout break path).
-                    if let Some(remaining) = md_buf.flush_all() {
-                        let out = render_markdown(&remaining);
-                        stdout.write_all(out.as_bytes()).await?;
+                        synth.push_str(l.description.trim_end());
+                        synth.push_str("\n\n[launched]\n");
+                        synth.push_str(&format!("  pane: {}\n", l.pane_id));
+                        if let Some(wt) = l.worktree.as_deref() {
+                            synth.push_str(&format!("  worktree: {wt}\n"));
+                        }
+                        if !l.resources.is_empty() {
+                            synth.push_str(&format!("  resources: {}\n", l.resources.join(", ")));
+                        }
+                        synth.push_str(&format!("  tag: {}\n", l.tag));
                     }
                     stdout.write_all(b"\n").await?;
+                    stdout.write_all(synth.as_bytes()).await?;
+                    stdout.write_all(b"\n").await?;
                     stdout.flush().await?;
+                    next_prompt = Some(synth);
                 }
                 continue 'session;
             }
@@ -1753,6 +1627,33 @@ pub async fn run_chat_loop(
                             // carries the updated model, preserving carried_model
                             // across turns in the daemon.
                             model = new_model;
+                        }
+                        Response::TaskReleased {
+                            pane_id,
+                            resources_freed,
+                            tag,
+                            summary,
+                            worktree_path,
+                            worktree_dirty,
+                            pane_tail,
+                        } => {
+                            // Flush any in-flight markdown before the release
+                            // banner so the user sees a clear break.
+                            if let Some(remaining) = md_buf.flush_all() {
+                                let out = render_markdown(&remaining);
+                                stdout.write_all(out.as_bytes()).await?;
+                            }
+                            let out = format_task_released(
+                                &pane_id,
+                                &resources_freed,
+                                tag.as_deref(),
+                                summary.as_deref(),
+                                worktree_path.as_deref(),
+                                worktree_dirty,
+                                &pane_tail,
+                            );
+                            stdout.write_all(out.as_bytes()).await?;
+                            stdout.flush().await?;
                         }
                         _ => {}
                     }
@@ -2111,11 +2012,6 @@ pub async fn run_resume(
                     }
                     Response::ModelSwitched { .. } => {
                         // resume mode has no persistent model variable to update.
-                    }
-                    Response::Heartbeat { .. } => {
-                        // Supervision-only frame; never emitted on the
-                        // Resume path.
-                        tracing::debug!("ignoring Heartbeat outside supervision loop");
                     }
                     Response::TaskReleased {
                         pane_id,

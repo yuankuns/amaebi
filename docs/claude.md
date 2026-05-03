@@ -5,9 +5,13 @@ chat` or pass it as the prompt to `amaebi ask`). It does four things:
 
 1. Creates a git worktree under `~/.amaebi/worktrees/<repo>/<tag>-<uuid8>/`.
 2. Allocates a tmux pane and starts `claude` (the Claude Code TUI) inside it.
-3. Injects the task description into the pane as the opening prompt.
-4. Runs a supervision loop (see [supervision.md](supervision.md)) that polls
-   the pane, calls the LLM for a WAIT / STEER / DONE verdict, and acts on it.
+3. Emits `Response::PaneAssigned { tag, pane_id, session_id, worktree, resources }`.
+4. Client synthesises a single `[launched]` user turn that hands the
+   description + pane context to the chat agentic loop, which then drives
+   supervision via the standard tmux/shell/file tools plus the lifecycle
+   tool `task_done`.  See
+   [design/claude-chat-takeover.md](design/claude-chat-takeover.md) for
+   the frozen contract.
 
 Parsing lives in `src/client.rs:280` (`parse_claude`); launch handling is in
 `src/daemon.rs` (`handle_claude_launch`).
@@ -193,8 +197,22 @@ it for the current canonical grammar.
 
 ## Exit and cleanup
 
-When supervision exits (DONE, timeout, interrupt, model error, client
-disconnect), the daemon runs `release_supervised_panes` and
-`release_task_leases_for_holder` (see `src/daemon.rs:2250`). This is
-unconditional: panes never stay stuck `Busy` past the supervision lifetime,
-and tag leases are freed so the next run with the same tag is not blocked.
+Five release paths funnel into one idempotent Rust function
+(`release_held_entry`):
+
+- LLM calls `task_done(pane_id, summary)` — the normal "task verified
+  complete" exit.  Streams a `Response::TaskReleased` frame to the chat
+  with the summary + pane tail + worktree status.
+- User types `/release %54 [--clean] [--summary "..."]` or
+  `/release all [--clean]` — same release frame, but the summary is
+  whatever the user typed (or empty for `all`).
+- Chat exits cleanly (Ctrl-D / Ctrl-C×2) — drains every held pane.
+- Socket drops abnormally (chat crash, terminal kill) — same drain,
+  archived to `~/.amaebi/inbox.db` as an `[abandoned]` report.
+- 24 h lease TTL — disaster backstop for daemon crash etc.
+
+Every path releases pane + resource + task-notebook leases.  The tmux
+pane and its `claude` process are never killed; the worktree is kept
+unless `--clean` is passed.  See
+[design/claude-chat-takeover.md](design/claude-chat-takeover.md) for the
+full contract.

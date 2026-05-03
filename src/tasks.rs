@@ -40,8 +40,6 @@ use crate::auth::amaebi_home;
 pub const LEASE_TTL_SECS: i64 = 86_400;
 
 /// Maximum history rows returned to the supervisor per turn.
-pub const RECENT_VERDICTS_WINDOW: usize = 10;
-
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS task_notes (
     id        INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -220,81 +218,6 @@ pub fn release_all_by_holder(conn: &Connection, holder: &str) -> Result<usize> {
 }
 
 // ---------------------------------------------------------------------------
-// Desc
-// ---------------------------------------------------------------------------
-
-/// Append a new `desc` row.  Previous descs are kept as history; readers
-/// pick the most recent one.
-pub fn append_desc(conn: &Connection, repo_dir: &str, tag: &str, desc: &str) -> Result<()> {
-    conn.execute(
-        "INSERT INTO task_notes (repo_dir, tag, kind, content, timestamp)
-         VALUES (?1, ?2, 'desc', ?3, ?4)",
-        params![repo_dir, tag, desc, now_epoch()],
-    )
-    .context("appending desc")?;
-    Ok(())
-}
-
-/// Return the most recent `desc` content for `(repo_dir, tag)`, or
-/// `None` when no desc has ever been written.
-pub fn latest_desc(conn: &Connection, repo_dir: &str, tag: &str) -> Result<Option<String>> {
-    conn.query_row(
-        "SELECT content FROM task_notes
-         WHERE repo_dir = ?1 AND tag = ?2 AND kind = 'desc'
-         ORDER BY timestamp DESC
-         LIMIT 1",
-        params![repo_dir, tag],
-        |row| row.get::<_, String>(0),
-    )
-    .map(Some)
-    .or_else(|e| match e {
-        rusqlite::Error::QueryReturnedNoRows => Ok(None),
-        other => Err(anyhow::Error::from(other).context("reading latest desc")),
-    })
-}
-
-// ---------------------------------------------------------------------------
-// Verdicts
-// ---------------------------------------------------------------------------
-
-/// Append a supervision verdict row.  Timestamp is derived server-side
-/// so callers need not order them.
-pub fn append_verdict(conn: &Connection, repo_dir: &str, tag: &str, verdict: &str) -> Result<()> {
-    conn.execute(
-        "INSERT INTO task_notes (repo_dir, tag, kind, content, timestamp)
-         VALUES (?1, ?2, 'verdict', ?3, ?4)",
-        params![repo_dir, tag, verdict, now_epoch()],
-    )
-    .context("appending verdict")?;
-    Ok(())
-}
-
-/// Return up to [`RECENT_VERDICTS_WINDOW`] most recent verdicts, oldest
-/// first (so the supervisor sees them in chronological order when
-/// rendered into a prompt).
-pub fn recent_verdicts(conn: &Connection, repo_dir: &str, tag: &str) -> Result<Vec<String>> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT content FROM task_notes
-             WHERE repo_dir = ?1 AND tag = ?2 AND kind = 'verdict'
-             ORDER BY timestamp DESC
-             LIMIT ?3",
-        )
-        .context("preparing recent_verdicts query")?;
-    let rows = stmt
-        .query_map(
-            params![repo_dir, tag, RECENT_VERDICTS_WINDOW as i64],
-            |row| row.get::<_, String>(0),
-        )
-        .context("running recent_verdicts query")?;
-    let mut out: Vec<String> = rows
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .context("collecting recent_verdicts rows")?;
-    out.reverse(); // oldest first for prompt rendering
-    Ok(out)
-}
-
-// ---------------------------------------------------------------------------
 // Observability — `amaebi tag list`
 // ---------------------------------------------------------------------------
 
@@ -376,131 +299,6 @@ mod tests {
     }
 
     // ── desc round-trip ─────────────────────────────────────────────────
-
-    #[test]
-    fn desc_not_present_initially() {
-        let (conn, _g) = fresh_db();
-        assert_eq!(latest_desc(&conn, "/proj", "kernel").unwrap(), None);
-    }
-
-    #[test]
-    fn append_and_read_latest_desc() {
-        let (conn, _g) = fresh_db();
-        append_desc(&conn, "/proj", "kernel", "first desc").unwrap();
-        assert_eq!(
-            latest_desc(&conn, "/proj", "kernel").unwrap().as_deref(),
-            Some("first desc")
-        );
-    }
-
-    #[test]
-    fn latest_desc_returns_most_recent() {
-        let (conn, _g) = fresh_db();
-        append_desc(&conn, "/proj", "kernel", "v1").unwrap();
-        // Force later timestamp (seconds resolution) — use an INSERT with
-        // explicit timestamp since test runs faster than 1s.
-        conn.execute(
-            "INSERT INTO task_notes (repo_dir, tag, kind, content, timestamp) \
-             VALUES ('/proj', 'kernel', 'desc', 'v2', ?1)",
-            params![now_epoch() + 1],
-        )
-        .unwrap();
-        assert_eq!(
-            latest_desc(&conn, "/proj", "kernel").unwrap().as_deref(),
-            Some("v2")
-        );
-    }
-
-    #[test]
-    fn desc_isolated_by_repo_dir_and_tag() {
-        let (conn, _g) = fresh_db();
-        append_desc(&conn, "/proj-a", "kernel", "a-kernel").unwrap();
-        append_desc(&conn, "/proj-b", "kernel", "b-kernel").unwrap();
-        append_desc(&conn, "/proj-a", "lint", "a-lint").unwrap();
-
-        assert_eq!(
-            latest_desc(&conn, "/proj-a", "kernel").unwrap().as_deref(),
-            Some("a-kernel")
-        );
-        assert_eq!(
-            latest_desc(&conn, "/proj-b", "kernel").unwrap().as_deref(),
-            Some("b-kernel")
-        );
-        assert_eq!(
-            latest_desc(&conn, "/proj-a", "lint").unwrap().as_deref(),
-            Some("a-lint")
-        );
-    }
-
-    // ── verdicts ─────────────────────────────────────────────────────────
-
-    #[test]
-    fn recent_verdicts_empty_initially() {
-        let (conn, _g) = fresh_db();
-        let v = recent_verdicts(&conn, "/proj", "kernel").unwrap();
-        assert!(v.is_empty());
-    }
-
-    #[test]
-    fn append_verdicts_and_read_oldest_first() {
-        let (conn, _g) = fresh_db();
-        // Use explicit timestamps so ordering is deterministic.
-        for (i, v) in ["first", "second", "third"].iter().enumerate() {
-            conn.execute(
-                "INSERT INTO task_notes (repo_dir, tag, kind, content, timestamp) \
-                 VALUES ('/proj', 'kernel', 'verdict', ?1, ?2)",
-                params![v, now_epoch() + i as i64],
-            )
-            .unwrap();
-        }
-        let v = recent_verdicts(&conn, "/proj", "kernel").unwrap();
-        assert_eq!(v, vec!["first", "second", "third"]);
-    }
-
-    #[test]
-    fn recent_verdicts_caps_at_window() {
-        let (conn, _g) = fresh_db();
-        let total = RECENT_VERDICTS_WINDOW + 5;
-        for i in 0..total {
-            conn.execute(
-                "INSERT INTO task_notes (repo_dir, tag, kind, content, timestamp) \
-                 VALUES ('/proj', 'kernel', 'verdict', ?1, ?2)",
-                params![format!("v{i}"), now_epoch() + i as i64],
-            )
-            .unwrap();
-        }
-        let v = recent_verdicts(&conn, "/proj", "kernel").unwrap();
-        assert_eq!(v.len(), RECENT_VERDICTS_WINDOW);
-        // Oldest-first means we should see the last 10 inserted, in order.
-        assert_eq!(
-            v.first().unwrap(),
-            &format!("v{}", total - RECENT_VERDICTS_WINDOW)
-        );
-        assert_eq!(v.last().unwrap(), &format!("v{}", total - 1));
-    }
-
-    #[test]
-    fn verdicts_isolated_by_repo_dir_and_tag() {
-        let (conn, _g) = fresh_db();
-        append_verdict(&conn, "/proj-a", "kernel", "a-v").unwrap();
-        append_verdict(&conn, "/proj-b", "kernel", "b-v").unwrap();
-        append_verdict(&conn, "/proj-a", "lint", "lint-v").unwrap();
-
-        assert_eq!(
-            recent_verdicts(&conn, "/proj-a", "kernel").unwrap(),
-            vec!["a-v".to_string()]
-        );
-        assert_eq!(
-            recent_verdicts(&conn, "/proj-b", "kernel").unwrap(),
-            vec!["b-v".to_string()]
-        );
-        assert_eq!(
-            recent_verdicts(&conn, "/proj-a", "lint").unwrap(),
-            vec!["lint-v".to_string()]
-        );
-    }
-
-    // ── lease ────────────────────────────────────────────────────────────
 
     #[test]
     fn acquire_fresh_lease_succeeds() {
@@ -609,8 +407,10 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let path = dir.path().join("tasks.db");
         let _c1 = init_db(&path).expect("first init");
-        let c2 = init_db(&path).expect("second init");
-        // Still writable after second init.
-        append_desc(&c2, "/proj", "kernel", "hi").unwrap();
+        let _c2 = init_db(&path).expect("second init");
+        // Re-running init_db on an existing file is a no-op; the schema
+        // uses IF NOT EXISTS so the second call observes the existing
+        // table.  The fact that we got two live connections back without
+        // error is the contract being exercised.
     }
 }

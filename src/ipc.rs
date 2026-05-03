@@ -74,21 +74,6 @@ pub enum ClaudeReleaseTarget {
     All,
 }
 
-/// A single pane+task pair for supervision.
-#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
-pub struct SupervisionTarget {
-    pub pane_id: String,
-    pub task_description: String,
-    /// Notebook tag — carried from [`TaskSpec::tag`].  `None` disables
-    /// the notebook path for this pane (e.g. legacy client).
-    #[serde(default)]
-    pub tag: Option<String>,
-    /// Canonicalized `client_cwd` at the time the task was launched.
-    /// Used together with `tag` as the notebook lookup key.
-    #[serde(default)]
-    pub repo_dir: Option<String>,
-}
-
 /// A message sent from the client to the daemon over the Unix socket.
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -196,15 +181,14 @@ pub enum Request {
         /// Chat session UUID issuing this launch.  Used together with
         /// `repo_dir` to acquire the notebook lease up front — rejecting a
         /// tag conflict BEFORE allocating panes or starting `claude`.
-        /// Matches the `session_id` the client will later send on
-        /// [`Request::SupervisePanes`] so the holder id is stable across
-        /// both phases (cleanup in `handle_supervision` releases by
-        /// that same holder).
+        /// Matches the `session_id` the client carries into the
+        /// subsequent [`Request::Chat`] so the holder id is stable across
+        /// launch + chat-takeover supervision
+        /// (`docs/design/claude-chat-takeover.md`).
         #[serde(default)]
         session_id: Option<String>,
         /// Canonicalised repo directory for this launch.  Keyed with
-        /// each task's `tag` to form the notebook lease key.  Must match
-        /// the `repo_dir` on the corresponding [`SupervisionTarget`].
+        /// each task's `tag` to form the notebook lease key.
         #[serde(default)]
         repo_dir: Option<String>,
     },
@@ -220,16 +204,9 @@ pub enum Request {
         description: String,
         repo_dir: String,
     },
-    /// Supervise tmux panes where Claude is executing tasks.
-    /// The daemon runs a Rust polling loop: capture pane → LLM analysis → act.
-    SupervisePanes {
-        panes: Vec<SupervisionTarget>,
-        model: String,
-        session_id: Option<String>,
-    },
     /// Release amaebi's ownership of a pane (or all panes held by this connection).
     /// Does NOT kill the pane, terminate the `claude` process, or remove the worktree
-    /// (unless `clean_worktree` is true).  Handler added in PR C3.
+    /// (unless `clean_worktree` is true).  Handler in `handle_claude_release`.
     ClaudeRelease {
         target: ClaudeReleaseTarget,
         #[serde(default)]
@@ -332,14 +309,6 @@ pub enum Response {
     },
     /// Reply to [`Request::GenerateTag`] carrying the resolved tag.
     TagGenerated { tag: String },
-    /// Daemon-side liveness signal emitted every `HEARTBEAT_INTERVAL_SECS`
-    /// by the heartbeat task spawned in `handle_supervision` (the wrapper,
-    /// not `handle_supervision_inner`, so cancellation is guaranteed on
-    /// every exit path).  Carries (elapsed supervision seconds, current
-    /// turn number) so a stuck pane can be diagnosed even when no
-    /// WAIT/STEER/DONE was produced recently.  The client treats any
-    /// heartbeat as a watchdog reset; rendering it is optional.
-    Heartbeat { elapsed_secs: u64, turn: u64 },
     /// Emitted when a pane is released via task_done, /release, socket break, or chat exit.
     /// One frame per released pane, followed by [`Response::Done`].
     TaskReleased {
@@ -662,7 +631,6 @@ mod tests {
             r#"{"type":"pane_assigned","tag":"pr-1","pane_id":"%3","session_id":"uuid-abc"}"#,
             r#"{"type":"capacity_error","requested":3,"max_panes":16,"current_busy":14}"#,
             r#"{"type":"model_switched","model":"bedrock/claude-opus-4.7"}"#,
-            r#"{"type":"heartbeat","elapsed_secs":600,"turn":2}"#,
             r#"{"type":"task_released","pane_id":"%54","resources_freed":[],"tag":null,"summary":null,"worktree_path":null,"worktree_dirty":false,"pane_tail":""}"#,
         ];
         for frame in frames {
@@ -681,7 +649,6 @@ mod tests {
                     | Response::PaneAssigned { .. }
                     | Response::CapacityError { .. }
                     | Response::ModelSwitched { .. }
-                    | Response::Heartbeat { .. }
                     | Response::TaskReleased { .. }
             ));
         }
@@ -794,35 +761,6 @@ mod tests {
     }
 
     #[test]
-    fn supervision_target_task_notebook_fields_absent_deserialize_as_none() {
-        // SupervisionTarget gained two new fields for the task notebook.
-        // Legacy payloads (pre-task-notebook PR) must still deserialise.
-        let legacy = r#"{"pane_id":"%3","task_description":"old task"}"#;
-        let back: SupervisionTarget = serde_json::from_str(legacy).expect("legacy must parse");
-        assert!(back.tag.is_none());
-        assert!(back.repo_dir.is_none());
-    }
-
-    #[test]
-    fn supervision_target_round_trips_with_task_notebook_fields() {
-        let t = SupervisionTarget {
-            pane_id: "%3".into(),
-            task_description: "do the thing".into(),
-            tag: Some("kernel-opt".into()),
-            repo_dir: Some("/home/me/proj".into()),
-        };
-        let json = serde_json::to_string(&t).unwrap();
-        // Pin the wire field names.
-        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(v["tag"], "kernel-opt");
-        assert_eq!(v["repo_dir"], "/home/me/proj");
-
-        let back: SupervisionTarget = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.tag.as_deref(), Some("kernel-opt"));
-        assert_eq!(back.repo_dir.as_deref(), Some("/home/me/proj"));
-    }
-
-    #[test]
     fn request_claude_launch_round_trip() {
         let req = Request::ClaudeLaunch {
             tasks: vec![
@@ -870,40 +808,6 @@ mod tests {
         assert_eq!(tasks.len(), 2);
         assert_eq!(session_id.as_deref(), Some("sess-123"));
         assert_eq!(repo_dir.as_deref(), Some("/home/user/repo"));
-    }
-
-    #[test]
-    fn request_supervise_panes_round_trip() {
-        let req = Request::SupervisePanes {
-            panes: vec![SupervisionTarget {
-                pane_id: "%3".into(),
-                task_description: "implement feature X".into(),
-                tag: None,
-                repo_dir: None,
-            }],
-            model: "gpt-4o".into(),
-            session_id: Some("uuid-abc".into()),
-        };
-        let json = serde_json::to_string(&req).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(v["type"], "supervise_panes");
-        assert_eq!(v["panes"][0]["pane_id"], "%3");
-        assert_eq!(v["model"], "gpt-4o");
-        assert_eq!(v["session_id"], "uuid-abc");
-
-        let back: Request = serde_json::from_str(&json).unwrap();
-        let Request::SupervisePanes {
-            panes,
-            model,
-            session_id,
-        } = back
-        else {
-            panic!("expected SupervisePanes");
-        };
-        assert_eq!(panes.len(), 1);
-        assert_eq!(panes[0].pane_id, "%3");
-        assert_eq!(model, "gpt-4o");
-        assert_eq!(session_id.as_deref(), Some("uuid-abc"));
     }
 
     #[test]
@@ -978,27 +882,6 @@ mod tests {
         assert_eq!(session_id, "uuid-xyz");
         assert_eq!(worktree, None);
         assert!(resources.is_empty());
-    }
-
-    #[test]
-    fn response_heartbeat_round_trip() {
-        let r = Response::Heartbeat {
-            elapsed_secs: 123,
-            turn: 7,
-        };
-        let s = serde_json::to_string(&r).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
-        assert_eq!(v["type"], "heartbeat");
-        assert_eq!(v["elapsed_secs"], 123);
-        assert_eq!(v["turn"], 7);
-        let back: Response = serde_json::from_str(&s).unwrap();
-        assert!(matches!(
-            back,
-            Response::Heartbeat {
-                elapsed_secs: 123,
-                turn: 7
-            }
-        ));
     }
 
     #[test]

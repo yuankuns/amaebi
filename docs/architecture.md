@@ -32,12 +32,14 @@ The **daemon** (`amaebi daemon`) is a single persistent process. It owns:
 
 - The HTTPS connection to Bedrock or the Copilot API, including token
   caching.
-- The tool executor (shell, read/edit file, tmux control, spawn_agent).
+- The tool executor (shell, read/edit file, tmux control, spawn_agent,
+  task_done).
 - SQLite connections for `memory.db`, `inbox.db`, `cron.db`, `tasks.db`.
 - The cron scheduler (1-minute tick).
-- The supervision loop for `/claude` runs (see
-  [supervision.md](supervision.md)).
-- Pane and resource leases.
+- Pane, resource, and per-conn held-pane bookkeeping — see
+  [claude.md](claude.md) and
+  [design/claude-chat-takeover.md](design/claude-chat-takeover.md) for
+  the release contract.
 
 The socket is `/tmp/amaebi.sock` by default (`DEFAULT_SOCKET` in
 `src/cli.rs:3`). One daemon per user.
@@ -120,13 +122,28 @@ passes `--worktree <existing-path>` the auto-create is skipped.
 │      ↓                                                            │
 │    render env vars + prompt_hint; export into pane shell          │
 │      ↓                                                            │
-│    spawn `claude` in pane, inject task description                │
+│    spawn `claude` in pane (task desc is NOT pasted here —         │
+│      the LLM pastes it via tmux_send_text)                         │
 │      ↓                                                            │
-│    enter supervision loop        (WAIT / STEER / DONE)            │
+│    record TaskEntry in state.held[conn_id]                        │
 │      ↓                                                            │
-│    on any exit:                                                   │
-│      release_supervised_panes()                                   │
-│      release_task_leases_for_holder()                             │
+│    stream Response::PaneAssigned + Response::Done                 │
+└──────────────────────────┬────────────────────────────────────────┘
+                           │
+                           ▼
+┌───────────────────────────────────────────────────────────────────┐
+│  Client:  synthesise `[launched]` user turn                       │
+│           → send Request::Chat on the same session                 │
+└──────────────────────────┬────────────────────────────────────────┘
+                           │
+                           ▼
+┌───────────────────────────────────────────────────────────────────┐
+│  Daemon agentic loop:                                             │
+│    LLM owns supervision via tmux_*, shell_command, read_file,     │
+│    edit_file, task_done.  Pane-alive invariant: the model MUST    │
+│    call a tool every turn while the pane is held.                 │
+│    Release on task_done / /release / chat exit / socket drop /    │
+│    24h TTL, funneling through one idempotent release_held_entry.  │
 └───────────────────────────────────────────────────────────────────┘
 ```
 
@@ -135,8 +152,9 @@ Validation at the client (parse-time) rejects impossible combinations early:
 `src/client.rs:433` and `src/client.rs:446`). The daemon re-validates and
 rolls back partial acquisitions if any later step fails.
 
-Cleanup at supervision exit is unconditional. See [supervision.md](
-supervision.md) for the release guarantees.
+Cleanup on any exit path is unconditional.  See
+[design/claude-chat-takeover.md](design/claude-chat-takeover.md) for the
+five release paths and the idempotent `release_held_entry` contract.
 
 ## Model routing
 
