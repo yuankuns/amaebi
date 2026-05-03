@@ -2357,10 +2357,6 @@ async fn drain_held_on_conn_exit(state: &DaemonState, conn_id: ConnId) {
     }
 }
 
-/// Capture the last `tmux capture-pane -p -t <pane>` snapshot.  Returns
-/// Ok(String) on success, Err otherwise — never panics.  Best-effort input
-/// for inbox archiving / TaskReleased frames; upstream callers always have
-/// a non-empty-string fallback.
 /// Maximum characters of pane_tail to archive per release.  Bounded because
 /// the tail is both streamed inside `Response::TaskReleased` frames and
 /// persisted to `inbox.db` on socket-break drains — an unbounded capture
@@ -2369,6 +2365,215 @@ async fn drain_held_on_conn_exit(state: &DaemonState, conn_id: ConnId) {
 /// (20–40 KB) but not unbounded.
 const PANE_TAIL_MAX_CHARS: usize = 32_768;
 
+/// Return `true` when `line` is a visual TUI chrome fragment from the
+/// Claude Code terminal UI with no informational content — a horizontal
+/// separator, the always-present bottom status bar, an empty prompt
+/// cursor, Claude's activity indicator (`✻ Brewed for …`), or a pure
+/// box-drawing border row.
+///
+/// Match criteria deliberately target **whole-line** chrome only so that
+/// real output containing these glyphs (e.g. a log line with `│` as a
+/// field separator) survives untouched.  False positives silently drop
+/// real information, which is worse than leaving noise in — every rule
+/// here is conservative and structure-anchored.
+///
+/// Originally added in PR #127 for supervision capture, deleted in PR
+/// #153 along with `handle_supervision_inner`, and restored here because
+/// the new `capture_pane_tail` output goes directly into the
+/// user-visible `Response::TaskReleased` pane_tail — exactly the place
+/// chrome noise hurts most.  LLM-facing `tmux_capture_pane` tool output
+/// stays raw on purpose.
+fn is_tui_chrome_line(line: &str) -> bool {
+    let t = line.trim();
+    if t.is_empty() {
+        return false; // real blank lines are meaningful; a separate pass trims trailing ones
+    }
+
+    // Rules 1 + 4 both iterate every char; fold into one pass so a
+    // long-but-unmatched line (common case: real Claude output) pays
+    // for one scan rather than two.
+    let mut char_count = 0usize;
+    let mut all_horizontal = true;
+    let mut all_border = true;
+    let mut has_vertical_glyph = false;
+    for c in t.chars() {
+        char_count += 1;
+        // U+2500 `─` light / U+2501 `━` heavy horizontals, plus the
+        // double-line U+2550 `═` that Claude Code uses in some panels.
+        let is_horizontal = matches!(c, '─' | '━' | '═');
+        // Vertical / corner / tee glyphs covering both the rounded
+        // (`╭╮╯╰`) and light-angle (`┌┐└┘`) corner styles, plus the
+        // heavy corners (`┏┓┗┛`) and double-line variants (`╔╗╚╝`,
+        // `║`).  Different Claude Code themes / terminals render
+        // slightly different corner styles; missing one lets whole
+        // frame rows survive `strip_tui_chrome`.
+        let is_vertical = matches!(
+            c,
+            '│' | '┃'
+                | '║'
+                | '╭'
+                | '╮'
+                | '╯'
+                | '╰'
+                | '┌'
+                | '┐'
+                | '└'
+                | '┘'
+                | '┏'
+                | '┓'
+                | '┗'
+                | '┛'
+                | '╔'
+                | '╗'
+                | '╚'
+                | '╝'
+                | '├'
+                | '┤'
+                | '┬'
+                | '┴'
+                | '┼'
+                | '┣'
+                | '┫'
+                | '┳'
+                | '┻'
+                | '╋'
+                | '╠'
+                | '╣'
+                | '╦'
+                | '╩'
+                | '╬'
+        );
+        let is_border_glyph = is_horizontal || is_vertical || c == ' ' || c == '\t';
+        if !is_horizontal {
+            all_horizontal = false;
+        }
+        if !is_border_glyph {
+            all_border = false;
+        }
+        if is_vertical {
+            has_vertical_glyph = true;
+        }
+        if !all_horizontal && !all_border {
+            break;
+        }
+    }
+    // Rule 1: all-horizontal divider, ≥10 chars so short markdown runs
+    // (`---` as a thematic break) don't get eaten.
+    if all_horizontal && char_count >= 10 {
+        return true;
+    }
+    // Rule 4: pure box-drawing frame — at least one vertical/corner
+    // glyph so rule 4 can't catch a short all-dash line.
+    if all_border && has_vertical_glyph {
+        return true;
+    }
+
+    // Rule 2: Claude Code bottom status bar variants.  The real status
+    // bar looks like:
+    //
+    //     ⏵⏵ bypass permissions on (shift+tab to cycle)
+    //     ? for shortcuts · esc to interrupt · ctrl+t to hide tasks
+    //
+    // The first form is anchored by its glyph prefix; the second by
+    // the bullet-separator `·` (U+00B7) that joins its tokens.  Bullet-
+    // separated hint lines are a load-bearing signal — real pane
+    // content mentioning "esc to interrupt" in prose (e.g. a comment
+    // about the key binding, a log line) doesn't use `·` as a
+    // delimiter, so requiring it blocks the substring-only false
+    // positive Copilot flagged on PR #155.
+    if t.starts_with("⏵⏵ bypass permissions") {
+        return true;
+    }
+    if t.contains('·') && (t.contains("esc to interrupt") || t.contains("ctrl+t to hide tasks")) {
+        return true;
+    }
+
+    // Rule 3: empty input cursor on its own.
+    if t == "❯" {
+        return true;
+    }
+
+    // Rule 5: Claude Code's activity indicator appears as
+    // `✻ Brewed for 1h 23m` / `✳ Working for 3s` / `● Baked for 42s`
+    // on its own line — always starts with a decorative glyph followed
+    // by a verb, then "for", then a duration like "42s" / "1m" / "1h".
+    //
+    // We anchor on FOUR signals to avoid eating legitimate bulleted
+    // prose that happens to match `<glyph> <word> for <duration>`
+    // (e.g. `● Retry for 30s`, `● Wait for 5m`):
+    //   1. Line starts with one of Claude's activity glyphs.
+    //   2. The first word is one of Claude Code's known activity verbs
+    //      (whitelist, not any word) — this is the key guard against
+    //      imperative bullets like "Retry" / "Wait" / "Check".
+    //   3. The second token is literally "for".
+    //   4. The third token looks like a duration — digit-prefixed and
+    //      ends in `s` / `m` / `h` (e.g. `42s`, `5m`, `1h`).
+    //
+    // The whitelist is observational — extend it if Claude Code adds
+    // new activity verbs.  False-negative (activity line kept in
+    // pane_tail) is noisy but harmless; false-positive (real content
+    // stripped) is silent data loss, so we err on the side of letting
+    // noise through.
+    const ACTIVITY_VERBS: &[&str] = &[
+        "Brewed",
+        "Baked",
+        "Cooked",
+        "Crunched",
+        "Simmered",
+        "Stewed",
+        "Thinking",
+        "Working",
+        "Processing",
+        "Reasoning",
+        "Pondering",
+    ];
+    fn looks_like_duration(tok: &str) -> bool {
+        // Shape: one or more digits, then exactly one unit letter.
+        let bytes = tok.as_bytes();
+        if bytes.len() < 2 {
+            return false;
+        }
+        let (digits, unit) = bytes.split_at(bytes.len() - 1);
+        digits.iter().all(|b| b.is_ascii_digit()) && matches!(unit[0], b's' | b'm' | b'h')
+    }
+    if let Some(first) = t.chars().next() {
+        if matches!(first, '✻' | '✳' | '●' | '◉' | '◍') {
+            let rest: String = t.chars().skip(1).collect();
+            let tokens: Vec<&str> = rest.split_whitespace().collect();
+            if tokens.len() >= 3
+                && ACTIVITY_VERBS.contains(&tokens[0])
+                && tokens[1] == "for"
+                && looks_like_duration(tokens[2])
+            {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+/// Remove whole-line TUI chrome from `raw`, preserving line order and
+/// all content blank lines.  Also trims runs of trailing blank lines
+/// (tmux capture pads the bottom of the pane with them when the
+/// underlying process produces less output than the pane height).
+fn strip_tui_chrome(raw: &str) -> String {
+    let kept: Vec<&str> = raw.lines().filter(|l| !is_tui_chrome_line(l)).collect();
+    // Trim trailing blank lines — tmux often pads the tail with them
+    // after dropping chrome, which would otherwise produce a long run
+    // of useless `|` bars in the rendered pane_tail block.
+    let mut end = kept.len();
+    while end > 0 && kept[end - 1].trim().is_empty() {
+        end -= 1;
+    }
+    kept[..end].join("\n")
+}
+
+/// Capture the last `tmux capture-pane -p -t <pane>` snapshot, strip TUI
+/// chrome, and bound the size.  Returns Ok(String) on success, Err
+/// otherwise — never panics.  Best-effort input for inbox archiving /
+/// TaskReleased frames; upstream callers always have a non-empty-string
+/// fallback.
 async fn capture_pane_tail(pane_id: &str) -> Result<String> {
     let pane = pane_id.to_string();
     let raw = tokio::task::spawn_blocking(move || {
@@ -2392,18 +2597,22 @@ async fn capture_pane_tail(pane_id: &str) -> Result<String> {
     .await
     .context("capture_pane_tail join")??;
 
+    // Strip TUI chrome before size truncation so we keep as much real
+    // content as possible within the byte budget.
+    let stripped = strip_tui_chrome(&raw);
+
     // Secondary byte-level bound in case a pane is very wide / packed.
     // Truncate to char boundary to keep `str` invariants intact.
-    if raw.len() > PANE_TAIL_MAX_CHARS {
+    if stripped.len() > PANE_TAIL_MAX_CHARS {
         let mut end = PANE_TAIL_MAX_CHARS;
-        while end > 0 && !raw.is_char_boundary(end) {
+        while end > 0 && !stripped.is_char_boundary(end) {
             end -= 1;
         }
-        let mut out = raw[..end].to_string();
+        let mut out = stripped[..end].to_string();
         out.push_str("\n…[pane_tail truncated]");
         return Ok(out);
     }
-    Ok(raw)
+    Ok(stripped)
 }
 
 /// True if the worktree at `path` has any uncommitted changes (tracked,
@@ -7920,5 +8129,191 @@ mod tests {
         assert!(remaining.contains(&"%a".to_string()));
         assert!(remaining.contains(&"%c".to_string()));
         assert!(!remaining.contains(&"%b".to_string()));
+    }
+
+    // ------------------------------------------------------------------
+    // is_tui_chrome_line / strip_tui_chrome (restored from PR #127)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn chrome_horizontal_divider_is_stripped() {
+        assert!(is_tui_chrome_line(
+            "────────────────────────────────────────"
+        ));
+        assert!(is_tui_chrome_line("━━━━━━━━━━━━━━"));
+        assert!(is_tui_chrome_line("    ──────────────    "));
+    }
+
+    #[test]
+    fn chrome_short_dash_run_is_not_stripped() {
+        // Markdown thematic break (`---`) is a real content line; rule 1's
+        // 10-char floor keeps it.
+        assert!(!is_tui_chrome_line("---"));
+        assert!(!is_tui_chrome_line("──"));
+    }
+
+    #[test]
+    fn chrome_bypass_permissions_status_bar_is_stripped() {
+        // First status-bar variant is anchored on its glyph prefix.
+        assert!(is_tui_chrome_line(
+            "⏵⏵ bypass permissions on (shift+tab to cycle)"
+        ));
+    }
+
+    #[test]
+    fn chrome_hint_bar_with_bullet_separator_is_stripped() {
+        // Second status-bar variant is anchored on the `·` bullet
+        // separator PLUS one of the Claude-specific hint phrases.
+        assert!(is_tui_chrome_line(
+            "? for shortcuts · esc to interrupt · ctrl+t to hide tasks"
+        ));
+        assert!(is_tui_chrome_line(
+            "  esc to interrupt · ctrl+t to hide tasks  "
+        ));
+    }
+
+    #[test]
+    fn chrome_bare_prose_mentioning_status_phrases_is_preserved() {
+        // Regression guard (Copilot review on PR #155): substring match
+        // for "esc to interrupt" alone would drop legitimate content
+        // (a user's note, a log line, a code comment mentioning the
+        // key binding).  Requiring the `·` bullet separator alongside
+        // the phrase blocks those false positives.
+        assert!(!is_tui_chrome_line(
+            "Press esc to interrupt the current job"
+        ));
+        assert!(!is_tui_chrome_line(
+            "// TODO: document ctrl+t to hide tasks in the README"
+        ));
+        assert!(!is_tui_chrome_line(
+            "error log: operator pressed esc to interrupt at 14:03"
+        ));
+    }
+
+    #[test]
+    fn chrome_empty_prompt_cursor_is_stripped() {
+        assert!(is_tui_chrome_line("❯"));
+        assert!(is_tui_chrome_line("  ❯  "));
+    }
+
+    #[test]
+    fn chrome_empty_prompt_with_content_is_preserved() {
+        // A real user prompt `❯ some command` must NOT be stripped.
+        assert!(!is_tui_chrome_line("❯ /exit"));
+        assert!(!is_tui_chrome_line("❯ build the project"));
+    }
+
+    #[test]
+    fn chrome_pure_border_line_is_stripped() {
+        // Rounded-corner style (Claude Code default).
+        assert!(is_tui_chrome_line("│   │"));
+        assert!(is_tui_chrome_line("╭──────────╮"));
+        assert!(is_tui_chrome_line("╰──────────╯"));
+    }
+
+    #[test]
+    fn chrome_border_line_light_corners_is_stripped() {
+        // Regression guard (Copilot review on PR #155): light-angle
+        // corners `┌┐└┘` were missing from rule 4, so a frame using
+        // that style would leak into pane_tail.  Also covers heavy
+        // corners (`┏┓┗┛`), double-line (`╔╗╚╝`, `═`), and tee
+        // glyphs (`┼` etc.) that panels commonly use.
+        //
+        // Note: rule 4 strips only lines that are PURE frame
+        // borders — a row like `│ content │` keeps content and is
+        // preserved, verified by the separate test below.
+        assert!(is_tui_chrome_line("┌──────────┐"));
+        assert!(is_tui_chrome_line("└──────────┘"));
+        assert!(is_tui_chrome_line("│         │"));
+        assert!(is_tui_chrome_line("┏━━━━━━━━━━┓"));
+        assert!(is_tui_chrome_line("┃         ┃"));
+        assert!(is_tui_chrome_line("╔══════════╗"));
+        assert!(is_tui_chrome_line("║         ║"));
+        assert!(is_tui_chrome_line("├──────────┤"));
+    }
+
+    #[test]
+    fn chrome_border_row_with_content_is_preserved() {
+        // Rule 4 requires EVERY char be a border glyph; any letter
+        // (real content) must survive.  Distinguishes `│         │`
+        // (pure frame, strip) from `│ value   │` (content in a panel
+        // cell, keep).
+        assert!(!is_tui_chrome_line("│ content │"));
+        assert!(!is_tui_chrome_line("║ header   ║"));
+        assert!(!is_tui_chrome_line("┃ status  ┃"));
+    }
+
+    #[test]
+    fn chrome_activity_indicator_is_stripped() {
+        // Claude's "busy" spinner lines — the regression that motivated
+        // restoring this helper.
+        assert!(is_tui_chrome_line("✻ Brewed for 5m 18s"));
+        assert!(is_tui_chrome_line("✳ Working for 3s"));
+        assert!(is_tui_chrome_line("● Baked for 42s"));
+        assert!(is_tui_chrome_line("  ✻ Crunched for 20s  "));
+    }
+
+    #[test]
+    fn chrome_bullet_with_for_but_no_duration_is_preserved() {
+        // A real bulleted sentence that happens to contain "for" must
+        // survive — rule 5 anchors on the `<glyph> <KNOWN-verb> for
+        // <duration>` shape.
+        assert!(!is_tui_chrome_line("● Use the flag for optimisation"));
+        assert!(!is_tui_chrome_line("● Check for null before dereferencing"));
+    }
+
+    #[test]
+    fn chrome_bullet_with_unknown_verb_and_duration_is_preserved() {
+        // Regression guard (Copilot review on PR #155): user-authored
+        // bullets like `● Retry for 30s` / `● Wait for 5m` were being
+        // eaten by an overly-broad rule-5 that accepted ANY word before
+        // "for".  Whitelist of claude's activity verbs fixes this.
+        assert!(!is_tui_chrome_line("● Retry for 30s"));
+        assert!(!is_tui_chrome_line("● Wait for 5m"));
+        assert!(!is_tui_chrome_line("● Schedule for 1h"));
+        assert!(!is_tui_chrome_line("✻ Sleep for 42s"));
+    }
+
+    #[test]
+    fn chrome_pipe_separated_log_line_is_preserved() {
+        // Real log output containing `│` as a field separator must not
+        // be mistaken for box-drawing chrome — rule 4 requires EVERY
+        // char be a border glyph, so a log line fails that predicate.
+        assert!(!is_tui_chrome_line(
+            "2026-05-03 INFO  │ field: value │ status=ok"
+        ));
+    }
+
+    #[test]
+    fn strip_tui_chrome_filters_expected_lines() {
+        let raw = "● Real output line\n\
+                   ────────────────────────────────────────\n\
+                   ❯ \n\
+                   ────────────────────────────────────────\n\
+                   ⏵⏵ bypass permissions on (shift+tab to cycle)\n";
+        let stripped = strip_tui_chrome(raw);
+        assert_eq!(stripped, "● Real output line");
+    }
+
+    #[test]
+    fn strip_tui_chrome_preserves_interior_blank_lines() {
+        // Blank lines between content paragraphs are meaningful (paragraph
+        // breaks); only trailing blank lines get trimmed.
+        let raw = "paragraph one\n\nparagraph two\n";
+        assert_eq!(strip_tui_chrome(raw), "paragraph one\n\nparagraph two");
+    }
+
+    #[test]
+    fn strip_tui_chrome_trims_trailing_blanks() {
+        // tmux often pads the tail with blank lines after the last content
+        // row; those would render as a wall of `|` bars in the pane_tail
+        // block and add no value.
+        let raw = "line one\n\n\n\n";
+        assert_eq!(strip_tui_chrome(raw), "line one");
+    }
+
+    #[test]
+    fn strip_tui_chrome_empty_input() {
+        assert_eq!(strip_tui_chrome(""), "");
     }
 }
