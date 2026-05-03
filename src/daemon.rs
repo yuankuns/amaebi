@@ -1126,7 +1126,7 @@ async fn handle_claude_release(
         return Ok(());
     }
 
-    for (i, pane_id) in pane_ids.iter().enumerate() {
+    for pane_id in pane_ids.iter() {
         // `summary` from a single /release %pane applies to THAT pane only.
         // /release all leaves summary empty (user shouldn't mass-assign one).
         let this_summary = if pane_ids.len() == 1 {
@@ -1134,7 +1134,6 @@ async fn handle_claude_release(
         } else {
             None
         };
-        let _ = i;
         match release_held_entry(state, conn_id, pane_id, clean_worktree, this_summary).await {
             Some(frame) => {
                 let mut w = writer.lock().await;
@@ -2039,7 +2038,15 @@ async fn handle_claude_launch(
             task_description: Some(raw_desc.clone()),
             created_at: Instant::now(),
         };
-        if let Ok(mut held) = state.held.lock() {
+        {
+            let mut held = state.held.lock().unwrap_or_else(|poisoned| {
+                tracing::warn!(
+                    conn_id,
+                    pane_id = %entry.pane_id,
+                    "handle_claude_launch: state.held mutex was poisoned; recovering to record TaskEntry"
+                );
+                poisoned.into_inner()
+            });
             held.entry(conn_id).or_default().push(entry);
         }
         let mut w = writer.lock().await;
@@ -2099,8 +2106,22 @@ async fn release_held_entry(
 ) -> Option<crate::ipc::Response> {
     // Take the TaskEntry out of the map up front.  Double-release finds
     // nothing and returns None, the core idempotency guarantee.
+    //
+    // Poisoned mutex: recover the guard via `into_inner()` and log loudly
+    // rather than silently swallowing as a no-op.  A silent no-op here
+    // would strand pane + resource + task leases until their 24 h TTL,
+    // which is strictly worse than proceeding on a poisoned lock since
+    // every call-site under `state.held` is a short critical section
+    // that cannot corrupt the map it guards.
     let entry = {
-        let mut held = state.held.lock().ok()?;
+        let mut held = state.held.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!(
+                pane_id,
+                conn_id,
+                "release_held_entry: state.held mutex was poisoned; recovering inner guard"
+            );
+            poisoned.into_inner()
+        });
         let list = held.get_mut(&conn_id)?;
         let pos = list.iter().position(|e| e.pane_id == pane_id)?;
         let entry = list.swap_remove(pos);
@@ -2175,12 +2196,17 @@ async fn release_held_entry(
 /// inbox as `[abandoned]` reports.  An `.ok()` on the inbox write keeps a
 /// sick DB from masking the actual release outcome.
 async fn drain_held_on_conn_exit(state: &DaemonState, conn_id: ConnId) {
-    let pane_ids: Vec<String> = match state.held.lock() {
-        Ok(h) => h
-            .get(&conn_id)
+    let pane_ids: Vec<String> = {
+        let held = state.held.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!(
+                conn_id,
+                "drain_held_on_conn_exit: state.held mutex was poisoned; recovering to drain"
+            );
+            poisoned.into_inner()
+        });
+        held.get(&conn_id)
             .map(|v| v.iter().map(|e| e.pane_id.clone()).collect())
-            .unwrap_or_default(),
-        Err(_) => return,
+            .unwrap_or_default()
     };
     if pane_ids.is_empty() {
         return;
@@ -2194,16 +2220,22 @@ async fn drain_held_on_conn_exit(state: &DaemonState, conn_id: ConnId) {
     for pane_id in pane_ids {
         // Grab session_id + task_description BEFORE the release removes
         // the TaskEntry — the caller-side inbox write needs both.
-        let (session_id, task_description) = state
-            .held
-            .lock()
-            .ok()
-            .and_then(|h| {
-                h.get(&conn_id)
-                    .and_then(|v| v.iter().find(|e| e.pane_id == pane_id))
-                    .map(|e| (e.session_id.clone(), e.task_description.clone()))
-            })
-            .unwrap_or((None, None));
+        // Poisoned mutex: recover the guard so the inbox write still
+        // captures what it can.
+        let (session_id, task_description) = {
+            let held = state.held.lock().unwrap_or_else(|poisoned| {
+                tracing::warn!(
+                    conn_id,
+                    pane_id = %pane_id,
+                    "drain_held_on_conn_exit: state.held mutex was poisoned; recovering for inbox metadata lookup"
+                );
+                poisoned.into_inner()
+            });
+            held.get(&conn_id)
+                .and_then(|v| v.iter().find(|e| e.pane_id == pane_id))
+                .map(|e| (e.session_id.clone(), e.task_description.clone()))
+                .unwrap_or((None, None))
+        };
 
         let released = release_held_entry(state, conn_id, &pane_id, false, None).await;
         if let Some(crate::ipc::Response::TaskReleased {
@@ -2236,11 +2268,22 @@ async fn drain_held_on_conn_exit(state: &DaemonState, conn_id: ConnId) {
 /// Ok(String) on success, Err otherwise — never panics.  Best-effort input
 /// for inbox archiving / TaskReleased frames; upstream callers always have
 /// a non-empty-string fallback.
+/// Maximum characters of pane_tail to archive per release.  Bounded because
+/// the tail is both streamed inside `Response::TaskReleased` frames and
+/// persisted to `inbox.db` on socket-break drains — an unbounded capture
+/// on a long-running `claude` session could easily be megabytes of
+/// scrollback.  Kept generous enough to cover typical rendered TUI output
+/// (20–40 KB) but not unbounded.
+const PANE_TAIL_MAX_CHARS: usize = 32_768;
+
 async fn capture_pane_tail(pane_id: &str) -> Result<String> {
     let pane = pane_id.to_string();
-    tokio::task::spawn_blocking(move || {
+    let raw = tokio::task::spawn_blocking(move || {
         let out = std::process::Command::new("tmux")
-            .args(["capture-pane", "-p", "-t"])
+            // `-p` prints to stdout; bound the capture to the last ~200 lines
+            // of scrollback (`-S -200`) so the tail stays a reasonable size
+            // even on panes with days of history.
+            .args(["capture-pane", "-p", "-S", "-200", "-t"])
             .arg(&pane)
             .output()
             .context("spawning tmux capture-pane")?;
@@ -2251,10 +2294,23 @@ async fn capture_pane_tail(pane_id: &str) -> Result<String> {
                 String::from_utf8_lossy(&out.stderr)
             ));
         }
-        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+        Ok::<String, anyhow::Error>(String::from_utf8_lossy(&out.stdout).into_owned())
     })
     .await
-    .context("capture_pane_tail join")?
+    .context("capture_pane_tail join")??;
+
+    // Secondary byte-level bound in case a pane is very wide / packed.
+    // Truncate to char boundary to keep `str` invariants intact.
+    if raw.len() > PANE_TAIL_MAX_CHARS {
+        let mut end = PANE_TAIL_MAX_CHARS;
+        while end > 0 && !raw.is_char_boundary(end) {
+            end -= 1;
+        }
+        let mut out = raw[..end].to_string();
+        out.push_str("\n…[pane_tail truncated]");
+        return Ok(out);
+    }
+    Ok(raw)
 }
 
 /// True if the worktree at `path` has any uncommitted changes (tracked,
@@ -4291,14 +4347,22 @@ const LARGE_TOOL_RESULT_CHARS: usize = 50_000;
 /// `stream_chat` retries 5xx, 429, and transport errors internally up to its
 /// `MAX_RETRIES`, but those errors can still surface here if retries are
 /// exhausted or if a non-retryable error occurs.
-#[allow(clippy::too_many_arguments)]
+///
 /// Return the list of `pane_id`s currently held by `conn_id`, or `None` when
 /// `held` is empty — the caller uses `None` to mean "no pane-alive invariant
-/// applies to this turn" and skip the reminder entirely.  Poisoned mutex is
-/// treated as "no held panes" (fail-open) so a corrupted lock state cannot
-/// stall the chat; the 24 h TTL still protects lease correctness.
+/// applies to this turn" and skip the reminder entirely.  Poisoned mutex:
+/// recover the guard and log, since missing the reminder on a single turn
+/// is a live-safety issue (LLM might stop responding with tools) but still
+/// better than hanging the whole chat on a `.lock().ok()?` that would
+/// produce None.  The 24 h TTL also protects lease correctness.
 fn pane_alive_held_panes(state: &DaemonState, conn_id: ConnId) -> Option<Vec<String>> {
-    let held = state.held.lock().ok()?;
+    let held = state.held.lock().unwrap_or_else(|poisoned| {
+        tracing::warn!(
+            conn_id,
+            "pane_alive_held_panes: state.held mutex was poisoned; recovering so reminder still injects"
+        );
+        poisoned.into_inner()
+    });
     let list = held.get(&conn_id)?;
     if list.is_empty() {
         return None;
@@ -4315,20 +4379,44 @@ fn format_pane_alive_reminder(pane_ids: &[String]) -> String {
     format!(
         "[pane-alive invariant]\n\
          You currently own the following /claude pane(s): {pane_list}.\n\
+         \n\
+         **You are a SUPERVISOR, not the executor.**  Each pane has Claude \
+         Code already running inside it with the user's task description \
+         already injected; Claude is doing the work.  Your job is to watch \
+         Claude, nudge it when needed, and declare done when verified.  \
+         Do NOT use `shell_command`, `edit_file`, `read_file`, or similar \
+         tools to do the task yourself — that bypasses Claude entirely and \
+         produces a parallel answer the user did not ask for.  If you need \
+         to look at worktree state, prefer `tmux_capture_pane` (watch what \
+         Claude sees / does) over running your own shell; only fall back to \
+         `shell_command` for meta-observations Claude cannot report (e.g. \
+         verifying that a file Claude claims to have written really exists).\n\
+         \n\
          While any of these panes is alive, you MUST call at least one tool \
          in every turn — do NOT reply with text only.\n\
-         Your vocabulary:\n\
-         - `tmux_wait` — pause until the pane falls idle (the correct way to \
-         \"wait and see\", not a text reply saying you will wait).\n\
-         - `tmux_capture_pane` / `shell_command` — inspect the pane or the \
-         worktree.\n\
-         - `tmux_send_text` / `tmux_send_key` — intervene (paste, ESC, Ctrl-C, \
-         arrow keys, etc.).\n\
-         - `task_done` — declare the task goal verified and release the pane.\n\
-         `task_done` is the ONLY way to exit supervision — do not just stop \
-         responding.  If you need to signal completion, call `task_done` with \
-         `pane_id` and a short `summary`.  Once ALL panes are released, this \
-         reminder goes away and you can reply with plain text again."
+         \n\
+         Your supervision vocabulary:\n\
+         - `tmux_capture_pane` — read the pane to see what Claude is doing.\n\
+         - `tmux_wait` — pause until the pane falls idle.  This is the \
+         correct way to \"wait and see\"; a text reply saying \"I'll wait\" \
+         is forbidden.\n\
+         - `tmux_send_text` — paste a correction / new instruction into \
+         Claude (e.g. \"try the other branch\", \"also run the benchmarks\").  \
+         This is how you STEER Claude without killing and restarting.\n\
+         - `tmux_send_key` — single control keys: `Escape` to cancel \
+         Claude's in-progress edit, `C-c` to interrupt, arrow keys / `q` to \
+         dismiss UI.  Use this when Claude is stuck in a modal dialog or \
+         needs to be cancelled mid-stream.  Do NOT use it for text — that \
+         is `tmux_send_text`.\n\
+         - `task_done` — declare the task goal verified and release the \
+         pane.  This is the ONLY way to exit supervision cleanly.\n\
+         \n\
+         `task_done` requires `pane_id` + a short `summary` of what Claude \
+         accomplished.  Only call it AFTER you have actually observed \
+         Claude's output (via `tmux_capture_pane`) and judged the work \
+         complete — do not call it on the first turn just to exit.  Once \
+         ALL panes are released, this reminder disappears and you can \
+         reply with plain text again."
     )
 }
 
@@ -4499,7 +4587,7 @@ where
         // 5-minute TTL matches typical idle gaps between user turns;
         // going longer wastes cache capacity on sessions that won't
         // continue.
-        let resp = invoke_model_with_cache(
+        let resp_result = invoke_model_with_cache(
             state,
             invoke_with,
             &messages,
@@ -4508,12 +4596,15 @@ where
             Some(crate::bedrock::CacheTtl::FiveMinutes),
             writer,
         )
-        .await?;
-        // Pop the pane-alive reminder if we injected one, so it doesn't
-        // persist into history / compaction / subsequent turns.
+        .await;
+        // Pop the pane-alive reminder BEFORE the `?` propagation — an
+        // early-return path (transport error, 5xx, retry exhaustion)
+        // must not leak the ephemeral reminder into the persisted
+        // history / next compaction.
         if pane_alive_injected.is_some() {
             let _ = messages.pop();
         }
+        let resp = resp_result?;
         if resp.cache_read_tokens.is_some() || resp.cache_write_tokens.is_some() {
             tracing::debug!(
                 cache_read = ?resp.cache_read_tokens,
