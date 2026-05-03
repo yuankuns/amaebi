@@ -1894,6 +1894,10 @@ async fn handle_claude_launch(
         // before this ClaudeLaunch arrived (or supplied by `--tag`).
         // It's used as pane lease holder / worktree dir / tmux title /
         // notebook key — all three are already wired up upstream.
+        // `worktree` + `resources` ride along so the client can synthesise a
+        // `[launched]` user turn without a second round-trip
+        // (`docs/design/claude-chat-takeover.md`, PR B/F).
+        let resources: Vec<String> = resource_leases.iter().map(|r| r.name.clone()).collect();
         let mut w = writer.lock().await;
         write_frame(
             &mut *w,
@@ -1901,6 +1905,8 @@ async fn handle_claude_launch(
                 tag: task.tag,
                 pane_id,
                 session_id,
+                worktree,
+                resources,
             },
         )
         .await?;

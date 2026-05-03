@@ -632,6 +632,7 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
                     tag,
                     pane_id,
                     session_id: sid,
+                    ..
                 } => {
                     let msg = format!("[pane {pane_id}] tag={tag} → session {sid}\n");
                     stdout.write_all(msg.as_bytes()).await?;
@@ -1181,6 +1182,7 @@ pub async fn run_chat_loop(
                             tag,
                             pane_id,
                             session_id: sid,
+                            ..
                         } => {
                             let msg = format!("[pane {pane_id}] tag={tag} → session {sid}\n");
                             stdout.write_all(msg.as_bytes()).await?;
