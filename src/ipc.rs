@@ -280,6 +280,20 @@ pub enum Response {
         pane_id: String,
         /// amaebi session UUID for the new chat session running in the pane.
         session_id: String,
+        /// Absolute path to the git worktree the task is running in, or
+        /// `None` when worktree isolation is off (auto-creation failed or
+        /// the caller opted out).  Carried here so the client can fold it
+        /// into the synthesised `[launched]` user turn; see
+        /// `docs/design/claude-chat-takeover.md` (PR B/F).
+        /// `#[serde(default)]` keeps older clients compatible with newer
+        /// daemons that emit this field.
+        #[serde(default)]
+        worktree: Option<String>,
+        /// Resolved resource names acquired for this pane, in canonical
+        /// `resource_lease` ordering.  Empty when `--resource` was not
+        /// passed.  Added alongside `worktree` for the same reason.
+        #[serde(default)]
+        resources: Vec<String>,
     },
     /// The LLM called the `switch_model` tool and the active model changed.
     ///
@@ -862,6 +876,8 @@ mod tests {
             tag: "pr-123".into(),
             pane_id: "%3".into(),
             session_id: "uuid-xyz".into(),
+            worktree: Some("/home/u/.amaebi/worktrees/amaebi/pr-123-ab12cd34".into()),
+            resources: vec!["xesim-9902".into(), "xesim-9903".into()],
         };
         let json = serde_json::to_string(&r).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -869,9 +885,63 @@ mod tests {
         assert_eq!(v["tag"], "pr-123");
         assert_eq!(v["pane_id"], "%3");
         assert_eq!(v["session_id"], "uuid-xyz");
+        assert_eq!(
+            v["worktree"],
+            "/home/u/.amaebi/worktrees/amaebi/pr-123-ab12cd34"
+        );
+        assert_eq!(v["resources"][0], "xesim-9902");
+        assert_eq!(v["resources"][1], "xesim-9903");
 
         let back: Response = serde_json::from_str(&json).unwrap();
-        assert!(matches!(back, Response::PaneAssigned { .. }));
+        let Response::PaneAssigned {
+            tag,
+            pane_id,
+            session_id,
+            worktree,
+            resources,
+        } = back
+        else {
+            panic!("expected PaneAssigned");
+        };
+        assert_eq!(tag, "pr-123");
+        assert_eq!(pane_id, "%3");
+        assert_eq!(session_id, "uuid-xyz");
+        assert_eq!(
+            worktree.as_deref(),
+            Some("/home/u/.amaebi/worktrees/amaebi/pr-123-ab12cd34")
+        );
+        assert_eq!(resources, vec!["xesim-9902", "xesim-9903"]);
+    }
+
+    /// A daemon that predates PR B emits `PaneAssigned` frames without
+    /// `worktree` / `resources`.  Deserialising such a frame must still
+    /// succeed and land on the documented defaults, so a newer client can
+    /// talk to an older daemon without `serde` erroring on the missing
+    /// fields.
+    #[test]
+    fn response_pane_assigned_defaults_when_old_format() {
+        let legacy = r#"{
+            "type": "pane_assigned",
+            "tag": "pr-123",
+            "pane_id": "%3",
+            "session_id": "uuid-xyz"
+        }"#;
+        let back: Response = serde_json::from_str(legacy).unwrap();
+        let Response::PaneAssigned {
+            tag,
+            pane_id,
+            session_id,
+            worktree,
+            resources,
+        } = back
+        else {
+            panic!("expected PaneAssigned");
+        };
+        assert_eq!(tag, "pr-123");
+        assert_eq!(pane_id, "%3");
+        assert_eq!(session_id, "uuid-xyz");
+        assert_eq!(worktree, None);
+        assert!(resources.is_empty());
     }
 
     #[test]
