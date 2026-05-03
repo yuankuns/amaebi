@@ -143,9 +143,15 @@ pub struct TaskEntry {
     pub resources: Vec<String>,
     pub worktree: Option<PathBuf>,
     pub tag: Option<String>,
-    /// Holder id passed to `release_task_leases_for_holder` on cleanup —
-    /// matches the `supervision:{session_id}` format that
-    /// `handle_claude_launch` uses when acquiring the notebook lease.
+    /// Canonicalised `repo_dir` paired with `tag` to form the task
+    /// notebook lease key `(repo_dir, tag)`.  Needed on release so
+    /// `tasks::release_lease` can target ONLY this pane's lease,
+    /// leaving any sibling pane's leases (under the same holder id)
+    /// untouched — see the over-release bug otherwise.
+    pub task_repo_dir: Option<String>,
+    /// Holder id used when the notebook lease was acquired — typically
+    /// `supervision:{session_id}`.  Required by `tasks::release_lease`
+    /// which verifies ownership before freeing.
     pub task_lease_holder: Option<String>,
     /// Session UUID for inbox writes when release happens without a live
     /// client to stream the result to (socket break, chat exit).
@@ -2049,6 +2055,16 @@ async fn handle_claude_launch(
             resources: resources.clone(),
             worktree: worktree.as_deref().map(PathBuf::from),
             tag: Some(task.tag.clone()),
+            // Only record a repo_dir when we actually acquired a notebook
+            // lease (resume-pane paths skip acquisition).  Without the
+            // lease, the `(repo_dir, tag)` key wouldn't exist in tasks.db
+            // and release_lease would be a no-op — but keeping the field
+            // in sync with lease_holder keeps the release logic simple.
+            task_repo_dir: if lease_holder.is_some() {
+                repo_dir.clone()
+            } else {
+                None
+            },
             task_lease_holder: lease_holder.clone(),
             session_id: Some(session_id.clone()),
             task_description: Some(raw_desc.clone()),
@@ -2099,6 +2115,30 @@ async fn release_task_leases_for_holder(state: &DaemonState, holder: &str) {
         };
         if let Err(e) = tasks::release_all_by_holder(conn, &holder) {
             tracing::warn!(holder, error = %e, "failed to release task leases");
+        }
+    })
+    .await;
+}
+
+/// Release one specific `(repo_dir, tag)` task lease for `holder`.  Used by
+/// `release_held_entry` so multi-pane `/claude` launches (which share a
+/// single `supervision:{session_id}` holder but hold distinct `(repo_dir,
+/// tag)` keys) only free the one pane's lease, leaving siblings intact.
+async fn release_one_task_lease(state: &DaemonState, repo_dir: &str, tag: &str, holder: &str) {
+    let tasks_db = Arc::clone(&state.tasks_db);
+    let repo_dir = repo_dir.to_string();
+    let tag = tag.to_string();
+    let holder = holder.to_string();
+    let _ = tokio::task::spawn_blocking(move || {
+        let guard = match tasks_db.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        let Some(conn) = guard.as_ref() else {
+            return;
+        };
+        if let Err(e) = tasks::release_lease(conn, &repo_dir, &tag, &holder) {
+            tracing::warn!(repo_dir, tag, holder, error = %e, "failed to release task lease");
         }
     })
     .await;
@@ -2185,8 +2225,18 @@ async fn release_held_entry(
             entry.resources.clone()
         }
     };
-    if let Some(holder) = entry.task_lease_holder.as_deref() {
-        release_task_leases_for_holder(state, holder).await;
+    // Release ONLY this pane's `(repo_dir, tag)` lease, not the whole
+    // holder.  A `/claude "A" "B"` launch holds two leases under the
+    // same `supervision:{session_id}` holder; a holder-wide release
+    // when task A finishes would wrongly free B's lease and allow a
+    // third invocation to acquire tag B while its pane is still
+    // running.
+    if let (Some(holder), Some(repo), Some(tag)) = (
+        entry.task_lease_holder.as_deref(),
+        entry.task_repo_dir.as_deref(),
+        entry.tag.as_deref(),
+    ) {
+        release_one_task_lease(state, repo, tag, holder).await;
     }
 
     // Capture pane tail (best-effort — don't fail the release if tmux is sick).
@@ -7795,6 +7845,7 @@ mod tests {
                 resources: vec!["xesim-dummy".into()],
                 worktree: None,
                 tag: Some("test-tag".into()),
+                task_repo_dir: None,
                 task_lease_holder: None,
                 session_id: Some("sid-test".into()),
                 task_description: Some("do the thing".into()),
@@ -7847,6 +7898,7 @@ mod tests {
                     resources: vec![],
                     worktree: None,
                     tag: None,
+                    task_repo_dir: None,
                     task_lease_holder: None,
                     session_id: None,
                     task_description: None,

@@ -66,8 +66,15 @@ more.
 3. Resource leases (`resource-state.json`, canonical ordering).
 4. Worktree directory + branch (`~/.amaebi/worktrees/<repo>/<tag>-<uuid8>/`).
 5. AGENTS.md written into the worktree.
-6. `claude` launched into the pane (but **the description is NOT pasted** —
-   that becomes the LLM's job so the LLM sees the same text the pane sees).
+6. `claude` launched into the pane AND the task description (git-context
+   preamble + raw desc) is pasted into the pane so Claude starts working
+   immediately — originally this doc proposed deferring the paste to the
+   LLM via `tmux_send_text`, but testing during PR #153 confirmed the
+   auto-paste is both more reliable (no race between Claude startup and
+   the LLM's first turn) and simpler (one synchronous step in Rust
+   instead of an implicit handshake in the chat loop).  The LLM's job
+   becomes supervising Claude from the moment `[launched]` lands, not
+   injecting the initial prompt.
 7. Insert into `HeldResources[conn_id]`.
 
 The daemon then writes `Response::PaneAssigned { tag, pane_id, session_id,
@@ -272,9 +279,17 @@ in chat A cannot release a pane held by chat B — they're different conns).
    message; not a separate prompt, not an auto-injected system text.
    `/claude` description and resource facts travel together as one turn so
    history is replay-safe.
-2. **Pre-op does NOT paste prompt into pane.**  The LLM pastes via
-   `tmux_send_text`.  Consequence: the LLM sees the same text the pane sees
-   — useful when diagnosing transcription issues.
+2. **Pre-op pastes the task description into the pane** so Claude
+   starts working immediately.  The original plan (LLM pastes via
+   `tmux_send_text`) was reversed during PR #153 after smoke testing
+   showed the auto-paste was strictly simpler and removed an implicit
+   race between Claude startup and the LLM's first supervision turn.
+   Consequence: the description the supervisor LLM reasons about (from
+   the `[launched]` block, derived from `TaskSpec::description` on the
+   client) is the raw user text, while the pane receives an enriched
+   version with git-context preamble.  This has not caused supervision
+   errors in practice because the supervisor's job is to WATCH Claude,
+   not to reason about the exact prompt Claude received.
 3. **`task_done` requires `pane_id` explicitly**, no default.  Single-pane
    chats and multi-pane chats use the same call shape.
 4. **LLM cannot call `release_*` directly.**  `task_done` is the only

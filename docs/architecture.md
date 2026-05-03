@@ -122,8 +122,10 @@ passes `--worktree <existing-path>` the auto-create is skipped.
 │      ↓                                                            │
 │    render env vars + prompt_hint; export into pane shell          │
 │      ↓                                                            │
-│    spawn `claude` in pane (task desc is NOT pasted here —         │
-│      the LLM pastes it via tmux_send_text)                         │
+│    spawn `claude` in pane AND paste task description              │
+│      (git-context preamble + raw desc, via tmux send-keys) so     │
+│      Claude starts working immediately.  The LLM supervisor       │
+│      picks up from there via the `[launched]` user turn.          │
 │      ↓                                                            │
 │    record TaskEntry in state.held[conn_id]                        │
 │      ↓                                                            │
