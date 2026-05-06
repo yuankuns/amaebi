@@ -4740,7 +4740,28 @@ fn format_pane_alive_reminder(pane_ids: &[String]) -> String {
          Claude's output (via `tmux_capture_pane`) and judged the work \
          complete — do not call it on the first turn just to exit.  Once \
          ALL panes are released, this reminder disappears and you can \
-         reply with plain text again."
+         reply with plain text again.\n\
+         \n\
+         **Multi-step plan (≥3 steps).**  For tasks with three or more \
+         distinct steps, maintain a plan as a markdown checklist inside \
+         your text reply (NOT in a tool call):\n\
+         \n\
+         ```\n\
+         - [ ] Step 1 description\n\
+         - [ ] Step 2 description\n\
+         - [x] Step 3 description (done)\n\
+         ```\n\
+         \n\
+         Rewrite the WHOLE checklist on every turn that changes status — \
+         do not diff, do not output just the changed line.  Use `[ ]` for \
+         pending / in-progress and `[x]` for completed.  The client picks \
+         up the most recent complete checklist and renders a live \
+         progress indicator for the user; emitting only a partial list \
+         will confuse the indicator.  Put the final state of the \
+         checklist in your `task_done` summary so the inbox archive \
+         captures it.  For trivial single-step tasks (a one-line echo, a \
+         single file edit) skip the checklist entirely — the overhead \
+         isn't worth it."
     )
 }
 
@@ -8129,6 +8150,38 @@ mod tests {
         // that backs up the prompt-level "don't reply with text only" rule.
         let r = format_pane_alive_reminder(&["%54".into()]);
         assert!(r.contains("MUST call at least one tool in every turn"));
+    }
+
+    #[test]
+    fn pane_alive_reminder_instructs_multi_step_plan_checklist() {
+        // Regression guard for the prompt clause that tells the
+        // supervisor LLM to maintain a markdown checklist for
+        // ≥3-step tasks.  The client's `PlanProgressTracker`
+        // (src/client.rs) parses that checklist out of streamed text
+        // to render the live `[plan N/M done]` status line — if this
+        // clause gets silently rewritten or dropped, the feature
+        // degrades to "no progress indicator ever appears" with no
+        // compile-time or CI signal.
+        let r = format_pane_alive_reminder(&["%54".into()]);
+        assert!(
+            r.contains("Multi-step plan"),
+            "prompt must keep the multi-step plan section header so \
+             future edits see it as a load-bearing clause"
+        );
+        assert!(
+            r.contains("- [ ] Step 1 description") && r.contains("- [x] Step 3 description"),
+            "prompt must keep the exact `- [ ]` / `- [x]` example \
+             markers — the client parser (PlanProgressTracker) \
+             matches those literal prefixes, so paraphrasing the \
+             example (e.g. using `* [ ]` or `[ ] Step …`) would \
+             silently break the progress indicator"
+        );
+        assert!(
+            r.contains("Rewrite the WHOLE checklist on every turn"),
+            "prompt must keep the rewrite-whole-list directive — \
+             diff-only / partial-list output confuses the tracker's \
+             latest-run-wins logic"
+        );
     }
 
     #[test]
