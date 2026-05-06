@@ -8153,6 +8153,38 @@ mod tests {
     }
 
     #[test]
+    fn pane_alive_reminder_instructs_multi_step_plan_checklist() {
+        // Regression guard for the prompt clause that tells the
+        // supervisor LLM to maintain a markdown checklist for
+        // ≥3-step tasks.  The client's `PlanProgressTracker`
+        // (src/client.rs) parses that checklist out of streamed text
+        // to render the live `[plan N/M done]` status line — if this
+        // clause gets silently rewritten or dropped, the feature
+        // degrades to "no progress indicator ever appears" with no
+        // compile-time or CI signal.
+        let r = format_pane_alive_reminder(&["%54".into()]);
+        assert!(
+            r.contains("Multi-step plan"),
+            "prompt must keep the multi-step plan section header so \
+             future edits see it as a load-bearing clause"
+        );
+        assert!(
+            r.contains("- [ ] Step 1 description") && r.contains("- [x] Step 3 description"),
+            "prompt must keep the exact `- [ ]` / `- [x]` example \
+             markers — the client parser (PlanProgressTracker) \
+             matches those literal prefixes, so paraphrasing the \
+             example (e.g. using `* [ ]` or `[ ] Step …`) would \
+             silently break the progress indicator"
+        );
+        assert!(
+            r.contains("Rewrite the WHOLE checklist on every turn"),
+            "prompt must keep the rewrite-whole-list directive — \
+             diff-only / partial-list output confuses the tracker's \
+             latest-run-wins logic"
+        );
+    }
+
+    #[test]
     fn pane_alive_reminder_lists_all_five_supervision_tools() {
         // Restrict the search to the "Your supervision vocabulary:"
         // section so a tool name mentioned in an earlier clause (e.g.

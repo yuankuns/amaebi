@@ -221,6 +221,14 @@ fn render_markdown(text: &str) -> String {
 /// streamed output.  Per-chunk work is proportional to the chunk size,
 /// not the accumulated response, so long streams don't degrade to O(n²)
 /// and memory doesn't duplicate what `MarkdownBuffer` already holds.
+///
+/// Rendering is gated on `render_enabled` (caller-supplied, typically
+/// `std::io::stderr().is_terminal()`).  When stderr is not a TTY —
+/// e.g. `amaebi chat 2>progress.log` — the tracker still parses the
+/// stream to stay consistent with the rest of the code, but skips all
+/// `\r\x1b[K…` ANSI control writes so redirected output stays free of
+/// terminal escape noise.  Matches the pattern used for other stderr
+/// UI in this file (`ToolUse`, `Compacting`, the SIGINT steer banner).
 #[derive(Default)]
 struct PlanProgressTracker {
     /// Unparsed tail of the stream — at most one partial (no-newline)
@@ -234,9 +242,20 @@ struct PlanProgressTracker {
     /// this when both are populated (latest-run-wins).
     latest: Option<(usize, usize)>,
     last_emitted: Option<(usize, usize)>,
+    /// `false` when stderr is not a TTY — all async render / clear /
+    /// finish methods become no-ops so we don't pollute a redirected
+    /// log with `\r\x1b[K[plan …]` noise.
+    render_enabled: bool,
 }
 
 impl PlanProgressTracker {
+    fn new(render_enabled: bool) -> Self {
+        Self {
+            render_enabled,
+            ..Default::default()
+        }
+    }
+
     fn push(&mut self, chunk: &str) {
         self.buf.push_str(chunk);
         // Only consume up to the last newline; any trailing partial
@@ -280,6 +299,9 @@ impl PlanProgressTracker {
     where
         W: tokio::io::AsyncWrite + Unpin,
     {
+        if !self.render_enabled {
+            return;
+        }
         let Some((done, total)) = self.latest_progress() else {
             return;
         };
@@ -306,6 +328,9 @@ impl PlanProgressTracker {
     where
         W: tokio::io::AsyncWrite + Unpin,
     {
+        if !self.render_enabled {
+            return;
+        }
         if self.last_emitted.is_some() {
             let _ = err.write_all(b"\n").await;
             let _ = err.flush().await;
@@ -323,7 +348,7 @@ impl PlanProgressTracker {
     where
         W: tokio::io::AsyncWrite + Unpin,
     {
-        if self.last_emitted.is_none() {
+        if !self.render_enabled || self.last_emitted.is_none() {
             return;
         }
         // `\r\x1b[K` wipes the status line in place; we don't need a
@@ -1320,7 +1345,12 @@ pub async fn run_chat_loop(
     // every new turn inside the stream loop below.  We hold a single
     // `stderr` handle for the whole session and reuse it on every render
     // so the per-chunk hot path doesn't re-acquire the descriptor.
-    let mut plan_tracker = PlanProgressTracker::default();
+    // Gate plan-line rendering on stderr being a TTY — when redirected
+    // (e.g. `amaebi chat 2>progress.log`) we skip all `\r\x1b[K…` writes
+    // so the log file stays free of terminal escape sequences.  Computed
+    // once per session; the handle type doesn't change mid-process.
+    let stderr_is_tty = std::io::stderr().is_terminal();
+    let mut plan_tracker = PlanProgressTracker::new(stderr_is_tty);
     let mut plan_err = tokio::io::stderr();
 
     'session: loop {
@@ -1733,7 +1763,7 @@ pub async fn run_chat_loop(
                             // one was emitted) and reset the tracker for
                             // the next turn.
                             plan_tracker.finish(&mut plan_err).await;
-                            plan_tracker = PlanProgressTracker::default();
+                            plan_tracker = PlanProgressTracker::new(stderr_is_tty);
                             break;
                         }
                         Response::Error { message } => {
@@ -1752,7 +1782,7 @@ pub async fn run_chat_loop(
                             // finish the progress line and reset the tracker
                             // so stale counts don't bleed into the next turn.
                             plan_tracker.finish(&mut plan_err).await;
-                            plan_tracker = PlanProgressTracker::default();
+                            plan_tracker = PlanProgressTracker::new(stderr_is_tty);
                             break;
                         }
                         Response::ToolUse { name, detail } => {
@@ -4474,7 +4504,7 @@ mod tests {
         // (e.g. a tool notice) must be preceded by `\r\x1b[K` so it
         // doesn't concatenate onto the `[plan …]` row.  Idempotent: a
         // second call with no fresh render is a no-op.
-        let mut t = PlanProgressTracker::default();
+        let mut t = PlanProgressTracker::new(true);
         t.push("- [x] step 1\n- [ ] step 2\n");
         let mut sink: Vec<u8> = Vec::new();
         t.render_if_changed(&mut sink).await;
@@ -4486,5 +4516,23 @@ mod tests {
         sink.clear();
         t.clear_for_mid_turn_output(&mut sink).await;
         assert!(sink.is_empty());
+    }
+
+    #[tokio::test]
+    async fn plan_tracker_non_tty_skips_all_ansi_writes() {
+        // Regression guard: when stderr isn't a TTY (e.g. redirected to
+        // a log), the tracker must not emit `\r\x1b[K…` escape codes,
+        // even though it still parses the stream to keep counts current.
+        let mut t = PlanProgressTracker::new(false);
+        t.push("- [x] a\n- [ ] b\n");
+        assert_eq!(t.latest_progress(), Some((1, 2)));
+        let mut sink: Vec<u8> = Vec::new();
+        t.render_if_changed(&mut sink).await;
+        t.clear_for_mid_turn_output(&mut sink).await;
+        t.finish(&mut sink).await;
+        assert!(
+            sink.is_empty(),
+            "non-tty tracker wrote escape bytes: {sink:?}"
+        );
     }
 }
