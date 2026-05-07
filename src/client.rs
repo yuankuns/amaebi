@@ -263,26 +263,49 @@ impl PlanProgressTracker {
         let Some(end) = self.buf.rfind('\n').map(|i| i + 1) else {
             return;
         };
-        // Parse the complete-lines prefix, then drain it so `buf`
-        // shrinks back to just the unparsed tail.
-        for line in self.buf[..end].lines() {
-            let trimmed = line.trim_start();
-            let is_done = trimmed.starts_with("- [x]") || trimmed.starts_with("- [X]");
-            let is_pending = trimmed.starts_with("- [ ]");
-            if is_done || is_pending {
-                let done = if is_done { 1 } else { 0 };
-                let (cd, ct) = self.current.unwrap_or((0, 0));
-                self.current = Some((cd + done, ct + 1));
-            } else if !trimmed.is_empty() {
-                // Non-checklist non-blank line terminates the current run.
-                if self.current.is_some() {
-                    self.latest = self.current.take();
-                }
-            }
-            // Blank lines inside a checklist are tolerated (some models
-            // add them between items).
+        // Split the parsed prefix out of `buf` into an owned string
+        // before scoring.  `score_line` takes `&mut self`, so we can't
+        // hold a borrow into `self.buf` while calling it — splitting
+        // first drops the borrow cleanly.  `buf` is left as just the
+        // unparsed tail.
+        let prefix: String = self.buf.drain(..end).collect();
+        for line in prefix.lines() {
+            self.score_line(line);
         }
-        self.buf.drain(..end);
+    }
+
+    /// Score the still-unparsed tail as if it were a complete line.
+    /// Call at end-of-turn (e.g. before `finish()`) so a checklist item
+    /// emitted without a trailing newline — which models sometimes do
+    /// when the checklist is the final thing in the reply — is still
+    /// counted.  Idempotent: once called, `buf` is empty, so repeated
+    /// calls are no-ops.
+    fn finalize_tail(&mut self) {
+        if self.buf.is_empty() {
+            return;
+        }
+        // Clone the tail into a local owned string so `score_line`
+        // can take a `&str` without borrowing self twice.
+        let tail = std::mem::take(&mut self.buf);
+        self.score_line(&tail);
+    }
+
+    fn score_line(&mut self, line: &str) {
+        let trimmed = line.trim_start();
+        let is_done = trimmed.starts_with("- [x]") || trimmed.starts_with("- [X]");
+        let is_pending = trimmed.starts_with("- [ ]");
+        if is_done || is_pending {
+            let done = if is_done { 1 } else { 0 };
+            let (cd, ct) = self.current.unwrap_or((0, 0));
+            self.current = Some((cd + done, ct + 1));
+        } else if !trimmed.is_empty() {
+            // Non-checklist non-blank line terminates the current run.
+            if self.current.is_some() {
+                self.latest = self.current.take();
+            }
+        }
+        // Blank lines inside a checklist are tolerated (some models
+        // add them between items).
     }
 
     /// Extract (done, total) for the most recent contiguous checklist.
@@ -1772,8 +1795,12 @@ pub async fn run_chat_loop(
                             }
                         }
                         Response::Done => {
-                            // Drain any steer-buffered text through md_buf before
-                            // flush_all so the final output is markdown-rendered.
+                            // Drain any steer-buffered text through md_buf
+                            // before flush_all so the final output is
+                            // markdown-rendered.  `plan_tracker` already
+                            // saw each chunk when it first arrived
+                            // (under `Response::Text`), so we don't push
+                            // them again here.
                             for chunk in steer_text_buf.drain(..) {
                                 md_buf.push(&chunk);
                             }
@@ -1784,9 +1811,18 @@ pub async fn run_chat_loop(
                             }
                             stdout.write_all(b"\n").await?;
                             stdout.flush().await?;
-                            // Move the cursor off the plan status line (if
-                            // one was emitted) and reset the tracker for
-                            // the next turn.
+                            // Score the unparsed tail (e.g. a checklist
+                            // item emitted without a trailing newline at
+                            // the very end of the reply) so the final
+                            // status line reflects the complete plan
+                            // before we draw it.
+                            plan_tracker.finalize_tail();
+                            // Draw the final status line (picks up any
+                            // progress that was suppressed while
+                            // steer_pending or that arrived in the tail
+                            // we just finalized), then move the cursor
+                            // off it and reset for the next turn.
+                            plan_tracker.render_if_changed(&mut plan_err).await;
                             plan_tracker.finish(&mut plan_err).await;
                             plan_tracker = PlanProgressTracker::new(stderr_is_tty);
                             break;
@@ -1804,8 +1840,11 @@ pub async fn run_chat_loop(
                             stdout.write_all(msg.as_bytes()).await?;
                             stdout.flush().await?;
                             // Error path terminates the turn just like Done;
-                            // finish the progress line and reset the tracker
-                            // so stale counts don't bleed into the next turn.
+                            // finalize the buffered tail, draw a final
+                            // status line if progress changed, then
+                            // finish + reset.
+                            plan_tracker.finalize_tail();
+                            plan_tracker.render_if_changed(&mut plan_err).await;
                             plan_tracker.finish(&mut plan_err).await;
                             plan_tracker = PlanProgressTracker::new(stderr_is_tty);
                             break;
@@ -1857,6 +1896,17 @@ pub async fn run_chat_loop(
                                 }
                             }
                             let _ = stdout.flush().await;
+                            // The steer flow erased the in-place plan
+                            // line (via `clear_for_mid_turn_output` in
+                            // the SIGINT / WaitingForInput paths) and
+                            // reset `last_emitted`, so a fresh draw
+                            // here is not a no-op: it restores the
+                            // indicator immediately after steering ends.
+                            // Without this, the status line stays
+                            // erased until the next `Response::Text`
+                            // chunk — a problem when the LLM goes
+                            // straight from SteerAck to Done.
+                            plan_tracker.render_if_changed(&mut plan_err).await;
                         }
                         Response::Compacting => {
                             // Flush pending markdown before the compacting notice.
@@ -4559,5 +4609,35 @@ mod tests {
             sink.is_empty(),
             "non-tty tracker wrote escape bytes: {sink:?}"
         );
+    }
+
+    #[test]
+    fn plan_tracker_finalize_tail_counts_unterminated_last_line() {
+        // Models sometimes emit the final checklist item without a
+        // trailing newline, then the reply ends.  `push` alone won't
+        // score that line (it only parses up to the last newline), so
+        // the end-of-turn paths must call `finalize_tail` before
+        // rendering the final status line.
+        let mut t = PlanProgressTracker::new(true);
+        t.push("- [x] step 1\n- [ ] step 2");
+        // Before finalize: only the terminated line counts.
+        assert_eq!(t.latest_progress(), Some((1, 1)));
+        t.finalize_tail();
+        assert_eq!(t.latest_progress(), Some((1, 2)));
+        // Idempotent: a second call does nothing — `buf` is empty now.
+        t.finalize_tail();
+        assert_eq!(t.latest_progress(), Some((1, 2)));
+    }
+
+    #[test]
+    fn plan_tracker_finalize_tail_ignores_empty_buf() {
+        // End-of-turn path always calls finalize; calling it when the
+        // stream ended on a newline (tail is empty) must be a no-op,
+        // not a panic and not a phantom count.
+        let mut t = PlanProgressTracker::new(true);
+        t.push("- [x] a\n- [x] b\n");
+        assert_eq!(t.latest_progress(), Some((2, 2)));
+        t.finalize_tail();
+        assert_eq!(t.latest_progress(), Some((2, 2)));
     }
 }
