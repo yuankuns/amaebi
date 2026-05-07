@@ -197,6 +197,192 @@ fn render_markdown(text: &str) -> String {
     }
 }
 
+/// Accumulates streamed assistant text and renders the most recent
+/// markdown checklist as a stderr progress line.
+///
+/// The LLM is instructed (see `format_pane_alive_reminder` in daemon.rs)
+/// to rewrite its plan on every status change using `- [ ]` / `- [x]`
+/// markers.  We watch the text buffer, find the last contiguous run of
+/// checklist lines, count done vs. total, and emit a
+/// `\r\x1b[K[plan {done}/{total} done]` status line so the user sees
+/// progress without scroll.  The leading `\r` anchors at column 0 and
+/// the `\x1b[K` clear-to-EOL prevents stale glyphs when successive
+/// renders have different widths; no trailing newline is emitted until
+/// the turn finishes.
+///
+/// Intentionally tolerant — malformed or partial checklists reduce to
+/// "no progress update this tick" rather than crash.  Emits only when
+/// (done, total) changes across renders so the stderr line doesn't flap.
+///
+/// Parsing is incremental: each `push` consumes complete
+/// (newline-terminated) lines only, updating the running `current` /
+/// `latest` state, then drops the parsed prefix so `buf` stays at
+/// O(size_of_unparsed_tail) rather than growing with the whole turn's
+/// streamed output.  Per-chunk work is proportional to the chunk size,
+/// not the accumulated response, so long streams don't degrade to O(n²)
+/// and memory doesn't duplicate what `MarkdownBuffer` already holds.
+///
+/// Rendering is gated on `render_enabled` (caller-supplied, typically
+/// `std::io::stderr().is_terminal()`).  When stderr is not a TTY —
+/// e.g. `amaebi chat 2>progress.log` — the tracker still parses the
+/// stream to stay consistent with the rest of the code, but skips all
+/// `\r\x1b[K…` ANSI control writes so redirected output stays free of
+/// terminal escape noise.  Matches the pattern used for other stderr
+/// UI in this file (`ToolUse`, `Compacting`, the SIGINT steer banner).
+#[derive(Default)]
+struct PlanProgressTracker {
+    /// Unparsed tail of the stream — at most one partial (no-newline)
+    /// line at any point, since `push` drains completed lines before
+    /// returning.
+    buf: String,
+    /// Running counts for the current contiguous checklist run.  `None`
+    /// once a non-checklist non-blank line terminates the run.
+    current: Option<(usize, usize)>,
+    /// Most recent fully-terminated checklist run.  `current` wins over
+    /// this when both are populated (latest-run-wins).
+    latest: Option<(usize, usize)>,
+    last_emitted: Option<(usize, usize)>,
+    /// `false` when stderr is not a TTY — all async render / clear /
+    /// finish methods become no-ops so we don't pollute a redirected
+    /// log with `\r\x1b[K[plan …]` noise.
+    render_enabled: bool,
+}
+
+impl PlanProgressTracker {
+    fn new(render_enabled: bool) -> Self {
+        Self {
+            render_enabled,
+            ..Default::default()
+        }
+    }
+
+    fn push(&mut self, chunk: &str) {
+        self.buf.push_str(chunk);
+        // Only consume up to the last newline; any trailing partial
+        // line stays buffered for next push.
+        let Some(end) = self.buf.rfind('\n').map(|i| i + 1) else {
+            return;
+        };
+        // Split the parsed prefix out of `buf` into an owned string
+        // before scoring.  `score_line` takes `&mut self`, so we can't
+        // hold a borrow into `self.buf` while calling it — splitting
+        // first drops the borrow cleanly.  `buf` is left as just the
+        // unparsed tail.
+        let prefix: String = self.buf.drain(..end).collect();
+        for line in prefix.lines() {
+            self.score_line(line);
+        }
+    }
+
+    /// Score the still-unparsed tail as if it were a complete line.
+    /// Call at end-of-turn (e.g. before `finish()`) so a checklist item
+    /// emitted without a trailing newline — which models sometimes do
+    /// when the checklist is the final thing in the reply — is still
+    /// counted.  Idempotent: once called, `buf` is empty, so repeated
+    /// calls are no-ops.
+    fn finalize_tail(&mut self) {
+        if self.buf.is_empty() {
+            return;
+        }
+        // Clone the tail into a local owned string so `score_line`
+        // can take a `&str` without borrowing self twice.
+        let tail = std::mem::take(&mut self.buf);
+        self.score_line(&tail);
+    }
+
+    fn score_line(&mut self, line: &str) {
+        let trimmed = line.trim_start();
+        let is_done = trimmed.starts_with("- [x]") || trimmed.starts_with("- [X]");
+        let is_pending = trimmed.starts_with("- [ ]");
+        if is_done || is_pending {
+            let done = if is_done { 1 } else { 0 };
+            let (cd, ct) = self.current.unwrap_or((0, 0));
+            self.current = Some((cd + done, ct + 1));
+        } else if !trimmed.is_empty() {
+            // Non-checklist non-blank line terminates the current run.
+            if self.current.is_some() {
+                self.latest = self.current.take();
+            }
+        }
+        // Blank lines inside a checklist are tolerated (some models
+        // add them between items).
+    }
+
+    /// Extract (done, total) for the most recent contiguous checklist.
+    /// `current` (still-open run) wins over `latest` (closed run) so
+    /// the displayed progress always reflects the newest plan the LLM
+    /// has emitted.
+    fn latest_progress(&self) -> Option<(usize, usize)> {
+        self.current.or(self.latest)
+    }
+
+    /// Emit a stderr progress line IF `latest_progress` has changed.
+    /// Best-effort; write errors are swallowed.
+    async fn render_if_changed<W>(&mut self, err: &mut W)
+    where
+        W: tokio::io::AsyncWrite + Unpin,
+    {
+        if !self.render_enabled {
+            return;
+        }
+        let Some((done, total)) = self.latest_progress() else {
+            return;
+        };
+        if total == 0 {
+            return;
+        }
+        if self.last_emitted == Some((done, total)) {
+            return;
+        }
+        self.last_emitted = Some((done, total));
+        // `\r` anchors the line at column 0 so subsequent renders
+        // overwrite in place; final `\n` intentionally omitted.
+        // `\x1b[K` clears to end-of-line so a shorter new line doesn't
+        // leave stale glyphs from the previous render.
+        let line = format!("\r\x1b[K[plan {done}/{total} done]");
+        let _ = err.write_all(line.as_bytes()).await;
+        let _ = err.flush().await;
+    }
+
+    /// Emit a final newline on stderr so the stream moves off the
+    /// progress line before the next chat `>` prompt.  Called once per
+    /// completed turn.  No-op when nothing was ever emitted.
+    async fn finish<W>(&mut self, err: &mut W)
+    where
+        W: tokio::io::AsyncWrite + Unpin,
+    {
+        if !self.render_enabled {
+            return;
+        }
+        if self.last_emitted.is_some() {
+            let _ = err.write_all(b"\n").await;
+            let _ = err.flush().await;
+        }
+    }
+
+    /// Clear an in-place plan line so mid-turn stderr output (tool
+    /// notices, compacting banners, SIGINT prompt, …) doesn't append
+    /// onto it and produce a garbled row like
+    /// `[plan 2/5 done]📄 foo.rs`.  Idempotent: no-op when nothing has
+    /// been emitted this turn.  After this returns the next
+    /// `render_if_changed` will re-draw the status line (the reset of
+    /// `last_emitted` forces a fresh render on the next progress tick).
+    async fn clear_for_mid_turn_output<W>(&mut self, err: &mut W)
+    where
+        W: tokio::io::AsyncWrite + Unpin,
+    {
+        if !self.render_enabled || self.last_emitted.is_none() {
+            return;
+        }
+        // `\r\x1b[K` wipes the status line in place; we don't need a
+        // newline here — the caller is about to print one itself
+        // (`eprintln!` et al).
+        let _ = err.write_all(b"\r\x1b[K").await;
+        let _ = err.flush().await;
+        self.last_emitted = None;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Slash command parsing
 // ---------------------------------------------------------------------------
@@ -1176,6 +1362,19 @@ pub async fn run_chat_loop(
     // streaming output does not interleave with user input.
     let mut steer_text_buf: Vec<String> = Vec::new();
     let mut md_buf = MarkdownBuffer::default();
+    // Plan progress tracker — separate from md_buf because its input is
+    // raw chunks (pre-markdown-render), per-turn not per-session, and its
+    // output goes to stderr not stdout.  A fresh tracker is installed on
+    // every new turn inside the stream loop below.  We hold a single
+    // `stderr` handle for the whole session and reuse it on every render
+    // so the per-chunk hot path doesn't re-acquire the descriptor.
+    // Gate plan-line rendering on stderr being a TTY — when redirected
+    // (e.g. `amaebi chat 2>progress.log`) we skip all `\r\x1b[K…` writes
+    // so the log file stays free of terminal escape sequences.  Computed
+    // once per session; the handle type doesn't change mid-process.
+    let stderr_is_tty = std::io::stderr().is_terminal();
+    let mut plan_tracker = PlanProgressTracker::new(stderr_is_tty);
+    let mut plan_err = tokio::io::stderr();
 
     'session: loop {
         let prompt = match next_prompt.take() {
@@ -1522,6 +1721,7 @@ pub async fn run_chat_loop(
                     }
                     steer_pending = true;
                     if std::io::stderr().is_terminal() {
+                        plan_tracker.clear_for_mid_turn_output(&mut plan_err).await;
                         eprintln!("\n^C interrupted. Enter correction (empty line to cancel): ");
                         // The prompt marker `> ` is emitted by rustyline itself.
                     }
@@ -1544,6 +1744,16 @@ pub async fn run_chat_loop(
                     let resp: Response = serde_json::from_str(&line)?;
                     match resp {
                         Response::Text { chunk } => {
+                            // Always feed the tracker — even while steer-
+                            // buffering — so checklist updates emitted
+                            // during a `WaitingForInput` / Ctrl-C steer
+                            // prompt aren't dropped.  We only suppress the
+                            // *render* (status-line write to stderr) while
+                            // the user is typing, so the correction prompt
+                            // stays readable; the tracker will draw the
+                            // catch-up status line on the next chunk after
+                            // `SteerAck` clears `steer_pending`.
+                            plan_tracker.push(&chunk);
                             if steer_pending {
                                 // Buffer text while the user is typing a steer
                                 // correction so streaming output does not
@@ -1551,16 +1761,46 @@ pub async fn run_chat_loop(
                                 steer_text_buf.push(chunk);
                             } else {
                                 md_buf.push(&chunk);
+                                // Output ordering within a tick: stdout
+                                // markdown comes FIRST, plan line LAST.
+                                // stdout and stderr share the terminal
+                                // cursor, so emitting the status line
+                                // before flushing markdown would land
+                                // the markdown at the end of `[plan N/M
+                                // done]`, garbling the row.  Clearing
+                                // the plan line before stdout writes
+                                // also prevents the old status bytes
+                                // from bleeding into the markdown line
+                                // when a redraw follows on the next tick.
+                                let mut flushed_stdout = false;
                                 while let Some(ready) = md_buf.flush_if_ready() {
+                                    if !flushed_stdout {
+                                        plan_tracker
+                                            .clear_for_mid_turn_output(&mut plan_err)
+                                            .await;
+                                        flushed_stdout = true;
+                                    }
                                     let out = render_markdown(&ready);
                                     stdout.write_all(out.as_bytes()).await?;
                                     stdout.flush().await?;
                                 }
+                                // Render the plan line AFTER all stdout
+                                // writes for this tick, so the status
+                                // line is always the last thing the
+                                // terminal drew — subsequent in-place
+                                // redraws via `\r\x1b[K` therefore
+                                // target the status line, not the
+                                // preceding markdown.
+                                plan_tracker.render_if_changed(&mut plan_err).await;
                             }
                         }
                         Response::Done => {
-                            // Drain any steer-buffered text through md_buf before
-                            // flush_all so the final output is markdown-rendered.
+                            // Drain any steer-buffered text through md_buf
+                            // before flush_all so the final output is
+                            // markdown-rendered.  `plan_tracker` already
+                            // saw each chunk when it first arrived
+                            // (under `Response::Text`), so we don't push
+                            // them again here.
                             for chunk in steer_text_buf.drain(..) {
                                 md_buf.push(&chunk);
                             }
@@ -1571,6 +1811,20 @@ pub async fn run_chat_loop(
                             }
                             stdout.write_all(b"\n").await?;
                             stdout.flush().await?;
+                            // Score the unparsed tail (e.g. a checklist
+                            // item emitted without a trailing newline at
+                            // the very end of the reply) so the final
+                            // status line reflects the complete plan
+                            // before we draw it.
+                            plan_tracker.finalize_tail();
+                            // Draw the final status line (picks up any
+                            // progress that was suppressed while
+                            // steer_pending or that arrived in the tail
+                            // we just finalized), then move the cursor
+                            // off it and reset for the next turn.
+                            plan_tracker.render_if_changed(&mut plan_err).await;
+                            plan_tracker.finish(&mut plan_err).await;
+                            plan_tracker = PlanProgressTracker::new(stderr_is_tty);
                             break;
                         }
                         Response::Error { message } => {
@@ -1585,6 +1839,14 @@ pub async fn run_chat_loop(
                             let msg = format!("Error: {message}\n");
                             stdout.write_all(msg.as_bytes()).await?;
                             stdout.flush().await?;
+                            // Error path terminates the turn just like Done;
+                            // finalize the buffered tail, draw a final
+                            // status line if progress changed, then
+                            // finish + reset.
+                            plan_tracker.finalize_tail();
+                            plan_tracker.render_if_changed(&mut plan_err).await;
+                            plan_tracker.finish(&mut plan_err).await;
+                            plan_tracker = PlanProgressTracker::new(stderr_is_tty);
                             break;
                         }
                         Response::ToolUse { name, detail } => {
@@ -1595,6 +1857,10 @@ pub async fn run_chat_loop(
                                 let _ = stdout.flush().await;
                             }
                             if std::io::stderr().is_terminal() {
+                                // Wipe any in-place `[plan N/M done]` line
+                                // so the tool notice doesn't concatenate
+                                // onto it and garble the row.
+                                plan_tracker.clear_for_mid_turn_output(&mut plan_err).await;
                                 match name.as_str() {
                                     "shell_command" => eprint!("{}", render_markdown(&format!("```bash\n$ {detail}\n```\n"))),
                                     "read_file"     => eprintln!("📄 {detail}"),
@@ -1608,6 +1874,7 @@ pub async fn run_chat_loop(
                             // iteration of the select! loop reads stdin via the
                             // existing steer arm — keeping SIGINT responsive.
                             if std::io::stderr().is_terminal() && !extra.is_empty() {
+                                plan_tracker.clear_for_mid_turn_output(&mut plan_err).await;
                                 eprintln!("\n{extra}");
                             }
                             // The prompt marker `> ` is emitted by rustyline itself.
@@ -1629,6 +1896,17 @@ pub async fn run_chat_loop(
                                 }
                             }
                             let _ = stdout.flush().await;
+                            // The steer flow erased the in-place plan
+                            // line (via `clear_for_mid_turn_output` in
+                            // the SIGINT / WaitingForInput paths) and
+                            // reset `last_emitted`, so a fresh draw
+                            // here is not a no-op: it restores the
+                            // indicator immediately after steering ends.
+                            // Without this, the status line stays
+                            // erased until the next `Response::Text`
+                            // chunk — a problem when the LLM goes
+                            // straight from SteerAck to Done.
+                            plan_tracker.render_if_changed(&mut plan_err).await;
                         }
                         Response::Compacting => {
                             // Flush pending markdown before the compacting notice.
@@ -1637,7 +1915,10 @@ pub async fn run_chat_loop(
                                 let _ = stdout.write_all(out.as_bytes()).await;
                                 let _ = stdout.flush().await;
                             }
-                            if std::io::stderr().is_terminal() { eprintln!("\n[compacting…]"); }
+                            if std::io::stderr().is_terminal() {
+                                plan_tracker.clear_for_mid_turn_output(&mut plan_err).await;
+                                eprintln!("\n[compacting…]");
+                            }
                         }
                         Response::ModelSwitched { model: new_model } => {
                             // Keep client model in sync so the next Request::Chat
@@ -4194,5 +4475,169 @@ mod tests {
         let dirty = format_task_released("%54", &[], None, None, Some("/path"), true, "");
         assert!(clean.contains("worktree=/path\n") || clean.contains("worktree=/path "));
         assert!(dirty.contains("worktree=/path (dirty)"));
+    }
+
+    // ------------------------------------------------------------------
+    // PlanProgressTracker
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn plan_tracker_empty_returns_none() {
+        let t = PlanProgressTracker::default();
+        assert!(t.latest_progress().is_none());
+    }
+
+    #[test]
+    fn plan_tracker_all_pending() {
+        let mut t = PlanProgressTracker::default();
+        t.push("- [ ] Step 1\n- [ ] Step 2\n- [ ] Step 3\n");
+        assert_eq!(t.latest_progress(), Some((0, 3)));
+    }
+
+    #[test]
+    fn plan_tracker_mixed_done() {
+        let mut t = PlanProgressTracker::default();
+        t.push("- [x] Step 1\n- [X] Step 2\n- [ ] Step 3\n");
+        assert_eq!(t.latest_progress(), Some((2, 3)));
+    }
+
+    #[test]
+    fn plan_tracker_picks_latest_run() {
+        // First checklist (superseded) + narrative line + second checklist.
+        let mut t = PlanProgressTracker::default();
+        t.push("- [ ] old step A\n- [ ] old step B\n");
+        t.push("Here is my revised plan:\n");
+        t.push("- [x] new step 1\n- [ ] new step 2\n");
+        assert_eq!(t.latest_progress(), Some((1, 2)));
+    }
+
+    #[test]
+    fn plan_tracker_indented_bullets_count() {
+        let mut t = PlanProgressTracker::default();
+        t.push("  - [ ] indented step\n    - [x] deeper step\n");
+        assert_eq!(t.latest_progress(), Some((1, 2)));
+    }
+
+    #[test]
+    fn plan_tracker_tolerates_blank_lines_inside_run() {
+        let mut t = PlanProgressTracker::default();
+        t.push("- [x] Step 1\n\n- [x] Step 2\n\n- [ ] Step 3\n");
+        assert_eq!(t.latest_progress(), Some((2, 3)));
+    }
+
+    #[test]
+    fn plan_tracker_non_checklist_resets_run() {
+        // A narrative sentence between two checklist blocks must make the
+        // SECOND block win — we want the most recent plan, not a merged
+        // count of both.
+        let mut t = PlanProgressTracker::default();
+        t.push("- [x] A\n- [x] B\n- [x] C\n");
+        t.push("Revised plan below:\n");
+        t.push("- [ ] X\n- [ ] Y\n");
+        assert_eq!(t.latest_progress(), Some((0, 2)));
+    }
+
+    #[test]
+    fn plan_tracker_no_checklist_markers_returns_none() {
+        let mut t = PlanProgressTracker::default();
+        t.push("Just some prose without any checklist in it.\n");
+        t.push("Maybe a bullet - no brackets.\n");
+        assert!(t.latest_progress().is_none());
+    }
+
+    #[test]
+    fn plan_tracker_incremental_handles_midline_split() {
+        // Streamed input often splits inside a line.  The parser must
+        // defer scoring a line until its terminating newline arrives,
+        // otherwise a half-seen "- [ " would be misclassified.
+        let mut t = PlanProgressTracker::default();
+        t.push("- [x] done\n- [");
+        assert_eq!(t.latest_progress(), Some((1, 1)));
+        t.push(" ] pending\n");
+        assert_eq!(t.latest_progress(), Some((1, 2)));
+    }
+
+    #[test]
+    fn plan_tracker_buf_does_not_grow_with_stream_length() {
+        // Memory invariant: `buf` holds only the unparsed tail (at most
+        // one partial line).  Feeding many completed lines must leave
+        // `buf` empty; a trailing partial-line chunk leaves only that
+        // fragment in `buf`.
+        let mut t = PlanProgressTracker::default();
+        for _ in 0..1000 {
+            t.push("- [ ] step\n");
+        }
+        assert_eq!(t.buf.len(), 0);
+        assert_eq!(t.latest_progress(), Some((0, 1000)));
+        t.push("- [x");
+        assert_eq!(t.buf.as_str(), "- [x");
+    }
+
+    #[tokio::test]
+    async fn plan_tracker_clear_for_mid_turn_output_wipes_line() {
+        // After a status line has been emitted, mid-turn stderr output
+        // (e.g. a tool notice) must be preceded by `\r\x1b[K` so it
+        // doesn't concatenate onto the `[plan …]` row.  Idempotent: a
+        // second call with no fresh render is a no-op.
+        let mut t = PlanProgressTracker::new(true);
+        t.push("- [x] step 1\n- [ ] step 2\n");
+        let mut sink: Vec<u8> = Vec::new();
+        t.render_if_changed(&mut sink).await;
+        assert_eq!(sink, b"\r\x1b[K[plan 1/2 done]");
+        sink.clear();
+        t.clear_for_mid_turn_output(&mut sink).await;
+        assert_eq!(sink, b"\r\x1b[K");
+        assert_eq!(t.last_emitted, None);
+        sink.clear();
+        t.clear_for_mid_turn_output(&mut sink).await;
+        assert!(sink.is_empty());
+    }
+
+    #[tokio::test]
+    async fn plan_tracker_non_tty_skips_all_ansi_writes() {
+        // Regression guard: when stderr isn't a TTY (e.g. redirected to
+        // a log), the tracker must not emit `\r\x1b[K…` escape codes,
+        // even though it still parses the stream to keep counts current.
+        let mut t = PlanProgressTracker::new(false);
+        t.push("- [x] a\n- [ ] b\n");
+        assert_eq!(t.latest_progress(), Some((1, 2)));
+        let mut sink: Vec<u8> = Vec::new();
+        t.render_if_changed(&mut sink).await;
+        t.clear_for_mid_turn_output(&mut sink).await;
+        t.finish(&mut sink).await;
+        assert!(
+            sink.is_empty(),
+            "non-tty tracker wrote escape bytes: {sink:?}"
+        );
+    }
+
+    #[test]
+    fn plan_tracker_finalize_tail_counts_unterminated_last_line() {
+        // Models sometimes emit the final checklist item without a
+        // trailing newline, then the reply ends.  `push` alone won't
+        // score that line (it only parses up to the last newline), so
+        // the end-of-turn paths must call `finalize_tail` before
+        // rendering the final status line.
+        let mut t = PlanProgressTracker::new(true);
+        t.push("- [x] step 1\n- [ ] step 2");
+        // Before finalize: only the terminated line counts.
+        assert_eq!(t.latest_progress(), Some((1, 1)));
+        t.finalize_tail();
+        assert_eq!(t.latest_progress(), Some((1, 2)));
+        // Idempotent: a second call does nothing — `buf` is empty now.
+        t.finalize_tail();
+        assert_eq!(t.latest_progress(), Some((1, 2)));
+    }
+
+    #[test]
+    fn plan_tracker_finalize_tail_ignores_empty_buf() {
+        // End-of-turn path always calls finalize; calling it when the
+        // stream ended on a newline (tail is empty) must be a no-op,
+        // not a panic and not a phantom count.
+        let mut t = PlanProgressTracker::new(true);
+        t.push("- [x] a\n- [x] b\n");
+        assert_eq!(t.latest_progress(), Some((2, 2)));
+        t.finalize_tail();
+        assert_eq!(t.latest_progress(), Some((2, 2)));
     }
 }
