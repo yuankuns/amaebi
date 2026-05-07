@@ -15,14 +15,12 @@
 
 ## Versioning
 - `Cargo.toml` `version` is calendar-versioned `YYYY.M.N` (no leading zeros on `M`/`N`).
-- The version is validated **per-commit** by comparing HEAD's `Cargo.toml` to HEAD's first-non-merge parent's `Cargo.toml`.  Rule:
-  - `YYYY` / `M` = year and month of HEAD's committer date.
-  - `N` = parent's `N` + 1 when HEAD is a qualifying commit (`feat(…)` / `feat:` / `fix(…)` / `fix:` / `docs(…)` / `docs:`) AND HEAD lands in the same `(YYYY, M)` as the parent.
-  - `N` = parent's `N` (no bump) for non-qualifying prefixes (`refactor`, `chore`, `test`, `revert`, `spike`, …) in the same month.
-  - Month rollover: when HEAD's `(YYYY, M)` differs from the parent's, `N` resets to `1` (qualifying) or `0` (non-qualifying), regardless of where the parent stood.  Squash-merge "跳号" gaps (e.g. master jumps from `.2` → `.13` in a single merge) are therefore tolerated — only neighbor-to-neighbor deltas are validated, not the absolute count.
-  - Merge commits (2+ parents) are transparent: `--check` walks down via `^2` (GitHub PR convention: `^2` is the incoming branch) to the first non-merge ancestor and validates THAT commit's `Cargo.toml` against its own parent's `Cargo.toml` + delta.  Handles GitHub's synthetic `refs/pull/<N>/merge` commits.
-- Each PR author bumps `Cargo.toml` in the commit that introduces qualifying changes.  Run `scripts/next-version.sh` (no flag) to print the expected value for HEAD; run with `--check` to pass/fail.
-- CI runs `scripts/next-version.sh --check` on every PR and red-fails if HEAD's `Cargo.toml` disagrees with parent + delta.
+- The rule depends on whether HEAD is on master or on a feature branch; see `scripts/next-version.sh` header for the full rationale.
+  - **On master (HEAD is an ancestor of `origin/master`).**  Expected = parent's `Cargo.toml` + delta(subject): `+1` for qualifying commits (`feat(…)` / `feat:` / `fix(…)` / `fix:` / `docs(…)` / `docs:`), `+0` otherwise (`refactor`, `chore`, `test`, `revert`, `spike`, …).  Squash-merge commits on master are 1-parent, so the PR title's prefix determines the bump.  Month rollover resets `N` to `1` (qualifying) or `0` (non-qualifying).
+  - **On a feature branch (non-ancestor of `origin/master`).**  Expected = master's `Cargo.toml` + `1` if **any** non-merge commit in `origin/master..HEAD` has a qualifying subject, else master's `Cargo.toml` unchanged.  Every commit on a single PR shares ONE expected value, so follow-up review fixes don't need a second bump.  Month rollover (HEAD's committer month differs from master's) resets `N` to `1` (qualifying PR) or `0` (non-qualifying PR).
+  - **Merge commits**: master MUST be linear — squash or rebase merges only.  A "Create a merge commit" PR subject is `Merge pull request ...` (non-qualifying → expected delta 0), but the merge tree usually contains the PR's bumped `Cargo.toml`, so `--check` would report a false mismatch.  Master-mode therefore fails fast on any 2+-parent commit with a message telling the operator to switch merge style.  Inside a PR branch it's fine: branch mode skips merges via `git log --no-merges`, so merging master back into a branch is transparent.  GitHub's synthetic `refs/pull/<N>/merge` is non-ancestor of master and falls into branch mode where the guard doesn't apply.
+- Each PR bumps `Cargo.toml` exactly once (on the first qualifying commit of the branch).  Subsequent review commits on the same PR — whether `fix`, `refactor`, `chore`, or another `feat` — must NOT bump the version; the branch-mode check enforces a single expected value for the whole PR.  Run `scripts/next-version.sh` (no flag) to print the expected value for HEAD; run with `--check` to pass/fail.
+- CI runs `scripts/next-version.sh --check` on every PR and red-fails if `Cargo.toml` disagrees with the expected value.  `scripts/next-version.test.sh` is a companion shell-level regression suite for the versioning logic itself.
 
 ## Architecture
 - SQLite is the source of truth for `memory_db`, `inbox.db`, and `cron.db`. Do not use `.jsonl` or `.json` files for state storage. Avoid `tempfile` atomic writes for data that belongs in SQLite.

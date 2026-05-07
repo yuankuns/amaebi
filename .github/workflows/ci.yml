@@ -17,11 +17,20 @@ jobs:
           # the branch to derive the expected Cargo.toml version.
           fetch-depth: 0
 
+      - name: Version logic self-test
+        # Regression suite for scripts/next-version.sh itself.  Spins up
+        # throwaway git repos and asserts master-mode / branch-mode /
+        # month-rollover / merge-commit behavior so a subtle bug in the
+        # rule can't ship silently and break every downstream PR.
+        run: scripts/next-version.test.sh
+
       - name: Version bump check
         # Verifies that `Cargo.toml` was bumped according to the rule in
-        # CLAUDE.md: each `feat(...)` on master bumps MINOR (PATCH=0),
-        # each `fix(...)` bumps PATCH; MAJOR is human-controlled.  Fails
-        # the build if Cargo.toml disagrees with the history scan.
+        # CLAUDE.md: on master, each `feat(/fix(/docs(` PR bumps `N` by
+        # one (other prefixes don't bump).  On a PR branch, the whole
+        # branch shares one expected version — so review-round commits
+        # don't churn `Cargo.toml`.  Fails the build if Cargo.toml
+        # disagrees with the derived expected value.
         run: scripts/next-version.sh --check
 
       - name: Build dev image (if missing)
