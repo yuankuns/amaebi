@@ -47,17 +47,22 @@
 # stays linear-per-commit so the squash subject continues to govern
 # the landed version.
 #
-# Merge-commit handling: no walking.  Branch mode scans
-# `master_ref..HEAD` with `--no-merges`, so a user merging master back
-# into the branch adds a merge commit that is transparent to the
-# qualifier scan (only the original PR work is counted).  Master mode
-# on a merge commit uses `HEAD^1` (first-parent) as the parent, so a
-# real-merge landing on master computes its delta against the prior
-# master tip — the right anchor.  GitHub's synthetic
-# `refs/pull/<N>/merge` commits have ^1 = base branch and ^2 = PR head;
-# since those are NOT ancestors of `origin/master`, they fall into
-# branch mode and are handled by the master_ref..HEAD scan, which
-# correctly identifies them as a non-landed PR.
+# Merge-commit handling: master MUST be linear (squash or rebase merges
+# only).  Branch mode scans `master_ref..HEAD` with `--no-merges`, so a
+# user merging master back into their branch adds a merge commit that
+# is transparent to the qualifier scan (only the original PR work is
+# counted).  On master itself, a 2+-parent commit breaks the rule: the
+# standard "Create a merge commit" PR subject is `Merge pull request
+# ...` (non-qualifying → expected delta 0), but the merge tree
+# typically contains the PR's Cargo.toml bump, so `--check` would
+# report a false mismatch.  Rather than silently papering over that,
+# master-mode explicitly fails on merge commits with a clear error so
+# the operator fixes their merge style (switch to squash / rebase)
+# instead of learning about the gap later.  GitHub's synthetic
+# `refs/pull/<N>/merge` commits are 2-parent but NOT ancestors of
+# `origin/master`, so they fall into branch mode and are validated via
+# the `master_ref..HEAD` scan — this guard only trips for merges that
+# actually land on master.
 #
 # Usage:
 #   scripts/next-version.sh            # print the expected version for HEAD
@@ -142,11 +147,28 @@ determine_mode() {
 
 # Compute expected version for `$1` under MASTER MODE (per-commit delta
 # against parent's Cargo.toml).  Root commits fall back to committer
-# month with N=1/0 depending on qualifier.
+# month with N=1/0 depending on qualifier.  Multi-parent commits on
+# master are rejected: the "Create a merge commit" button produces a
+# `Merge pull request ...` subject (non-qualifying → expected delta 0)
+# while the merge tree carries the PR's bumped Cargo.toml, so --check
+# would flag a false mismatch.  We fail fast with actionable guidance
+# instead.
 expected_version_master_mode() {
     local ref="$1"
     local parent_hash parent_ver parent_year parent_month parent_n
     local ref_iso ref_year ref_month ref_subject qualifying delta
+    local parent_count
+
+    # `%P` is a space-separated list of parent hashes; `wc -w` counts them.
+    parent_count=$(git log -1 --format='%P' "$ref" | wc -w)
+    if [[ "$parent_count" -ge 2 ]]; then
+        die "merge commit on master ($ref has $parent_count parents).  \
+This rule requires linear history on master; use squash or rebase merges \
+instead of \"Create a merge commit\".  Branch-mode is happy to scan through \
+merges inside a PR, but once a multi-parent commit lands on master the \
+delta rule cannot distinguish a non-qualifying merge subject from a \
+qualifying Cargo.toml bump in the incoming tree."
+    fi
 
     parent_hash=$(git log -1 --format='%H' "${ref}^1" 2>/dev/null || echo "")
     if [[ -z "$parent_hash" ]]; then

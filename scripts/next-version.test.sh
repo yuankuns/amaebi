@@ -129,6 +129,49 @@ scenario_master_mode_refactor_no_bump() {
     rm -rf "$dir"
 }
 
+scenario_master_mode_rejects_merge_commit() {
+    echo "scenario: master mode — merge commit on master fails fast"
+    # A 2+-parent commit that is an ancestor of $master_ref triggers the
+    # master-mode guard.  Without the guard, this case silently mismatches
+    # because the merge subject is `Merge pull request ...` (non-qualifying
+    # → expected +0) while the merge tree contains the PR's bumped
+    # Cargo.toml.
+    local dir; dir=$(make_repo)
+    write_cargo "$dir" "2026.5.5"
+    commit_all "$dir" "fix: master prior" "2026-05-01T00:00:00"
+    (cd "$dir" && git checkout -q -b feat/topic)
+    write_cargo "$dir" "2026.5.6"
+    commit_all "$dir" "fix(t): branch work" "2026-05-02T00:00:00"
+    (
+        cd "$dir"
+        git checkout -q master
+        GIT_AUTHOR_DATE=2026-05-03T00:00:00 \
+            GIT_COMMITTER_DATE=2026-05-03T00:00:00 \
+            git merge --no-ff -q -m "Merge pull request #77" feat/topic
+        # Simulate the merge having landed on `origin/master`: point
+        # simulated-master at the merge commit so it's an ancestor.
+        git branch simulated-master master
+    )
+    local out; out=$(
+        cd "$dir"
+        set +e
+        NEXT_VERSION_MASTER_REF="simulated-master" "$script_path" 2>&1
+        echo "__EXIT__=$?"
+    )
+    local exit_line; exit_line=$(echo "$out" | tail -1)
+    assert_eq "merge on master → exit 1" "__EXIT__=1" "$exit_line"
+    if echo "$out" | grep -q "merge commit on master"; then
+        pass=$((pass + 1))
+        echo "  ok   error message mentions 'merge commit on master'"
+    else
+        fail=$((fail + 1))
+        failures+=("master merge error message: expected 'merge commit on master' substring, got: $out")
+        echo "  FAIL error message missing 'merge commit on master'"
+        echo "       output: $out"
+    fi
+    rm -rf "$dir"
+}
+
 scenario_branch_mode_single_fix_bumps_once() {
     echo "scenario: branch mode — single fix on branch → master + 1"
     local dir; dir=$(make_repo)
@@ -320,6 +363,7 @@ scenario_branch_mode_with_internal_merge_is_transparent() {
 
 scenario_master_mode_fix_bumps_n
 scenario_master_mode_refactor_no_bump
+scenario_master_mode_rejects_merge_commit
 scenario_branch_mode_single_fix_bumps_once
 scenario_branch_mode_fix_plus_refactors_still_one_bump
 scenario_branch_mode_all_refactors_no_bump
