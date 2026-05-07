@@ -1738,12 +1738,37 @@ pub async fn run_chat_loop(
                                 steer_text_buf.push(chunk);
                             } else {
                                 md_buf.push(&chunk);
-                                plan_tracker.render_if_changed(&mut plan_err).await;
+                                // Output ordering within a tick: stdout
+                                // markdown comes FIRST, plan line LAST.
+                                // stdout and stderr share the terminal
+                                // cursor, so emitting the status line
+                                // before flushing markdown would land
+                                // the markdown at the end of `[plan N/M
+                                // done]`, garbling the row.  Clearing
+                                // the plan line before stdout writes
+                                // also prevents the old status bytes
+                                // from bleeding into the markdown line
+                                // when a redraw follows on the next tick.
+                                let mut flushed_stdout = false;
                                 while let Some(ready) = md_buf.flush_if_ready() {
+                                    if !flushed_stdout {
+                                        plan_tracker
+                                            .clear_for_mid_turn_output(&mut plan_err)
+                                            .await;
+                                        flushed_stdout = true;
+                                    }
                                     let out = render_markdown(&ready);
                                     stdout.write_all(out.as_bytes()).await?;
                                     stdout.flush().await?;
                                 }
+                                // Render the plan line AFTER all stdout
+                                // writes for this tick, so the status
+                                // line is always the last thing the
+                                // terminal drew — subsequent in-place
+                                // redraws via `\r\x1b[K` therefore
+                                // target the status line, not the
+                                // preceding markdown.
+                                plan_tracker.render_if_changed(&mut plan_err).await;
                             }
                         }
                         Response::Done => {
