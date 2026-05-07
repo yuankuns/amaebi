@@ -319,6 +319,14 @@ pub enum Response {
         worktree_path: Option<String>,
         worktree_dirty: bool,
         pane_tail: String,
+        /// Wall-clock milliseconds between `/claude` launch (or resume)
+        /// and this release.  Rendered as `  duration: Xm Ys` under the
+        /// `[released …]` header so the user can see how long the
+        /// supervision loop ran.  `#[serde(default)]` so older clients
+        /// that omit the field can still deserialise pre-upgrade
+        /// daemon outputs in tests and replay fixtures.
+        #[serde(default)]
+        elapsed_ms: u64,
     },
     /// The [`Request::ClaudeLaunch`] was rejected because adding the requested
     /// panes would exceed the configured maximum.
@@ -339,6 +347,31 @@ pub enum Response {
 // ---------------------------------------------------------------------------
 // Frame helpers
 // ---------------------------------------------------------------------------
+
+/// Render a duration in milliseconds as a compact human-readable
+/// string: `"1h 4m 27s"`, `"14m 2s"`, `"37s"`, or `"312ms"` for sub-
+/// second values.  Used by the release UI (`format_task_released`) and
+/// by the inbox archive body so both surfaces agree on the wording.
+///
+/// Zero-padding is deliberately omitted — `"14m 2s"` reads more
+/// naturally than `"14m 02s"` in the chat transcript and we're
+/// rendering for humans, not sort keys.
+pub fn format_duration_ms(ms: u64) -> String {
+    if ms < 1000 {
+        return format!("{ms}ms");
+    }
+    let total_secs = ms / 1000;
+    let s = total_secs % 60;
+    let m = (total_secs / 60) % 60;
+    let h = total_secs / 3600;
+    if h > 0 {
+        format!("{h}h {m}m {s}s")
+    } else if m > 0 {
+        format!("{m}m {s}s")
+    } else {
+        format!("{s}s")
+    }
+}
 
 /// Write one `Response` frame as a JSON line to `writer`.
 pub async fn write_frame<W>(writer: &mut W, frame: &Response) -> anyhow::Result<()>
@@ -1008,6 +1041,7 @@ mod tests {
             worktree_path: Some("/tmp/x".into()),
             worktree_dirty: true,
             pane_tail: "$ echo done\n".into(),
+            elapsed_ms: 123_456,
         };
         let json = serde_json::to_string(&r).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -1019,6 +1053,7 @@ mod tests {
         assert_eq!(v["worktree_path"], "/tmp/x");
         assert_eq!(v["worktree_dirty"], true);
         assert_eq!(v["pane_tail"], "$ echo done\n");
+        assert_eq!(v["elapsed_ms"], 123_456);
 
         let back: Response = serde_json::from_str(&json).unwrap();
         let Response::TaskReleased {
@@ -1029,6 +1064,7 @@ mod tests {
             worktree_path,
             worktree_dirty,
             pane_tail,
+            elapsed_ms,
         } = back
         else {
             panic!("expected TaskReleased");
@@ -1040,6 +1076,21 @@ mod tests {
         assert_eq!(worktree_path.as_deref(), Some("/tmp/x"));
         assert!(worktree_dirty);
         assert_eq!(pane_tail, "$ echo done\n");
+        assert_eq!(elapsed_ms, 123_456);
+    }
+
+    #[test]
+    fn task_released_legacy_payload_without_elapsed_ms_deserialises() {
+        // #[serde(default)] lets pre-upgrade daemon fixtures (no
+        // elapsed_ms field) round-trip; confirms the client can still
+        // parse old replay logs and inbox archives.
+        let legacy = r#"{"type":"task_released","pane_id":"%7","resources_freed":[],"tag":null,"summary":null,"worktree_path":null,"worktree_dirty":false,"pane_tail":""}"#;
+        let Response::TaskReleased { elapsed_ms, .. } =
+            serde_json::from_str(legacy).expect("legacy payload must parse")
+        else {
+            panic!("expected TaskReleased");
+        };
+        assert_eq!(elapsed_ms, 0);
     }
 
     #[tokio::test]
@@ -1059,5 +1110,35 @@ mod tests {
         let s = String::from_utf8(buf).unwrap();
         let v: serde_json::Value = serde_json::from_str(s.trim_end()).unwrap();
         assert_eq!(v["chunk"], "streamed");
+    }
+
+    #[test]
+    fn format_duration_ms_sub_second() {
+        assert_eq!(format_duration_ms(0), "0ms");
+        assert_eq!(format_duration_ms(312), "312ms");
+        assert_eq!(format_duration_ms(999), "999ms");
+    }
+
+    #[test]
+    fn format_duration_ms_seconds_only() {
+        assert_eq!(format_duration_ms(1_000), "1s");
+        assert_eq!(format_duration_ms(37_500), "37s");
+        assert_eq!(format_duration_ms(59_999), "59s");
+    }
+
+    #[test]
+    fn format_duration_ms_minutes_and_seconds() {
+        assert_eq!(format_duration_ms(60_000), "1m 0s");
+        assert_eq!(format_duration_ms(14 * 60_000 + 2_000), "14m 2s");
+        assert_eq!(format_duration_ms(59 * 60_000 + 59_000), "59m 59s");
+    }
+
+    #[test]
+    fn format_duration_ms_hours_minutes_seconds() {
+        assert_eq!(format_duration_ms(3_600_000), "1h 0m 0s");
+        assert_eq!(
+            format_duration_ms(3_600_000 + 4 * 60_000 + 27_000),
+            "1h 4m 27s"
+        );
     }
 }
