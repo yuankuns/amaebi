@@ -434,6 +434,12 @@ enum SlashCommand {
     Claude(Result<Vec<ClaudeTask>, String>),
     /// `/release %pane [--clean] [--summary "..."]` or `/release all [--clean]`.
     Release(Result<ReleaseCmd, String>),
+    /// `/replyreview <PR> [<PR> ...]` — launch one Claude pane per PR,
+    /// each pane handling that PR's unresolved reviewer comments.  The
+    /// parser returns the PR numbers; worktree + description resolution
+    /// happens at dispatch time via `resolve_replyreview_tasks` (needs
+    /// async `gh` / `git` shell-outs).
+    ReplyReview(Result<Vec<u32>, String>),
 }
 
 /// Parse a slash command from user input.
@@ -443,6 +449,13 @@ fn parse_slash_command(input: &str) -> Option<SlashCommand> {
     if let Some(cmd) = parse_model(input) {
         return Some(SlashCommand::Model(cmd));
     }
+    // `/replyreview` is checked before `/claude` because the prefix is
+    // more specific; `/claude` uses a `starts_with("/claude")` test with
+    // a whitespace-or-EOS guard that wouldn't accept `/replyreview` but
+    // we still want parse order to reflect specificity.
+    if let Some(result) = parse_replyreview(input) {
+        return Some(SlashCommand::ReplyReview(result));
+    }
     if let Some(result) = parse_claude(input) {
         return Some(SlashCommand::Claude(result));
     }
@@ -450,6 +463,126 @@ fn parse_slash_command(input: &str) -> Option<SlashCommand> {
         return Some(SlashCommand::Release(result));
     }
     None
+}
+
+/// Parse `/replyreview <PR> [<PR> ...]`.  Each PR number may optionally
+/// be prefixed with `#` to match GitHub's convention.  Returns `None`
+/// if the input is not a `/replyreview` command, `Some(Err)` for a
+/// syntactic error, `Some(Ok(Vec<u32>))` for a list of PR numbers.
+fn parse_replyreview(input: &str) -> Option<Result<Vec<u32>, String>> {
+    let rest = input.strip_prefix("/replyreview")?;
+    if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
+        // Reject `/replyreviewfoo`, not a command.
+        return None;
+    }
+    let rest = rest.trim();
+    let usage = "usage: /replyreview <PR> [<PR> ...]  \
+                 (numbers, optionally `#`-prefixed; each PR opens its own \
+                 pane inside that PR's head branch worktree)";
+    if rest.is_empty() {
+        return Some(Err(usage.to_string()));
+    }
+    let mut prs: Vec<u32> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for token in rest.split_whitespace() {
+        // Tolerate a leading `#` since users copy-paste `#157` from
+        // GitHub issue/PR references.  No other sigils accepted.
+        let stripped = token.strip_prefix('#').unwrap_or(token);
+        let n: u32 = match stripped.parse() {
+            Ok(n) if n > 0 => n,
+            _ => {
+                return Some(Err(format!("`{token}` is not a valid PR number; {usage}")));
+            }
+        };
+        // Deduplicate while preserving first-seen order — the user
+        // shouldn't get two panes for the same PR if they type
+        // `/replyreview 157 157` (would cause worktree contention).
+        if seen.insert(n) {
+            prs.push(n);
+        }
+    }
+    if prs.is_empty() {
+        return Some(Err(usage.to_string()));
+    }
+    Some(Ok(prs))
+}
+
+/// Render the full instruction block Claude receives as the opening
+/// turn of a `/replyreview <N>` session.  Extracted into its own fn
+/// so the shape can be unit-tested without shelling out.
+fn render_replyreview_description(pr_number: u32) -> String {
+    format!(
+        r#"帮我处理本仓库 PR #{pr_number} 的所有未解决 reviewer 评论。你已经处在这个 PR 的 head branch worktree 中，`gh` 命令会自动定位到正确的仓库。
+
+## 流程
+
+1. 读 PR 基本信息和改动：
+   ```
+   gh pr view {pr_number} --json number,title,headRefName,baseRefName,state,body,url
+   gh pr diff {pr_number}
+   ```
+
+2. 拉所有 inline review comments 和 review 本体：
+   ```
+   gh api repos/$(gh repo view --json nameWithOwner -q .nameWithOwner)/pulls/{pr_number}/comments
+   gh api repos/$(gh repo view --json nameWithOwner -q .nameWithOwner)/pulls/{pr_number}/reviews
+   ```
+
+3. 用 GraphQL 找未解决的 review threads（`isResolved=false`）：
+   ```
+   gh api graphql -f query='query {{ repository(owner:"OWNER",name:"REPO") {{ pullRequest(number:{pr_number}) {{ reviewThreads(last:50) {{ nodes {{ id isResolved path line comments(last:5) {{ nodes {{ id author {{ login }} body createdAt }} }} }} }} }} }} }}'
+   ```
+   把 `OWNER` / `REPO` 替换成 `gh repo view --json nameWithOwner -q .nameWithOwner` 的结果。
+
+4. 对每条**未解决**且**上次你没回过**的评论，做判断：
+   - 读评论本身、它锚定的代码行（`path`/`line`）、PR diff 相关部分。
+   - **有理** → 在当前 worktree 里修，然后：
+     1. 素质三连：`cargo test`（或 `cargo test --bin amaebi`，跟随项目惯例）、`cargo fmt --check`（不过就 `cargo fmt`）、`cargo clippy -- -D warnings`。
+     2. 处理 calver：如果 PR 已有 Cargo.toml 版本 bump 且本轮不需要加新 bump（按 CLAUDE.md 规则），不改版本号；否则按规则 bump 一次。
+     3. `git add` 具体文件 → `git commit` → `git push`。
+     4. 在该评论下 reply 说明"Fixed in <commit hash> — <修了啥>"：
+        ```
+        gh api repos/$(gh repo view --json nameWithOwner -q .nameWithOwner)/pulls/comments/<COMMENT_ID>/replies -X POST -f body='Fixed in <sha> — <one-line description>'
+        ```
+   - **无理** → 只 reply，解释当前设计为什么是对的，不改代码：
+        ```
+        gh api repos/$(gh repo view --json nameWithOwner -q .nameWithOwner)/pulls/comments/<COMMENT_ID>/replies -X POST -f body='<explanation>'
+        ```
+   - **超出能力范围**（需要真机测试、需要私有工具、缺少凭据）→ reply 明说这一点，不要强行修也不要静默跳过。
+
+5. 所有处理过的 thread 用 GraphQL resolve 掉：
+   ```
+   gh api graphql -f query='mutation {{ resolveReviewThread(input:{{threadId:"<THREAD_ID>"}}) {{ thread {{ isResolved }} }} }}'
+   ```
+
+6. 重新戳 Copilot 做一轮 review：
+   - 查当前 requested reviewers：
+     ```
+     gh api graphql -f query='query {{ repository(owner:"OWNER",name:"REPO") {{ pullRequest(number:{pr_number}) {{ id reviewRequests(last:10) {{ nodes {{ requestedReviewer {{ __typename ... on Bot {{ login id }} ... on User {{ login id }} }} }} }} }} }} }}'
+     ```
+   - 如果 `copilot-pull-request-reviewer` 已经在列表里：先用 `requestReviews` mutation（`union:false`）把 reviewer 列表替换成**不含 Copilot** 的集合（保留其他人），再用第二个 `requestReviews` mutation（`union:true`, 同时带 `userIds` 和 `botIds`）把它重新加进去。这样会触发一次新的 review_request 事件。
+   - 如果 Copilot 不在列表里，直接 `requestReviews union:true botIds:["BOT_kgDOCnlnWA"]` 加上去就行。
+   - Copilot 的 bot GraphQL id 是 `BOT_kgDOCnlnWA`（已知常量）。
+
+7. 等 Copilot 再审一轮：
+   - 轮询 `gh api repos/OWNER/REPO/pulls/{pr_number}/comments` 和 `reviews`，筛 `user.login == "Copilot"` 且 `created_at > <你上次 push 的时间>` 的新评论。
+   - 最多等 20 分钟（中间用 `sleep 300` 分 4 次）。有新评论 → 回到第 4 步再修一轮。
+   - **总共最多 3 轮**循环（第 1 轮是初次处理，第 2、3 轮是 Copilot 回来后的 follow-up）。3 轮之后不再等，直接走第 8 步。
+
+8. 收尾：用 `task_done` 汇报本轮处理了哪些评论，哪些改了代码、哪些只回了、哪些 superseded、哪些暂时跳过。如果还有未解决但你判断无法继续处理的评论（比如 Copilot 在第 3 轮又提新问题且你确认是无理的），在 summary 里也列出来。
+
+## 硬约束
+
+- **不要 merge PR、不要 force push、不要关闭 PR**。只做 review comment 响应和 push follow-up 修复。
+- **不要跳过 CI 钩子**（不要 `--no-verify`）。如果 pre-commit 失败，修根源再 commit。
+- **主仓（`~/amaebi`）必须保持在 master**。所有改动发生在当前 worktree。
+- **只回 `isResolved=false` 的线程**。已经 resolved 的不要再碰。
+- 如果一条评论你上轮已经回过（最新的 reply 作者是你 `gh api user --jq .login` 的 login），本轮跳过。
+- 每次 push 前都要跑素质三连。
+- **不要无限循环戳 Copilot**。3 轮硬上限。
+
+开始吧。先读 PR 状态和未解决评论列表，再规划本轮要处理哪些。"#
+    )
 }
 
 /// Format a `Response::TaskReleased` frame for terminal output.  Shared by the
@@ -1467,8 +1600,39 @@ pub async fn run_chat_loop(
         };
 
         // Dispatch slash commands before sending to daemon.
-        match parse_slash_command(&prompt) {
-            Some(SlashCommand::Claude(parse_result)) => {
+        //
+        // `/replyreview` normalises to the same `Vec<ClaudeTask>` shape
+        // as `/claude` after the async head-branch + worktree resolution
+        // (`resolve_replyreview_tasks`), so both paths share the launch
+        // body below.  Conceptually:
+        //   /replyreview 157 158
+        //     ≈ /claude --worktree <wt-for-157> --tag replyreview-157 "..."
+        //                --worktree <wt-for-158> --tag replyreview-158 "..."
+        // with the description auto-generated from the PR number.
+        // Normalise both `/claude` and `/replyreview` into a single
+        // `Result<Vec<ClaudeTask>, String>` that the launch body
+        // consumes; other slash commands fall through to the match
+        // below.  Extracting the Claude-family into `claude_tasks_
+        // result` and leaving the rest as `other_slash` avoids a
+        // partial-move borrow error where the later `match slash`
+        // would observe a moved-out String from the ReplyReview(Err)
+        // arm.
+        let (claude_tasks_result, other_slash): (
+            Option<Result<Vec<ClaudeTask>, String>>,
+            Option<SlashCommand>,
+        ) = match parse_slash_command(&prompt) {
+            Some(SlashCommand::Claude(r)) => (Some(r), None),
+            Some(SlashCommand::ReplyReview(Ok(prs))) => {
+                (Some(resolve_replyreview_tasks(&prs).await), None)
+            }
+            Some(SlashCommand::ReplyReview(Err(msg))) => (Some(Err(msg)), None),
+            other => (None, other),
+        };
+        // Re-dispatch: if we produced tasks via the normalisation above,
+        // run the Claude-launch flow; otherwise fall back to the other
+        // slash-command arms.
+        if let Some(parse_result) = claude_tasks_result {
+            {
                 let mut tasks = match parse_result {
                     Ok(t) => t,
                     Err(msg) => {
@@ -1622,6 +1786,14 @@ pub async fn run_chat_loop(
                     next_prompt = Some(synth);
                 }
                 continue 'session;
+            }
+        }
+        match other_slash {
+            // Both Claude and ReplyReview variants were siphoned off
+            // into `claude_tasks_result` above, so they can never
+            // appear here at runtime.
+            Some(SlashCommand::Claude(_)) | Some(SlashCommand::ReplyReview(_)) => {
+                unreachable!("Claude/ReplyReview variants are consumed above")
             }
             Some(SlashCommand::Model(new_model)) => {
                 match new_model {
@@ -2571,6 +2743,190 @@ async fn flush_steer_buffer(
 // ---------------------------------------------------------------------------
 // Daemon auto-start
 // ---------------------------------------------------------------------------
+
+/// Resolve one PR number into a `ClaudeTask` ready for `ClaudeLaunch`.
+/// Shells out to `gh` to fetch the PR's head branch and to `git
+/// worktree` to either reuse an existing checkout of that branch or
+/// create a fresh worktree.
+///
+/// Errors are returned as strings so the caller can surface them to
+/// the user and bail (not `anyhow::Error` — the dispatch site already
+/// uses `Result<_, String>` for user-facing slash command errors, and
+/// we want messages suitable for chat output).
+async fn resolve_one_replyreview_task(pr: u32) -> Result<ClaudeTask, String> {
+    use tokio::process::Command;
+
+    // 1. Fetch PR metadata (head branch + cross-repo flag).  Ask for
+    //    exactly the fields we consume so the JSON parsing is robust
+    //    to future schema additions.
+    let view_out = Command::new("gh")
+        .args([
+            "pr",
+            "view",
+            &pr.to_string(),
+            "--json",
+            "headRefName,isCrossRepository,state",
+        ])
+        .output()
+        .await
+        .map_err(|e| format!("failed to spawn `gh pr view {pr}`: {e}"))?;
+    if !view_out.status.success() {
+        return Err(format!(
+            "gh pr view {pr} failed: {}",
+            String::from_utf8_lossy(&view_out.stderr).trim()
+        ));
+    }
+    #[derive(serde::Deserialize)]
+    struct PrView {
+        #[serde(rename = "headRefName")]
+        head_ref_name: String,
+        #[serde(rename = "isCrossRepository")]
+        is_cross_repository: bool,
+        state: String,
+    }
+    let view: PrView = serde_json::from_slice(&view_out.stdout)
+        .map_err(|e| format!("parsing `gh pr view {pr}` JSON failed: {e}"))?;
+
+    // 2. Reject cross-repo PRs from forks.  Handling them would
+    //    require push access to the fork (usually unavailable) and
+    //    detached HEAD gymnastics; first version says no.
+    if view.is_cross_repository {
+        return Err(format!(
+            "PR #{pr} is from a fork ({}); /replyreview only supports same-repo \
+             PRs in this version — handle fork PRs manually",
+            view.head_ref_name
+        ));
+    }
+
+    // 3. Reject closed/merged PRs — there's nothing actionable and
+    //    pushing to the branch of a merged PR is a common footgun.
+    if view.state != "OPEN" && view.state != "DRAFT" {
+        return Err(format!(
+            "PR #{pr} is in state {} — /replyreview only processes OPEN / DRAFT PRs",
+            view.state
+        ));
+    }
+    let head_branch = view.head_ref_name;
+
+    // 4. Look for an existing worktree already checked out on the PR
+    //    branch.  `git worktree list --porcelain` emits blocks of the
+    //    form:
+    //       worktree <path>
+    //       HEAD <sha>
+    //       branch refs/heads/<name>
+    //       (blank line between blocks)
+    //    We scan for a block whose `branch` line matches the PR branch
+    //    and reuse that path.  The user may have left dirty changes
+    //    there; we honour them rather than stash/reset (per the
+    //    /claude resume-pane semantics — continue in the existing
+    //    workspace, don't destroy in-progress work).
+    let list_out = Command::new("git")
+        .args(["worktree", "list", "--porcelain"])
+        .output()
+        .await
+        .map_err(|e| format!("failed to spawn `git worktree list`: {e}"))?;
+    if !list_out.status.success() {
+        return Err(format!(
+            "git worktree list failed: {}",
+            String::from_utf8_lossy(&list_out.stderr).trim()
+        ));
+    }
+    let list_stdout = String::from_utf8_lossy(&list_out.stdout);
+    let mut existing_path: Option<String> = None;
+    let wanted_ref = format!("refs/heads/{head_branch}");
+    let mut current_path: Option<String> = None;
+    for raw in list_stdout.lines() {
+        if let Some(path) = raw.strip_prefix("worktree ") {
+            current_path = Some(path.to_string());
+        } else if let Some(branch) = raw.strip_prefix("branch ") {
+            if branch == wanted_ref {
+                existing_path = current_path.clone();
+                break;
+            }
+        } else if raw.is_empty() {
+            current_path = None;
+        }
+    }
+
+    let worktree_path = if let Some(path) = existing_path {
+        path
+    } else {
+        // 5. No existing worktree on this branch → create one under
+        //    ~/.amaebi/worktrees/replyreview/pr<N>-<short-id>.  We
+        //    deliberately don't fetch origin first: `gh pr view`
+        //    succeeded so the remote tracking ref is already current
+        //    enough for `git worktree add <path> <branch>` to work,
+        //    and skipping the fetch avoids surprising the user with
+        //    unrelated remote state updates.
+        let home = std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .ok_or_else(|| "HOME is not set; cannot locate worktree root".to_string())?;
+        let short_id: String = uuid::Uuid::new_v4()
+            .to_string()
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .take(8)
+            .collect();
+        let path = home
+            .join(".amaebi")
+            .join("worktrees")
+            .join("replyreview")
+            .join(format!("pr{pr}-{short_id}"));
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("creating {}: {e}", parent.display()))?;
+        }
+        let path_str = path
+            .to_str()
+            .ok_or_else(|| format!("worktree path is not valid UTF-8: {}", path.display()))?;
+        let add_out = Command::new("git")
+            .args(["worktree", "add", path_str, &head_branch])
+            .output()
+            .await
+            .map_err(|e| format!("failed to spawn `git worktree add`: {e}"))?;
+        if !add_out.status.success() {
+            return Err(format!(
+                "git worktree add {} {}: {}",
+                path_str,
+                head_branch,
+                String::from_utf8_lossy(&add_out.stderr).trim()
+            ));
+        }
+        path_str.to_string()
+    };
+
+    Ok(ClaudeTask {
+        tag: format!("replyreview-{pr}"),
+        description: render_replyreview_description(pr),
+        worktree: Some(worktree_path),
+        auto_enter: true,
+        // No --cwd override: client_cwd defaults to the chat's cwd so
+        // the daemon resolves repo-scoped leases against the same path
+        // as a regular /claude.  The pane's working directory is set
+        // to `worktree` at launch, so `gh` commands inside the pane
+        // resolve to the PR's repo automatically.
+        cwd: None,
+        resume_pane: None,
+        resources: Vec::new(),
+        resource_timeout_secs: None,
+    })
+}
+
+/// Resolve every PR in a `/replyreview` invocation in sequence.  Stops
+/// on the first failure and returns a `String` error (the interactive
+/// dispatcher surfaces it to the user and skips the launch).
+///
+/// Sequential rather than parallel because:
+/// - the error message on failure should pinpoint exactly one PR, and
+/// - `git worktree add` touches the same repo metadata; concurrent
+///   worktree creation would risk racing on `.git/worktrees/`.
+async fn resolve_replyreview_tasks(prs: &[u32]) -> Result<Vec<ClaudeTask>, String> {
+    let mut out = Vec::with_capacity(prs.len());
+    for &pr in prs {
+        out.push(resolve_one_replyreview_task(pr).await?);
+    }
+    Ok(out)
+}
 
 /// Fill in `tasks[*].tag` when empty, asking the daemon to generate a
 /// tag via its Haiku tagger.  One dedicated short-lived connection per
@@ -4704,6 +5060,130 @@ mod tests {
         assert!(
             !out.contains("duration:"),
             "zero elapsed should skip the duration line: {out}"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // parse_replyreview
+    // ------------------------------------------------------------------
+
+    fn replyreview_prs(input: &str) -> Vec<u32> {
+        match parse_slash_command(input) {
+            Some(SlashCommand::ReplyReview(Ok(prs))) => prs,
+            other => panic!("expected ReplyReview prs, got {other:?}"),
+        }
+    }
+
+    fn replyreview_err(input: &str) -> String {
+        match parse_slash_command(input) {
+            Some(SlashCommand::ReplyReview(Err(msg))) => msg,
+            other => panic!("expected ReplyReview error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_replyreview_single_pr() {
+        assert_eq!(replyreview_prs("/replyreview 157"), vec![157]);
+    }
+
+    #[test]
+    fn parse_replyreview_multiple_prs() {
+        assert_eq!(
+            replyreview_prs("/replyreview 157 158 42"),
+            vec![157, 158, 42]
+        );
+    }
+
+    #[test]
+    fn parse_replyreview_accepts_hash_prefix() {
+        // GitHub copy-paste tends to include `#`; tolerate it so users
+        // don't have to strip it manually.
+        assert_eq!(replyreview_prs("/replyreview #157 #158"), vec![157, 158]);
+    }
+
+    #[test]
+    fn parse_replyreview_deduplicates_repeated_numbers() {
+        // `git worktree add` would fail on the second occurrence; the
+        // parser dedupes so the user gets one pane per PR regardless.
+        assert_eq!(replyreview_prs("/replyreview 157 157 158"), vec![157, 158]);
+    }
+
+    #[test]
+    fn parse_replyreview_bare_returns_usage_err() {
+        let msg = replyreview_err("/replyreview");
+        assert!(msg.contains("usage:"), "expected usage hint, got: {msg}");
+        assert!(msg.contains("<PR>"));
+    }
+
+    #[test]
+    fn parse_replyreview_whitespace_only_returns_usage_err() {
+        let msg = replyreview_err("/replyreview    ");
+        assert!(msg.contains("usage:"));
+    }
+
+    #[test]
+    fn parse_replyreview_rejects_non_numeric_token() {
+        let msg = replyreview_err("/replyreview 157 abc 158");
+        assert!(
+            msg.contains("not a valid PR number"),
+            "expected invalid-PR message, got: {msg}"
+        );
+        assert!(msg.contains("abc"));
+    }
+
+    #[test]
+    fn parse_replyreview_rejects_zero() {
+        // 0 is never a valid PR number on GitHub; catching it here
+        // gives a clearer error than a later `gh pr view 0` network
+        // failure.
+        let msg = replyreview_err("/replyreview 0");
+        assert!(msg.contains("not a valid PR number"));
+    }
+
+    #[test]
+    fn parse_replyreview_false_positive_prefix_rejected() {
+        // `/replyreviewthing` must not hit the replyreview parser; fall
+        // through so the user sees the "no such slash command" path.
+        assert!(parse_slash_command("/replyreviewthing 157").is_none());
+    }
+
+    #[test]
+    fn render_replyreview_description_includes_pr_number() {
+        // The description is injected as Claude's opening turn; the
+        // PR number must land literally in multiple spots so Claude
+        // has an unambiguous handle regardless of which paragraph it
+        // starts reading from.
+        let desc = render_replyreview_description(157);
+        assert!(desc.contains("PR #157"), "desc missing `PR #157`: {desc}");
+        assert!(
+            desc.contains("pulls/157/comments"),
+            "desc missing pulls/157/comments pattern"
+        );
+        assert!(
+            desc.contains("gh pr view 157"),
+            "desc missing gh pr view 157 invocation"
+        );
+    }
+
+    #[test]
+    fn render_replyreview_description_pins_load_bearing_rules() {
+        // Anchor on the three rules that, if silently dropped in a
+        // future edit, would cause Claude to do something the user
+        // explicitly didn't want: (1) don't merge, (2) only unresolved
+        // threads, (3) hard 3-round cap on the Copilot loop.
+        let desc = render_replyreview_description(157);
+        assert!(
+            desc.contains("不要 merge PR"),
+            "desc must keep the no-merge guard"
+        );
+        assert!(
+            desc.contains("isResolved=false"),
+            "desc must keep the unresolved-only constraint"
+        );
+        assert!(
+            desc.contains("最多 3 轮") || desc.contains("3 轮硬上限"),
+            "desc must keep the 3-round hard cap so we don't burn \
+             unbounded Copilot cycles"
         );
     }
 }
