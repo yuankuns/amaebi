@@ -4,8 +4,15 @@
 # (HEAD) and, with --check, fail CI if Cargo.toml disagrees.
 #
 # Calendar versioning: YYYY.M.N.
-#   - YYYY / M = year and month of HEAD's committer date (or master's
-#     committer date if we're running on a feature branch; see below).
+#   - YYYY / M = year and month of HEAD's committer date (master mode),
+#     or of the latest non-merge commit in `master_ref..HEAD` (branch
+#     mode — so CI's synthetic `refs/pull/<N>/merge` commit-time of
+#     "now" doesn't trigger a spurious month rollover).
+#   - Branch-mode rollover compares those (YYYY, M) to the master
+#     Cargo.toml *version*'s (YYYY, M), not to master's committer date.
+#     Using the version is important because an inactive master can sit
+#     on stale content-dates for weeks while still being "the current
+#     state of master" for purposes of anchoring the PR's expected N.
 #
 # The rule depends on which MODE we're in:
 #
@@ -198,7 +205,19 @@ expected_version_branch_mode() {
     master_ver=$(cargo_version_at "$master_ref")
     read -r master_year master_month master_n <<<"$(split_version "$master_ver")"
 
-    ref_iso=$(git log -1 --format='%cI' "$ref")
+    # Derive HEAD's year/month from the latest non-merge commit in
+    # `master_ref..ref`, NOT from `ref` itself.  On GitHub Actions PR
+    # builds, `HEAD` is a synthetic `refs/pull/<N>/merge` whose committer
+    # date is the workflow run time, not the PR head's time — using that
+    # directly can trigger a spurious month rollover when CI runs after
+    # month-end.  The latest author commit on the branch is the right
+    # anchor for "when the PR's work was actually done".  If the branch
+    # has no non-merge commits (pathological: empty PR), fall back to
+    # `ref`'s own date.
+    ref_iso=$(git log --no-merges -1 --format='%cI' "${master_ref}..${ref}" 2>/dev/null)
+    if [[ -z "$ref_iso" ]]; then
+        ref_iso=$(git log -1 --format='%cI' "$ref")
+    fi
     ref_year=$(echo "$ref_iso" | cut -c1-4)
     ref_month=$((10#$(echo "$ref_iso" | cut -c6-7)))
 

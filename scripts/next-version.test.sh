@@ -230,6 +230,32 @@ scenario_branch_mode_no_qualifier_month_rollover() {
     rm -rf "$dir"
 }
 
+scenario_branch_mode_synthetic_merge_date_does_not_roll_month() {
+    echo "scenario: branch mode — synthetic merge dated 'now' doesn't roll month"
+    # Simulates CI's `refs/pull/<N>/merge`: PR work happened in May but the
+    # synthetic merge commit (HEAD on CI) is dated in June.  Expected value
+    # must key off the latest non-merge commit in `master_ref..HEAD`, so
+    # month stays May and the version stays `master + 1` instead of
+    # rolling to 2026.6.1.
+    local dir; dir=$(make_repo)
+    write_cargo "$dir" "2026.5.5"
+    commit_all "$dir" "fix: master prior" "2026-05-01T00:00:00"
+    (cd "$dir" && git branch simulated-master master && git checkout -q -b feat/topic)
+    write_cargo "$dir" "2026.5.6"
+    commit_all "$dir" "fix(t): branch work done in May" "2026-05-02T00:00:00"
+    # Build a GitHub-style synthetic merge with a June committer date.
+    (
+        cd "$dir"
+        git checkout -q master
+        GIT_AUTHOR_DATE=2026-06-15T00:00:00 \
+            GIT_COMMITTER_DATE=2026-06-15T00:00:00 \
+            git merge --no-ff -q -m "Merge pull request #99" feat/topic
+    )
+    local out; out=$(run_script "$dir" "simulated-master")
+    assert_eq "synthetic merge in June, work in May → 2026.5.6 not 2026.6.1" "2026.5.6" "$out"
+    rm -rf "$dir"
+}
+
 scenario_branch_mode_synthetic_pr_merge_routes_via_caret2() {
     echo "scenario: branch mode — synthetic refs/pull/<N>/merge resolves via ^2"
     local dir; dir=$(make_repo)
@@ -240,11 +266,16 @@ scenario_branch_mode_synthetic_pr_merge_routes_via_caret2() {
     commit_all "$dir" "fix(t): branch work" "2026-05-02T00:00:00"
     # Fabricate a GitHub-style merge commit: master + feat/topic merged,
     # with ^1 = master tip and ^2 = feat/topic tip.  `git merge --no-ff`
-    # from a detached master gives exactly that.
+    # from a detached master gives exactly that.  Pin the merge commit's
+    # committer date so the scenario is deterministic across months —
+    # without this, the merge commit's "now" committer time could push
+    # branch-mode rollover tests into the wrong month.
     (
         cd "$dir"
         git checkout -q master
-        git merge --no-ff -q -m "Merge pull request #99" feat/topic
+        GIT_AUTHOR_DATE=2026-05-02T12:00:00 \
+            GIT_COMMITTER_DATE=2026-05-02T12:00:00 \
+            git merge --no-ff -q -m "Merge pull request #99" feat/topic
     )
     local out; out=$(run_script "$dir" "simulated-master")
     # Anchor walks ^2 to feat/topic tip → branch mode → master + 1.
@@ -295,6 +326,7 @@ scenario_branch_mode_all_refactors_no_bump
 scenario_branch_mode_double_bump_caught
 scenario_branch_mode_month_rollover
 scenario_branch_mode_no_qualifier_month_rollover
+scenario_branch_mode_synthetic_merge_date_does_not_roll_month
 scenario_branch_mode_synthetic_pr_merge_routes_via_caret2
 scenario_branch_mode_with_internal_merge_is_transparent
 
