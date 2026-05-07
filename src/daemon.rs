@@ -2242,6 +2242,26 @@ async fn release_held_entry(
     // Capture pane tail (best-effort — don't fail the release if tmux is sick).
     let pane_tail = capture_pane_tail(pane_id).await.unwrap_or_default();
 
+    // Elapsed milliseconds since the TaskEntry was created.  Shared by
+    // the inbox archive body and the `Response::TaskReleased` frame so
+    // the two surfaces can't drift.  Two rounding concerns to flag:
+    //   - `Duration::as_millis()` truncates.  A genuinely sub-1ms
+    //     release (rare but possible on a cached no-op launch) would
+    //     otherwise land at 0 and the client's "elapsed_ms == 0 means
+    //     legacy payload" suppression would eat the duration line,
+    //     leaving users confused.  `.max(1)` rounds up so non-legacy
+    //     durations always render.
+    //   - `u128 → u64` conversion saturates at `u64::MAX` (~584
+    //     million years).  Any supervision loop hitting that cap has
+    //     much bigger problems than a wrong duration string.
+    let elapsed_ms: u64 = entry
+        .created_at
+        .elapsed()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+        .max(1);
+
     // Worktree dirty flag — cheap git-porcelain query, tolerates missing dir.
     let (worktree_path, worktree_dirty) = match entry.worktree.as_deref() {
         Some(wt) => {
@@ -2294,14 +2314,7 @@ async fn release_held_entry(
         // snapshots sees the same shape as the live chat print.
         body.push_str(&format!(
             "duration: {}\n",
-            crate::ipc::format_duration_ms(
-                entry
-                    .created_at
-                    .elapsed()
-                    .as_millis()
-                    .try_into()
-                    .unwrap_or(u64::MAX)
-            )
+            crate::ipc::format_duration_ms(elapsed_ms)
         ));
         if let Some(s) = &summary {
             body.push_str(&format!("\nsummary:\n{s}\n"));
@@ -2318,17 +2331,6 @@ async fn release_held_entry(
             }
         }
     }
-
-    // Wall-clock duration of the supervision loop.  `Instant::elapsed`
-    // saturates at zero if the system clock jumped backward, and the
-    // cast to u64 saturates at u64::MAX — in both cases we'd rather
-    // ship a slightly-off number than panic on the release path.
-    let elapsed_ms: u64 = entry
-        .created_at
-        .elapsed()
-        .as_millis()
-        .try_into()
-        .unwrap_or(u64::MAX);
 
     Some(crate::ipc::Response::TaskReleased {
         pane_id: pane_id.to_string(),

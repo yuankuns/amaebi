@@ -481,10 +481,15 @@ fn format_task_released(
         ));
     }
     out.push('\n');
-    // `elapsed_ms == 0` only happens on legacy fixtures that predate
-    // the field (they deserialize with `#[serde(default)]`).  Skip the
-    // line in that case so replay diffs stay stable; real releases
-    // always round to at least a few milliseconds.
+    // `elapsed_ms == 0` is reserved for "field absent on the wire"
+    // (legacy payloads that predate `TaskReleased.elapsed_ms` — they
+    // deserialize with `#[serde(default)]`).  Real releases cannot
+    // produce `0` because the daemon rounds sub-millisecond durations
+    // up to `1` before shipping the frame; see
+    // `release_held_entry`'s `elapsed_ms` computation for the
+    // round-up rationale.  Suppressing the line when zero therefore
+    // keeps replay diffs stable without hiding any legitimate
+    // duration from the live UI.
     if elapsed_ms > 0 {
         out.push_str(&format!(
             "  duration: {}\n",

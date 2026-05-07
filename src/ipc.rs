@@ -319,12 +319,18 @@ pub enum Response {
         worktree_path: Option<String>,
         worktree_dirty: bool,
         pane_tail: String,
-        /// Wall-clock milliseconds between `/claude` launch (or resume)
-        /// and this release.  Rendered as `  duration: Xm Ys` under the
-        /// `[released …]` header so the user can see how long the
-        /// supervision loop ran.  `#[serde(default)]` so older clients
-        /// that omit the field can still deserialise pre-upgrade
-        /// daemon outputs in tests and replay fixtures.
+        /// Monotonic elapsed milliseconds between `/claude` launch (or
+        /// resume) and this release, derived from `Instant::elapsed()`
+        /// on the daemon's `TaskEntry.created_at`.  Unaffected by wall-
+        /// clock / timezone adjustments on the host.  Rendered as
+        /// `  duration: Xm Ys` under the `[released …]` header so the
+        /// user can see how long the supervision loop ran.  The daemon
+        /// rounds sub-millisecond durations up to `1` so `0` is
+        /// reserved for "field absent" on legacy payloads — see the
+        /// client's zero-suppression in `format_task_released`.
+        /// `#[serde(default)]` so older clients that omit the field
+        /// can still deserialise pre-upgrade daemon outputs in tests
+        /// and replay fixtures.
         #[serde(default)]
         elapsed_ms: u64,
     },
