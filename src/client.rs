@@ -450,9 +450,10 @@ fn parse_slash_command(input: &str) -> Option<SlashCommand> {
         return Some(SlashCommand::Model(cmd));
     }
     // `/replyreview` is checked before `/claude` because the prefix is
-    // more specific; `/claude` uses a `starts_with("/claude")` test with
-    // a whitespace-or-EOS guard that wouldn't accept `/replyreview` but
-    // we still want parse order to reflect specificity.
+    // more specific.  Both parsers use the same `strip_prefix` +
+    // whitespace-or-EOS guard pattern, so `/replyreview` wouldn't be
+    // mis-claimed by `parse_claude`, but keeping parse order aligned
+    // with prefix specificity is still clearer for future readers.
     if let Some(result) = parse_replyreview(input) {
         return Some(SlashCommand::ReplyReview(result));
     }
@@ -2808,18 +2809,21 @@ async fn resolve_one_replyreview_task(pr: u32) -> Result<ClaudeTask, String> {
     }
     let head_branch = view.head_ref_name;
 
-    // 4. Look for an existing worktree already checked out on the PR
-    //    branch.  `git worktree list --porcelain` emits blocks of the
-    //    form:
+    // 4. Look for an existing DEDICATED worktree already checked out on
+    //    the PR branch.  `git worktree list --porcelain` emits blocks of
+    //    the form:
     //       worktree <path>
     //       HEAD <sha>
     //       branch refs/heads/<name>
     //       (blank line between blocks)
-    //    We scan for a block whose `branch` line matches the PR branch
-    //    and reuse that path.  The user may have left dirty changes
-    //    there; we honour them rather than stash/reset (per the
+    //    The FIRST block is always the primary worktree (the user's main
+    //    checkout).  We skip it for reuse — amaebi's convention is that
+    //    the main checkout stays on master, and editing it from a
+    //    /replyreview pane would violate that (and risk clobbering the
+    //    user's in-flight work).  We only reuse a non-primary worktree.
+    //    Dirty state there is honoured rather than stashed/reset, per
     //    /claude resume-pane semantics — continue in the existing
-    //    workspace, don't destroy in-progress work).
+    //    workspace, don't destroy in-progress work.
     let list_out = Command::new("git")
         .args(["worktree", "list", "--porcelain"])
         .output()
@@ -2835,32 +2839,38 @@ async fn resolve_one_replyreview_task(pr: u32) -> Result<ClaudeTask, String> {
     let mut existing_path: Option<String> = None;
     let wanted_ref = format!("refs/heads/{head_branch}");
     let mut current_path: Option<String> = None;
+    // `is_primary` flips off after the first block's blank-line terminator.
+    // `git worktree list --porcelain` always emits the main worktree first,
+    // so this flag accurately identifies "the user's primary checkout" on
+    // the first pass without any extra filesystem probing.
+    let mut is_primary = true;
     for raw in list_stdout.lines() {
         if let Some(path) = raw.strip_prefix("worktree ") {
             current_path = Some(path.to_string());
         } else if let Some(branch) = raw.strip_prefix("branch ") {
-            if branch == wanted_ref {
+            if branch == wanted_ref && !is_primary {
                 existing_path = current_path.clone();
                 break;
             }
         } else if raw.is_empty() {
             current_path = None;
+            is_primary = false;
         }
     }
 
     let worktree_path = if let Some(path) = existing_path {
         path
     } else {
-        // 5. No existing worktree on this branch → create one under
-        //    ~/.amaebi/worktrees/replyreview/pr<N>-<short-id>.  We
-        //    deliberately don't fetch origin first: `gh pr view`
-        //    succeeded so the remote tracking ref is already current
-        //    enough for `git worktree add <path> <branch>` to work,
-        //    and skipping the fetch avoids surprising the user with
-        //    unrelated remote state updates.
-        let home = std::env::var_os("HOME")
-            .map(std::path::PathBuf::from)
-            .ok_or_else(|| "HOME is not set; cannot locate worktree root".to_string())?;
+        // 5. No reusable worktree on this branch → create one under
+        //    ~/.amaebi/worktrees/replyreview/pr<N>-<short-id>.  Fetch the
+        //    PR head branch from `origin` first so `git worktree add`
+        //    works on a fresh clone where the branch hasn't been checked
+        //    out locally yet, and starts from the authoritative remote
+        //    state rather than a stale local ref.  We then create a
+        //    fresh local branch with `-B`, pointed at `origin/<branch>`,
+        //    so Claude has a proper branch to push (and pulls remote
+        //    updates into the worktree).
+        let home = crate::auth::amaebi_home().map_err(|e| format!("resolving ~/.amaebi: {e}"))?;
         let short_id: String = uuid::Uuid::new_v4()
             .to_string()
             .chars()
@@ -2868,27 +2878,58 @@ async fn resolve_one_replyreview_task(pr: u32) -> Result<ClaudeTask, String> {
             .take(8)
             .collect();
         let path = home
-            .join(".amaebi")
             .join("worktrees")
             .join("replyreview")
             .join(format!("pr{pr}-{short_id}"));
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
+            tokio::fs::create_dir_all(parent)
+                .await
                 .map_err(|e| format!("creating {}: {e}", parent.display()))?;
         }
         let path_str = path
             .to_str()
             .ok_or_else(|| format!("worktree path is not valid UTF-8: {}", path.display()))?;
+
+        // Fetch the branch from origin.  `gh pr view` above succeeded but
+        // that only proves the PR exists remotely; the local clone may
+        // not have a refs/remotes/origin/<head_branch> at all (fresh
+        // clone default fetch refspec won't pull arbitrary branches).
+        let fetch_out = Command::new("git")
+            .args(["fetch", "origin", &head_branch])
+            .output()
+            .await
+            .map_err(|e| format!("failed to spawn `git fetch origin {head_branch}`: {e}"))?;
+        if !fetch_out.status.success() {
+            return Err(format!(
+                "git fetch origin {head_branch}: {}",
+                String::from_utf8_lossy(&fetch_out.stderr).trim()
+            ));
+        }
+
+        // `-B <branch>` creates-or-resets the local branch to the
+        // start-point, which is `origin/<head_branch>`.  If the local
+        // branch already exists but is stale, this updates it; if it
+        // doesn't exist, this creates it.  Either way the worktree
+        // starts from the remote state.
+        let start_point = format!("origin/{head_branch}");
         let add_out = Command::new("git")
-            .args(["worktree", "add", path_str, &head_branch])
+            .args([
+                "worktree",
+                "add",
+                "-B",
+                &head_branch,
+                path_str,
+                &start_point,
+            ])
             .output()
             .await
             .map_err(|e| format!("failed to spawn `git worktree add`: {e}"))?;
         if !add_out.status.success() {
             return Err(format!(
-                "git worktree add {} {}: {}",
-                path_str,
+                "git worktree add -B {} {} {}: {}",
                 head_branch,
+                path_str,
+                start_point,
                 String::from_utf8_lossy(&add_out.stderr).trim()
             ));
         }
