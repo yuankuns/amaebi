@@ -557,13 +557,17 @@ fn render_replyreview_description(pr_number: u32) -> String {
    ```
 
 6. 重新戳 Copilot 做一轮 review：
-   - 查当前 requested reviewers：
+   - 查当前 requested reviewers，**并在同一步里顺便解析出 PR id 和 Copilot 的 bot GraphQL id**（不要写死常量——对 GHES、对将来 GitHub 换 bot identity 都更健壮）：
      ```
      gh api graphql -f query='query {{ repository(owner:"OWNER",name:"REPO") {{ pullRequest(number:{pr_number}) {{ id reviewRequests(last:10) {{ nodes {{ requestedReviewer {{ __typename ... on Bot {{ login id }} ... on User {{ login id }} }} }} }} }} }} }}'
      ```
-   - 如果 `copilot-pull-request-reviewer` 已经在列表里：先用 `requestReviews` mutation（`union:false`）把 reviewer 列表替换成**不含 Copilot** 的集合（保留其他人），再用第二个 `requestReviews` mutation（`union:true`, 同时带 `userIds` 和 `botIds`）把它重新加进去。这样会触发一次新的 review_request 事件。
-   - 如果 Copilot 不在列表里，直接 `requestReviews union:true botIds:["BOT_kgDOCnlnWA"]` 加上去就行。
-   - Copilot 的 bot GraphQL id 是 `BOT_kgDOCnlnWA`（已知常量）。
+     - 从返回里挑 `requestedReviewer.__typename == "Bot"` 且 `login == "copilot-pull-request-reviewer"` 的那条，拿它的 `id` —— 这就是 Copilot 的 bot id（通常是 `BOT_kgDOCnlnWA`，但不要假设）。
+     - 如果 Copilot 当前 **不在** 这个 reviewer 列表里，需要先查一下它的 id。两条路二选一：
+       * 试探性 `union:true, botIds:["<GUESS>"]`，如果失败就 fallback 到下一条；
+       * 或者直接用 `gh api graphql -f query='query {{ search(type:USER,query:"copilot-pull-request-reviewer") {{ nodes {{ __typename ... on Bot {{ login id }} }} }} }}'` 搜一次。推荐后者——稳。
+   - 拿到 bot id 之后：
+     - **Copilot 已在列表里** → 先用 `requestReviews` mutation（`union:false`）把 reviewer 列表替换成**不含 Copilot** 的集合（保留其他人），再用第二个 `requestReviews` mutation（`union:true`, 同时带 `userIds` 和 `botIds`）把它重新加进去。这样会触发一次新的 review_request 事件。
+     - **Copilot 不在列表里** → 直接 `requestReviews union:true botIds:["<resolved_bot_id>"]` 加上去即可。
 
 7. 等 Copilot 再审一轮：
    - 轮询 `gh api repos/OWNER/REPO/pulls/{pr_number}/comments` 和 `reviews`，筛 `user.login == "Copilot"` 且 `created_at > <你上次 push 的时间>` 的新评论。
@@ -2750,6 +2754,47 @@ async fn flush_steer_buffer(
 /// worktree` to either reuse an existing checkout of that branch or
 /// create a fresh worktree.
 ///
+/// Scan `git worktree list --porcelain` output and return the path of
+/// an existing non-primary worktree that has `head_branch` checked out,
+/// or `None` if none qualifies.
+///
+/// Porcelain format (stable since git 2.7): each worktree is a block of
+/// key-line pairs separated by a single blank line.  `--porcelain`
+/// always emits the primary (repo-root) worktree first; subsequent
+/// blocks are additional worktrees in creation order.  We deliberately
+/// skip the first block so `/replyreview` can't latch onto the user's
+/// main checkout even if that main checkout happens to be sitting on
+/// the PR's head branch — doing so would violate the "main repo stays
+/// on master" rule from CLAUDE.md and let Claude edit the user's
+/// working copy.
+///
+/// Pure function; extracted from `resolve_one_replyreview_task` so the
+/// porcelain-parsing edge cases (primary-only, multiple worktrees,
+/// detached HEAD blocks with no `branch` line) can be unit tested in
+/// isolation.
+fn find_reusable_worktree(porcelain: &str, head_branch: &str) -> Option<String> {
+    let wanted_ref = format!("refs/heads/{head_branch}");
+    let mut current_path: Option<String> = None;
+    // `is_primary` flips off after the first block's blank-line
+    // terminator.  On the primary block we still walk the fields so
+    // `current_path` gets wired up consistently, but the branch-match
+    // branch is gated on `!is_primary`.
+    let mut is_primary = true;
+    for raw in porcelain.lines() {
+        if let Some(path) = raw.strip_prefix("worktree ") {
+            current_path = Some(path.to_string());
+        } else if let Some(branch) = raw.strip_prefix("branch ") {
+            if branch == wanted_ref && !is_primary {
+                return current_path;
+            }
+        } else if raw.is_empty() {
+            current_path = None;
+            is_primary = false;
+        }
+    }
+    None
+}
+
 /// Errors are returned as strings so the caller can surface them to
 /// the user and bail (not `anyhow::Error` — the dispatch site already
 /// uses `Result<_, String>` for user-facing slash command errors, and
@@ -2836,27 +2881,7 @@ async fn resolve_one_replyreview_task(pr: u32) -> Result<ClaudeTask, String> {
         ));
     }
     let list_stdout = String::from_utf8_lossy(&list_out.stdout);
-    let mut existing_path: Option<String> = None;
-    let wanted_ref = format!("refs/heads/{head_branch}");
-    let mut current_path: Option<String> = None;
-    // `is_primary` flips off after the first block's blank-line terminator.
-    // `git worktree list --porcelain` always emits the main worktree first,
-    // so this flag accurately identifies "the user's primary checkout" on
-    // the first pass without any extra filesystem probing.
-    let mut is_primary = true;
-    for raw in list_stdout.lines() {
-        if let Some(path) = raw.strip_prefix("worktree ") {
-            current_path = Some(path.to_string());
-        } else if let Some(branch) = raw.strip_prefix("branch ") {
-            if branch == wanted_ref && !is_primary {
-                existing_path = current_path.clone();
-                break;
-            }
-        } else if raw.is_empty() {
-            current_path = None;
-            is_primary = false;
-        }
-    }
+    let existing_path = find_reusable_worktree(&list_stdout, &head_branch);
 
     let worktree_path = if let Some(path) = existing_path {
         path
@@ -2894,14 +2919,25 @@ async fn resolve_one_replyreview_task(pr: u32) -> Result<ClaudeTask, String> {
         // that only proves the PR exists remotely; the local clone may
         // not have a refs/remotes/origin/<head_branch> at all (fresh
         // clone default fetch refspec won't pull arbitrary branches).
+        //
+        // Use an explicit `refs/heads/<branch>:refs/remotes/origin/<branch>`
+        // refspec rather than the bare branch name.  Two reasons:
+        // (1) a PR head branch starting with `-` (valid on GitHub) would
+        //     otherwise be parsed as a git option and potentially trigger
+        //     option injection; the refspec form is never confused for a
+        //     flag because refs start with `refs/`.
+        // (2) it pins exactly what gets written to `refs/remotes/origin/`
+        //     even if the local clone has an unusual fetch refspec
+        //     configured.
+        let refspec = format!("refs/heads/{head_branch}:refs/remotes/origin/{head_branch}");
         let fetch_out = Command::new("git")
-            .args(["fetch", "origin", &head_branch])
+            .args(["fetch", "origin", "--", &refspec])
             .output()
             .await
-            .map_err(|e| format!("failed to spawn `git fetch origin {head_branch}`: {e}"))?;
+            .map_err(|e| format!("failed to spawn `git fetch origin -- {refspec}`: {e}"))?;
         if !fetch_out.status.success() {
             return Err(format!(
-                "git fetch origin {head_branch}: {}",
+                "git fetch origin -- {refspec}: {}",
                 String::from_utf8_lossy(&fetch_out.stderr).trim()
             ));
         }
@@ -2910,7 +2946,9 @@ async fn resolve_one_replyreview_task(pr: u32) -> Result<ClaudeTask, String> {
         // start-point, which is `origin/<head_branch>`.  If the local
         // branch already exists but is stale, this updates it; if it
         // doesn't exist, this creates it.  Either way the worktree
-        // starts from the remote state.
+        // starts from the remote state.  `--` defends against the
+        // same `-`-prefix branch-name injection; anything after `--`
+        // is treated as a positional argument by git.
         let start_point = format!("origin/{head_branch}");
         let add_out = Command::new("git")
             .args([
@@ -2918,6 +2956,7 @@ async fn resolve_one_replyreview_task(pr: u32) -> Result<ClaudeTask, String> {
                 "add",
                 "-B",
                 &head_branch,
+                "--",
                 path_str,
                 &start_point,
             ])
@@ -2926,7 +2965,7 @@ async fn resolve_one_replyreview_task(pr: u32) -> Result<ClaudeTask, String> {
             .map_err(|e| format!("failed to spawn `git worktree add`: {e}"))?;
         if !add_out.status.success() {
             return Err(format!(
-                "git worktree add -B {} {} {}: {}",
+                "git worktree add -B {} -- {} {}: {}",
                 head_branch,
                 path_str,
                 start_point,
@@ -5226,5 +5265,153 @@ mod tests {
             "desc must keep the 3-round hard cap so we don't burn \
              unbounded Copilot cycles"
         );
+    }
+
+    #[test]
+    fn render_replyreview_description_does_not_hardcode_bot_id_alone() {
+        // Regression guard: the prompt must not ship a raw
+        // `botIds:["BOT_kgDOCnlnWA"]` without a surrounding
+        // "look it up dynamically" directive.  A user running this
+        // on GHES or against a future GitHub where the bot's node id
+        // changes would get a silent failure otherwise.  We accept
+        // mentions of the literal id (as a fallback guess or "通常
+        // 是 …" hint) as long as the dynamic-lookup instruction is
+        // also present.
+        let desc = render_replyreview_description(157);
+        if desc.contains("BOT_kgDOCnlnWA") {
+            assert!(
+                desc.contains("不要假设") || desc.contains("look it up") || desc.contains("search"),
+                "prompt mentions the bot id constant but lacks the \
+                 dynamic-lookup directive; GHES / future-GitHub \
+                 users will hit silent failures.  Either drop the \
+                 constant or keep it as an explicit fallback hint \
+                 with the lookup instruction alongside."
+            );
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // find_reusable_worktree — `git worktree list --porcelain` parsing
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn find_reusable_worktree_skips_primary_even_on_matching_branch() {
+        // Primary worktree (first block) is always skipped — even if
+        // the user happens to have the PR's head branch checked out in
+        // the main repo root.  Reusing it would violate the "main repo
+        // stays on master" rule in CLAUDE.md.
+        let porcelain = "\
+worktree /home/u/amaebi
+HEAD deadbeef
+branch refs/heads/feat/my-branch
+
+";
+        assert_eq!(find_reusable_worktree(porcelain, "feat/my-branch"), None);
+    }
+
+    #[test]
+    fn find_reusable_worktree_primary_only_returns_none() {
+        // Just the primary worktree, and the user isn't even on the
+        // target branch: nothing to reuse.
+        let porcelain = "\
+worktree /home/u/amaebi
+HEAD deadbeef
+branch refs/heads/master
+
+";
+        assert_eq!(find_reusable_worktree(porcelain, "feat/my-branch"), None);
+    }
+
+    #[test]
+    fn find_reusable_worktree_reuses_matching_non_primary() {
+        // Primary on master, secondary on the target branch: return
+        // the secondary's path.
+        let porcelain = "\
+worktree /home/u/amaebi
+HEAD deadbeef
+branch refs/heads/master
+
+worktree /home/u/.amaebi/worktrees/replyreview/pr157-abc12345
+HEAD cafebabe
+branch refs/heads/feat/my-branch
+
+";
+        assert_eq!(
+            find_reusable_worktree(porcelain, "feat/my-branch"),
+            Some("/home/u/.amaebi/worktrees/replyreview/pr157-abc12345".to_string())
+        );
+    }
+
+    #[test]
+    fn find_reusable_worktree_picks_first_match_across_multiple() {
+        // Unusual but possible: two non-primary worktrees both holding
+        // the same branch (git actually forbids this, but the parser
+        // shouldn't crash).  First non-primary match wins.
+        let porcelain = "\
+worktree /home/u/amaebi
+HEAD 00000000
+branch refs/heads/master
+
+worktree /home/u/wt-one
+HEAD 11111111
+branch refs/heads/feat/target
+
+worktree /home/u/wt-two
+HEAD 22222222
+branch refs/heads/feat/target
+
+";
+        assert_eq!(
+            find_reusable_worktree(porcelain, "feat/target"),
+            Some("/home/u/wt-one".to_string())
+        );
+    }
+
+    #[test]
+    fn find_reusable_worktree_detached_head_block_is_ignored() {
+        // A detached-HEAD worktree has no `branch` line, only a
+        // `detached` marker.  The scan skips it without tripping over
+        // the missing ref.
+        let porcelain = "\
+worktree /home/u/amaebi
+HEAD 00000000
+branch refs/heads/master
+
+worktree /home/u/wt-detached
+HEAD 11111111
+detached
+
+worktree /home/u/wt-target
+HEAD 22222222
+branch refs/heads/feat/target
+
+";
+        assert_eq!(
+            find_reusable_worktree(porcelain, "feat/target"),
+            Some("/home/u/wt-target".to_string())
+        );
+    }
+
+    #[test]
+    fn find_reusable_worktree_empty_input_returns_none() {
+        assert_eq!(find_reusable_worktree("", "feat/anything"), None);
+    }
+
+    #[test]
+    fn find_reusable_worktree_does_not_substring_match_branch_names() {
+        // `feat/target` must not be reused when the only match is the
+        // suffix of a longer branch like `feat/target-2`.  Full-ref
+        // equality prevents that false positive.
+        let porcelain = "\
+worktree /home/u/amaebi
+HEAD 00000000
+branch refs/heads/master
+
+worktree /home/u/wt-similar
+HEAD 11111111
+branch refs/heads/feat/target-2
+
+";
+        assert_eq!(find_reusable_worktree(porcelain, "feat/target"), None);
     }
 }
