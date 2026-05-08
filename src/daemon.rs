@@ -4383,9 +4383,11 @@ where
 /// subsequent calls in the same session.  Copilot has no equivalent
 /// field; the TTL is silently dropped there.
 ///
-/// Use [`bedrock::CacheTtl::FiveMinutes`] for interactive chat (short
-/// idle gaps) and [`bedrock::CacheTtl::OneHour`] for long-running
-/// supervision loops where the same prompt is resent on every tick.
+/// Use [`bedrock::CacheTtl::OneHour`] (the agentic loop's current
+/// default) for any session that may sit inside a long-running tool
+/// call like `tmux_wait`.  [`bedrock::CacheTtl::FiveMinutes`] is
+/// reserved for short-lived callers that don't want to pay the 2×
+/// write premium.
 #[allow(clippy::too_many_arguments)]
 async fn invoke_model_with_cache<W>(
     state: &DaemonState,
@@ -5012,16 +5014,29 @@ where
         // is user/assistant-role; neither is covered by a system-level
         // cachePoint (extending to those would require additional
         // cachePoints and a per-turn stability policy — deferred).
-        // 5-minute TTL matches typical idle gaps between user turns;
-        // going longer wastes cache capacity on sessions that won't
-        // continue.
+        //
+        // 1-hour TTL (vs 5-minute) is chosen because this loop is the
+        // shared agentic path for both chat and /claude supervision.
+        // Supervision sessions spend most wall-time inside `tmux_wait`
+        // (pane-idle polls routinely run 5–30 minutes, occasionally up
+        // to the 2-hour timeout), and empirically every cache miss on
+        // the post-wait turn falls into the 5m–1h window — none land
+        // beyond an hour.  With 5m TTL those misses repeatedly pay the
+        // 1.25× write premium and then serve one hit each; with 1h TTL
+        // the same turns read cache (~47% fewer writes in measured
+        // runs).  The 2× write premium of 1h is paid once per truly
+        // idle-over-an-hour gap, which is rare in practice.
+        // Pure chat sessions with short idle gaps are unaffected on
+        // the hit path — both TTLs serve them — and pay the 2× write
+        // only if the session is abandoned before a second turn, a
+        // cost we accept to unlock the supervision-loop savings.
         let resp_result = invoke_model_with_cache(
             state,
             invoke_with,
             &messages,
             &schemas,
             response_max_tokens(invoke_with),
-            Some(crate::bedrock::CacheTtl::FiveMinutes),
+            Some(crate::bedrock::CacheTtl::OneHour),
             writer,
         )
         .await;
