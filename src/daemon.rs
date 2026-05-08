@@ -2242,6 +2242,26 @@ async fn release_held_entry(
     // Capture pane tail (best-effort — don't fail the release if tmux is sick).
     let pane_tail = capture_pane_tail(pane_id).await.unwrap_or_default();
 
+    // Elapsed milliseconds since the TaskEntry was created.  Shared by
+    // the inbox archive body and the `Response::TaskReleased` frame so
+    // the two surfaces can't drift.  Two rounding concerns to flag:
+    //   - `Duration::as_millis()` truncates.  A genuinely sub-1ms
+    //     release (rare but possible on a cached no-op launch) would
+    //     otherwise land at 0 and the client's "elapsed_ms == 0 means
+    //     legacy payload" suppression would eat the duration line,
+    //     leaving users confused.  `.max(1)` rounds up so non-legacy
+    //     durations always render.
+    //   - `u128 → u64` conversion saturates at `u64::MAX` (~584
+    //     million years).  Any supervision loop hitting that cap has
+    //     much bigger problems than a wrong duration string.
+    let elapsed_ms: u64 = entry
+        .created_at
+        .elapsed()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+        .max(1);
+
     // Worktree dirty flag — cheap git-porcelain query, tolerates missing dir.
     let (worktree_path, worktree_dirty) = match entry.worktree.as_deref() {
         Some(wt) => {
@@ -2288,6 +2308,14 @@ async fn release_held_entry(
         if let Some(wt) = &worktree_path {
             body.push_str(&format!("worktree: {wt} (dirty={worktree_dirty})\n"));
         }
+        // Elapsed from launch to release.  The inbox row ordering
+        // (tag → worktree → duration) mirrors the interactive release
+        // UI in `format_task_released` so a user reviewing archive
+        // snapshots sees the same shape as the live chat print.
+        body.push_str(&format!(
+            "duration: {}\n",
+            crate::ipc::format_duration_ms(elapsed_ms)
+        ));
         if let Some(s) = &summary {
             body.push_str(&format!("\nsummary:\n{s}\n"));
         }
@@ -2312,6 +2340,7 @@ async fn release_held_entry(
         worktree_path,
         worktree_dirty,
         pane_tail,
+        elapsed_ms,
     })
 }
 
@@ -4741,6 +4770,25 @@ fn format_pane_alive_reminder(pane_ids: &[String]) -> String {
          complete — do not call it on the first turn just to exit.  Once \
          ALL panes are released, this reminder disappears and you can \
          reply with plain text again.\n\
+         \n\
+         **`task_done` means the user's objective is DEMONSTRABLY MET.** \
+         You must be able to point to concrete evidence in the pane \
+         that matches the task description: passing tests, a numerical \
+         threshold hit, a file committed, an output matching the \
+         spec.  A summary that says \"unable to fully resolve\", \
+         \"precision stuck at 0.7 (target was 0.99)\", \"escalating to \
+         user / PISA tools\", \"needs next-session effort\", or \"work \
+         handed off\" is NOT a completed task — it's a blocked task, \
+         and releasing it with `task_done` hides the blocker from the \
+         user.  When Claude is genuinely blocked (missing expertise, \
+         missing tooling, external dependency, numerical goal not met \
+         after exhausting approaches), DO NOT call `task_done`; \
+         instead emit a text reply that names the concrete blocker so \
+         the user can decide whether to continue steering, switch \
+         strategies, or release manually via `/release`.  This is the \
+         same escalation-as-text-reply escape hatch covered by the \
+         \"Make decisions; do not bounce them to the user\" section \
+         above — applied here to the specific release decision.\n\
          \n\
          **Multi-step plan (≥3 steps).**  For tasks with three or more \
          distinct steps, maintain a plan as a markdown checklist inside \
@@ -8213,6 +8261,42 @@ mod tests {
                  cover for a missing vocabulary row"
             );
         }
+    }
+
+    #[test]
+    fn pane_alive_reminder_blocks_task_done_when_goal_not_met() {
+        // Regression guard for the prompt clause that stops the
+        // supervisor from calling `task_done` when Claude bailed out
+        // with "unable to resolve" / "escalating to user".  This was
+        // added after a live incident in window 6 where the supervisor
+        // released a pane with a summary that said the precision goal
+        // (Cosine >= 0.99) had NOT been met (actual: 0.698) and the
+        // user only learned about the blocker by scrolling through the
+        // pane tail.
+        //
+        // The prompt depends on the reader catching BOTH halves of
+        // the rule: (1) task_done means the objective is demonstrably
+        // met, and (2) blocker cases must be escalated via a text
+        // reply, not hidden inside a task_done summary.  Anchoring on
+        // distinctive substrings from each half.
+        let r = format_pane_alive_reminder(&["%54".into()]);
+        assert!(
+            r.contains("DEMONSTRABLY MET"),
+            "prompt must keep the demonstrably-met anchor — without it \
+             the supervisor drifts back to releasing blocked tasks with \
+             `task_done` when the executor bails out"
+        );
+        assert!(
+            r.contains("NOT a completed task"),
+            "prompt must keep the explicit \"NOT a completed task\" \
+             framing so the LLM matches the anti-pattern against its \
+             own draft summary before calling task_done"
+        );
+        assert!(
+            r.contains("DO NOT call `task_done`"),
+            "prompt must keep the directive telling the supervisor to \
+             escalate-as-text-reply instead of releasing a blocked task"
+        );
     }
 
     /// Direct-insert a TaskEntry (bypassing handle_claude_launch) and

@@ -456,6 +456,7 @@ fn parse_slash_command(input: &str) -> Option<SlashCommand> {
 /// Chat, Resume, Ask, and `/release` stream handlers so rendering is
 /// consistent no matter how the release was triggered (task_done, /release,
 /// socket break in a different conn, etc.).
+#[allow(clippy::too_many_arguments)] // mirrors `Response::TaskReleased`'s fields 1:1
 fn format_task_released(
     pane_id: &str,
     resources_freed: &[String],
@@ -464,6 +465,7 @@ fn format_task_released(
     worktree_path: Option<&str>,
     worktree_dirty: bool,
     pane_tail: &str,
+    elapsed_ms: u64,
 ) -> String {
     let mut out = format!("[released {pane_id}]");
     if let Some(t) = tag {
@@ -479,6 +481,21 @@ fn format_task_released(
         ));
     }
     out.push('\n');
+    // `elapsed_ms == 0` is reserved for "field absent on the wire"
+    // (legacy payloads that predate `TaskReleased.elapsed_ms` — they
+    // deserialize with `#[serde(default)]`).  Real releases cannot
+    // produce `0` because the daemon rounds sub-millisecond durations
+    // up to `1` before shipping the frame; see
+    // `release_held_entry`'s `elapsed_ms` computation for the
+    // round-up rationale.  Suppressing the line when zero therefore
+    // keeps replay diffs stable without hiding any legitimate
+    // duration from the live UI.
+    if elapsed_ms > 0 {
+        out.push_str(&format!(
+            "  duration: {}\n",
+            crate::ipc::format_duration_ms(elapsed_ms)
+        ));
+    }
     if let Some(s) = summary {
         out.push_str(&format!("  summary: {s}\n"));
     }
@@ -1220,6 +1237,7 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
                         worktree_path,
                         worktree_dirty,
                         pane_tail,
+                        elapsed_ms,
                     } => {
                         let out = format_task_released(
                             &pane_id,
@@ -1229,6 +1247,7 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
                             worktree_path.as_deref(),
                             worktree_dirty,
                             &pane_tail,
+                            elapsed_ms,
                         );
                         stdout.write_all(out.as_bytes()).await?;
                     }
@@ -1673,6 +1692,7 @@ pub async fn run_chat_loop(
                                     worktree_path,
                                     worktree_dirty,
                                     pane_tail,
+                                    elapsed_ms,
                                 } => {
                                     let out = format_task_released(
                                         &pane_id,
@@ -1682,6 +1702,7 @@ pub async fn run_chat_loop(
                                         worktree_path.as_deref(),
                                         worktree_dirty,
                                         &pane_tail,
+                                        elapsed_ms,
                                     );
                                     stdout.write_all(out.as_bytes()).await?;
                                 }
@@ -1934,6 +1955,7 @@ pub async fn run_chat_loop(
                             worktree_path,
                             worktree_dirty,
                             pane_tail,
+                            elapsed_ms,
                         } => {
                             // Flush any in-flight markdown before the release
                             // banner so the user sees a clear break.
@@ -1949,6 +1971,7 @@ pub async fn run_chat_loop(
                                 worktree_path.as_deref(),
                                 worktree_dirty,
                                 &pane_tail,
+                                elapsed_ms,
                             );
                             stdout.write_all(out.as_bytes()).await?;
                             stdout.flush().await?;
@@ -2319,6 +2342,7 @@ pub async fn run_resume(
                         worktree_path,
                         worktree_dirty,
                         pane_tail,
+                        elapsed_ms,
                     } => {
                         let out = format_task_released(
                             &pane_id,
@@ -2328,6 +2352,7 @@ pub async fn run_resume(
                             worktree_path.as_deref(),
                             worktree_dirty,
                             &pane_tail,
+                            elapsed_ms,
                         );
                         stdout.write_all(out.as_bytes()).await?;
                     }
@@ -4384,27 +4409,28 @@ mod tests {
 
     #[test]
     fn format_task_released_header_includes_pane_and_tag() {
-        let out = format_task_released("%54", &[], Some("kernel-opt"), None, None, false, "");
+        let out = format_task_released("%54", &[], Some("kernel-opt"), None, None, false, "", 0);
         assert!(out.starts_with("[released %54]"));
         assert!(out.contains("tag=kernel-opt"));
     }
 
     #[test]
     fn format_task_released_header_without_tag_omits_tag_field() {
-        let out = format_task_released("%54", &[], None, None, None, false, "");
+        let out = format_task_released("%54", &[], None, None, None, false, "", 0);
         assert!(out.starts_with("[released %54]"));
         assert!(!out.contains("tag="));
     }
 
     #[test]
     fn format_task_released_includes_summary_when_present() {
-        let out = format_task_released("%54", &[], None, Some("all tests pass"), None, false, "");
+        let out =
+            format_task_released("%54", &[], None, Some("all tests pass"), None, false, "", 0);
         assert!(out.contains("  summary: all tests pass\n"));
     }
 
     #[test]
     fn format_task_released_summary_absent_when_none() {
-        let out = format_task_released("%54", &[], None, None, None, false, "");
+        let out = format_task_released("%54", &[], None, None, None, false, "", 0);
         assert!(!out.contains("  summary: "));
     }
 
@@ -4413,8 +4439,8 @@ mod tests {
         // Hint block must appear regardless of tag presence — the pane
         // is preserved across release and --resume-pane is the correct
         // reuse path.
-        let with_tag = format_task_released("%54", &[], Some("foo"), None, None, false, "");
-        let without_tag = format_task_released("%7", &[], None, None, None, false, "");
+        let with_tag = format_task_released("%54", &[], Some("foo"), None, None, false, "", 0);
+        let without_tag = format_task_released("%7", &[], None, None, None, false, "", 0);
         assert!(with_tag.contains("--- resume this pane ---"));
         assert!(with_tag.contains("/claude --resume-pane %54"));
         assert!(without_tag.contains("--- resume this pane ---"));
@@ -4427,7 +4453,7 @@ mod tests {
         // requires a description on the `--tag` path, so a bare
         // `/claude --tag <tag>` hint would error out.  Confirm the
         // hint only mentions --resume-pane, never --tag.
-        let out = format_task_released("%54", &[], Some("kernel-opt"), None, None, false, "");
+        let out = format_task_released("%54", &[], Some("kernel-opt"), None, None, false, "", 0);
         // The header still carries `tag=kernel-opt` as a label; the
         // resume-hint block must NOT contain `/claude --tag`.
         let hint_start = out.find("--- resume this pane ---").expect("hint present");
@@ -4441,7 +4467,7 @@ mod tests {
     #[test]
     fn format_task_released_pane_tail_rendered_with_pipe_prefix() {
         let tail = "line1\nline2\nline3";
-        let out = format_task_released("%54", &[], None, None, None, false, tail);
+        let out = format_task_released("%54", &[], None, None, None, false, tail, 0);
         assert!(out.contains("--- pane tail ---"));
         assert!(out.contains("  | line1\n"));
         assert!(out.contains("  | line2\n"));
@@ -4451,7 +4477,7 @@ mod tests {
     #[test]
     fn format_task_released_empty_pane_tail_skipped() {
         // Empty / whitespace-only tail should not emit the tail block.
-        let out = format_task_released("%54", &[], None, None, None, false, "   \n\n  ");
+        let out = format_task_released("%54", &[], None, None, None, false, "   \n\n  ", 0);
         assert!(!out.contains("--- pane tail ---"));
     }
 
@@ -4465,20 +4491,21 @@ mod tests {
             None,
             false,
             "",
+            0,
         );
         assert!(out.contains("resources=[xesim-9902,gpu-0]"));
     }
 
     #[test]
     fn format_task_released_worktree_dirty_flag_rendered() {
-        let clean = format_task_released("%54", &[], None, None, Some("/path"), false, "");
-        let dirty = format_task_released("%54", &[], None, None, Some("/path"), true, "");
+        let clean = format_task_released("%54", &[], None, None, Some("/path"), false, "", 0);
+        let dirty = format_task_released("%54", &[], None, None, Some("/path"), true, "", 0);
         assert!(clean.contains("worktree=/path\n") || clean.contains("worktree=/path "));
         assert!(dirty.contains("worktree=/path (dirty)"));
     }
 
     // ------------------------------------------------------------------
-    // PlanProgressTracker
+    // PlanProgressTracker (inherited from PR #157)
     // ------------------------------------------------------------------
 
     #[test]
@@ -4639,5 +4666,44 @@ mod tests {
         assert_eq!(t.latest_progress(), Some((2, 2)));
         t.finalize_tail();
         assert_eq!(t.latest_progress(), Some((2, 2)));
+    }
+
+    // ------------------------------------------------------------------
+    // format_task_released — duration (PR #159)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn format_task_released_duration_rendered_when_nonzero() {
+        // Elapsed_ms > 0 → a `  duration:` line appears between the
+        // header and the summary.  Spot-check the three size buckets
+        // (sub-second, sub-minute, and multi-minute) so a future
+        // wording change in `format_duration_ms` fails loudly here.
+        let sub_sec = format_task_released("%54", &[], None, None, None, false, "", 312);
+        assert!(
+            sub_sec.contains("  duration: 312ms\n"),
+            "sub-second duration missing: {sub_sec}"
+        );
+        let under_minute = format_task_released("%54", &[], None, None, None, false, "", 37_500);
+        assert!(
+            under_minute.contains("  duration: 37s\n"),
+            "37-second duration missing: {under_minute}"
+        );
+        let over_minute =
+            format_task_released("%54", &[], None, None, None, false, "", 14 * 60_000 + 2_000);
+        assert!(
+            over_minute.contains("  duration: 14m 2s\n"),
+            "14m 2s duration missing: {over_minute}"
+        );
+    }
+
+    #[test]
+    fn format_task_released_duration_suppressed_when_zero() {
+        // Legacy fixtures (pre-serde-default field) deserialize with
+        // elapsed_ms=0; we don't want those to render `duration: 0s`.
+        let out = format_task_released("%54", &[], None, None, None, false, "", 0);
+        assert!(
+            !out.contains("duration:"),
+            "zero elapsed should skip the duration line: {out}"
+        );
     }
 }
