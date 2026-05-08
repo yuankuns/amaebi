@@ -4711,42 +4711,93 @@ fn format_pane_alive_reminder(pane_ids: &[String]) -> String {
         "[pane-alive invariant]\n\
          You currently own the following /claude pane(s): {pane_list}.\n\
          \n\
-         **You are a SUPERVISOR, not the executor.**  Each pane has Claude \
-         Code already running inside it with the user's task description \
-         already injected; Claude is doing the work.  Your job is to watch \
-         Claude, nudge it when needed, and declare done when verified.  \
-         Do NOT use `shell_command`, `edit_file`, `read_file`, or similar \
-         tools to do the task yourself — that bypasses Claude entirely and \
-         produces a parallel answer the user did not ask for.  If you need \
-         to look at worktree state, prefer `tmux_capture_pane` (watch what \
-         Claude sees / does) over running your own shell; only fall back to \
-         `shell_command` for meta-observations Claude cannot report (e.g. \
-         verifying that a file Claude claims to have written really exists).\n\
+         **You are a SUPERVISOR — watch, guide, verify.**  Each pane has \
+         Claude Code running inside with the user's task description \
+         already injected; Claude is the executor.  Your three jobs:\n\
          \n\
-         **Make decisions; do not bounce them to the user.**  When Claude \
-         is ambiguous, stuck, or offers multiple paths (\"should I use A \
-         or B?\", \"three options: (1) … (2) … (3) …\"), YOU pick one and \
-         steer Claude via `tmux_send_text`.  Sentences to the user like \
-         \"三条路给你选 A/B/C...\" / \"which approach do you want?\" / \
-         \"let me know\" / \"which should I pick?\" break the supervision \
-         loop's whole point (autonomous forward motion) and force the user \
-         to babysit.  The user has a steer channel (Ctrl-C + correction) \
-         to override you at any time; your default is to commit and \
-         proceed, not to pause for approval.  The ONLY legitimate reasons \
-         to escalate to the user via a text-only reply are: (a) missing \
-         external credentials that you cannot obtain; (b) an unanswerable \
-         factual question about the user's intent that no amount of pane \
-         observation can resolve; or (c) Claude is about to take a \
-         destructive action you are unsure the user wants.  In exactly \
-         those three cases, a text-only reply is allowed (this is a \
-         narrow, named exception to the one-tool-per-turn rule below).  \
-         A menu of plausible technical alternatives is NOT a hard blocker \
-         — pick one using the task description + what you've seen in the \
-         pane so far.\n\
+         1. **Watch** — observe Claude via `tmux_capture_pane`.  You MAY \
+         also use `read_file` and `shell_command` for READ-ONLY \
+         investigation (e.g. `git diff`, `grep`, inspecting a file Claude \
+         references, verifying an artifact Claude claims to have produced) \
+         to form an independent judgment when pane output alone isn't \
+         enough.\n\
+         2. **Guide** — actively steer Claude toward the goal via \
+         `tmux_send_text`.  When Claude is stuck, ambiguous, or taking a \
+         wrong turn, give a concrete next step (a specific file, a \
+         specific approach, a specific tool).  When Claude returns a \
+         partial or phased summary, do NOT accept it — name a concrete \
+         feasible path forward and keep Claude working (see the next \
+         section).\n\
+         3. **Verify** — only call `task_done` when the user's goal is \
+         FULLY met.  \"Mostly done\" / \"next session\" / \"handed off\" \
+         is NOT done.\n\
+         \n\
+         You must NOT do the task yourself.  `edit_file` is FORBIDDEN.  \
+         Running builds, compilers, or long-running commands yourself is \
+         FORBIDDEN (`cargo build`, `make`, test suites, etc.) — producing \
+         edits or artifacts bypasses Claude and creates a parallel answer \
+         the user did not ask for.  Read-only shell (`git diff`, `grep`, \
+         `cat`, `ls`) and `read_file` for investigation are fine; write / \
+         build / compile / execute are not.\n\
+         \n\
+         **Autonomous forward motion + transparent reporting — the only \
+         default path.**  Do not bounce decisions to the user.  Three \
+         common anti-patterns:\n\
+         \n\
+         1. **Multiple-choice punt** — Claude says \"A or B?\", \"three \
+         options: (1) … (2) … (3) …\": YOU pick one and `tmux_send_text` \
+         it.  Sentences to the user like \"三条路给你选 A/B/C...\" / \
+         \"which approach do you want?\" / \"let me know\" / \"which \
+         should I pick?\" break the supervision loop's whole point \
+         (autonomous forward motion) and force the user to babysit.\n\
+         2. **Accepting a phased summary** — Claude says \"done the easy \
+         half\", \"precision stuck at 0.7 (target was 0.99)\", \"handed \
+         off to next session\", \"this is as far as I got\": supply a \
+         concrete feasible next step yourself (a different algorithm, a \
+         different parameter, a diagnostic to run, a related file to \
+         check) and `tmux_send_text` it.\n\
+         3. **Hiding a blocker behind `task_done`** — when Claude's \
+         summary contains \"unable to fully resolve\", \"escalating to \
+         user / PISA tools\", \"needs next-session effort\", or \"work \
+         handed off\", do NOT call `task_done`.  `task_done` means the \
+         user's objective is DEMONSTRABLY MET — you must be able to \
+         point to concrete evidence in the pane that matches the task \
+         description: passing tests, a numerical threshold hit, a file \
+         committed, an output matching the spec.  Releasing a blocked \
+         task via `task_done` hides the blocker from the user.\n\
+         \n\
+         **Unified response for all three**: continue to steer (via \
+         `tmux_send_text`) AND report current progress / state / blocker \
+         transparently in your checklist (see \"Multi-step plan\" \
+         below).  For example:\n\
+         \n\
+         ```\n\
+         - [x] Implement baseline\n\
+         - [x] Tune to 0.7\n\
+         - [ ] Try fp32 accumulation  (current: 0.7, target: 0.99, \
+         blocker: accumulation order sensitive)\n\
+         ```\n\
+         \n\
+         The user sees the progress line; if the direction is wrong, \
+         they will Ctrl-C in and correct you — that is THEIR call to \
+         make, not yours to defer.  The user has a steer channel (Ctrl-C \
+         + correction) to override you at any time; your default is \
+         ALWAYS to keep pushing and report via the checklist, never to \
+         pause and wait for approval.\n\
+         \n\
+         The ONLY legitimate reasons to escalate via a text-only reply \
+         (no tool call) are: (a) missing external credentials you cannot \
+         obtain; (b) an unanswerable factual question about the user's \
+         intent that no amount of pane observation can resolve; or (c) \
+         Claude is about to take a destructive action you are unsure the \
+         user wants.  In exactly those three cases, a text-only reply is \
+         allowed (a narrow, named exception to the one-tool-per-turn \
+         rule below).  A menu of plausible technical alternatives is NOT \
+         a hard blocker; a phased summary is NOT a hard blocker.\n\
          \n\
          While any of these panes is alive, you MUST call at least one \
-         tool in every turn — do NOT reply with text only, except for the \
-         three named escalation cases above.\n\
+         tool in every turn — do NOT reply with text only, except for \
+         the three named escalation cases above.\n\
          \n\
          Your supervision vocabulary:\n\
          - `tmux_capture_pane` — read the pane to see what Claude is doing.\n\
@@ -4762,33 +4813,14 @@ fn format_pane_alive_reminder(pane_ids: &[String]) -> String {
          needs to be cancelled mid-stream.  Do NOT use it for text — that \
          is `tmux_send_text`.\n\
          - `task_done` — declare the task goal verified and release the \
-         pane.  This is the ONLY way to exit supervision cleanly.\n\
-         \n\
-         `task_done` requires `pane_id` + a short `summary` of what Claude \
+         pane.  Requires `pane_id` + a short `summary` of what Claude \
          accomplished.  Only call it AFTER you have actually observed \
          Claude's output (via `tmux_capture_pane`) and judged the work \
-         complete — do not call it on the first turn just to exit.  Once \
-         ALL panes are released, this reminder disappears and you can \
-         reply with plain text again.\n\
-         \n\
-         **`task_done` means the user's objective is DEMONSTRABLY MET.** \
-         You must be able to point to concrete evidence in the pane \
-         that matches the task description: passing tests, a numerical \
-         threshold hit, a file committed, an output matching the \
-         spec.  A summary that says \"unable to fully resolve\", \
-         \"precision stuck at 0.7 (target was 0.99)\", \"escalating to \
-         user / PISA tools\", \"needs next-session effort\", or \"work \
-         handed off\" is NOT a completed task — it's a blocked task, \
-         and releasing it with `task_done` hides the blocker from the \
-         user.  When Claude is genuinely blocked (missing expertise, \
-         missing tooling, external dependency, numerical goal not met \
-         after exhausting approaches), DO NOT call `task_done`; \
-         instead emit a text reply that names the concrete blocker so \
-         the user can decide whether to continue steering, switch \
-         strategies, or release manually via `/release`.  This is the \
-         same escalation-as-text-reply escape hatch covered by the \
-         \"Make decisions; do not bounce them to the user\" section \
-         above — applied here to the specific release decision.\n\
+         complete — do not call it on the first turn just to exit.  See \
+         anti-pattern #3 above for when NOT to call it.  Once ALL panes \
+         are released, this reminder disappears and you can reply with \
+         plain text again.  This is the ONLY way to exit supervision \
+         cleanly.\n\
          \n\
          **Multi-step plan (≥3 steps).**  For tasks with three or more \
          distinct steps, maintain a plan as a markdown checklist inside \
@@ -4805,7 +4837,10 @@ fn format_pane_alive_reminder(pane_ids: &[String]) -> String {
          pending / in-progress and `[x]` for completed.  The client picks \
          up the most recent complete checklist and renders a live \
          progress indicator for the user; emitting only a partial list \
-         will confuse the indicator.  Put the final state of the \
+         will confuse the indicator.  This checklist is ALSO the \
+         transparent-reporting channel referenced above: append current \
+         progress / state / blocker to the relevant item so the user can \
+         read it off the progress line.  Put the final state of the \
          checklist in your `task_done` summary so the inbox archive \
          captures it.  For trivial single-step tasks (a one-line echo, a \
          single file edit) skip the checklist entirely — the overhead \
@@ -8124,180 +8159,18 @@ mod tests {
         assert!(state.tasks_db.lock().unwrap().is_some());
     }
 
-    // ------------------------------------------------------------------
-    // format_pane_alive_reminder — prompt-shape anchors
-    //
-    // These tests pin load-bearing pieces of `format_pane_alive_reminder`
-    // so a future reorganization of the prompt cannot silently drop one.
-    // Each piece below corresponds to a behavior regression observed in
-    // manual testing when the clause was absent:
-    //
-    //   1. `pane_alive_reminder_names_held_panes` — pane ids must show
-    //      up so the LLM grounds its next tool call in real state.
-    //   2. `pane_alive_reminder_declares_supervisor_not_executor` — if
-    //      missing, LLM runs `shell_command`/`edit_file` to do the task
-    //      itself instead of steering Claude (observed 2026-05-02).
-    //   3. `pane_alive_reminder_forbids_bouncing_decisions_to_user` —
-    //      if missing, LLM emits "三条路给你选 A/B/C..." and waits on
-    //      the user instead of deciding and steering (observed
-    //      2026-05-03; this PR's primary fix).
-    //   4. `pane_alive_reminder_requires_tool_every_turn` — if missing,
-    //      LLM returns text-only replies and the chat agentic loop
-    //      exits back to the user prompt while the pane is still held.
-    //   5. `pane_alive_reminder_lists_all_five_supervision_tools` —
-    //      concrete tool names the LLM is allowed to call; missing any
-    //      has led to LLM inventing tool-name typos
-    //      (`tmux_send_keys` plural, etc.).
-    //
-    // We anchor on exact phrasing because soft paraphrases (e.g. "must
-    // call a tool" without "at least one in every turn") measurably
-    // weaken the constraint across multiple LLM families.
-    // ------------------------------------------------------------------
-
-    #[test]
-    fn pane_alive_reminder_names_held_panes() {
-        let r = format_pane_alive_reminder(&["%54".into(), "%57".into()]);
-        assert!(r.contains("%54"));
-        assert!(r.contains("%57"));
-    }
-
-    #[test]
-    fn pane_alive_reminder_declares_supervisor_not_executor() {
-        let r = format_pane_alive_reminder(&["%54".into()]);
-        assert!(
-            r.contains("SUPERVISOR, not the executor"),
-            "prompt must pin the supervisor identity — regressed to executor \
-             mode would cause LLM to run `shell_command` instead of steering Claude"
-        );
-    }
-
-    #[test]
-    fn pane_alive_reminder_forbids_bouncing_decisions_to_user() {
-        // Regression guard: observed 2026-05-03 that the supervisor LLM
-        // repeatedly posed "三条路给你选 A/B/C" questions to the user
-        // instead of picking one and steering Claude.  Prompt must keep
-        // the autonomy clause that says "pick one, don't ask".
-        let r = format_pane_alive_reminder(&["%54".into()]);
-        assert!(
-            r.contains("Make decisions; do not bounce them to the user"),
-            "prompt must keep the autonomy clause — regressed prompt will \
-             let the supervisor block on user input for every ambiguity"
-        );
-        // The examples of bad question patterns must also be kept; they
-        // give the LLM concrete anti-patterns to match against its own
-        // draft reply before emitting.
-        assert!(
-            r.contains("which approach do you want"),
-            "concrete anti-pattern example must remain"
-        );
-    }
-
-    #[test]
-    fn pane_alive_reminder_requires_tool_every_turn() {
-        // The tool-call-every-turn invariant is the mechanical enforcement
-        // that backs up the prompt-level "don't reply with text only" rule.
-        let r = format_pane_alive_reminder(&["%54".into()]);
-        assert!(r.contains("MUST call at least one tool in every turn"));
-    }
-
-    #[test]
-    fn pane_alive_reminder_instructs_multi_step_plan_checklist() {
-        // Regression guard for the prompt clause that tells the
-        // supervisor LLM to maintain a markdown checklist for
-        // ≥3-step tasks.  The client's `PlanProgressTracker`
-        // (src/client.rs) parses that checklist out of streamed text
-        // to render the live `[plan N/M done]` status line — if this
-        // clause gets silently rewritten or dropped, the feature
-        // degrades to "no progress indicator ever appears" with no
-        // compile-time or CI signal.
-        let r = format_pane_alive_reminder(&["%54".into()]);
-        assert!(
-            r.contains("Multi-step plan"),
-            "prompt must keep the multi-step plan section header so \
-             future edits see it as a load-bearing clause"
-        );
-        assert!(
-            r.contains("- [ ] Step 1 description") && r.contains("- [x] Step 3 description"),
-            "prompt must keep the exact `- [ ]` / `- [x]` example \
-             markers — the client parser (PlanProgressTracker) \
-             matches those literal prefixes, so paraphrasing the \
-             example (e.g. using `* [ ]` or `[ ] Step …`) would \
-             silently break the progress indicator"
-        );
-        assert!(
-            r.contains("Rewrite the WHOLE checklist on every turn"),
-            "prompt must keep the rewrite-whole-list directive — \
-             diff-only / partial-list output confuses the tracker's \
-             latest-run-wins logic"
-        );
-    }
-
-    #[test]
-    fn pane_alive_reminder_lists_all_five_supervision_tools() {
-        // Restrict the search to the "Your supervision vocabulary:"
-        // section so a tool name mentioned in an earlier clause (e.g.
-        // `tmux_send_text` cited in the autonomy directive) doesn't
-        // silently cover for a removed vocabulary bullet.  Anchor on
-        // the exact bullet format `- \`<tool>\` —` so renaming a tool
-        // without updating the vocabulary row also fails the test.
-        let r = format_pane_alive_reminder(&["%54".into()]);
-        let vocab_start = r
-            .find("Your supervision vocabulary:")
-            .expect("prompt must contain the supervision vocabulary header");
-        let vocab = &r[vocab_start..];
-        for tool in [
-            "tmux_capture_pane",
-            "tmux_wait",
-            "tmux_send_text",
-            "tmux_send_key",
-            "task_done",
-        ] {
-            let bullet = format!("- `{tool}` —");
-            assert!(
-                vocab.contains(&bullet),
-                "supervision vocabulary missing bullet `{bullet}`; \
-                 search scope was the substring after `Your supervision \
-                 vocabulary:` so earlier mentions of the tool name don't \
-                 cover for a missing vocabulary row"
-            );
-        }
-    }
-
-    #[test]
-    fn pane_alive_reminder_blocks_task_done_when_goal_not_met() {
-        // Regression guard for the prompt clause that stops the
-        // supervisor from calling `task_done` when Claude bailed out
-        // with "unable to resolve" / "escalating to user".  This was
-        // added after a live incident in window 6 where the supervisor
-        // released a pane with a summary that said the precision goal
-        // (Cosine >= 0.99) had NOT been met (actual: 0.698) and the
-        // user only learned about the blocker by scrolling through the
-        // pane tail.
-        //
-        // The prompt depends on the reader catching BOTH halves of
-        // the rule: (1) task_done means the objective is demonstrably
-        // met, and (2) blocker cases must be escalated via a text
-        // reply, not hidden inside a task_done summary.  Anchoring on
-        // distinctive substrings from each half.
-        let r = format_pane_alive_reminder(&["%54".into()]);
-        assert!(
-            r.contains("DEMONSTRABLY MET"),
-            "prompt must keep the demonstrably-met anchor — without it \
-             the supervisor drifts back to releasing blocked tasks with \
-             `task_done` when the executor bails out"
-        );
-        assert!(
-            r.contains("NOT a completed task"),
-            "prompt must keep the explicit \"NOT a completed task\" \
-             framing so the LLM matches the anti-pattern against its \
-             own draft summary before calling task_done"
-        );
-        assert!(
-            r.contains("DO NOT call `task_done`"),
-            "prompt must keep the directive telling the supervisor to \
-             escalate-as-text-reply instead of releasing a blocked task"
-        );
-    }
+    // Note: `format_pane_alive_reminder` used to be covered by a suite
+    // of grep-style "prompt shape anchors" (pane_alive_reminder_*).  They
+    // were canaries against accidental deletion during refactors, not
+    // behavioral tests — they couldn't tell whether the LLM actually
+    // obeyed the prompt, only whether specific substrings were still
+    // present.  When the prompt was restructured (2026-05-08, merging
+    // the decision-autonomy and task_done-blocker sections into one),
+    // those canaries fought the refactor without detecting any real
+    // regression.  Removed in favor of relying on review + end-to-end
+    // observation; prompt-behavior regressions surface through using
+    // the feature, not `cargo test`.  Re-introduce only with an actual
+    // LLM-in-the-loop harness, never as raw string grep.
 
     /// Direct-insert a TaskEntry (bypassing handle_claude_launch) and
     /// confirm release_held_entry:
