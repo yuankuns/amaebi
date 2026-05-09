@@ -1408,9 +1408,15 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
                         // top-of-turn; refuse them mid-turn with a message
                         // that explains the retry path.
                         if parse_slash_command(&text).is_some() {
-                            let msg = "[error] slash commands cannot be used as \
-                                       a mid-turn steer.  Wait for the current \
-                                       reply to finish, then retype the command.\n";
+                            // `\` line continuations collapse the newline AND
+                            // preserve leading spaces, producing one long run-
+                            // on line.  Use explicit `\n` + spaces so the
+                            // rendered output actually wraps the way the PR
+                            // description claims.
+                            let msg = concat!(
+                                "[error] slash commands cannot be used as a mid-turn steer.\n",
+                                "        Wait for the current reply to finish, then retype the command.\n",
+                            );
                             let _ = stdout.write_all(msg.as_bytes()).await;
                             let _ = stdout.flush().await;
                         } else {
@@ -2563,9 +2569,14 @@ pub async fn run_resume(
                         // turn is still streaming would be posted as a plain
                         // text steer and corrupt the conversation.
                         if parse_slash_command(&text).is_some() {
-                            let msg = "[error] slash commands cannot be used as \
-                                       a mid-turn steer.  Wait for the current \
-                                       reply to finish, then retype the command.\n";
+                            // Same formatting fix as the chat-loop arm: `\`
+                            // line continuations swallow the newline, so use
+                            // explicit `\n` to break the message across two
+                            // lines.
+                            let msg = concat!(
+                                "[error] slash commands cannot be used as a mid-turn steer.\n",
+                                "        Wait for the current reply to finish, then retype the command.\n",
+                            );
                             let _ = stdout.write_all(msg.as_bytes()).await;
                             let _ = stdout.flush().await;
                         } else {
@@ -4423,16 +4434,18 @@ mod tests {
     }
 
     // Regression guard for the mid-turn slash-command rejection in
-    // `run_chat_loop` / `run_resume`.  Both loops refuse to forward a
-    // stdin line as a `Request::Steer` when `parse_slash_command`
-    // recognises it — if that predicate ever stopped matching any of
-    // these shapes, an impatient user re-typing a command during an
-    // in-flight turn would silently corrupt the conversation by
-    // shipping "/claude --resource ..." as a plain steer message (the
-    // original bug from 2026-05-09).  The loops don't have easy unit
-    // tests of their own, so we anchor the shared predicate here.
+    // `run_chat_loop` / `run_resume`.  The guard asks
+    // `parse_slash_command(&text).is_some()` before forwarding stdin as
+    // a `Request::Steer`, so it must recognise every command *prefix*
+    // — including shapes that are themselves parse errors (like bare
+    // `/claude`, asserted in `parse_claude_bare_returns_err`).  A bare
+    // `/claude` is not "routable" in the dispatch sense, but it IS
+    // something the user typed as a slash command and must not be
+    // silently reshipped as plain-text steer.  The loops don't have
+    // easy unit tests of their own, so this anchors the shared
+    // predicate the guard relies on.
     #[test]
-    fn parse_slash_command_matches_every_routable_shape() {
+    fn parse_slash_command_recognises_every_command_shape() {
         for input in [
             "/claude",
             "/claude  ",
