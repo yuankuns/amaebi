@@ -1397,19 +1397,37 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
             steer_line = next_stdin_line(&mut stdin_lines) => {
                 match steer_line {
                     Some(text) if !text.trim().is_empty() => {
-                        // steer_pending is already true (set on Ctrl-C); just send the request.
-                        let steer_req = Request::Steer {
-                            session_id: session_id_copy.clone(),
-                            message: text,
-                        };
-                        let mut frame =
-                            serde_json::to_string(&steer_req).context("serializing Steer")?;
-                        frame.push('\n');
-                        // If the daemon has already finished and closed the
-                        // connection, the write will fail — swallow the error
-                        // so the response loop can drain normally.
-                        let _ = writer.write_all(frame.as_bytes()).await;
-                        let _ = writer.flush().await;
+                        // Guard: slash commands typed during an in-flight turn
+                        // would otherwise be shipped as a plain-text steer and
+                        // silently concatenated onto the ongoing conversation,
+                        // which is how an impatient `/claude --resource ...`
+                        // ended up asking the supervisor LLM to do the task
+                        // itself instead of launching a pane (observed
+                        // 2026-05-09).  Slash commands are a client-side
+                        // concern routed through `parse_slash_command` at
+                        // top-of-turn; refuse them mid-turn with a message
+                        // that explains the retry path.
+                        if parse_slash_command(&text).is_some() {
+                            let msg = "[error] slash commands cannot be used as \
+                                       a mid-turn steer.  Wait for the current \
+                                       reply to finish, then retype the command.\n";
+                            let _ = stdout.write_all(msg.as_bytes()).await;
+                            let _ = stdout.flush().await;
+                        } else {
+                            // steer_pending is already true (set on Ctrl-C); just send the request.
+                            let steer_req = Request::Steer {
+                                session_id: session_id_copy.clone(),
+                                message: text,
+                            };
+                            let mut frame =
+                                serde_json::to_string(&steer_req).context("serializing Steer")?;
+                            frame.push('\n');
+                            // If the daemon has already finished and closed the
+                            // connection, the write will fail — swallow the error
+                            // so the response loop can drain normally.
+                            let _ = writer.write_all(frame.as_bytes()).await;
+                            let _ = writer.flush().await;
+                        }
                     }
                     Some(_) => {
                         // Empty or whitespace-only line (e.g. bare Enter) — if a steer
@@ -2539,16 +2557,29 @@ pub async fn run_resume(
             steer_line = next_stdin_line(&mut stdin_lines) => {
                 match steer_line {
                     Some(text) if !text.trim().is_empty() => {
-                        // steer_pending already set on Ctrl-C; just send the request.
-                        let steer_req = Request::Steer {
-                            session_id: session_uuid.clone(),
-                            message: text,
-                        };
-                        let mut frame = serde_json::to_string(&steer_req)
-                            .context("serializing Steer")?;
-                        frame.push('\n');
-                        let _ = writer.write_all(frame.as_bytes()).await;
-                        let _ = writer.flush().await;
+                        // Same mid-turn slash-command guard as `run_chat_loop`
+                        // (see the sibling steer_line arm for the full
+                        // rationale): a slash command typed while the resumed
+                        // turn is still streaming would be posted as a plain
+                        // text steer and corrupt the conversation.
+                        if parse_slash_command(&text).is_some() {
+                            let msg = "[error] slash commands cannot be used as \
+                                       a mid-turn steer.  Wait for the current \
+                                       reply to finish, then retype the command.\n";
+                            let _ = stdout.write_all(msg.as_bytes()).await;
+                            let _ = stdout.flush().await;
+                        } else {
+                            // steer_pending already set on Ctrl-C; just send the request.
+                            let steer_req = Request::Steer {
+                                session_id: session_uuid.clone(),
+                                message: text,
+                            };
+                            let mut frame = serde_json::to_string(&steer_req)
+                                .context("serializing Steer")?;
+                            frame.push('\n');
+                            let _ = writer.write_all(frame.as_bytes()).await;
+                            let _ = writer.flush().await;
+                        }
                     }
                     Some(_) => {
                         // Empty or whitespace-only line — if a steer is pending,
@@ -4389,6 +4420,39 @@ mod tests {
     fn parse_claude_false_positive_prefix_rejected() {
         assert!(parse_slash_command("/claudefoo").is_none());
         assert!(parse_slash_command("/claude--help").is_none());
+    }
+
+    // Regression guard for the mid-turn slash-command rejection in
+    // `run_chat_loop` / `run_resume`.  Both loops refuse to forward a
+    // stdin line as a `Request::Steer` when `parse_slash_command`
+    // recognises it — if that predicate ever stopped matching any of
+    // these shapes, an impatient user re-typing a command during an
+    // in-flight turn would silently corrupt the conversation by
+    // shipping "/claude --resource ..." as a plain steer message (the
+    // original bug from 2026-05-09).  The loops don't have easy unit
+    // tests of their own, so we anchor the shared predicate here.
+    #[test]
+    fn parse_slash_command_matches_every_routable_shape() {
+        for input in [
+            "/claude",
+            "/claude  ",
+            "/claude \"do the thing\"",
+            "/claude --resource sim-9903 重构 dispatcher",
+            "/claude --resume-pane %54",
+            "/model",
+            "/model claude-opus-4.6[1m]",
+            "/release %54",
+            "/release all --clean",
+            "/replyreview 157",
+            "/replyreview 157 158",
+        ] {
+            assert!(
+                parse_slash_command(input).is_some(),
+                "parse_slash_command({input:?}) must return Some so the \
+                 mid-turn steer guard rejects it instead of forwarding it \
+                 as plain text"
+            );
+        }
     }
 
     #[test]
