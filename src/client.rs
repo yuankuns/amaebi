@@ -1419,6 +1419,20 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
                             );
                             let _ = stdout.write_all(msg.as_bytes()).await;
                             let _ = stdout.flush().await;
+                            // If a steer was pending (Ctrl-C path), treat the
+                            // rejected slash command like an empty-line cancel
+                            // so the buffered daemon output can flush — the
+                            // user told to "wait for the current reply to
+                            // finish" needs to actually see it finish.
+                            // Without this the CLI would stay in
+                            // `steer_pending=true` forever (no `SteerAck`
+                            // will ever arrive) and look hung.
+                            if steer_pending {
+                                steer_pending = false;
+                                last_ctrl_c = None;
+                                flush_steer_buffer(&mut steer_buffer, &mut buffer_truncated, &mut stdout).await?;
+                                buffer_truncated = false;
+                            }
                         } else {
                             // The stdin reader runs whenever stdin is a TTY,
                             // so this arm fires both during an in-flight
@@ -2619,6 +2633,18 @@ pub async fn run_resume(
                             );
                             let _ = stdout.write_all(msg.as_bytes()).await;
                             let _ = stdout.flush().await;
+                            // Same Ctrl-C-path cleanup as the sibling arm
+                            // in `run`: if `steer_pending` is true, the
+                            // rejected slash command is effectively a
+                            // cancel — otherwise output stays buffered
+                            // forever (no `SteerAck` will arrive) and the
+                            // session looks hung.
+                            if steer_pending {
+                                steer_pending = false;
+                                last_ctrl_c = None;
+                                flush_steer_buffer(&mut steer_buffer, &mut buffer_truncated, &mut stdout).await?;
+                                buffer_truncated = false;
+                            }
                         } else {
                             // The stdin reader fires on any line typed
                             // during a streaming turn, not only after
