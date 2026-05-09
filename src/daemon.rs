@@ -5007,7 +5007,7 @@ where
         if let Some(held_panes) = &pane_alive_injected {
             messages.push(Message::system(format_pane_alive_reminder(held_panes)));
         }
-        // Enable 5-minute prompt caching.  Covers only the system-level
+        // Enable 1-hour prompt caching.  Covers only the system-level
         // blocks — the base system prompt plus any skill messages
         // (SOUL.md / AGENTS.md) injected by `inject_skill_files`.
         // Tools are a separate request field and the message history
