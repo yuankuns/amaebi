@@ -532,6 +532,41 @@ pub fn ensure_idle_panes(needed: usize) -> Result<()> {
 fn ensure_idle_panes_locked(needed: usize) -> Result<()> {
     let mut state = read_state_unlocked()?;
 
+    // Reap zombie lease records BEFORE any capacity math.  If the user
+    // closed tmux panes directly (e.g. `:kill-pane`, window closed in
+    // another tool), `tmux-state.json` still carries those entries until
+    // a heartbeat / release event touches them — and in the typical
+    // workflow that never happens, so they accumulate forever.  Without
+    // reaping first, `total` below would include dead panes and we'd
+    // reject a fresh `/claude` with a misleading "capacity reached"
+    // even when tmux itself has plenty of room.
+    //
+    // If `tmux list-panes -a` fails (tmux not installed, no server,
+    // transient error), log and skip reaping rather than failing the
+    // whole request — we'd rather preserve the existing ledger under
+    // uncertainty than risk wiping it based on an empty / wrong list.
+    // The capacity check below still runs on the un-reaped state, so
+    // behavior in that edge case is exactly the old (pre-fix) behavior.
+    match tmux_list_all_panes_sync() {
+        Ok(live) => {
+            let zombies = reap_zombies(&mut state, &live);
+            if !zombies.is_empty() {
+                tracing::info!(
+                    count = zombies.len(),
+                    ids = ?zombies,
+                    "reaped zombie pane lease records before capacity check"
+                );
+                // Persist the reap so subsequent callers (and dashboards)
+                // see the cleaned ledger.  Safe under the caller-held
+                // LOCK_EX.
+                write_state_unlocked(&state)?;
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "skipping zombie reap; keeping existing ledger");
+        }
+    }
+
     let idle_count = state
         .values()
         .filter(|l| l.effective_status() == PaneStatus::Idle)
@@ -761,6 +796,61 @@ pub fn mark_claude_started(pane_id: &str) -> Result<()> {
 // ---------------------------------------------------------------------------
 // Private tmux helpers (sync, safe to call inside spawn_blocking / flock)
 // ---------------------------------------------------------------------------
+
+/// Run `tmux list-panes -a -F "#{pane_id}"` and return every live pane ID
+/// across all sessions as a set.  Used by `reap_zombies` to drop lease
+/// records that point at panes the user closed behind amaebi's back —
+/// without this, `tmux-state.json` accumulates entries indefinitely and
+/// eventually saturates `MAX_PANES` even though the tmux server has
+/// nothing left on them.
+///
+/// Tests can bypass the real tmux call by setting the
+/// `AMAEBI_TEST_TMUX_PANES_OVERRIDE` env var to a whitespace-separated
+/// list of pane ids (e.g. `"%0 %1 %2"`).  Empty string means "tmux
+/// reports no live panes", which lets tests exercise the all-zombies
+/// path without shelling out.
+fn tmux_list_all_panes_sync() -> Result<std::collections::HashSet<String>> {
+    if let Ok(override_str) = std::env::var("AMAEBI_TEST_TMUX_PANES_OVERRIDE") {
+        return Ok(override_str
+            .split_whitespace()
+            .map(str::to_string)
+            .collect());
+    }
+    let output = std::process::Command::new("tmux")
+        .args(["list-panes", "-a", "-F", "#{pane_id}"])
+        .output()
+        .context("spawning tmux list-panes -a")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("tmux list-panes -a failed: {stderr}");
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+/// Drop lease records whose `pane_id` is no longer present in `live`.
+/// Returns the removed pane ids in insertion order (HashMap iteration
+/// order is arbitrary but stable within one process, which is enough
+/// for unit tests).
+///
+/// Pure function — takes the live-pane set as a parameter so tests can
+/// inject any set they like without touching a real tmux server.  The
+/// caller is responsible for obtaining `live` (production path uses
+/// [`tmux_list_all_panes_sync`]; tests build it by hand).
+fn reap_zombies(state: &mut PaneState, live: &std::collections::HashSet<String>) -> Vec<String> {
+    let zombies: Vec<String> = state
+        .keys()
+        .filter(|k| !live.contains(*k))
+        .cloned()
+        .collect();
+    for z in &zombies {
+        state.remove(z);
+    }
+    zombies
+}
 
 /// Run `tmux list-windows -F "#{window_id}"` and return a list of window IDs.
 fn tmux_list_windows_sync() -> Result<Vec<String>> {
@@ -1235,11 +1325,18 @@ mod tests {
             let _guard = crate::test_utils::with_temp_home();
             // Fill all MAX_PANES slots with Busy leases.
             let mut state: PaneState = HashMap::new();
+            let mut ids = Vec::with_capacity(MAX_PANES);
             for i in 0..MAX_PANES {
                 let pid = format!("%{i}");
                 state.insert(pid.clone(), make_busy(&pid, "@0", None));
+                ids.push(pid);
             }
             write_state_unlocked(&state).expect("seed state");
+
+            // Tell the zombie-reap step that every seeded pane is still
+            // alive in tmux — without this it would drop them all and
+            // the capacity check would pass instead of failing.
+            std::env::set_var("AMAEBI_TEST_TMUX_PANES_OVERRIDE", ids.join(" "));
 
             // Acquiring the lock before calling the internal helper so we can
             // test the logic without real tmux.
@@ -1247,6 +1344,8 @@ mod tests {
             lock.lock_exclusive().expect("flock");
             let result = ensure_idle_panes_locked(1);
             lock.unlock().expect("unlock");
+
+            std::env::remove_var("AMAEBI_TEST_TMUX_PANES_OVERRIDE");
 
             let err = result.expect_err("should be Err");
             let cap = err.downcast_ref::<CapacityError>().expect("CapacityError");
@@ -1264,14 +1363,137 @@ mod tests {
             state.insert("%1".to_string(), make_idle("%1", "@0"));
             write_state_unlocked(&state).expect("seed state");
 
+            // Mark the seeded panes as live so the reap leaves them alone.
+            unsafe {
+                std::env::set_var("AMAEBI_TEST_TMUX_PANES_OVERRIDE", "%0 %1");
+            }
+
             let lock = open_lock_file().expect("open lock");
             lock.lock_exclusive().expect("flock");
-            // 2 idle panes, need 2 → no-op, no tmux calls.
+            // 2 idle panes, need 2 → no-op, no new tmux windows created.
             let result = ensure_idle_panes_locked(2);
             lock.unlock().expect("unlock");
 
-            result.expect("should succeed without calling tmux");
+            std::env::remove_var("AMAEBI_TEST_TMUX_PANES_OVERRIDE");
+
+            result.expect("should succeed without creating new windows");
         }
+    }
+
+    #[test]
+    fn ensure_idle_panes_reaps_zombies_before_capacity_check() {
+        // End-to-end regression for the window-6 bug (2026-05-10):
+        // ledger has MAX_PANES entries, but only a handful are still
+        // alive in tmux.  Before the fix, this would reject with
+        // CapacityError because `total == MAX_PANES`; after the fix,
+        // the zombies are reaped first and capacity is judged against
+        // what's actually live.  We don't exercise the tmux-window
+        // creation path (that requires a real tmux); instead we ask
+        // for `needed = <idle count>` so no deficit remains and the
+        // function short-circuits at the idle-count check.
+        let _guard = crate::test_utils::with_temp_home();
+        let mut state: PaneState = HashMap::new();
+        // 2 live + 14 zombies = 16 entries total (saturated ledger).
+        for i in 0..2 {
+            let pid = format!("%live{i}");
+            state.insert(pid.clone(), make_idle(&pid, "@0"));
+        }
+        for i in 0..14 {
+            let pid = format!("%zombie{i}");
+            state.insert(pid.clone(), make_idle(&pid, "@0"));
+        }
+        assert_eq!(state.len(), MAX_PANES, "seed must saturate MAX_PANES");
+        write_state_unlocked(&state).expect("seed state");
+
+        // tmux only reports the 2 live panes — the 14 zombies were
+        // closed behind amaebi's back.
+        unsafe {
+            std::env::set_var("AMAEBI_TEST_TMUX_PANES_OVERRIDE", "%live0 %live1");
+        }
+
+        let lock = open_lock_file().expect("open lock");
+        lock.lock_exclusive().expect("flock");
+        // Need 2 idle panes; we have 2 live idle after reap → Ok.
+        let result = ensure_idle_panes_locked(2);
+        lock.unlock().expect("unlock");
+
+        unsafe {
+            std::env::remove_var("AMAEBI_TEST_TMUX_PANES_OVERRIDE");
+        }
+
+        result.expect("reap should drop the 14 zombies; 2 live idle is enough");
+
+        // Persisted ledger must now have only the live entries — if
+        // the reap didn't write through, the next launch would see a
+        // saturated state again.
+        let reloaded = read_state_unlocked().expect("reload state");
+        assert_eq!(reloaded.len(), 2);
+        assert!(reloaded.contains_key("%live0"));
+        assert!(reloaded.contains_key("%live1"));
+    }
+
+    // ── reap_zombies ─────────────────────────────────────────────────────
+    //
+    // `reap_zombies` is the pure predicate behind the zombie cleanup now
+    // performed at the top of `ensure_idle_panes_locked`.  Before this
+    // fix, `tmux-state.json` accumulated lease records for panes the
+    // user had closed directly in tmux — the ledger eventually hit 16
+    // entries and blocked every new `/claude` with a misleading
+    // "capacity reached" even though tmux had plenty of room.  These
+    // tests pin the three interesting cases.
+
+    #[test]
+    fn reap_zombies_removes_entries_not_in_live_set() {
+        let mut state: PaneState = HashMap::new();
+        state.insert("%0".into(), make_idle("%0", "@0"));
+        state.insert("%1".into(), make_busy("%1", "@1", None));
+        state.insert("%2".into(), make_idle("%2", "@2"));
+        // Only %0 and %2 are still alive in tmux.  %1 is a zombie
+        // (user closed it in tmux without releasing through amaebi).
+        let live: std::collections::HashSet<String> =
+            ["%0".to_string(), "%2".to_string()].into_iter().collect();
+
+        let removed = reap_zombies(&mut state, &live);
+
+        assert_eq!(removed, vec!["%1".to_string()]);
+        assert!(!state.contains_key("%1"));
+        assert!(state.contains_key("%0"));
+        assert!(state.contains_key("%2"));
+    }
+
+    #[test]
+    fn reap_zombies_noop_when_state_matches_live() {
+        // If every ledger entry is still alive, reap must not touch
+        // anything and must return an empty vec.  This is the common
+        // hot path — we don't want to pay a write on every
+        // `ensure_idle_panes_locked` call.
+        let mut state: PaneState = HashMap::new();
+        state.insert("%0".into(), make_idle("%0", "@0"));
+        state.insert("%1".into(), make_idle("%1", "@0"));
+        let live: std::collections::HashSet<String> =
+            ["%0".to_string(), "%1".to_string()].into_iter().collect();
+
+        let removed = reap_zombies(&mut state, &live);
+
+        assert!(removed.is_empty());
+        assert_eq!(state.len(), 2);
+    }
+
+    #[test]
+    fn reap_zombies_clears_all_when_tmux_is_empty() {
+        // Defensive: if tmux was restarted and returns no panes at all,
+        // every ledger entry is a zombie.  reap must empty the state
+        // rather than leaving stale records that would immediately
+        // re-saturate capacity on the next launch.
+        let mut state: PaneState = HashMap::new();
+        state.insert("%9".into(), make_busy("%9", "@0", None));
+        state.insert("%8".into(), make_idle("%8", "@0"));
+        let live: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        let removed = reap_zombies(&mut state, &live);
+
+        assert_eq!(removed.len(), 2);
+        assert!(state.is_empty());
     }
 
     #[test]
