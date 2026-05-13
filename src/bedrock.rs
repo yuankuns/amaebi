@@ -1039,8 +1039,31 @@ where
 {
     let msg_type = frame.headers.get(":message-type").map(|s| s.as_str());
     if msg_type == Some("exception") || msg_type == Some("error") {
+        // Preserve structured diagnostic signal before bailing.  Bedrock's
+        // event-stream protocol carries the AWS exception kind in the
+        // `:exception-type` header (documented values: InternalServerException,
+        // ModelStreamErrorException, ThrottlingException, ValidationException,
+        // ServiceUnavailableException, AccessDeniedException, ResourceNotFoundException,
+        // ServiceQuotaExceededException).  Until this change we discarded that
+        // header and only kept the free-text payload message, which made it
+        // impossible to tell whether a given in-stream failure was transient
+        // (worth retrying) or fatal (config bug).  Record both the exception
+        // type header and the full header set so a future retry decision
+        // can be grounded in real observed traffic rather than guesswork.
         let body = String::from_utf8_lossy(&frame.payload);
-        anyhow::bail!("Bedrock exception: {body}");
+        let exception_type = frame
+            .headers
+            .get(":exception-type")
+            .map(|s| s.as_str())
+            .unwrap_or("<missing>");
+        tracing::error!(
+            message_type = ?msg_type,
+            exception_type = %exception_type,
+            headers = ?frame.headers,
+            payload = %body,
+            "Bedrock stream exception frame"
+        );
+        anyhow::bail!("Bedrock exception [type={exception_type}]: {body}");
     }
 
     let event_type = match frame.headers.get(":event-type") {
@@ -1960,5 +1983,89 @@ mod tests {
         .await;
         assert!(result.is_err());
         assert!(format!("{:?}", result.unwrap_err()).contains("exception"));
+    }
+
+    #[tokio::test]
+    async fn exception_frame_preserves_exception_type_header_in_error() {
+        // Regression guard: before this change we threw away the
+        // `:exception-type` header (AWS's structured exception kind) and
+        // only bubbled up the free-text payload message.  That lost the
+        // one signal we'd need to decide whether an in-stream Bedrock
+        // failure is transient (retry) or fatal (config bug).  The error
+        // string must now carry both the AWS exception type AND the
+        // payload message so future retry logic can ground its decision
+        // in real production traffic rather than speculation.
+        let payload = br#"{"message":"The system encountered an unexpected error during processing. Try your request again."}"#;
+        let frame_bytes = eventstream::build_test_frame(
+            &[
+                (":event-type", "error"),
+                (":message-type", "exception"),
+                (":exception-type", "InternalServerException"),
+            ],
+            payload,
+        );
+        let mut sink = tokio::io::sink();
+        let (parsed, _) = eventstream::try_parse_frame(&frame_bytes).unwrap().unwrap();
+        let result = handle_frame(
+            &parsed,
+            &mut String::new(),
+            &mut Vec::new(),
+            &mut std::collections::HashMap::new(),
+            &mut FinishReason::Stop,
+            &mut 0,
+            &mut None,
+            &mut None,
+            &mut sink,
+        )
+        .await;
+        let err_str = format!("{:?}", result.unwrap_err());
+        assert!(
+            err_str.contains("InternalServerException"),
+            "error must include structured :exception-type so a future \
+             retry classifier can branch on it; got: {err_str}"
+        );
+        assert!(
+            err_str.contains("Try your request again"),
+            "error must also include payload message for humans; got: {err_str}"
+        );
+    }
+
+    #[tokio::test]
+    async fn exception_frame_without_type_header_marks_it_missing() {
+        // Defensive: some upstream/proxy failure modes deliver an
+        // exception frame with no `:exception-type` header at all
+        // (observed 2026-05-13 payload had only `{"message": "..."}`,
+        // no `__type` field either — consistent with a load-balancer
+        // level flake rather than a structured model-side error).
+        // The error surface must say so explicitly instead of silently
+        // dropping the anomaly — that way the next observation tells
+        // us whether to expand the retry classifier or keep the
+        // conservative "no header → fatal" default.
+        let payload = br#"{"message":"The system encountered an unexpected error during processing. Try your request again."}"#;
+        let frame_bytes = eventstream::build_test_frame(
+            &[(":event-type", "error"), (":message-type", "exception")],
+            payload,
+        );
+        let mut sink = tokio::io::sink();
+        let (parsed, _) = eventstream::try_parse_frame(&frame_bytes).unwrap().unwrap();
+        let result = handle_frame(
+            &parsed,
+            &mut String::new(),
+            &mut Vec::new(),
+            &mut std::collections::HashMap::new(),
+            &mut FinishReason::Stop,
+            &mut 0,
+            &mut None,
+            &mut None,
+            &mut sink,
+        )
+        .await;
+        let err_str = format!("{:?}", result.unwrap_err());
+        assert!(
+            err_str.contains("<missing>"),
+            "error must flag a missing :exception-type header explicitly so \
+             the next incident is distinguishable from a known structured \
+             exception; got: {err_str}"
+        );
     }
 }
