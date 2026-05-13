@@ -808,8 +808,12 @@ pub fn mark_claude_started(pane_id: &str) -> Result<()> {
 /// `AMAEBI_TEST_TMUX_PANES_OVERRIDE` env var to a whitespace-separated
 /// list of pane ids (e.g. `"%0 %1 %2"`).  Empty string means "tmux
 /// reports no live panes", which lets tests exercise the all-zombies
-/// path without shelling out.
+/// path without shelling out.  The override is gated behind `#[cfg(test)]`
+/// so production builds always shell out to real tmux — a stray env var
+/// in the daemon's environment must never be able to drop legitimate
+/// lease records.
 fn tmux_list_all_panes_sync() -> Result<std::collections::HashSet<String>> {
+    #[cfg(test)]
     if let Ok(override_str) = std::env::var("AMAEBI_TEST_TMUX_PANES_OVERRIDE") {
         return Ok(override_str
             .split_whitespace()
@@ -832,9 +836,11 @@ fn tmux_list_all_panes_sync() -> Result<std::collections::HashSet<String>> {
 }
 
 /// Drop lease records whose `pane_id` is no longer present in `live`.
-/// Returns the removed pane ids in insertion order (HashMap iteration
-/// order is arbitrary but stable within one process, which is enough
-/// for unit tests).
+/// Returns the removed pane ids in unspecified order (the implementation
+/// iterates `state.keys()`, and `std::collections::HashMap` iteration
+/// order is arbitrary and may change across runs / hash-seed rotations).
+/// Unit tests that care about membership assert with sets / `contains`,
+/// not positional equality.
 ///
 /// Pure function — takes the live-pane set as a parameter so tests can
 /// inject any set they like without touching a real tmux server.  The
@@ -1364,9 +1370,7 @@ mod tests {
             write_state_unlocked(&state).expect("seed state");
 
             // Mark the seeded panes as live so the reap leaves them alone.
-            unsafe {
-                std::env::set_var("AMAEBI_TEST_TMUX_PANES_OVERRIDE", "%0 %1");
-            }
+            std::env::set_var("AMAEBI_TEST_TMUX_PANES_OVERRIDE", "%0 %1");
 
             let lock = open_lock_file().expect("open lock");
             lock.lock_exclusive().expect("flock");
@@ -1407,9 +1411,7 @@ mod tests {
 
         // tmux only reports the 2 live panes — the 14 zombies were
         // closed behind amaebi's back.
-        unsafe {
-            std::env::set_var("AMAEBI_TEST_TMUX_PANES_OVERRIDE", "%live0 %live1");
-        }
+        std::env::set_var("AMAEBI_TEST_TMUX_PANES_OVERRIDE", "%live0 %live1");
 
         let lock = open_lock_file().expect("open lock");
         lock.lock_exclusive().expect("flock");
@@ -1417,9 +1419,7 @@ mod tests {
         let result = ensure_idle_panes_locked(2);
         lock.unlock().expect("unlock");
 
-        unsafe {
-            std::env::remove_var("AMAEBI_TEST_TMUX_PANES_OVERRIDE");
-        }
+        std::env::remove_var("AMAEBI_TEST_TMUX_PANES_OVERRIDE");
 
         result.expect("reap should drop the 14 zombies; 2 live idle is enough");
 
