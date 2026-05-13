@@ -529,9 +529,40 @@ pub fn ensure_idle_panes(needed: usize) -> Result<()> {
     result
 }
 
-fn ensure_idle_panes_locked(needed: usize) -> Result<()> {
+/// Read the pane state, drop records whose `pane_id` is no longer in
+/// tmux, and persist the cleaned state if anything was removed.  Used as
+/// the first step of any capacity / availability decision so downstream
+/// math is never inflated by panes the user closed behind amaebi's back.
+///
+/// Tmux failure (not installed, no server, transient error) degrades to
+/// "keep existing ledger": we'd rather preserve a stale ledger than
+/// wipe it based on an empty / wrong list.  Callers see the pre-fix
+/// behavior on that edge, which is strictly no-worse than the old code.
+///
+/// Must be called with the pane-state flock held LOCK_EX (same contract
+/// as `write_state_unlocked`).
+fn reap_zombies_and_load_state_unlocked() -> Result<PaneState> {
     let mut state = read_state_unlocked()?;
+    match tmux_list_all_panes_sync() {
+        Ok(live) => {
+            let zombies = reap_zombies(&mut state, &live);
+            if !zombies.is_empty() {
+                tracing::info!(
+                    count = zombies.len(),
+                    ids = ?zombies,
+                    "reaped zombie pane lease records"
+                );
+                write_state_unlocked(&state)?;
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "skipping zombie reap; keeping existing ledger");
+        }
+    }
+    Ok(state)
+}
 
+fn ensure_idle_panes_locked(needed: usize) -> Result<()> {
     // Reap zombie lease records BEFORE any capacity math.  If the user
     // closed tmux panes directly (e.g. `:kill-pane`, window closed in
     // another tool), `tmux-state.json` still carries those entries until
@@ -540,32 +571,7 @@ fn ensure_idle_panes_locked(needed: usize) -> Result<()> {
     // reaping first, `total` below would include dead panes and we'd
     // reject a fresh `/claude` with a misleading "capacity reached"
     // even when tmux itself has plenty of room.
-    //
-    // If `tmux list-panes -a` fails (tmux not installed, no server,
-    // transient error), log and skip reaping rather than failing the
-    // whole request — we'd rather preserve the existing ledger under
-    // uncertainty than risk wiping it based on an empty / wrong list.
-    // The capacity check below still runs on the un-reaped state, so
-    // behavior in that edge case is exactly the old (pre-fix) behavior.
-    match tmux_list_all_panes_sync() {
-        Ok(live) => {
-            let zombies = reap_zombies(&mut state, &live);
-            if !zombies.is_empty() {
-                tracing::info!(
-                    count = zombies.len(),
-                    ids = ?zombies,
-                    "reaped zombie pane lease records before capacity check"
-                );
-                // Persist the reap so subsequent callers (and dashboards)
-                // see the cleaned ledger.  Safe under the caller-held
-                // LOCK_EX.
-                write_state_unlocked(&state)?;
-            }
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "skipping zombie reap; keeping existing ledger");
-        }
-    }
+    let mut state = reap_zombies_and_load_state_unlocked()?;
 
     let idle_count = state
         .values()
@@ -689,8 +695,13 @@ pub fn ensure_and_acquire_idle(
         //     worktree.is_some(), so those panes won't actually be selected.
         //     Counting them as available suppresses expansion and leads to
         //     "no idle panes available" instead.
-        // If none are available, expand the pool with a new blank pane.
-        let state = read_state_unlocked()?;
+        // Reap zombies first so `available` / `total_idle` reflect only
+        // panes tmux still knows about — otherwise a ledger bloated with
+        // zombie Idle entries would make `ensure_idle_panes_locked`
+        // receive a `needed = total_idle + 1` way larger than we really
+        // want, producing spurious `CapacityError` (or over-creation)
+        // once the reap inside that function shrinks `idle_count`.
+        let state = reap_zombies_and_load_state_unlocked()?;
         let available = state
             .values()
             .filter(|l| {
@@ -965,26 +976,32 @@ mod tests {
     use super::*;
 
     /// RAII guard that sets `AMAEBI_TEST_TMUX_PANES_OVERRIDE` on construction
-    /// and unconditionally removes it on drop — including unwinding drops
-    /// caused by a test assertion panicking.  Without this, a panic between
-    /// `set_var` and `remove_var` would leave the env var set for the rest
-    /// of the test process, making unrelated tests' zombie reap behavior
-    /// order-dependent on whichever test panicked first.  Tests that use
+    /// and restores the prior value (or removes it if unset) on drop — even
+    /// when the drop is caused by a panicking assertion.  Tests that use
     /// this guard are also tagged `#[serial_test::serial]` because the env
-    /// var is process-global — two parallel holders would clobber each
-    /// other regardless of RAII cleanup.
-    struct TmuxOverride;
+    /// var is process-global; two parallel holders would clobber each
+    /// other regardless of RAII cleanup.  Capturing the prior value means
+    /// nested holders and pre-set environments (CI harness, dev shell) are
+    /// left untouched, so cleanup is never a silent mutation of the outer
+    /// scope.
+    struct TmuxOverride {
+        prior: Option<std::ffi::OsString>,
+    }
 
     impl TmuxOverride {
         fn set(panes: &str) -> Self {
+            let prior = std::env::var_os("AMAEBI_TEST_TMUX_PANES_OVERRIDE");
             std::env::set_var("AMAEBI_TEST_TMUX_PANES_OVERRIDE", panes);
-            Self
+            Self { prior }
         }
     }
 
     impl Drop for TmuxOverride {
         fn drop(&mut self) {
-            std::env::remove_var("AMAEBI_TEST_TMUX_PANES_OVERRIDE");
+            match self.prior.take() {
+                Some(v) => std::env::set_var("AMAEBI_TEST_TMUX_PANES_OVERRIDE", v),
+                None => std::env::remove_var("AMAEBI_TEST_TMUX_PANES_OVERRIDE"),
+            }
         }
     }
 
@@ -1453,6 +1470,49 @@ mod tests {
         assert_eq!(reloaded.len(), 2);
         assert!(reloaded.contains_key("%live0"));
         assert!(reloaded.contains_key("%live1"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn ensure_and_acquire_idle_reaps_zombies_before_counting_available() {
+        // Regression for the round-3 review comment: before the fix,
+        // `ensure_and_acquire_idle` computed `available` / `total_idle`
+        // from the pre-reap state, so a ledger bloated with zombie Idle
+        // entries would (a) mask the fact that no live pane is usable
+        // or (b) pass `needed = total_idle + 1` through to
+        // `ensure_idle_panes_locked` with an inflated value, producing
+        // spurious CapacityError once that function's internal reap
+        // shrank idle_count.
+        //
+        // This test pins the "reap before counting" contract in the
+        // cheap end-to-end case: 2 zombies + 1 live blank idle pane.
+        // After reap, `available = 1` (the live blank), so no expansion
+        // is needed and `acquire_first_idle_locked` selects the live
+        // pane without touching real tmux.
+        let _guard = crate::test_utils::with_temp_home();
+        let mut state: PaneState = HashMap::new();
+        state.insert("%live".into(), make_idle("%live", "@0"));
+        state.insert("%zombie0".into(), make_idle("%zombie0", "@0"));
+        state.insert("%zombie1".into(), make_idle("%zombie1", "@0"));
+        write_state_unlocked(&state).expect("seed state");
+
+        let _override = TmuxOverride::set("%live");
+
+        let (pane_id, had_claude) = ensure_and_acquire_idle("t", "s", None).expect("acquire");
+
+        assert_eq!(pane_id, "%live", "must pick the live pane, not a zombie");
+        assert!(!had_claude);
+
+        let reloaded = read_state_unlocked().expect("reload");
+        assert!(
+            !reloaded.contains_key("%zombie0") && !reloaded.contains_key("%zombie1"),
+            "zombies must be reaped before acquisition"
+        );
+        assert_eq!(
+            reloaded["%live"].effective_status(),
+            PaneStatus::Busy,
+            "acquired pane must be marked busy"
+        );
     }
 
     // ── reap_zombies ─────────────────────────────────────────────────────
