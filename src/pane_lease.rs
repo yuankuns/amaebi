@@ -964,6 +964,30 @@ pub(crate) fn seed_state_for_test(lease: PaneLease) -> Result<()> {
 mod tests {
     use super::*;
 
+    /// RAII guard that sets `AMAEBI_TEST_TMUX_PANES_OVERRIDE` on construction
+    /// and unconditionally removes it on drop — including unwinding drops
+    /// caused by a test assertion panicking.  Without this, a panic between
+    /// `set_var` and `remove_var` would leave the env var set for the rest
+    /// of the test process, making unrelated tests' zombie reap behavior
+    /// order-dependent on whichever test panicked first.  Tests that use
+    /// this guard are also tagged `#[serial_test::serial]` because the env
+    /// var is process-global — two parallel holders would clobber each
+    /// other regardless of RAII cleanup.
+    struct TmuxOverride;
+
+    impl TmuxOverride {
+        fn set(panes: &str) -> Self {
+            std::env::set_var("AMAEBI_TEST_TMUX_PANES_OVERRIDE", panes);
+            Self
+        }
+    }
+
+    impl Drop for TmuxOverride {
+        fn drop(&mut self) {
+            std::env::remove_var("AMAEBI_TEST_TMUX_PANES_OVERRIDE");
+        }
+    }
+
     fn make_idle(pane_id: &str, window_id: &str) -> PaneLease {
         PaneLease::new_idle(pane_id.to_string(), window_id.to_string())
     }
@@ -1326,6 +1350,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn ensure_idle_panes_capacity_exceeded_returns_err() {
         {
             let _guard = crate::test_utils::with_temp_home();
@@ -1341,8 +1366,9 @@ mod tests {
 
             // Tell the zombie-reap step that every seeded pane is still
             // alive in tmux — without this it would drop them all and
-            // the capacity check would pass instead of failing.
-            std::env::set_var("AMAEBI_TEST_TMUX_PANES_OVERRIDE", ids.join(" "));
+            // the capacity check would pass instead of failing.  RAII
+            // guard clears the env var even if the asserts below panic.
+            let _override = TmuxOverride::set(&ids.join(" "));
 
             // Acquiring the lock before calling the internal helper so we can
             // test the logic without real tmux.
@@ -1350,8 +1376,6 @@ mod tests {
             lock.lock_exclusive().expect("flock");
             let result = ensure_idle_panes_locked(1);
             lock.unlock().expect("unlock");
-
-            std::env::remove_var("AMAEBI_TEST_TMUX_PANES_OVERRIDE");
 
             let err = result.expect_err("should be Err");
             let cap = err.downcast_ref::<CapacityError>().expect("CapacityError");
@@ -1361,6 +1385,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn ensure_idle_panes_noop_when_enough_idle() {
         {
             let _guard = crate::test_utils::with_temp_home();
@@ -1370,7 +1395,7 @@ mod tests {
             write_state_unlocked(&state).expect("seed state");
 
             // Mark the seeded panes as live so the reap leaves them alone.
-            std::env::set_var("AMAEBI_TEST_TMUX_PANES_OVERRIDE", "%0 %1");
+            let _override = TmuxOverride::set("%0 %1");
 
             let lock = open_lock_file().expect("open lock");
             lock.lock_exclusive().expect("flock");
@@ -1378,13 +1403,12 @@ mod tests {
             let result = ensure_idle_panes_locked(2);
             lock.unlock().expect("unlock");
 
-            std::env::remove_var("AMAEBI_TEST_TMUX_PANES_OVERRIDE");
-
             result.expect("should succeed without creating new windows");
         }
     }
 
     #[test]
+    #[serial_test::serial]
     fn ensure_idle_panes_reaps_zombies_before_capacity_check() {
         // End-to-end regression for the window-6 bug (2026-05-10):
         // ledger has MAX_PANES entries, but only a handful are still
@@ -1410,16 +1434,15 @@ mod tests {
         write_state_unlocked(&state).expect("seed state");
 
         // tmux only reports the 2 live panes — the 14 zombies were
-        // closed behind amaebi's back.
-        std::env::set_var("AMAEBI_TEST_TMUX_PANES_OVERRIDE", "%live0 %live1");
+        // closed behind amaebi's back.  RAII guard clears the env var
+        // even if the asserts below panic.
+        let _override = TmuxOverride::set("%live0 %live1");
 
         let lock = open_lock_file().expect("open lock");
         lock.lock_exclusive().expect("flock");
         // Need 2 idle panes; we have 2 live idle after reap → Ok.
         let result = ensure_idle_panes_locked(2);
         lock.unlock().expect("unlock");
-
-        std::env::remove_var("AMAEBI_TEST_TMUX_PANES_OVERRIDE");
 
         result.expect("reap should drop the 14 zombies; 2 live idle is enough");
 
