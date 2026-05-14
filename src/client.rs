@@ -3177,7 +3177,7 @@ async fn resolve_missing_tags(
 
 /// `stdin`/`stdout`/`stderr` all redirected to `/dev/null`.  Connection is
 /// then retried with exponential back-off up to ~5 seconds before giving up.
-async fn connect_or_start_daemon(socket: &std::path::Path) -> Result<UnixStream> {
+pub(crate) async fn connect_or_start_daemon(socket: &std::path::Path) -> Result<UnixStream> {
     // Happy path: daemon is already running.
     if let Ok(stream) = UnixStream::connect(socket).await {
         return Ok(stream);

@@ -1,6 +1,6 @@
 [package]
 name = "amaebi"
-version = "2026.5.28"
+version = "2026.5.29"
 edition = "2021"
 
 [[bin]]
@@ -28,7 +28,10 @@ fs2 = "0.4"
 libc = "0.2"
 termimad = "0.34"
 ratatui = "0.30"
-crossterm = "0.29"
+# `event-stream` adds an async stream of terminal events, so the TUI chat
+# loop (src/tui.rs) can select! between keyboard input and daemon frames
+# without blocking the runtime on raw-mode polling.
+crossterm = { version = "0.29", features = ["event-stream"] }
 rustyline = "14"
 toml = "0.8"
 

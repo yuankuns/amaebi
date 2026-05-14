@@ -86,6 +86,15 @@ pub enum Command {
             default_missing_value = "",
         )]
         resume: Option<String>,
+        /// Use the new split-screen TUI: transcript on top, a persistent
+        /// input box on the bottom.  Experimental — Step 1 only wires a
+        /// minimal loop (printable chars + Enter + Ctrl-C exit; no
+        /// slash commands, no Ctrl-C steer, no resume).  Without this
+        /// flag the classic line-based chat UI is used.  Will
+        /// eventually flip to the default and the classic path will be
+        /// removed.
+        #[arg(long)]
+        tui: bool,
     },
     /// Authenticate with GitHub Copilot via the device flow.
     Auth {

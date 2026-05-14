@@ -30,6 +30,7 @@ mod tasks;
 #[cfg(test)]
 mod test_utils;
 mod tools;
+mod tui;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -101,6 +102,7 @@ async fn main() -> Result<()> {
             socket,
             model,
             resume,
+            tui,
         } => {
             let resumed = if resume.is_some() {
                 let cwd = std::env::current_dir().context("getting current directory")?;
@@ -114,7 +116,16 @@ async fn main() -> Result<()> {
             } else {
                 None
             };
-            match client::run_chat_loop(socket, prompt, model, resumed).await {
+            // `--tui` routes to the experimental split-screen UI
+            // (src/tui.rs).  Only a minimal loop is wired up today;
+            // without the flag we keep the classic line-based chat
+            // entirely untouched so nothing changes for default users.
+            let result = if tui {
+                tui::run_chat_tui(socket, prompt, model, resumed).await
+            } else {
+                client::run_chat_loop(socket, prompt, model, resumed).await
+            };
+            match result {
                 Ok(()) => Ok(()),
                 Err(e) if e.is::<client::Interrupted>() => std::process::exit(130),
                 Err(e) => Err(e),
