@@ -45,6 +45,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Terminal;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use unicode_width::UnicodeWidthStr;
 
 use crate::ipc::{Request, Response};
 use crate::provider;
@@ -386,6 +387,18 @@ fn floor_char_boundary(s: &str, idx: usize) -> usize {
     i
 }
 
+/// Compute the cursor's terminal column inside the input box (relative
+/// to the inside-border origin), clamped to the visible width.
+///
+/// Must use *display width* — terminal columns occupied — rather than
+/// `chars().count()` because CJK / fullwidth / emoji glyphs each
+/// occupy two columns but only one Unicode scalar.  Without this fix
+/// Chinese input parks the cursor halfway through the user's text
+/// (observed 2026-05-15).
+fn input_cursor_column(input: &str, visible_width: u16) -> u16 {
+    UnicodeWidthStr::width(input).min(visible_width as usize) as u16
+}
+
 /// Dispatch a single daemon frame.  Returns `true` when the turn has
 /// completed (Done / Error), so callers can clear `streaming` and
 /// perform any queued work.
@@ -508,14 +521,12 @@ fn draw(
                 .block(Block::default().borders(Borders::ALL).title(input_title));
             frame.render_widget(input, chunks[1]);
 
-            // Position the terminal cursor inside the input box so the
-            // user sees where their next character will land.  Clamp
-            // against the visible width so a long input that wraps
-            // doesn't park the cursor off-screen; proper multiline
-            // cursor handling arrives with reedline.
-            let visible = chunks[1].width.saturating_sub(2); // account for borders
-            let cursor_char_x = state.input.chars().count().min(visible as usize) as u16;
-            frame.set_cursor_position((chunks[1].x + 1 + cursor_char_x, chunks[1].y + 1));
+            // Position the terminal cursor inside the input box.  See
+            // `input_cursor_column` for the why; pulling the math out
+            // of the closure keeps it unit-testable.
+            let visible = chunks[1].width.saturating_sub(2);
+            let cursor_col = input_cursor_column(&state.input, visible);
+            frame.set_cursor_position((chunks[1].x + 1 + cursor_col, chunks[1].y + 1));
         })
         .map_err(|e| anyhow::anyhow!("terminal.draw: {e}"))?;
     Ok(())
@@ -699,5 +710,28 @@ mod tests {
         let transcript = vec![tl];
         let (y, _) = scroll_offset(&transcript, 20);
         assert_eq!(y, 0);
+    }
+
+    #[test]
+    fn input_cursor_column_uses_display_width_for_cjk() {
+        // 你好 = 2 chars, but each CJK glyph occupies 2 terminal
+        // columns, so the cursor must land at column 4.  The
+        // pre-fix code used chars().count() and would have parked
+        // the cursor at column 2, halfway through the user's text.
+        assert_eq!(input_cursor_column("你好", 80), 4);
+        // Ascii baseline.
+        assert_eq!(input_cursor_column("hi", 80), 2);
+        // Mixed CJK + ASCII.
+        assert_eq!(input_cursor_column("你hi好", 80), 6);
+    }
+
+    #[test]
+    fn input_cursor_column_clamps_at_visible_width() {
+        // A long input must not park the cursor past the right edge
+        // of the visible area; clamp at `visible_width`.  Without
+        // wrap awareness this is a single-line approximation, but it
+        // at least keeps the cursor on screen.
+        let s = "你".repeat(50); // 100 columns wide
+        assert_eq!(input_cursor_column(&s, 20), 20);
     }
 }

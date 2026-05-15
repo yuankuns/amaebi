@@ -32,6 +32,13 @@ ratatui = "0.30"
 # loop (src/tui.rs) can select! between keyboard input and daemon frames
 # without blocking the runtime on raw-mode polling.
 crossterm = { version = "0.29", features = ["event-stream"] }
+# Used by the TUI input box (src/tui.rs) to compute terminal-column
+# width of multi-byte input — CJK / fullwidth / emoji glyphs occupy
+# two columns in a terminal but one Unicode scalar each, so cursor
+# positioning needs the column count, not the char count.  Same major
+# version as ratatui's transitive copy to keep a single resolved
+# version in the lockfile.
+unicode-width = "0.2"
 rustyline = "14"
 toml = "0.8"
 
