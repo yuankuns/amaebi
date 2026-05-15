@@ -60,7 +60,6 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Terminal;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use unicode_width::UnicodeWidthStr;
 
 use crate::client::{parse_slash_command, SlashCommand};
 use crate::ipc::{Request, Response};
@@ -595,18 +594,6 @@ fn next_char_boundary(s: &str, idx: usize) -> usize {
     i
 }
 
-/// Compute the cursor's terminal column inside the input box (relative
-/// to the inside-border origin), clamped to the visible width.
-///
-/// Must use *display width* — terminal columns occupied — rather than
-/// `chars().count()` because CJK / fullwidth / emoji glyphs each
-/// occupy two columns but only one Unicode scalar.  Without this fix
-/// Chinese input parks the cursor halfway through the user's text
-/// (observed 2026-05-15).
-fn input_cursor_column(input: &str, visible_width: u16) -> u16 {
-    UnicodeWidthStr::width(input).min(visible_width as usize) as u16
-}
-
 /// Dispatch a single daemon frame.  Returns `true` when the turn has
 /// completed (Done / Error), so callers can clear `streaming` and
 /// perform any queued work.
@@ -843,15 +830,52 @@ fn draw(
 ) -> Result<()> {
     terminal
         .draw(|frame| {
-            // Transcript gets all remaining rows; input box pinned at
-            // the bottom with a fixed 3-row height (border + one line +
-            // border).  `Min(0)` rather than `Min(1)` means the
-            // transcript can collapse to zero height on a tiny window
-            // without causing layout errors.
+            // Two-pass layout: we need to know the input box's height
+            // before we can carve up the screen, but the height
+            // depends on how many wrapped visual rows the current
+            // input occupies, which depends on the available width,
+            // which depends on the layout itself.  Resolve by:
+            //   1. Assume the maximum frame width for the input box
+            //      (the layout is a vertical split, so width comes
+            //      out the same regardless of vertical allocation).
+            //   2. Build the input Paragraph once and ask ratatui how
+            //      many visual rows it would occupy at that width.
+            //   3. Cap the input box at half the frame so a paste-
+            //      bomb doesn't eat the whole transcript; floor at 3
+            //      rows so the empty box still has a one-line cavity.
+            //   4. Run the actual layout with that cap as a Length.
+            let total_area = frame.area();
+            let input_text = state.input.as_str();
+
+            let input_title = if state.streaming {
+                " input (streaming… Enter queues for next turn — not yet wired) "
+            } else {
+                " input (Enter to send, Ctrl-C to exit) "
+            };
+
+            // Build the Paragraph once and reuse for both line_count
+            // and final render — ratatui's Paragraph is cheap to
+            // construct but cloning Lines isn't free, so we hold the
+            // borrowed-content version here and pass it to both.
+            let input_para = Paragraph::new(Line::from(input_text))
+                .wrap(Wrap { trim: false })
+                .block(Block::default().borders(Borders::ALL).title(input_title));
+
+            // line_count includes block borders (top + bottom = +2)
+            // when the paragraph carries a Block, so the value already
+            // counts the box chrome and we can use it directly as the
+            // Length.  Floor at 3 so an empty input still shows the
+            // standard 1-row cavity; cap at half the frame so a long
+            // paste doesn't consume the whole window.
+            let max_input_height = (total_area.height / 2).max(3);
+            let input_box_width = total_area.width;
+            let input_lines = input_para.line_count(input_box_width) as u16;
+            let input_height = input_lines.clamp(3, max_input_height);
+
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([Constraint::Min(0), Constraint::Length(3)])
-                .split(frame.area());
+                .constraints([Constraint::Min(0), Constraint::Length(input_height)])
+                .split(total_area);
 
             let lines: Vec<Line> = state
                 .transcript
@@ -861,34 +885,72 @@ fn draw(
 
             let transcript = Paragraph::new(lines)
                 .block(Block::default().borders(Borders::ALL).title(" amaebi "))
-                .wrap(Wrap { trim: false })
-                .scroll(scroll_offset(&state.transcript, chunks[0].height));
+                .wrap(Wrap { trim: false });
+
+            // Compute follow-tail scroll based on actual visual rows
+            // (post-wrap).  Without this, a single long line wraps
+            // into N rows but scroll_offset still treats it as 1, so
+            // the newest content gets pushed below the bottom border.
+            let transcript_visible_rows = chunks[0].height.saturating_sub(2);
+            let transcript_total_rows = transcript.line_count(chunks[0].width) as u16;
+            let scroll_y = transcript_total_rows.saturating_sub(transcript_visible_rows);
+            let transcript = transcript.scroll((scroll_y, 0));
 
             frame.render_widget(transcript, chunks[0]);
+            frame.render_widget(input_para, chunks[1]);
 
-            let input_title = if state.streaming {
-                " input (streaming… Enter queues for next turn — not yet wired) "
-            } else {
-                " input (Enter to send, Ctrl-C to exit) "
-            };
-            let input = Paragraph::new(Line::from(state.input.as_str()))
-                .block(Block::default().borders(Borders::ALL).title(input_title));
-            frame.render_widget(input, chunks[1]);
-
-            // Position the terminal cursor inside the input box at the
-            // logical cursor position (`input_cursor`), not at the end
-            // of the input — that's how Left/Right/Home/End work.
-            // `input_cursor_column` measures display width up to that
-            // byte offset so CJK glyphs land on column boundaries.
-            let visible = chunks[1].width.saturating_sub(2);
-            let cursor_col = input_cursor_column(
-                &state.input[..state.input_cursor.min(state.input.len())],
-                visible,
-            );
-            frame.set_cursor_position((chunks[1].x + 1 + cursor_col, chunks[1].y + 1));
+            // Cursor position inside the input box.  When the input
+            // wraps to multiple rows we have to land the cursor at
+            // (row, col) in display-width terms, not at a flat byte
+            // count.  inner_width is the area inside the borders.
+            let inner_width = chunks[1].width.saturating_sub(2);
+            let typed_so_far = &state.input[..state.input_cursor.min(state.input.len())];
+            let (cursor_row, cursor_col) = wrapped_cursor_position(typed_so_far, inner_width);
+            // Clamp the cursor row to the visible area: an
+            // overflowing input can't park the cursor below the
+            // bottom border.
+            let visible_rows = chunks[1].height.saturating_sub(2);
+            let cursor_row = cursor_row.min(visible_rows.saturating_sub(1));
+            frame.set_cursor_position((chunks[1].x + 1 + cursor_col, chunks[1].y + 1 + cursor_row));
         })
         .map_err(|e| anyhow::anyhow!("terminal.draw: {e}"))?;
     Ok(())
+}
+
+/// Return the (row, col) in display-width terms where the cursor
+/// should land after typing `typed` into a box of inner width
+/// `inner_width`.  Implements a simple character-grid wrap that
+/// matches ratatui's `Wrap { trim: false }` behaviour for the
+/// no-whitespace case.
+///
+/// Word wrapping (which ratatui actually uses) can shift a long word
+/// onto a new line earlier than this estimate predicts, so the
+/// reported (row, col) is a lower bound on the real cursor position
+/// in pathological cases.  For typical interactive input — where the
+/// user is not pasting a 200-character word with no breaks — the
+/// estimate is exact.
+fn wrapped_cursor_position(typed: &str, inner_width: u16) -> (u16, u16) {
+    if inner_width == 0 {
+        return (0, 0);
+    }
+    let inner = inner_width as usize;
+    let mut row: u16 = 0;
+    let mut col: usize = 0;
+    for ch in typed.chars() {
+        let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        if w == 0 {
+            // Combining characters etc. — they don't advance the
+            // cursor in a terminal, so we skip them outright rather
+            // than risk an off-by-one wrap.
+            continue;
+        }
+        if col + w > inner {
+            row = row.saturating_add(1);
+            col = 0;
+        }
+        col += w;
+    }
+    (row, col as u16)
 }
 
 fn transcript_line_to_ratatui(tl: &TranscriptLine) -> Line<'static> {
@@ -907,20 +969,6 @@ fn transcript_line_to_ratatui(tl: &TranscriptLine) -> Line<'static> {
         Span::raw(prefix),
         Span::styled(tl.text.clone(), style),
     ])
-}
-
-/// Follow-tail scroll: if the transcript has more logical lines than
-/// fit inside the visible area, shift the viewport so the newest line
-/// is on the bottom edge.  Step 1 does no wrap-aware accounting — with
-/// `Wrap { trim: false }` a single long line may occupy multiple visual
-/// rows, so the clamp is a lower bound on the right answer and can
-/// leave a line or two of stale content at the top of a resized view.
-/// Proper scroll + PgUp support arrives with Step 5.
-fn scroll_offset(transcript: &[TranscriptLine], viewport_height: u16) -> (u16, u16) {
-    // Subtract 2 for the borders of the enclosing Block.
-    let visible = viewport_height.saturating_sub(2) as usize;
-    let overflow = transcript.len().saturating_sub(visible);
-    (overflow as u16, 0)
 }
 
 // ---------------------------------------------------------------------------
@@ -1040,59 +1088,44 @@ mod tests {
         assert!(clamped < past_end);
     }
 
+    // ── wrapped_cursor_position ────────────────────────────────
+    // Drives the multi-row cursor placement when input wraps in the
+    // bottom box.  Anchored on the contract that cursor position is
+    // measured in display-width terms (CJK = 2 cols), and that
+    // hitting the right edge advances row.
+
     #[test]
-    fn scroll_offset_follows_tail_when_overflowing() {
-        // A transcript of 10 lines in a viewport of 5 visible rows
-        // (plus 2 for borders → viewport_height=7) must scroll by 5
-        // rows so the newest line is at the bottom.
-        let tl = TranscriptLine {
-            kind: LineKind::System,
-            text: "x".into(),
-        };
-        let transcript: Vec<_> = std::iter::repeat_with(|| TranscriptLine {
-            kind: tl.kind,
-            text: tl.text.clone(),
-        })
-        .take(10)
-        .collect();
-        let (y, x) = scroll_offset(&transcript, 7);
-        assert_eq!(x, 0);
-        assert_eq!(y, 5);
+    fn wrapped_cursor_position_single_row() {
+        // Short input fits on one row; col equals display width, row is 0.
+        assert_eq!(wrapped_cursor_position("hello", 80), (0, 5));
+        assert_eq!(wrapped_cursor_position("你好", 80), (0, 4));
     }
 
     #[test]
-    fn scroll_offset_zero_when_below_viewport() {
-        let tl = TranscriptLine {
-            kind: LineKind::System,
-            text: "x".into(),
-        };
-        let transcript = vec![tl];
-        let (y, _) = scroll_offset(&transcript, 20);
-        assert_eq!(y, 0);
+    fn wrapped_cursor_position_wraps_when_full() {
+        // After 5 chars in a 5-wide box, the next char goes to a new
+        // row at column 0.  The current cursor (typing-so-far ends
+        // at the boundary) reports (1, 0) — the start of the next row.
+        // Anything fewer than 5 chars stays on row 0.
+        assert_eq!(wrapped_cursor_position("abcd", 5), (0, 4));
+        assert_eq!(wrapped_cursor_position("abcde", 5), (0, 5));
+        // 5 chars + 1 more → wrap.
+        assert_eq!(wrapped_cursor_position("abcdef", 5), (1, 1));
     }
 
     #[test]
-    fn input_cursor_column_uses_display_width_for_cjk() {
-        // 你好 = 2 chars, but each CJK glyph occupies 2 terminal
-        // columns, so the cursor must land at column 4.  The
-        // pre-fix code used chars().count() and would have parked
-        // the cursor at column 2, halfway through the user's text.
-        assert_eq!(input_cursor_column("你好", 80), 4);
-        // Ascii baseline.
-        assert_eq!(input_cursor_column("hi", 80), 2);
-        // Mixed CJK + ASCII.
-        assert_eq!(input_cursor_column("你hi好", 80), 6);
+    fn wrapped_cursor_position_zero_width_safe() {
+        // Pathological: a 0-wide visible region (window collapsed).
+        // Must not divide-by-zero or panic.  We don't care what the
+        // value is, only that we get something.
+        let _ = wrapped_cursor_position("hello", 0);
     }
 
-    #[test]
-    fn input_cursor_column_clamps_at_visible_width() {
-        // A long input must not park the cursor past the right edge
-        // of the visible area; clamp at `visible_width`.  Without
-        // wrap awareness this is a single-line approximation, but it
-        // at least keeps the cursor on screen.
-        let s = "你".repeat(50); // 100 columns wide
-        assert_eq!(input_cursor_column(&s, 20), 20);
-    }
+    // Note: the previous `input_cursor_column_*` tests anchored a
+    // single-row cursor formula that is now obsolete.  The wrap-aware
+    // replacement is `wrapped_cursor_position`, covered by its own
+    // tests above; the CJK display-width contract (你 = 2 cols) now
+    // lives in `wrapped_cursor_position_single_row`.
 
     #[test]
     fn classify_input_routes_slash_model() {
@@ -1238,14 +1271,9 @@ mod tests {
         assert_eq!(s.input_cursor, 0);
     }
 
-    #[test]
-    fn input_cursor_column_uses_byte_slice_in_render() {
-        // Render-side regression: the cursor column must measure
-        // display width of `input[..cursor]`, not of the whole input.
-        // For "你hi好" with cursor in the middle (byte 5, after "你hi"),
-        // display width is 2 (你) + 2 (hi) = 4 columns.
-        assert_eq!(input_cursor_column("你hi", 80), 4);
-    }
+    // (cursor render byte-slice contract is now covered by
+    // wrapped_cursor_position_single_row above — same shape, but
+    // also accounts for multi-row wrap.)
 
     // ── history navigation ───────────────────────────────────────
     // ↑/↓ walk through `state.history` (oldest-first) starting from

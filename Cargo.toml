@@ -27,7 +27,14 @@ tokio-util = { version = "0.7", features = ["compat"] }
 fs2 = "0.4"
 libc = "0.2"
 termimad = "0.34"
-ratatui = "0.30"
+# `unstable-rendered-line-info` exposes `Paragraph::line_count(width)`,
+# which we need to know how many visual rows a wrapped paragraph
+# occupies — the TUI's follow-tail scroll math (`src/tui.rs`) goes
+# wrong without it on long messages.  The feature is feature-gated
+# upstream behind the `instability` crate; the function itself is
+# stable enough for our use (it implements ratatui's WordWrapper
+# directly and just counts iterations).
+ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 # `event-stream` adds an async stream of terminal events, so the TUI chat
 # loop (src/tui.rs) can select! between keyboard input and daemon frames
 # without blocking the runtime on raw-mode polling.
