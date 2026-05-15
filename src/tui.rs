@@ -33,13 +33,17 @@
 //!   over to the chat-takeover loop.
 //! - Char-grid wrap (no word-boundary surprises) for both transcript
 //!   and input box, sized correctly for CJK / fullwidth glyphs.
+//! - Mid-turn Ctrl-C steer: first Ctrl-C while streaming sends
+//!   `Request::Interrupt`, buffers subsequent stream output, and
+//!   prompts for a correction; Enter submits the correction as a
+//!   `Request::Steer`; empty Enter cancels and flushes the buffer
+//!   back into the transcript; second Ctrl-C exits.
 //!
 //! Still on the to-do list (will land in subsequent commits on this
 //! same branch):
 //!
 //! - `/release` (recognised but parked behind a "not yet wired"
 //!   message; classic chat covers it for now).
-//! - Ctrl-C mid-generation steer + steer buffering.
 //! - `--resume` (UUID is accepted but treated like a new session).
 //! - Plan progress indicator (`[plan N/M done]`).
 //! - Tool-notice colour styling (`ToolUse`, `Compacting`,
@@ -70,6 +74,26 @@ use crate::client::{parse_slash_command, SlashCommand};
 use crate::ipc::{Request, Response};
 use crate::provider;
 use crate::session;
+
+/// How long the user has between two Ctrl-C presses to trigger an
+/// exit.  Mirrors classic chat's `DOUBLE_CTRLC_WINDOW` so the muscle
+/// memory is identical between the two UIs.
+const DOUBLE_CTRLC_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// One-line hint shown the first time the user presses Ctrl-C with
+/// an empty input box.  Single string so the de-dup check in
+/// `handle_key` can compare cheaply (no need to spam the transcript
+/// when the user mashes Ctrl-C).
+const CTRLC_EXIT_HINT: &str =
+    "press Ctrl-C again within 2s to exit (or type a message and Enter to continue)";
+
+/// Cap on how many `Response` frames we buffer while `steer_pending`
+/// is true.  Mirrors classic chat's `STEER_BUFFER_MAX_FRAMES`.  A
+/// long-running tool-heavy turn could blast hundreds of frames into
+/// the buffer if the user takes their time typing the correction;
+/// past this cap we evict oldest-first and emit a single truncation
+/// notice on flush so the user knows some frames were dropped.
+const STEER_BUFFER_MAX_FRAMES: usize = 1000;
 
 /// Public entry — called from `main.rs` when `--tui` is set.
 ///
@@ -161,6 +185,15 @@ pub async fn run_chat_tui(
                                 if !text.trim().is_empty() && !state.streaming {
                                     dispatch_input(&mut write_half, &mut state, text).await?;
                                 }
+                            }
+                            KeyOutcome::InterruptForSteer => {
+                                send_interrupt_and_arm_steer(&mut write_half, &mut state).await?;
+                            }
+                            KeyOutcome::SubmitSteer(text) => {
+                                send_steer(&mut write_half, &mut state, text).await?;
+                            }
+                            KeyOutcome::CancelSteer => {
+                                cancel_steer(&mut state);
                             }
                             KeyOutcome::Exit => break,
                         }
@@ -281,25 +314,18 @@ struct AppState {
     /// / `ToolUse` / `Compacting` / `WaitingForInput` frames are
     /// buffered into `steer_buffer` instead of going to the
     /// transcript so they don't fight the steer prompt for screen
-    /// real estate.  Reserved for the upcoming Ctrl-C-steer commit
-    /// on this branch; not yet wired into handle_response.
-    #[allow(dead_code)]
+    /// real estate.
     steer_pending: bool,
     /// Frames received while `steer_pending`, replayed through
     /// `handle_response` once steering ends.  Capped at
     /// `STEER_BUFFER_MAX_FRAMES` (oldest-first eviction); when an
     /// eviction has happened the next flush prepends a truncation
-    /// notice so the user knows some output was dropped.  Reserved
-    /// for the upcoming Ctrl-C-steer commit on this branch.
-    #[allow(dead_code)]
+    /// notice so the user knows some output was dropped.
     steer_buffer: Vec<Response>,
-    #[allow(dead_code)]
     steer_buffer_truncated: bool,
     /// Timestamp of the last Ctrl-C press, used to detect the
     /// double-Ctrl-C-within-window exit gesture.  Cleared every time
-    /// we leave the steer/exit-pending state.  Reserved for the
-    /// upcoming Ctrl-C-steer commit on this branch.
-    #[allow(dead_code)]
+    /// we leave the steer/exit-pending state.
     last_ctrl_c: Option<std::time::Instant>,
     /// Set while a `/claude` (or `/replyreview`) launch is in flight.
     /// Holds the tag→description map needed to reconstitute the
@@ -519,20 +545,77 @@ impl AppState {
 // Event handling
 // ---------------------------------------------------------------------------
 
+#[derive(Debug)]
 enum KeyOutcome {
     Continue,
     SubmitInput(String),
+    /// User asked to exit the TUI (Ctrl-D, or double-Ctrl-C).
     Exit,
+    /// First Ctrl-C while a turn is streaming.  The caller must:
+    /// 1. Send `Request::Interrupt` so the daemon stops mid-generation.
+    /// 2. Flip `state.steer_pending = true` so subsequent Response
+    ///    frames buffer rather than scribble over the user's input.
+    /// 3. Push a hint to the transcript explaining the steer protocol.
+    InterruptForSteer,
+    /// Submit a steer correction (`Request::Steer { message: text }`)
+    /// for the in-flight turn.  Carries the text the user typed.
+    SubmitSteer(String),
+    /// Empty Enter while `steer_pending`: cancel the steer and let
+    /// the buffered output flush back to the transcript.
+    CancelSteer,
 }
 
 fn handle_key(key: KeyEvent, state: &mut AppState) -> KeyOutcome {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let now = std::time::Instant::now();
     match key.code {
-        // Ctrl-C / Ctrl-D exit the TUI.  A future commit on this branch
-        // will change Ctrl-C into the steer trigger while a turn is
-        // streaming, matching the classic chat semantics.
-        KeyCode::Char('c') if ctrl => KeyOutcome::Exit,
+        // Ctrl-C semantics — depends on what mode we're in:
+        //
+        //   • streaming, no steer pending  → InterruptForSteer
+        //   • streaming, steer pending     → second Ctrl-C exits
+        //   • idle, non-empty input        → clear the input
+        //   • idle, empty input            → first arms double-press
+        //                                    (within `DOUBLE_CTRLC_WINDOW`),
+        //                                    second exits
+        //
+        // This matches the classic chat (run_chat_loop) contract so
+        // muscle memory transfers between the two UIs.  Ctrl-D always
+        // exits — no double-press required, no steer interaction.
         KeyCode::Char('d') if ctrl => KeyOutcome::Exit,
+        KeyCode::Char('c') if ctrl => {
+            if state.streaming {
+                if state.steer_pending {
+                    // Second Ctrl-C while still pending → exit.
+                    return KeyOutcome::Exit;
+                }
+                state.last_ctrl_c = Some(now);
+                return KeyOutcome::InterruptForSteer;
+            }
+            // Idle.  Non-empty input: treat Ctrl-C as a "wipe the
+            // current line" rather than an exit gesture, matching
+            // shell readline.
+            if !state.input.is_empty() {
+                state.input.clear();
+                state.input_cursor = 0;
+                state.last_ctrl_c = None;
+                return KeyOutcome::Continue;
+            }
+            // Empty input + idle: first press arms the double-press
+            // window; second press inside the window exits.
+            if let Some(prev) = state.last_ctrl_c {
+                if now.duration_since(prev) <= DOUBLE_CTRLC_WINDOW {
+                    return KeyOutcome::Exit;
+                }
+            }
+            state.last_ctrl_c = Some(now);
+            // Show a single-line hint so the user knows another
+            // Ctrl-C will exit.  Push at most one of these — checking
+            // the previous transcript line keeps Ctrl-C spam clean.
+            if state.transcript.last().map(|tl| tl.text.as_str()) != Some(CTRLC_EXIT_HINT) {
+                state.push_system_line(CTRLC_EXIT_HINT.to_string());
+            }
+            KeyOutcome::Continue
+        }
         // Emacs-style line editing.  These are the bare minimum any
         // serious user expects in a text input box.  They mirror what
         // reedline (a likely later replacement) would offer; doing them
@@ -569,6 +652,18 @@ fn handle_key(key: KeyEvent, state: &mut AppState) -> KeyOutcome {
         KeyCode::Enter => {
             let text = std::mem::take(&mut state.input);
             state.input_cursor = 0;
+            // Reset the double-Ctrl-C window any time Enter is pressed —
+            // the user is doing something other than confirming an exit.
+            state.last_ctrl_c = None;
+            // While a steer is pending, Enter has different semantics:
+            //   - non-empty → submit as Request::Steer correction
+            //   - empty     → cancel the steer (drain buffer, resume)
+            if state.steer_pending {
+                if text.trim().is_empty() {
+                    return KeyOutcome::CancelSteer;
+                }
+                return KeyOutcome::SubmitSteer(text);
+            }
             KeyOutcome::SubmitInput(text)
         }
         KeyCode::Backspace => {
@@ -679,6 +774,24 @@ fn next_char_boundary(s: &str, idx: usize) -> usize {
 /// completes, since send_prompt is async and can't be invoked from
 /// inside this synchronous handler.
 fn handle_response(resp: Response, state: &mut AppState) -> ResponseOutcome {
+    // While the user is typing a steer correction, buffer streaming-
+    // content frames (Text / ToolUse / Compacting / WaitingForInput)
+    // so they don't fight the steer prompt for screen real estate.
+    // Control frames (Done / Error / SteerAck / ModelSwitched /
+    // PaneAssigned / CapacityError) bypass the buffer because they
+    // change the steer-pending state itself or carry information the
+    // user needs to see immediately.
+    if state.steer_pending && is_buffered_frame(&resp) {
+        if state.steer_buffer.len() >= STEER_BUFFER_MAX_FRAMES {
+            // Evict oldest first so the freshest output survives.
+            // Mark `steer_buffer_truncated` so the eventual flush can
+            // tell the user some frames were dropped.
+            state.steer_buffer.remove(0);
+            state.steer_buffer_truncated = true;
+        }
+        state.steer_buffer.push(resp);
+        return ResponseOutcome::Continuing;
+    }
     match resp {
         Response::Text { chunk } => {
             state.push_assistant_chunk(&chunk);
@@ -721,7 +834,16 @@ fn handle_response(resp: Response, state: &mut AppState) -> ResponseOutcome {
             ResponseOutcome::Continuing
         }
         Response::SteerAck => {
+            // Daemon accepted our steer correction.  Drain the
+            // buffered frames (which arrived while the user was
+            // typing) back into the transcript, then clear the
+            // steer_pending flag.  Order matters: `flush_steer_buffer`
+            // re-enters `handle_response`, so we must clear the flag
+            // FIRST or it'll re-buffer everything we just popped.
+            state.steer_pending = false;
+            state.last_ctrl_c = None;
             state.push_system_line("[steer acknowledged]".to_string());
+            flush_steer_buffer(state);
             ResponseOutcome::Continuing
         }
         Response::ModelSwitched { model } => {
@@ -793,6 +915,20 @@ fn handle_response(resp: Response, state: &mut AppState) -> ResponseOutcome {
             ResponseOutcome::Continuing
         }
     }
+}
+
+/// True for `Response` variants we want to buffer while the user is
+/// composing a steer correction, false for control frames that need
+/// to be processed immediately (state changes, errors, the
+/// SteerAck that ends steer mode).
+fn is_buffered_frame(resp: &Response) -> bool {
+    matches!(
+        resp,
+        Response::Text { .. }
+            | Response::ToolUse { .. }
+            | Response::Compacting
+            | Response::WaitingForInput { .. }
+    )
 }
 
 /// What `handle_response` wants the caller (the main run_chat_tui
@@ -907,6 +1043,108 @@ async fn send_prompt(
         .context("sending Chat request to daemon")?;
     writer.flush().await.ok();
     Ok(())
+}
+
+/// Mid-turn Ctrl-C handler: ship `Request::Interrupt` so the daemon
+/// stops the agentic loop ASAP, then arm `state.steer_pending` so
+/// subsequent `Response::Text` / `ToolUse` / etc. frames buffer
+/// instead of fighting the user's correction for screen real estate.
+/// Push a one-line breadcrumb so the user knows what mode they're in
+/// and how to get out (matches classic chat's prompt).
+async fn send_interrupt_and_arm_steer(
+    writer: &mut tokio::net::unix::OwnedWriteHalf,
+    state: &mut AppState,
+) -> Result<()> {
+    state.steer_pending = true;
+    state.steer_buffer.clear();
+    state.steer_buffer_truncated = false;
+    state.push_system_line(
+        "[steer] type a correction and press Enter, empty Enter to cancel, \
+         Ctrl-C again to exit"
+            .to_string(),
+    );
+
+    let req = Request::Interrupt {
+        session_id: state.session_id.clone(),
+    };
+    let mut frame = serde_json::to_string(&req).context("serializing Request::Interrupt")?;
+    frame.push('\n');
+    // The daemon may have already finished the turn before our
+    // Interrupt arrives; either way SteerAck-or-Done lands.  Swallow
+    // a closed-pipe error so the response loop can drain normally.
+    let _ = writer.write_all(frame.as_bytes()).await;
+    let _ = writer.flush().await;
+    Ok(())
+}
+
+/// Send a steer correction for the in-flight turn.  The daemon will
+/// drain it as a fresh user message between model turns and reply
+/// with `Response::SteerAck`, which is where the buffered output
+/// gets flushed back into the transcript (in `handle_response`).
+async fn send_steer(
+    writer: &mut tokio::net::unix::OwnedWriteHalf,
+    state: &mut AppState,
+    text: String,
+) -> Result<()> {
+    state.push_user_line(format!("> [steer] {text}"));
+    let req = Request::Steer {
+        session_id: state.session_id.clone(),
+        message: text,
+    };
+    let mut frame = serde_json::to_string(&req).context("serializing Request::Steer")?;
+    frame.push('\n');
+    let _ = writer.write_all(frame.as_bytes()).await;
+    let _ = writer.flush().await;
+    // Stay in steer-pending until we see SteerAck so any in-flight
+    // chunks the daemon already shipped before our Steer arrived
+    // continue to buffer instead of clobbering the steer prompt.
+    Ok(())
+}
+
+/// Empty Enter while `steer_pending`: roll back the steer mode and
+/// flush the buffered output into the transcript so the user can
+/// see what they Ctrl-C'd over.  Synchronous because there's no
+/// daemon round-trip — the daemon never knew we typed anything.
+fn cancel_steer(state: &mut AppState) {
+    // Order matters: clear `steer_pending` BEFORE flushing, otherwise
+    // `flush_steer_buffer` re-enters `handle_response` which would
+    // re-buffer the very frames we just popped (the steer-buffering
+    // guard at the top of `handle_response` is gated on
+    // `state.steer_pending`).
+    state.steer_pending = false;
+    state.last_ctrl_c = None;
+    state.push_system_line("[steer cancelled]".to_string());
+    flush_steer_buffer(state);
+}
+
+/// Replay every frame buffered while `steer_pending` was set, in
+/// arrival order, by feeding them back through `handle_response` —
+/// the same code path normal frames take, so styling/state stays
+/// consistent.  If we evicted any frames at the buffer cap, a
+/// truncation notice is prepended so the user knows the buffer
+/// scrolled past some output.  Note: `handle_response` writes to
+/// `state.steer_buffer` only when `steer_pending` is true, so by
+/// the time a flush runs we must already have cleared that flag —
+/// callers (`cancel_steer`, the SteerAck arm of `handle_response`)
+/// arrange that ordering.
+fn flush_steer_buffer(state: &mut AppState) {
+    if state.steer_buffer_truncated {
+        state.push_system_line(format!(
+            "[steer] buffer truncated — dropped older frames past {STEER_BUFFER_MAX_FRAMES}"
+        ));
+        state.steer_buffer_truncated = false;
+    }
+    let buffered: Vec<Response> = std::mem::take(&mut state.steer_buffer);
+    for frame in buffered {
+        // Recurse into the normal handler.  Steer-pending is false
+        // at this point so frames go to the transcript proper.  We
+        // ignore the ResponseOutcome — none of the buffered frames
+        // would request an async follow-up that the cancel/SteerAck
+        // path could service inline anyway (SendSynth only fires on
+        // Done with a /claude in flight, which would have been
+        // surfaced before the steer was armed).
+        let _ = handle_response(frame, state);
+    }
 }
 
 /// What `dispatch_input` decided to do with a freshly-submitted line.
@@ -1142,10 +1380,12 @@ fn draw(
             // has to wrap anything itself.
             let total_area = frame.area();
 
-            let input_title = if state.streaming {
-                " input (streaming… Enter queues for next turn — not yet wired) "
+            let input_title = if state.steer_pending {
+                " steer (Enter to submit correction, empty Enter to cancel, Ctrl-C exits) "
+            } else if state.streaming {
+                " streaming… Ctrl-C to interrupt and steer "
             } else {
-                " input (Enter to send, Ctrl-C to exit) "
+                " input (Enter to send, Ctrl-C twice to exit) "
             };
 
             // Floor at 3 so an empty input still shows a 1-row cavity;
@@ -1716,6 +1956,148 @@ mod tests {
         // Single-pane case (no separator).
         let single = render_launched_block(&launched[..1]);
         assert!(!single.contains("---"));
+    }
+
+    // ── Ctrl-C steer ────────────────────────────────────────────
+    // Mid-turn Ctrl-C arms steer mode: subsequent Response frames
+    // buffer instead of clobbering the user's correction; SteerAck
+    // (or empty-Enter cancel) flushes the buffer back to the
+    // transcript.  These tests pin the state machine's contract.
+
+    #[test]
+    fn ctrl_c_while_streaming_arms_steer() {
+        // First Ctrl-C while streaming: handle_key returns
+        // InterruptForSteer and stamps last_ctrl_c so a second press
+        // can detect the double-press exit gesture.
+        let mut s = test_state();
+        s.streaming = true;
+        let outcome = handle_key(ctrl_key('c'), &mut s);
+        assert!(matches!(outcome, KeyOutcome::InterruptForSteer));
+        assert!(s.last_ctrl_c.is_some());
+    }
+
+    #[test]
+    fn second_ctrl_c_while_steer_pending_exits() {
+        // Second Ctrl-C while steer is already armed exits — matches
+        // classic chat's escape hatch when the user changes their
+        // mind mid-correction.
+        let mut s = test_state();
+        s.streaming = true;
+        s.steer_pending = true;
+        let outcome = handle_key(ctrl_key('c'), &mut s);
+        assert!(matches!(outcome, KeyOutcome::Exit));
+    }
+
+    #[test]
+    fn ctrl_c_idle_with_text_clears_input() {
+        // Ctrl-C with a non-empty input box clears the line (shell
+        // readline convention) instead of arming exit.
+        let mut s = test_state();
+        s.input = "half-typed".into();
+        s.input_cursor = s.input.len();
+        let outcome = handle_key(ctrl_key('c'), &mut s);
+        assert!(matches!(outcome, KeyOutcome::Continue));
+        assert!(s.input.is_empty());
+        assert_eq!(s.input_cursor, 0);
+    }
+
+    #[test]
+    fn ctrl_c_idle_empty_arms_double_press() {
+        // First Ctrl-C with empty input on an idle session arms the
+        // double-press.  A hint line is added to the transcript so
+        // the user knows what's about to happen.
+        let mut s = test_state();
+        let outcome = handle_key(ctrl_key('c'), &mut s);
+        assert!(matches!(outcome, KeyOutcome::Continue));
+        assert!(s.last_ctrl_c.is_some());
+        assert_eq!(s.transcript.last().unwrap().text, CTRLC_EXIT_HINT,);
+    }
+
+    #[test]
+    fn enter_while_steer_pending_routes_to_submit_steer() {
+        // Non-empty Enter while steer-pending submits as a steer
+        // correction, not as a fresh chat prompt.
+        let mut s = test_state();
+        s.streaming = true;
+        s.steer_pending = true;
+        s.input = "fix this".into();
+        s.input_cursor = s.input.len();
+        let outcome = handle_key(key(KeyCode::Enter), &mut s);
+        match outcome {
+            KeyOutcome::SubmitSteer(text) => assert_eq!(text, "fix this"),
+            other => panic!("expected SubmitSteer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn empty_enter_while_steer_pending_cancels() {
+        let mut s = test_state();
+        s.streaming = true;
+        s.steer_pending = true;
+        let outcome = handle_key(key(KeyCode::Enter), &mut s);
+        assert!(matches!(outcome, KeyOutcome::CancelSteer));
+    }
+
+    #[test]
+    fn buffered_frames_drain_on_steer_ack_in_order() {
+        // While steer_pending, Text frames buffer.  When SteerAck
+        // arrives, the buffered chunks should land in the transcript
+        // in their original order, exactly as if they'd never been
+        // intercepted.
+        let mut s = test_state();
+        s.streaming = true;
+        s.steer_pending = true;
+
+        let _ = handle_response(
+            Response::Text {
+                chunk: "alpha\n".into(),
+            },
+            &mut s,
+        );
+        let _ = handle_response(
+            Response::Text {
+                chunk: "beta\n".into(),
+            },
+            &mut s,
+        );
+        // Nothing in transcript yet — frames are in the buffer.
+        assert_eq!(s.steer_buffer.len(), 2);
+        assert!(!s
+            .transcript
+            .iter()
+            .any(|tl| tl.text.contains("alpha") || tl.text.contains("beta")));
+
+        // SteerAck flushes.
+        let _ = handle_response(Response::SteerAck, &mut s);
+        assert!(!s.steer_pending);
+        let texts: Vec<&str> = s.transcript.iter().map(|tl| tl.text.as_str()).collect();
+        let alpha_pos = texts.iter().position(|t| t.contains("alpha")).unwrap();
+        let beta_pos = texts.iter().position(|t| t.contains("beta")).unwrap();
+        assert!(alpha_pos < beta_pos, "alpha must precede beta");
+    }
+
+    #[test]
+    fn cancel_steer_flushes_buffer_and_clears_pending() {
+        // Empty-Enter cancel path also drains the buffer back into
+        // the transcript so the user can see what they Ctrl-C'd over,
+        // and clears the steer-pending flag.
+        let mut s = test_state();
+        s.streaming = true;
+        s.steer_pending = true;
+        let _ = handle_response(
+            Response::Text {
+                chunk: "queued chunk\n".into(),
+            },
+            &mut s,
+        );
+        cancel_steer(&mut s);
+        assert!(!s.steer_pending);
+        assert!(
+            s.transcript
+                .iter()
+                .any(|tl| tl.text.contains("queued chunk")),
+            "buffered chunk must be flushed to the transcript on cancel"
+        );
     }
 
     // ── line editing ─────────────────────────────────────────────
