@@ -7,26 +7,32 @@
 //! chat thread and feedback memory `feedback_prefer_libraries` for
 //! rationale.
 //!
-//! **This is Step 1 only.**  We intentionally wire the thinnest possible
-//! loop here so the structural change (enter alt screen + raw mode +
-//! split layout + async event stream + daemon frames over the same
-//! `tokio::select!`) can be validated independently before we start
-//! porting behaviour.  In particular the following are **not** yet
-//! implemented:
+//! **Currently in development on `feat/tui`.**  The structural pieces
+//! land first; behaviour gets ported step by step.  Already wired:
 //!
-//! - Slash commands (`/model`, `/claude`, `/release`, `/replyreview`) —
-//!   Enter currently sends the literal text as a `Request::Chat` prompt.
+//! - Split layout (alt screen + raw mode + transcript / input split).
+//! - Streaming `Response::Text` chunks render into the transcript
+//!   while the user types in the bottom box without any cursor war.
+//! - `/model` (show / switch) — daemon-side `Response::ModelSwitched`
+//!   also keeps `state.model` in sync.
+//! - CJK / fullwidth / emoji input (cursor positioned by display
+//!   width, not by Unicode scalar count).
+//!
+//! Still on the to-do list (will land in subsequent commits on this
+//! same branch):
+//!
+//! - `/claude` / `/release` / `/replyreview` — recognised but emit a
+//!   "not yet wired in --tui" message instead of falling through to
+//!   chat (which would re-create the window-6 footgun fixed in #163).
 //! - Ctrl-C mid-generation steer + steer buffering.
 //! - `--resume` (UUID is accepted but treated like a new session).
 //! - Plan progress indicator (`[plan N/M done]`).
-//! - Tool-notice rendering (`ToolUse`, `Compacting`, `WaitingForInput`
-//!   are stringified into the transcript, not highlighted).
+//! - Tool-notice colour styling (`ToolUse`, `Compacting`,
+//!   `WaitingForInput` are currently rendered as plain `[…]` lines).
 //! - Markdown rendering — assistant text is emitted verbatim.
-//! - TUI-internal scrollback (PgUp / mouse wheel); we always follow the
-//!   tail of the transcript.
+//! - TUI-internal scrollback (PgUp / mouse wheel); we always follow
+//!   the tail of the transcript.
 //! - History navigation (↑/↓) and `history.jsonl` append.
-//!
-//! Those will land in subsequent steps on the same `feat/tui` branch.
 
 use std::io::stdout;
 use std::path::PathBuf;
@@ -47,6 +53,7 @@ use ratatui::Terminal;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use unicode_width::UnicodeWidthStr;
 
+use crate::client::{parse_slash_command, SlashCommand};
 use crate::ipc::{Request, Response};
 use crate::provider;
 use crate::session;
@@ -131,7 +138,7 @@ pub async fn run_chat_tui(
                             KeyOutcome::Continue => {}
                             KeyOutcome::SubmitInput(text) => {
                                 if !text.trim().is_empty() && !state.streaming {
-                                    send_prompt(&mut write_half, &mut state, text).await?;
+                                    dispatch_input(&mut write_half, &mut state, text).await?;
                                 }
                             }
                             KeyOutcome::Exit => break,
@@ -218,7 +225,9 @@ struct TranscriptLine {
 
 struct AppState {
     session_id: String,
-    #[allow(dead_code)] // surfaced in status bar in a later step
+    /// The model used for the next outgoing `Request::Chat`.  Mutated
+    /// by `/model <name>` (see `dispatch_input`) and by daemon-side
+    /// `Response::ModelSwitched` events on the server's request.
     model: String,
     transcript: Vec<TranscriptLine>,
     input: String,
@@ -433,6 +442,15 @@ fn handle_response(resp: Response, state: &mut AppState) -> bool {
             state.push_system_line("[steer acknowledged]".to_string());
             false
         }
+        Response::ModelSwitched { model } => {
+            // Daemon-side model switch (e.g. the LLM called the
+            // `switch_model` tool).  Mirror it locally so the next
+            // outgoing Request::Chat carries the new value.  Same
+            // behaviour as run_chat_loop's ModelSwitched handler.
+            state.push_system_line(format!("[model switched: {} → {}]", state.model, model));
+            state.model = model;
+            false
+        }
         Response::WaitingForInput { prompt } => {
             if !prompt.is_empty() {
                 state.push_system_line(prompt);
@@ -472,6 +490,70 @@ async fn send_prompt(
         .await
         .context("sending Chat request to daemon")?;
     writer.flush().await.ok();
+    Ok(())
+}
+
+/// What `dispatch_input` decided to do with a freshly-submitted line.
+///
+/// Pulling the decision out of the side-effect-laden async function
+/// keeps it unit-testable without a real Unix socket.  The decision is
+/// pure-state-readable: we look at `parse_slash_command(text)` and
+/// nothing else.
+#[derive(Debug, PartialEq, Eq)]
+enum InputDispatch {
+    /// `/model` (no arg): show current model in transcript.
+    ShowModel,
+    /// `/model <name>`: update `state.model` to this name.
+    SwitchModel(String),
+    /// `/claude` / `/release` / `/replyreview` — recognised but not
+    /// yet ported to the TUI flow.  Tell the user to fall back to
+    /// classic chat instead of silently sending the literal text as a
+    /// chat prompt (window-6 footgun, fixed in #163).
+    NotYetWired,
+    /// Plain text: send as `Request::Chat` to the daemon.
+    SendChat,
+}
+
+fn classify_input(text: &str) -> InputDispatch {
+    match parse_slash_command(text) {
+        Some(SlashCommand::Model(None)) => InputDispatch::ShowModel,
+        Some(SlashCommand::Model(Some(name))) => InputDispatch::SwitchModel(name),
+        Some(_) => InputDispatch::NotYetWired,
+        None => InputDispatch::SendChat,
+    }
+}
+
+/// Dispatch a single Enter-pressed line.  Side-effect wrapper around
+/// `classify_input`: applies the resulting `InputDispatch` to `state`
+/// and the daemon socket.
+async fn dispatch_input(
+    writer: &mut tokio::net::unix::OwnedWriteHalf,
+    state: &mut AppState,
+    text: String,
+) -> Result<()> {
+    match classify_input(&text) {
+        InputDispatch::ShowModel => {
+            state.push_system_line(format!("[model] current: {}", state.model));
+        }
+        InputDispatch::SwitchModel(name) => {
+            // Local-only switch: the daemon picks up the new model on
+            // the next `Request::Chat` because we ship `state.model`
+            // in every request.  Same shape as classic chat (see
+            // run_chat_loop's /model handling).
+            state.push_system_line(format!("[model] {} → {}", state.model, name));
+            state.model = name;
+        }
+        InputDispatch::NotYetWired => {
+            state.push_system_line(
+                "[error] /claude /release /replyreview are not yet wired in --tui; \
+                 fall back to classic chat (no --tui flag) for those commands."
+                    .to_string(),
+            );
+        }
+        InputDispatch::SendChat => {
+            send_prompt(writer, state, text).await?;
+        }
+    }
     Ok(())
 }
 
@@ -733,5 +815,46 @@ mod tests {
         // at least keeps the cursor on screen.
         let s = "你".repeat(50); // 100 columns wide
         assert_eq!(input_cursor_column(&s, 20), 20);
+    }
+
+    #[test]
+    fn classify_input_routes_slash_model() {
+        // Bare `/model` shows the current model; `/model <name>`
+        // switches.  Anything else with leading text should not be
+        // treated as a slash command.
+        assert_eq!(classify_input("/model"), InputDispatch::ShowModel);
+        assert_eq!(
+            classify_input("/model claude-opus-4.7[1m]"),
+            InputDispatch::SwitchModel("claude-opus-4.7[1m]".to_string())
+        );
+    }
+
+    #[test]
+    fn classify_input_routes_unported_slashes_to_not_yet_wired() {
+        // The window-6 regression (#163) was that slash commands typed
+        // mid-turn got shipped to the daemon as plain text.  In
+        // --tui we have a similar risk: /claude needs the
+        // ClaudeLaunch flow which isn't wired yet, so we must NOT
+        // fall through to SendChat.
+        for input in [
+            "/claude --resource sim-9901 do the thing",
+            "/release %54",
+            "/replyreview 165",
+        ] {
+            assert_eq!(
+                classify_input(input),
+                InputDispatch::NotYetWired,
+                "input {input:?} must not silently send as chat"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_input_passes_through_plain_text() {
+        // Non-slash text is a normal chat message.  Leading slashes
+        // that don't match any command (e.g. `/notacommand`) also
+        // fall through, matching parse_slash_command's None branch.
+        assert_eq!(classify_input("hello world"), InputDispatch::SendChat,);
+        assert_eq!(classify_input("/notacommand foo"), InputDispatch::SendChat,);
     }
 }

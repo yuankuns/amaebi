@@ -388,8 +388,12 @@ impl PlanProgressTracker {
 // ---------------------------------------------------------------------------
 
 /// A task for the `/claude` command.
+///
+/// `pub(crate)` so the SlashCommand variant in tui.rs's view of the
+/// public API isn't more private than its constructor type.  All
+/// fields stay private to client.rs.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ClaudeTask {
+pub(crate) struct ClaudeTask {
     /// Short task label derived from the description.
     tag: String,
     /// Task description / opening prompt.
@@ -413,8 +417,11 @@ struct ClaudeTask {
 }
 
 /// A parsed `/release` command.
+///
+/// `pub(crate)` for the same reason as `ClaudeTask`: keep
+/// `SlashCommand`'s type-level visibility consistent.
 #[derive(Debug, PartialEq, Clone)]
-enum ReleaseCmd {
+pub(crate) enum ReleaseCmd {
     Pane {
         pane_id: String,
         clean: bool,
@@ -426,8 +433,12 @@ enum ReleaseCmd {
 }
 
 /// A parsed slash command from user input.
+///
+/// `pub(crate)` so the new TUI loop (`src/tui.rs`) can dispatch the
+/// same way the classic chat loop does, without re-implementing the
+/// parser.  The variants are still owned here.
 #[derive(Debug, PartialEq)]
-enum SlashCommand {
+pub(crate) enum SlashCommand {
     /// `/model [<name>]` — switch model or show current.
     Model(Option<String>),
     /// `/claude "task" ...` — launch parallel Claude sessions.
@@ -445,7 +456,7 @@ enum SlashCommand {
 /// Parse a slash command from user input.
 ///
 /// Returns `None` if the input is not a recognised slash command.
-fn parse_slash_command(input: &str) -> Option<SlashCommand> {
+pub(crate) fn parse_slash_command(input: &str) -> Option<SlashCommand> {
     if let Some(cmd) = parse_model(input) {
         return Some(SlashCommand::Model(cmd));
     }
