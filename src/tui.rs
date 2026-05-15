@@ -57,7 +57,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Terminal;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -830,22 +830,19 @@ fn draw(
 ) -> Result<()> {
     terminal
         .draw(|frame| {
-            // Two-pass layout: we need to know the input box's height
-            // before we can carve up the screen, but the height
-            // depends on how many wrapped visual rows the current
-            // input occupies, which depends on the available width,
-            // which depends on the layout itself.  Resolve by:
-            //   1. Assume the maximum frame width for the input box
-            //      (the layout is a vertical split, so width comes
-            //      out the same regardless of vertical allocation).
-            //   2. Build the input Paragraph once and ask ratatui how
-            //      many visual rows it would occupy at that width.
-            //   3. Cap the input box at half the frame so a paste-
-            //      bomb doesn't eat the whole transcript; floor at 3
-            //      rows so the empty box still has a one-line cavity.
-            //   4. Run the actual layout with that cap as a Length.
+            // We deliberately do NOT use ratatui's `Wrap { trim: false }`
+            // because that uses a word-boundary wrapper (`WordWrapper`)
+            // which mishandles CJK: a Chinese sentence has no spaces,
+            // so the wrapper either treats it as one un-breakable word
+            // and overshoots the right border, or it breaks at the
+            // first stray ASCII it finds inside the run (observed
+            // 2026-05-15 — a "input box" English fragment in an
+            // otherwise-Chinese assistant reply caused an aggressive
+            // mid-sentence break).  Pre-wrapping every line ourselves
+            // on display columns guarantees each Line we hand to
+            // ratatui is already ≤ inner_width, so the renderer never
+            // has to wrap anything itself.
             let total_area = frame.area();
-            let input_text = state.input.as_str();
 
             let input_title = if state.streaming {
                 " input (streaming… Enter queues for next turn — not yet wired) "
@@ -853,62 +850,59 @@ fn draw(
                 " input (Enter to send, Ctrl-C to exit) "
             };
 
-            // Build the Paragraph once and reuse for both line_count
-            // and final render — ratatui's Paragraph is cheap to
-            // construct but cloning Lines isn't free, so we hold the
-            // borrowed-content version here and pass it to both.
-            let input_para = Paragraph::new(Line::from(input_text))
-                .wrap(Wrap { trim: false })
-                .block(Block::default().borders(Borders::ALL).title(input_title));
-
-            // line_count includes block borders (top + bottom = +2)
-            // when the paragraph carries a Block, so the value already
-            // counts the box chrome and we can use it directly as the
-            // Length.  Floor at 3 so an empty input still shows the
-            // standard 1-row cavity; cap at half the frame so a long
-            // paste doesn't consume the whole window.
+            // Floor at 3 so an empty input still shows a 1-row cavity;
+            // cap at half the frame so a paste-bomb can't consume the
+            // whole transcript area.
             let max_input_height = (total_area.height / 2).max(3);
-            let input_box_width = total_area.width;
-            let input_lines = input_para.line_count(input_box_width) as u16;
-            let input_height = input_lines.clamp(3, max_input_height);
+            let input_inner_width = total_area.width.saturating_sub(2);
+            let input_segments = char_grid_wrap(&state.input, input_inner_width);
+            let input_visual_rows = input_segments.len().max(1) as u16;
+            let input_height = (input_visual_rows + 2).clamp(3, max_input_height);
 
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Min(0), Constraint::Length(input_height)])
                 .split(total_area);
 
-            let lines: Vec<Line> = state
-                .transcript
-                .iter()
-                .map(|tl| transcript_line_to_ratatui(tl))
-                .collect();
-
-            let transcript = Paragraph::new(lines)
-                .block(Block::default().borders(Borders::ALL).title(" amaebi "))
-                .wrap(Wrap { trim: false });
-
-            // Compute follow-tail scroll based on actual visual rows
-            // (post-wrap).  Without this, a single long line wraps
-            // into N rows but scroll_offset still treats it as 1, so
-            // the newest content gets pushed below the bottom border.
+            // Transcript: pre-wrap every entry into one Line per
+            // visual row so ratatui never has to wrap.
+            let transcript_inner_width = chunks[0].width.saturating_sub(2);
+            let mut transcript_lines: Vec<Line> = Vec::new();
+            for tl in &state.transcript {
+                push_wrapped_transcript_line(&mut transcript_lines, tl, transcript_inner_width);
+            }
+            let transcript_total_rows = transcript_lines.len() as u16;
             let transcript_visible_rows = chunks[0].height.saturating_sub(2);
-            let transcript_total_rows = transcript.line_count(chunks[0].width) as u16;
             let scroll_y = transcript_total_rows.saturating_sub(transcript_visible_rows);
-            let transcript = transcript.scroll((scroll_y, 0));
 
+            let transcript = Paragraph::new(transcript_lines)
+                .block(Block::default().borders(Borders::ALL).title(" amaebi "))
+                .scroll((scroll_y, 0));
             frame.render_widget(transcript, chunks[0]);
+
+            // Input: same pre-wrap.  Each segment becomes its own
+            // Line, so ratatui draws them on consecutive rows
+            // verbatim.  An empty input still emits one empty Line
+            // so the box renders correctly.
+            let mut input_lines: Vec<Line> = Vec::with_capacity(input_segments.len().max(1));
+            if input_segments.is_empty() {
+                input_lines.push(Line::from(""));
+            } else {
+                for &(s, e) in &input_segments {
+                    input_lines.push(Line::from(state.input[s..e].to_string()));
+                }
+            }
+            let input_para = Paragraph::new(input_lines)
+                .block(Block::default().borders(Borders::ALL).title(input_title));
             frame.render_widget(input_para, chunks[1]);
 
-            // Cursor position inside the input box.  When the input
-            // wraps to multiple rows we have to land the cursor at
-            // (row, col) in display-width terms, not at a flat byte
-            // count.  inner_width is the area inside the borders.
+            // Cursor position inside the input box: walk the typed-
+            // so-far prefix under the same char-grid wrap so the
+            // cursor lands exactly where the renderer placed the
+            // matching character.
             let inner_width = chunks[1].width.saturating_sub(2);
             let typed_so_far = &state.input[..state.input_cursor.min(state.input.len())];
             let (cursor_row, cursor_col) = wrapped_cursor_position(typed_so_far, inner_width);
-            // Clamp the cursor row to the visible area: an
-            // overflowing input can't park the cursor below the
-            // bottom border.
             let visible_rows = chunks[1].height.saturating_sub(2);
             let cursor_row = cursor_row.min(visible_rows.saturating_sub(1));
             frame.set_cursor_position((chunks[1].x + 1 + cursor_col, chunks[1].y + 1 + cursor_row));
@@ -917,18 +911,86 @@ fn draw(
     Ok(())
 }
 
+/// Append the visual rows for one transcript entry to `out`, wrapping
+/// at `inner_width` columns under a char-grid wrap.  Preserves the
+/// entry's `LineKind` styling on every visual row so a wrapped User
+/// line stays cyan all the way down, etc.
+fn push_wrapped_transcript_line(
+    out: &mut Vec<Line<'static>>,
+    tl: &TranscriptLine,
+    inner_width: u16,
+) {
+    let style = match tl.kind {
+        LineKind::System => Style::default().fg(Color::DarkGray),
+        LineKind::User => Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+        LineKind::Assistant { .. } => Style::default(),
+        LineKind::Error => Style::default().fg(Color::Red),
+    };
+    let prefix: &'static str = match tl.kind {
+        LineKind::System => "  ",
+        LineKind::Error => "! ",
+        LineKind::User | LineKind::Assistant { .. } => "",
+    };
+
+    // Empty text still produces an empty visual row so a deliberate
+    // blank line in the transcript stays a blank line.
+    if tl.text.is_empty() {
+        out.push(Line::from(vec![
+            Span::raw(prefix),
+            Span::styled(String::new(), style),
+        ]));
+        return;
+    }
+
+    // Reserve `prefix`'s width on the first visual row only —
+    // continuation rows shift left to use the full inner width.
+    let prefix_cols =
+        unicode_width::UnicodeWidthStr::width(prefix).min(inner_width as usize) as u16;
+    let first_inner = inner_width.saturating_sub(prefix_cols);
+    let first_segments = char_grid_wrap(&tl.text, first_inner);
+    if first_segments.is_empty() {
+        out.push(Line::from(vec![
+            Span::raw(prefix),
+            Span::styled(String::new(), style),
+        ]));
+        return;
+    }
+
+    let (s, e) = first_segments[0];
+    out.push(Line::from(vec![
+        Span::raw(prefix),
+        Span::styled(tl.text[s..e].to_string(), style),
+    ]));
+    if first_segments.len() == 1 {
+        return;
+    }
+
+    // Wrap the remaining text at the full inner width — continuation
+    // rows have no prefix, so they get more columns.  We can't reuse
+    // `first_segments[1..]` because those breaks were computed under
+    // the narrower `first_inner`.
+    let remainder = &tl.text[e..];
+    if remainder.is_empty() {
+        return;
+    }
+    for (rs, re) in char_grid_wrap(remainder, inner_width) {
+        out.push(Line::from(Span::styled(
+            remainder[rs..re].to_string(),
+            style,
+        )));
+    }
+}
+
 /// Return the (row, col) in display-width terms where the cursor
 /// should land after typing `typed` into a box of inner width
-/// `inner_width`.  Implements a simple character-grid wrap that
-/// matches ratatui's `Wrap { trim: false }` behaviour for the
-/// no-whitespace case.
+/// `inner_width`.  Implements a character-grid wrap (no word
+/// boundaries): a glyph that won't fit on the current row goes to
+/// the next row at column 0.
 ///
-/// Word wrapping (which ratatui actually uses) can shift a long word
-/// onto a new line earlier than this estimate predicts, so the
-/// reported (row, col) is a lower bound on the real cursor position
-/// in pathological cases.  For typical interactive input — where the
-/// user is not pasting a 200-character word with no breaks — the
-/// estimate is exact.
+/// Must match `char_grid_wrap`'s break decisions exactly, otherwise
+/// the rendered text and the cursor diverge.
 fn wrapped_cursor_position(typed: &str, inner_width: u16) -> (u16, u16) {
     if inner_width == 0 {
         return (0, 0);
@@ -939,9 +1001,6 @@ fn wrapped_cursor_position(typed: &str, inner_width: u16) -> (u16, u16) {
     for ch in typed.chars() {
         let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
         if w == 0 {
-            // Combining characters etc. — they don't advance the
-            // cursor in a terminal, so we skip them outright rather
-            // than risk an off-by-one wrap.
             continue;
         }
         if col + w > inner {
@@ -953,22 +1012,43 @@ fn wrapped_cursor_position(typed: &str, inner_width: u16) -> (u16, u16) {
     (row, col as u16)
 }
 
-fn transcript_line_to_ratatui(tl: &TranscriptLine) -> Line<'static> {
-    let (prefix, style) = match tl.kind {
-        LineKind::System => ("  ", Style::default().fg(Color::DarkGray)),
-        LineKind::User => (
-            "",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        LineKind::Assistant { .. } => ("", Style::default()),
-        LineKind::Error => ("! ", Style::default().fg(Color::Red)),
-    };
-    Line::from(vec![
-        Span::raw(prefix),
-        Span::styled(tl.text.clone(), style),
-    ])
+/// Hard char-grid wrap: split `text` on display-column boundaries so
+/// every emitted segment occupies at most `inner_width` terminal
+/// columns.  Unlike ratatui's `Wrap { trim: false }` (which is
+/// word-aware via `WordWrapper`), this never tries to break on
+/// spaces — important for CJK input, where the WordWrapper treats a
+/// whole sentence as one un-breakable word and overshoots the right
+/// border, OR makes a poor break at the first ASCII character it
+/// finds inside the run.  The output is a list of byte ranges into
+/// `text`, one per visual row, allocation-free at call time apart
+/// from the Vec itself.  `Vec::is_empty()` if `text` is empty.
+fn char_grid_wrap(text: &str, inner_width: u16) -> Vec<(usize, usize)> {
+    if inner_width == 0 || text.is_empty() {
+        return Vec::new();
+    }
+    let inner = inner_width as usize;
+    let mut out: Vec<(usize, usize)> = Vec::new();
+    let mut start: usize = 0;
+    let mut col: usize = 0;
+    for (idx, ch) in text.char_indices() {
+        let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        if w == 0 {
+            continue;
+        }
+        if col + w > inner {
+            // Break: emit the current segment, start a new one
+            // at this character.
+            out.push((start, idx));
+            start = idx;
+            col = 0;
+        }
+        col += w;
+    }
+    // Final segment, if any.
+    if start < text.len() {
+        out.push((start, text.len()));
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -1119,6 +1199,103 @@ mod tests {
         // Must not divide-by-zero or panic.  We don't care what the
         // value is, only that we get something.
         let _ = wrapped_cursor_position("hello", 0);
+    }
+
+    // ── char_grid_wrap ───────────────────────────────────────────
+    // The render path now pre-wraps every Line with this function
+    // before handing it to ratatui, so it's a load-bearing primitive.
+    // The contract: every emitted segment has display width
+    // ≤ inner_width, and the segments concatenate back to the input
+    // verbatim.  These tests pin both halves.
+
+    fn assert_wrap_round_trips(text: &str, inner: u16) {
+        let segs = char_grid_wrap(text, inner);
+        // Each segment fits.
+        for &(s, e) in &segs {
+            let w = unicode_width::UnicodeWidthStr::width(&text[s..e]);
+            assert!(
+                w <= inner as usize,
+                "segment {:?} has width {} > inner {}",
+                &text[s..e],
+                w,
+                inner
+            );
+        }
+        // Segments concatenate back to the original.
+        let glued: String = segs.iter().map(|&(s, e)| &text[s..e]).collect();
+        assert_eq!(glued, text);
+    }
+
+    #[test]
+    fn char_grid_wrap_short_input_one_segment() {
+        let segs = char_grid_wrap("hi", 10);
+        assert_eq!(segs, vec![(0, 2)]);
+    }
+
+    #[test]
+    fn char_grid_wrap_breaks_cjk_at_column_boundary() {
+        // CJK glyphs are 2 cols each; in a 5-wide box we fit 2 per row
+        // (4 cols) and the third spills.  Without our wrap, ratatui's
+        // word-aware wrapper would either overshoot or break at an
+        // unrelated ASCII character.
+        let text = "你好世界";
+        let segs = char_grid_wrap(text, 5);
+        assert_eq!(segs.len(), 2);
+        // Each segment has 2 glyphs (4 cols), well within 5.
+        assert_eq!(&text[segs[0].0..segs[0].1], "你好");
+        assert_eq!(&text[segs[1].0..segs[1].1], "世界");
+        assert_wrap_round_trips(text, 5);
+    }
+
+    #[test]
+    fn char_grid_wrap_mixed_cjk_and_ascii_no_word_breaks() {
+        // The window-5 regression: an English fragment ("input box")
+        // embedded in Chinese — ratatui's WordWrapper would prefer to
+        // break on the space between "input" and "box", leaving the
+        // surrounding Chinese running off the right border.  Our
+        // char-grid wrap doesn't care about spaces; it just tracks
+        // column count and breaks where the next glyph won't fit.
+        let text = "应该看到 input box 这里继续";
+        // 30 cols is wide enough for several glyphs; the wrap must
+        // simply walk left-to-right and break only when full.
+        assert_wrap_round_trips(text, 30);
+        assert_wrap_round_trips(text, 12);
+        assert_wrap_round_trips(text, 4);
+    }
+
+    #[test]
+    fn char_grid_wrap_empty_and_zero_width() {
+        assert!(char_grid_wrap("", 10).is_empty());
+        assert!(char_grid_wrap("nonempty", 0).is_empty());
+    }
+
+    #[test]
+    fn char_grid_wrap_matches_wrapped_cursor_position() {
+        // Critical invariant: the cursor walker and the wrapper must
+        // agree on break decisions, otherwise the cursor and the
+        // rendered text drift apart.  Walk a few realistic inputs
+        // under both and confirm the row counts match.
+        for (text, inner) in [
+            ("你好世界", 5u16),
+            ("应该看到 input box 这里", 12),
+            ("hello world goodbye world", 10),
+            ("aaaaa", 1),
+        ] {
+            let segs = char_grid_wrap(text, inner);
+            let (final_row, _final_col) = wrapped_cursor_position(text, inner);
+            // After the full text, the cursor sits at the start of
+            // (or partway through) the last visual row.  So the row
+            // index equals segs.len() - 1, unless the text is empty.
+            if segs.is_empty() {
+                assert_eq!(final_row, 0);
+            } else {
+                assert_eq!(
+                    final_row as usize,
+                    segs.len() - 1,
+                    "wrap and cursor disagree for {text:?} at inner={inner}"
+                );
+            }
+        }
     }
 
     // Note: the previous `input_cursor_column_*` tests anchored a
