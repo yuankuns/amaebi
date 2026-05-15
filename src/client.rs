@@ -389,31 +389,32 @@ impl PlanProgressTracker {
 
 /// A task for the `/claude` command.
 ///
-/// `pub(crate)` so the SlashCommand variant in tui.rs's view of the
-/// public API isn't more private than its constructor type.  All
-/// fields stay private to client.rs.
+/// `pub(crate)` (and fields too) so the new TUI dispatch in
+/// `crate::tui` can build a `TaskSpec` and snapshot description/tag
+/// without re-implementing the parser.  Classic chat populates
+/// these fields directly via `parse_claude`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ClaudeTask {
     /// Short task label derived from the description.
-    tag: String,
+    pub(crate) tag: String,
     /// Task description / opening prompt.
-    description: String,
+    pub(crate) description: String,
     /// Optional absolute worktree path.
-    worktree: Option<String>,
+    pub(crate) worktree: Option<String>,
     /// Whether to auto-send Enter after injecting the command into the pane.
-    auto_enter: bool,
+    pub(crate) auto_enter: bool,
     /// Override for the client working directory used to locate the git repo
     /// when auto-creating a worktree.  Maps to TaskSpec::client_cwd.
-    cwd: Option<String>,
+    pub(crate) cwd: Option<String>,
     /// Optional tmux pane id (e.g. `"%41"`) to reuse via `--resume-pane`.
     /// Mutually exclusive with `worktree`; checked at parse time.
-    resume_pane: Option<String>,
+    pub(crate) resume_pane: Option<String>,
     /// One or more resource specs passed via `--resource`.  Each string is
     /// either a resource name (e.g. `sim-9900`) or `class:<name>` /
     /// `any:<name>` for any-idle-of-class selection.  Parsed by the daemon.
-    resources: Vec<String>,
+    pub(crate) resources: Vec<String>,
     /// Seconds to wait for busy resources.  `None` / `0` → fail fast.
-    resource_timeout_secs: Option<u64>,
+    pub(crate) resource_timeout_secs: Option<u64>,
 }
 
 /// A parsed `/release` command.
@@ -3123,7 +3124,7 @@ async fn resolve_one_replyreview_task(pr: u32) -> Result<ClaudeTask, String> {
 /// - the error message on failure should pinpoint exactly one PR, and
 /// - `git worktree add` touches the same repo metadata; concurrent
 ///   worktree creation would risk racing on `.git/worktrees/`.
-async fn resolve_replyreview_tasks(prs: &[u32]) -> Result<Vec<ClaudeTask>, String> {
+pub(crate) async fn resolve_replyreview_tasks(prs: &[u32]) -> Result<Vec<ClaudeTask>, String> {
     let mut out = Vec::with_capacity(prs.len());
     for &pr in prs {
         out.push(resolve_one_replyreview_task(pr).await?);
@@ -3137,7 +3138,7 @@ async fn resolve_replyreview_tasks(prs: &[u32]) -> Result<Vec<ClaudeTask>, Strin
 /// on ClaudeLaunch / SupervisePanes frames.  Any IPC failure propagates
 /// as `Err` to the caller; the caller is expected to surface the error
 /// to the user and skip the launch rather than ship an empty tag.
-async fn resolve_missing_tags(
+pub(crate) async fn resolve_missing_tags(
     socket: &std::path::Path,
     tasks: &mut [ClaudeTask],
     client_cwd: &str,

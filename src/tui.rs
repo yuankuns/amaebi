@@ -27,13 +27,18 @@
 //!   (loaded from `~/.amaebi/history.jsonl` at startup, appended to
 //!   on each submit).  ↑ from a draft snapshots it; ↓ past the
 //!   newest entry restores it.
+//! - `/claude` and `/replyreview` (full launch flow): tag generation,
+//!   `Request::ClaudeLaunch`, `PaneAssigned` accumulation, and the
+//!   synthesised `[launched]` supervision prompt that hands control
+//!   over to the chat-takeover loop.
+//! - Char-grid wrap (no word-boundary surprises) for both transcript
+//!   and input box, sized correctly for CJK / fullwidth glyphs.
 //!
 //! Still on the to-do list (will land in subsequent commits on this
 //! same branch):
 //!
-//! - `/claude` / `/release` / `/replyreview` — recognised but emit a
-//!   "not yet wired in --tui" message instead of falling through to
-//!   chat (which would re-create the window-6 footgun fixed in #163).
+//! - `/release` (recognised but parked behind a "not yet wired"
+//!   message; classic chat covers it for now).
 //! - Ctrl-C mid-generation steer + steer buffering.
 //! - `--resume` (UUID is accepted but treated like a new session).
 //! - Plan progress indicator (`[plan N/M done]`).
@@ -109,7 +114,8 @@ pub async fn run_chat_tui(
     let backend = CrosstermBackend::new(stdout());
     let mut terminal = Terminal::new(backend).context("creating ratatui terminal")?;
 
-    let mut state = AppState::new(session_id.clone(), model.clone());
+    let cwd_str = cwd.to_string_lossy().into_owned();
+    let mut state = AppState::new(session_id.clone(), model.clone(), socket.clone(), cwd_str);
     // Load this cwd's prior prompts so ↑/↓ can recall them.  Done in
     // a spawn_blocking because the loader does sync file I/O (seek +
     // read up to LOAD_TAIL_BYTES) and we don't want to stall the
@@ -179,10 +185,13 @@ pub async fn run_chat_tui(
                     Ok(Some(line)) => {
                         match serde_json::from_str::<Response>(&line) {
                             Ok(resp) => {
-                                if handle_response(resp, &mut state) {
-                                    // Turn is done; if we have a pending
-                                    // queued submission this is where a
-                                    // future step would dispatch it.
+                                let outcome = handle_response(resp, &mut state);
+                                // Some outcomes need an async follow-up
+                                // that handle_response can't perform —
+                                // /claude's "send synthesised
+                                // supervision prompt" is the main one.
+                                if let ResponseOutcome::TurnEndedSendSynth(synth) = outcome {
+                                    send_prompt(&mut write_half, &mut state, synth).await?;
                                 }
                                 draw(&mut terminal, &state)?;
                             }
@@ -266,10 +275,73 @@ struct AppState {
     /// press ↓ past the most-recent history entry, so arrowing up
     /// then down doesn't lose what they were typing.
     history_draft: String,
+    /// True between the first mid-turn Ctrl-C and either a successful
+    /// steer (sent + `Response::SteerAck` received), an empty-Enter
+    /// cancel, or a second Ctrl-C exit.  While set, `Response::Text`
+    /// / `ToolUse` / `Compacting` / `WaitingForInput` frames are
+    /// buffered into `steer_buffer` instead of going to the
+    /// transcript so they don't fight the steer prompt for screen
+    /// real estate.  Reserved for the upcoming Ctrl-C-steer commit
+    /// on this branch; not yet wired into handle_response.
+    #[allow(dead_code)]
+    steer_pending: bool,
+    /// Frames received while `steer_pending`, replayed through
+    /// `handle_response` once steering ends.  Capped at
+    /// `STEER_BUFFER_MAX_FRAMES` (oldest-first eviction); when an
+    /// eviction has happened the next flush prepends a truncation
+    /// notice so the user knows some output was dropped.  Reserved
+    /// for the upcoming Ctrl-C-steer commit on this branch.
+    #[allow(dead_code)]
+    steer_buffer: Vec<Response>,
+    #[allow(dead_code)]
+    steer_buffer_truncated: bool,
+    /// Timestamp of the last Ctrl-C press, used to detect the
+    /// double-Ctrl-C-within-window exit gesture.  Cleared every time
+    /// we leave the steer/exit-pending state.  Reserved for the
+    /// upcoming Ctrl-C-steer commit on this branch.
+    #[allow(dead_code)]
+    last_ctrl_c: Option<std::time::Instant>,
+    /// Set while a `/claude` (or `/replyreview`) launch is in flight.
+    /// Holds the tag→description map needed to reconstitute the
+    /// `[launched]` block once the daemon emits `Response::Done`,
+    /// plus a running list of `PaneAssigned` frames received so far.
+    /// Cleared the moment the synthesised supervision prompt is sent.
+    pending_claude: Option<PendingClaudeLaunch>,
+    /// Absolute path to the daemon socket — needed by /claude to
+    /// open a side-channel for `Request::GenerateTag`.  Set once at
+    /// startup; never mutated.
+    socket_path: PathBuf,
+    /// Canonical cwd at startup, snapshotted so /claude can pin
+    /// `client_cwd` in TaskSpec the same way classic chat does.
+    cwd_str: String,
+}
+
+/// One pane that the daemon has assigned to us during a /claude
+/// launch.  Used to synthesise the post-launch user turn.
+#[derive(Debug, Clone)]
+struct LaunchedPane {
+    pane_id: String,
+    description: String,
+    tag: String,
+    worktree: Option<String>,
+    resources: Vec<String>,
+}
+
+/// Per-launch in-flight state.  Built when `/claude` ships
+/// `Request::ClaudeLaunch`, drained when the daemon emits
+/// `Response::Done` (success path) or `Response::Error` (failure).
+#[derive(Debug, Clone)]
+struct PendingClaudeLaunch {
+    /// tag → original task description, used to look up the
+    /// description when daemon replies with `PaneAssigned { tag }`.
+    descriptions: std::collections::HashMap<String, String>,
+    /// Accumulator: one entry per `PaneAssigned` frame received,
+    /// flushed into the synthesised `[launched]` block on Done.
+    launched: Vec<LaunchedPane>,
 }
 
 impl AppState {
-    fn new(session_id: String, model: String) -> Self {
+    fn new(session_id: String, model: String, socket_path: PathBuf, cwd_str: String) -> Self {
         Self {
             session_id,
             model,
@@ -280,6 +352,13 @@ impl AppState {
             history: Vec::new(),
             history_pos: None,
             history_draft: String::new(),
+            steer_pending: false,
+            steer_buffer: Vec::new(),
+            steer_buffer_truncated: false,
+            last_ctrl_c: None,
+            pending_claude: None,
+            socket_path,
+            cwd_str,
         }
     }
 
@@ -594,39 +673,56 @@ fn next_char_boundary(s: &str, idx: usize) -> usize {
     i
 }
 
-/// Dispatch a single daemon frame.  Returns `true` when the turn has
-/// completed (Done / Error), so callers can clear `streaming` and
-/// perform any queued work.
-fn handle_response(resp: Response, state: &mut AppState) -> bool {
+/// Dispatch a single daemon frame.  Returns a `ResponseOutcome`
+/// enumerating any follow-up the caller needs to perform — namely
+/// "send this synthesised supervision prompt" once a `/claude` launch
+/// completes, since send_prompt is async and can't be invoked from
+/// inside this synchronous handler.
+fn handle_response(resp: Response, state: &mut AppState) -> ResponseOutcome {
     match resp {
         Response::Text { chunk } => {
             state.push_assistant_chunk(&chunk);
-            false
+            ResponseOutcome::Continuing
         }
         Response::Done => {
             state.close_open_assistant_line();
             state.streaming = false;
-            true
+            // If a /claude launch was in flight, this Done means the
+            // daemon has finished assigning panes.  Synthesise the
+            // [launched] block and ask the caller to send it as a
+            // user turn so the LLM enters supervision mode.  Empty
+            // launched list means the launch errored before assigning
+            // anything; nothing to synthesise.
+            if let Some(pending) = state.pending_claude.take() {
+                if !pending.launched.is_empty() {
+                    let synth = render_launched_block(&pending.launched);
+                    state.push_system_line(String::new());
+                    return ResponseOutcome::TurnEndedSendSynth(synth);
+                }
+            }
+            ResponseOutcome::TurnEnded
         }
         Response::Error { message } => {
             state.close_open_assistant_line();
             state.push_error_line(format!("error: {message}"));
             state.streaming = false;
-            true
+            // Drop any in-flight /claude launch state on error so
+            // a subsequent input doesn't leak it into a synthesised
+            // supervision prompt.
+            state.pending_claude = None;
+            ResponseOutcome::TurnEnded
         }
         Response::ToolUse { name, detail } => {
-            // Step 1 just stringifies these; Step 2 will colour-code
-            // them like the classic UI does.
             state.push_system_line(format!("[{name}] {detail}"));
-            false
+            ResponseOutcome::Continuing
         }
         Response::Compacting => {
             state.push_system_line("[compacting conversation…]".to_string());
-            false
+            ResponseOutcome::Continuing
         }
         Response::SteerAck => {
             state.push_system_line("[steer acknowledged]".to_string());
-            false
+            ResponseOutcome::Continuing
         }
         Response::ModelSwitched { model } => {
             // Daemon-side model switch (e.g. the LLM called the
@@ -635,24 +731,85 @@ fn handle_response(resp: Response, state: &mut AppState) -> bool {
             // behaviour as run_chat_loop's ModelSwitched handler.
             state.push_system_line(format!("[model switched: {} → {}]", state.model, model));
             state.model = model;
-            false
+            ResponseOutcome::Continuing
         }
         Response::WaitingForInput { prompt } => {
             if !prompt.is_empty() {
                 state.push_system_line(prompt);
             }
             state.streaming = false;
-            // We treat this as a turn end for Step 1 — the user can
-            // just type their reply in the input box.
-            true
+            ResponseOutcome::TurnEnded
         }
-        // All other variants surface once we expose the features that
-        // generate them (detach, memory, PaneAssigned, etc.).
+        Response::PaneAssigned {
+            tag,
+            pane_id,
+            session_id: _sid,
+            worktree,
+            resources,
+        } => {
+            // Surface the assignment so the user can see what landed.
+            let resources_blurb = if resources.is_empty() {
+                String::new()
+            } else {
+                format!(" resources={}", resources.join(","))
+            };
+            state.push_system_line(format!("[pane {pane_id}] tag={tag}{resources_blurb}"));
+            // Buffer for the supervision prompt synthesised on Done.
+            // If the user typed /claude but no pending state was set
+            // (shouldn't happen on this path), defensively skip the
+            // accumulator instead of panicking.
+            if let Some(pending) = state.pending_claude.as_mut() {
+                let description = pending
+                    .descriptions
+                    .get(&tag)
+                    .cloned()
+                    .unwrap_or_else(|| tag.clone());
+                pending.launched.push(LaunchedPane {
+                    pane_id,
+                    description,
+                    tag,
+                    worktree,
+                    resources,
+                });
+            }
+            ResponseOutcome::Continuing
+        }
+        Response::CapacityError {
+            requested,
+            max_panes,
+            current_busy,
+        } => {
+            state.push_error_line(format!(
+                "[error] capacity limit reached: max_panes={max_panes}, busy={current_busy}, \
+                 requested={requested}; free existing panes to continue"
+            ));
+            // Clear pending state so we don't try to synth a
+            // supervision prompt for a launch that never happened.
+            state.pending_claude = None;
+            ResponseOutcome::Continuing
+        }
         other => {
             state.push_system_line(format!("[{other:?}]"));
-            false
+            ResponseOutcome::Continuing
         }
     }
+}
+
+/// What `handle_response` wants the caller (the main run_chat_tui
+/// select loop) to do next.  The handler can't perform async work
+/// itself, so anything that needs the daemon socket or `send_prompt`
+/// is requested here and executed by the caller.
+#[derive(Debug, PartialEq, Eq)]
+enum ResponseOutcome {
+    /// Frame consumed; turn still in progress.  Just redraw.
+    Continuing,
+    /// Turn finished cleanly — flip `streaming = false`, redraw, do
+    /// nothing else.
+    TurnEnded,
+    /// Turn finished, and the caller should now ship the included
+    /// synthesised user prompt as a fresh `Request::Chat` so the LLM
+    /// takes over supervision after `/claude`.
+    TurnEndedSendSynth(String),
 }
 
 /// Push the same startup banner the classic chat prints (logo +
@@ -754,21 +911,30 @@ async fn send_prompt(
 
 /// What `dispatch_input` decided to do with a freshly-submitted line.
 ///
-/// Pulling the decision out of the side-effect-laden async function
-/// keeps it unit-testable without a real Unix socket.  The decision is
-/// pure-state-readable: we look at `parse_slash_command(text)` and
-/// nothing else.
+/// Pulling the slash-command decision out of the async dispatcher
+/// keeps the parser part unit-testable without a real Unix socket.
+/// `Claude` and `ReplyReview` carry the parser output verbatim;
+/// dispatching them runs async work (tag generation, ClaudeLaunch
+/// IPC) which we do directly in `dispatch_input`.
 #[derive(Debug, PartialEq, Eq)]
 enum InputDispatch {
     /// `/model` (no arg): show current model in transcript.
     ShowModel,
     /// `/model <name>`: update `state.model` to this name.
     SwitchModel(String),
-    /// `/claude` / `/release` / `/replyreview` — recognised but not
-    /// yet ported to the TUI flow.  Tell the user to fall back to
-    /// classic chat instead of silently sending the literal text as a
-    /// chat prompt (window-6 footgun, fixed in #163).
-    NotYetWired,
+    /// `/claude "task" ...` — parser succeeded with the given tasks.
+    Claude(Vec<crate::client::ClaudeTask>),
+    /// `/replyreview <PR> ...` — parser succeeded with these PR
+    /// numbers.  Worktree + description resolution happens
+    /// asynchronously via `crate::client::resolve_replyreview_tasks`.
+    ReplyReview(Vec<u32>),
+    /// `/release` is recognised but not yet ported to --tui.  Tell
+    /// the user to fall back rather than silently shipping the
+    /// literal text to the daemon (window-6 footgun fixed in #163).
+    NotYetWired(&'static str),
+    /// Slash command failed to parse; surface the parser error to
+    /// the transcript.
+    SlashError(String),
     /// Plain text: send as `Request::Chat` to the daemon.
     SendChat,
 }
@@ -777,7 +943,11 @@ fn classify_input(text: &str) -> InputDispatch {
     match parse_slash_command(text) {
         Some(SlashCommand::Model(None)) => InputDispatch::ShowModel,
         Some(SlashCommand::Model(Some(name))) => InputDispatch::SwitchModel(name),
-        Some(_) => InputDispatch::NotYetWired,
+        Some(SlashCommand::Claude(Ok(tasks))) => InputDispatch::Claude(tasks),
+        Some(SlashCommand::Claude(Err(msg))) => InputDispatch::SlashError(msg),
+        Some(SlashCommand::ReplyReview(Ok(prs))) => InputDispatch::ReplyReview(prs),
+        Some(SlashCommand::ReplyReview(Err(msg))) => InputDispatch::SlashError(msg),
+        Some(SlashCommand::Release(_)) => InputDispatch::NotYetWired("/release"),
         None => InputDispatch::SendChat,
     }
 }
@@ -802,18 +972,146 @@ async fn dispatch_input(
             state.push_system_line(format!("[model] {} → {}", state.model, name));
             state.model = name;
         }
-        InputDispatch::NotYetWired => {
-            state.push_system_line(
-                "[error] /claude /release /replyreview are not yet wired in --tui; \
-                 fall back to classic chat (no --tui flag) for those commands."
-                    .to_string(),
-            );
+        InputDispatch::Claude(tasks) => {
+            launch_claude_tasks(writer, state, tasks).await?;
+        }
+        InputDispatch::ReplyReview(prs) => {
+            // /replyreview is normalised into the same Vec<ClaudeTask>
+            // shape as /claude after head-branch + worktree
+            // resolution (matches classic chat's flow).  This is an
+            // async + network-bound step (gh + git), so we surface a
+            // breadcrumb so the user knows the TUI hasn't frozen.
+            state.push_system_line(format!(
+                "[replyreview] resolving {} PR(s) — running gh + git…",
+                prs.len()
+            ));
+            match crate::client::resolve_replyreview_tasks(&prs).await {
+                Ok(tasks) => launch_claude_tasks(writer, state, tasks).await?,
+                Err(msg) => state.push_error_line(format!("/replyreview: {msg}")),
+            }
+        }
+        InputDispatch::NotYetWired(name) => {
+            state.push_system_line(format!(
+                "[error] {name} is not yet wired in --tui; \
+                 fall back to classic chat (no --tui flag) for that command."
+            ));
+        }
+        InputDispatch::SlashError(msg) => {
+            state.push_error_line(msg);
         }
         InputDispatch::SendChat => {
             send_prompt(writer, state, text).await?;
         }
     }
     Ok(())
+}
+
+/// Send `Request::ClaudeLaunch` for the given tasks and arm
+/// `state.pending_claude` so the response handler can collect
+/// `PaneAssigned` frames and synthesise the supervision prompt on
+/// `Response::Done`.  Any pre-launch error (tag generation failure,
+/// IPC error) is surfaced to the transcript and `pending_claude`
+/// stays None so the next user input isn't blocked.
+async fn launch_claude_tasks(
+    writer: &mut tokio::net::unix::OwnedWriteHalf,
+    state: &mut AppState,
+    mut tasks: Vec<crate::client::ClaudeTask>,
+) -> Result<()> {
+    if tasks.is_empty() {
+        // Defensive — parser should have errored before getting here.
+        return Ok(());
+    }
+    // Resolve any tasks that arrived without an explicit --tag by
+    // shelling a Request::GenerateTag over a one-shot side connection.
+    // Same flow as classic chat (see run_chat_loop).
+    if let Err(e) =
+        crate::client::resolve_missing_tags(&state.socket_path, &mut tasks, &state.cwd_str).await
+    {
+        state.push_error_line(format!("[error] tag generation failed: {e:#}"));
+        return Ok(());
+    }
+
+    // Snapshot tag → original description so the response handler
+    // can rebuild the [launched] block on Response::Done.
+    let descriptions: std::collections::HashMap<String, String> = tasks
+        .iter()
+        .map(|t| (t.tag.clone(), t.description.clone()))
+        .collect();
+
+    // Resolve client_cwd the way classic chat does: prefer the task's
+    // --cwd override, else the chat process's cwd; canonicalise so
+    // the daemon's notebook lookup matches across symlink/`..` paths.
+    let invocation_repo_dir: Option<String> = Some({
+        let effective_cwd = tasks
+            .iter()
+            .find_map(|t| t.cwd.clone())
+            .unwrap_or_else(|| state.cwd_str.clone());
+        crate::session::canonical_key(std::path::Path::new(&effective_cwd))
+    });
+
+    let task_specs: Vec<crate::ipc::TaskSpec> = tasks
+        .into_iter()
+        .map(|t| crate::ipc::TaskSpec {
+            tag: t.tag,
+            description: t.description,
+            worktree: t.worktree,
+            client_cwd: t.cwd.or_else(|| Some(state.cwd_str.clone())),
+            auto_enter: t.auto_enter,
+            resume_pane: t.resume_pane,
+            resources: t.resources,
+            resource_timeout_secs: t.resource_timeout_secs,
+        })
+        .collect();
+
+    let req = Request::ClaudeLaunch {
+        tasks: task_specs,
+        session_id: Some(state.session_id.clone()),
+        repo_dir: invocation_repo_dir,
+    };
+    let mut frame = serde_json::to_string(&req).context("serializing ClaudeLaunch")?;
+    frame.push('\n');
+    if let Err(e) = writer.write_all(frame.as_bytes()).await {
+        state.push_error_line(format!("[error] sending /claude to daemon: {e}"));
+        return Ok(());
+    }
+    let _ = writer.flush().await;
+
+    // Tell the user we shipped the launch, and hand the rest of the
+    // flow to the main response loop via `pending_claude`.
+    state.push_system_line(format!(
+        "[claude] launching {} task(s); waiting for pane assignment…",
+        descriptions.len()
+    ));
+    state.pending_claude = Some(PendingClaudeLaunch {
+        descriptions,
+        launched: Vec::new(),
+    });
+    state.streaming = true;
+    Ok(())
+}
+
+/// Synthesise the `[launched]` user-turn that classic chat emits
+/// after a `/claude` flow lands its `Response::Done`.  The LLM reads
+/// this on its next Chat round and takes over supervision per the
+/// chat-takeover contract (see `docs/design/claude-chat-takeover.md`).
+fn render_launched_block(launched: &[LaunchedPane]) -> String {
+    let mut synth = String::new();
+    for l in launched {
+        if !synth.is_empty() {
+            synth.push_str("\n\n---\n\n");
+        }
+        synth.push_str(l.description.trim_end());
+        synth.push_str("\n\n[launched]\n");
+        synth.push_str(&format!("  pane: {}\n", l.pane_id));
+        if let Some(wt) = l.worktree.as_deref() {
+            synth.push_str(&format!("  worktree: {wt}\n"));
+        }
+        if !l.resources.is_empty() {
+            synth.push_str(&format!("  resources: {}\n", l.resources.join(", ")));
+        }
+        synth.push_str(&format!("  tag: {}\n", l.tag));
+    }
+    synth
 }
 
 // ---------------------------------------------------------------------------
@@ -1092,9 +1390,20 @@ mod tests {
     // that a refactor might plausibly break: stream-chunking that
     // respects newlines, backspace UTF-8 safety, and follow-tail math.
 
+    /// Build an AppState with placeholder socket/cwd values that the
+    /// pure-state tests don't exercise.
+    fn test_state() -> AppState {
+        AppState::new(
+            "sid".into(),
+            "model".into(),
+            std::path::PathBuf::from("/tmp/amaebi-test.sock"),
+            "/tmp".to_string(),
+        )
+    }
+
     #[test]
     fn assistant_chunks_across_newlines_split_into_distinct_lines() {
-        let mut state = AppState::new("sid".into(), "model".into());
+        let mut state = test_state();
         // A single chunk spanning two logical lines must land as two
         // transcript entries, the first closed (is_open=false) and the
         // second open so the next chunk attaches to it.
@@ -1117,7 +1426,7 @@ mod tests {
         // Two streamed chunks with no newline between them must merge
         // into a single line — the common case for token-by-token
         // model output.
-        let mut state = AppState::new("sid".into(), "model".into());
+        let mut state = test_state();
         state.push_assistant_chunk("hello ");
         state.push_assistant_chunk("world");
         assert_eq!(state.transcript.len(), 1);
@@ -1133,12 +1442,12 @@ mod tests {
         // Response::Done must close the currently open assistant line
         // so a subsequent turn doesn't accidentally concatenate onto
         // the previous reply.
-        let mut state = AppState::new("sid".into(), "model".into());
+        let mut state = test_state();
         state.push_assistant_chunk("partial without newline");
         state.streaming = true;
 
-        let turn_ended = handle_response(Response::Done, &mut state);
-        assert!(turn_ended);
+        let outcome = handle_response(Response::Done, &mut state);
+        assert_eq!(outcome, ResponseOutcome::TurnEnded);
         assert!(!state.streaming);
         assert!(matches!(
             state.transcript.last().unwrap().kind,
@@ -1317,23 +1626,50 @@ mod tests {
     }
 
     #[test]
-    fn classify_input_routes_unported_slashes_to_not_yet_wired() {
-        // The window-6 regression (#163) was that slash commands typed
-        // mid-turn got shipped to the daemon as plain text.  In
-        // --tui we have a similar risk: /claude needs the
-        // ClaudeLaunch flow which isn't wired yet, so we must NOT
-        // fall through to SendChat.
-        for input in [
-            "/claude --resource sim-9901 do the thing",
-            "/release %54",
-            "/replyreview 165",
-        ] {
-            assert_eq!(
-                classify_input(input),
-                InputDispatch::NotYetWired,
-                "input {input:?} must not silently send as chat"
-            );
+    fn classify_input_routes_claude_with_tasks() {
+        // /claude carries the parser output verbatim through
+        // InputDispatch::Claude so the dispatcher can hand them off
+        // to launch_claude_tasks without re-parsing.
+        let dispatched = classify_input("/claude \"do X\"");
+        match dispatched {
+            InputDispatch::Claude(tasks) => {
+                assert_eq!(tasks.len(), 1);
+                assert_eq!(tasks[0].description, "do X");
+            }
+            other => panic!("expected Claude(_), got {other:?}"),
         }
+    }
+
+    #[test]
+    fn classify_input_routes_replyreview_with_prs() {
+        let dispatched = classify_input("/replyreview 165 168");
+        match dispatched {
+            InputDispatch::ReplyReview(prs) => assert_eq!(prs, vec![165, 168]),
+            other => panic!("expected ReplyReview(_), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_input_surfaces_slash_parse_errors() {
+        // Bare /claude is a usage error; the user sees it in the
+        // transcript via SlashError rather than a silent no-op.
+        match classify_input("/claude") {
+            InputDispatch::SlashError(msg) => {
+                assert!(msg.contains("usage:"), "expected usage hint, got {msg:?}");
+            }
+            other => panic!("expected SlashError(_), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_input_routes_release_to_not_yet_wired() {
+        // /release is recognised but not yet ported.  Must NOT fall
+        // through to SendChat (window-6 footgun, #163).
+        assert_eq!(
+            classify_input("/release %54"),
+            InputDispatch::NotYetWired("/release"),
+            "/release must not silently send as chat"
+        );
     }
 
     #[test]
@@ -1345,6 +1681,43 @@ mod tests {
         assert_eq!(classify_input("/notacommand foo"), InputDispatch::SendChat,);
     }
 
+    #[test]
+    fn render_launched_block_concatenates_panes_with_separator() {
+        // The synthesised user-turn shape is the chat-takeover
+        // contract: original description + [launched] block per pane,
+        // separated by `---`.  Anchoring on the literal markers so a
+        // future refactor can't silently change the format the daemon
+        // (and Claude prompts) expect.
+        let launched = vec![
+            LaunchedPane {
+                pane_id: "%41".into(),
+                description: "do the thing".into(),
+                tag: "thing-1".into(),
+                worktree: Some("/tmp/wt-thing".into()),
+                resources: vec!["sim-9900".into()],
+            },
+            LaunchedPane {
+                pane_id: "%42".into(),
+                description: "do the other".into(),
+                tag: "other-2".into(),
+                worktree: None,
+                resources: vec![],
+            },
+        ];
+        let synth = render_launched_block(&launched);
+        assert!(synth.contains("[launched]"));
+        assert!(synth.contains("  pane: %41"));
+        assert!(synth.contains("  worktree: /tmp/wt-thing"));
+        assert!(synth.contains("  resources: sim-9900"));
+        assert!(synth.contains("  tag: thing-1"));
+        assert!(synth.contains("---"));
+        assert!(synth.contains("  pane: %42"));
+        assert!(synth.contains("  tag: other-2"));
+        // Single-pane case (no separator).
+        let single = render_launched_block(&launched[..1]);
+        assert!(!single.contains("---"));
+    }
+
     // ── line editing ─────────────────────────────────────────────
     // These tests verify the byte-offset-based cursor model: every
     // position is a UTF-8 char boundary, and Left/Right/Backspace/
@@ -1353,7 +1726,7 @@ mod tests {
     // user sees garbled text or silent panics on CJK input.
 
     fn make_test_state(text: &str, cursor: usize) -> AppState {
-        let mut s = AppState::new("sid".into(), "model".into());
+        let mut s = test_state();
         s.input = text.to_string();
         s.input_cursor = cursor;
         s
@@ -1459,7 +1832,7 @@ mod tests {
     // entry restores it — the same shell-style readline contract.
 
     fn populate(history: &[&str]) -> AppState {
-        let mut s = AppState::new("sid".into(), "model".into());
+        let mut s = test_state();
         s.history = history.iter().map(|s| s.to_string()).collect();
         s
     }
