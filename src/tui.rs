@@ -23,6 +23,10 @@
 //! - Startup banner (logo + version + model + sandbox + session +
 //!   cwd) rendered into the transcript so it survives the alt-screen
 //!   switch instead of being cleared by the first ratatui draw.
+//! - History navigation: ↑/↓ walk through this cwd's prior prompts
+//!   (loaded from `~/.amaebi/history.jsonl` at startup, appended to
+//!   on each submit).  ↑ from a draft snapshots it; ↓ past the
+//!   newest entry restores it.
 //!
 //! Still on the to-do list (will land in subsequent commits on this
 //! same branch):
@@ -38,7 +42,6 @@
 //! - Markdown rendering — assistant text is emitted verbatim.
 //! - TUI-internal scrollback (PgUp / mouse wheel); we always follow
 //!   the tail of the transcript.
-//! - History navigation (↑/↓) and `history.jsonl` append.
 
 use std::io::stdout;
 use std::path::PathBuf;
@@ -108,9 +111,20 @@ pub async fn run_chat_tui(
     let mut terminal = Terminal::new(backend).context("creating ratatui terminal")?;
 
     let mut state = AppState::new(session_id.clone(), model.clone());
+    // Load this cwd's prior prompts so ↑/↓ can recall them.  Done in
+    // a spawn_blocking because the loader does sync file I/O (seek +
+    // read up to LOAD_TAIL_BYTES) and we don't want to stall the
+    // tokio runtime waiting on disk.  Set the session id first so
+    // subsequent record_history_line calls tag fresh rows correctly.
+    crate::client::set_history_session_id(&session_id);
+    state.history = tokio::task::spawn_blocking(crate::client::load_cwd_history)
+        .await
+        .unwrap_or_default();
+
     push_banner(&mut state, &cwd);
-    state
-        .push_system_line("Type a message and press Enter to send.  Ctrl-C / Ctrl-D exits.".into());
+    state.push_system_line(
+        "Type a message and press Enter to send.  ↑/↓ for history.  Ctrl-C / Ctrl-D exits.".into(),
+    );
     state.push_system_line(String::new());
 
     // Pump an optional opening prompt synthetically so the user doesn't
@@ -235,6 +249,24 @@ struct AppState {
     input: String,
     input_cursor: usize,
     streaming: bool,
+    /// Persisted history (oldest-first) of past prompts the user
+    /// submitted in this cwd.  Populated once at startup from
+    /// `~/.amaebi/history.jsonl`; appended to in-place every time
+    /// the user submits a new line so ↑/↓ within a single session
+    /// can recall what was just sent.
+    history: Vec<String>,
+    /// Where the user is in the history when scrolling with ↑/↓.
+    /// `None` means "not in history mode — the input box shows a
+    /// fresh draft".  `Some(i)` means we're showing `history[i]`.
+    /// Indices count from the END of `history` (i.e. `Some(0)` is
+    /// the most recent submitted prompt) so newly-appended history
+    /// rows don't shift the user's position out from under them.
+    history_pos: Option<usize>,
+    /// The user's in-progress draft, captured the first time they
+    /// press ↑ from a non-history-mode input.  Restored when they
+    /// press ↓ past the most-recent history entry, so arrowing up
+    /// then down doesn't lose what they were typing.
+    history_draft: String,
 }
 
 impl AppState {
@@ -246,7 +278,77 @@ impl AppState {
             input: String::new(),
             input_cursor: 0,
             streaming: false,
+            history: Vec::new(),
+            history_pos: None,
+            history_draft: String::new(),
         }
+    }
+
+    /// Replace the input buffer with `text`, reset the cursor to the
+    /// end, and (typically) clear history-mode.  Used by both the
+    /// up/down history walkers and by the dispatch path's "restore
+    /// the user's draft" branch.
+    fn set_input(&mut self, text: String) {
+        self.input = text;
+        self.input_cursor = self.input.len();
+    }
+
+    /// Walk back one step in history (↑).  First press from a
+    /// non-history-mode input also captures `self.input` as the
+    /// draft to restore on ↓.  No-op when there's no history or
+    /// we're already at the oldest entry.
+    fn history_prev(&mut self) {
+        if self.history.is_empty() {
+            return;
+        }
+        // history_pos counts from the END of self.history, so 0 = most
+        // recent, len-1 = oldest.  Stepping ↑ increases the index.
+        let new_pos = match self.history_pos {
+            None => {
+                // Entering history mode — snapshot the draft so we can
+                // come back to it via ↓.
+                self.history_draft = self.input.clone();
+                0
+            }
+            Some(p) if p + 1 < self.history.len() => p + 1,
+            Some(p) => p, // already at oldest
+        };
+        self.history_pos = Some(new_pos);
+        let i = self.history.len() - 1 - new_pos;
+        let text = self.history[i].clone();
+        self.set_input(text);
+    }
+
+    /// Walk forward one step in history (↓).  Stepping past the most
+    /// recent entry leaves history mode and restores the draft we
+    /// captured on the first ↑ press.
+    fn history_next(&mut self) {
+        let Some(pos) = self.history_pos else { return };
+        if pos == 0 {
+            // Stepping past most recent — restore the draft.
+            let draft = std::mem::take(&mut self.history_draft);
+            self.history_pos = None;
+            self.set_input(draft);
+            return;
+        }
+        let new_pos = pos - 1;
+        self.history_pos = Some(new_pos);
+        let i = self.history.len() - 1 - new_pos;
+        let text = self.history[i].clone();
+        self.set_input(text);
+    }
+
+    /// Append `display` to in-memory history (so ↑ in this session
+    /// can recall it without re-reading the file) and reset history
+    /// scroll state.  Called from `send_prompt` after a successful
+    /// dispatch.  Dedupes the most-recent entry the same way
+    /// `load_cwd_history` does.
+    fn record_submitted_prompt(&mut self, display: &str) {
+        if self.history.last().map(String::as_str) != Some(display) {
+            self.history.push(display.to_string());
+        }
+        self.history_pos = None;
+        self.history_draft.clear();
     }
 
     fn push_system_line(&mut self, text: String) {
@@ -426,6 +528,18 @@ fn handle_key(key: KeyEvent, state: &mut AppState) -> KeyOutcome {
         }
         KeyCode::End => {
             state.input_cursor = state.input.len();
+            KeyOutcome::Continue
+        }
+        KeyCode::Up => {
+            // ↑ recalls older history entries (same direction as
+            // shell readline).  The first press from a non-history
+            // input also snapshots the current draft so ↓ past the
+            // most-recent entry can restore it.
+            state.history_prev();
+            KeyOutcome::Continue
+        }
+        KeyCode::Down => {
+            state.history_next();
             KeyOutcome::Continue
         }
         KeyCode::Char(c) => {
@@ -624,6 +738,16 @@ async fn send_prompt(
 ) -> Result<()> {
     state.push_user_line(format!("> {prompt}"));
     state.streaming = true;
+
+    // Record in-memory + persist to ~/.amaebi/history.jsonl so this
+    // prompt becomes ↑-recallable both within this session and on the
+    // next chat invocation in the same cwd.  Disk write is best-
+    // effort: a missing / locked / full history file should not break
+    // the chat itself.
+    state.record_submitted_prompt(&prompt);
+    if let Err(e) = crate::client::record_history_line(&prompt) {
+        tracing::warn!(error = %e, "failed to persist prompt to history.jsonl");
+    }
 
     let req = Request::Chat {
         prompt,
@@ -1121,5 +1245,75 @@ mod tests {
         // For "你hi好" with cursor in the middle (byte 5, after "你hi"),
         // display width is 2 (你) + 2 (hi) = 4 columns.
         assert_eq!(input_cursor_column("你hi", 80), 4);
+    }
+
+    // ── history navigation ───────────────────────────────────────
+    // ↑/↓ walk through `state.history` (oldest-first) starting from
+    // the most recent entry.  The first ↑ from a non-history input
+    // also captures the in-progress draft so ↓ past the most recent
+    // entry restores it — the same shell-style readline contract.
+
+    fn populate(history: &[&str]) -> AppState {
+        let mut s = AppState::new("sid".into(), "model".into());
+        s.history = history.iter().map(|s| s.to_string()).collect();
+        s
+    }
+
+    #[test]
+    fn history_prev_walks_back_from_most_recent() {
+        let mut s = populate(&["one", "two", "three"]);
+        let _ = handle_key(key(KeyCode::Up), &mut s);
+        assert_eq!(s.input, "three", "first ↑ shows the most recent prompt");
+        let _ = handle_key(key(KeyCode::Up), &mut s);
+        assert_eq!(s.input, "two");
+        let _ = handle_key(key(KeyCode::Up), &mut s);
+        assert_eq!(s.input, "one");
+        let _ = handle_key(key(KeyCode::Up), &mut s);
+        assert_eq!(s.input, "one", "↑ at oldest stays put");
+    }
+
+    #[test]
+    fn history_down_past_newest_restores_draft() {
+        let mut s = populate(&["one", "two"]);
+        // User had typed a half-formed draft, then started arrowing.
+        s.input = "wip".into();
+        s.input_cursor = s.input.len();
+
+        let _ = handle_key(key(KeyCode::Up), &mut s);
+        assert_eq!(s.input, "two");
+        let _ = handle_key(key(KeyCode::Up), &mut s);
+        assert_eq!(s.input, "one");
+        let _ = handle_key(key(KeyCode::Down), &mut s);
+        assert_eq!(s.input, "two");
+        let _ = handle_key(key(KeyCode::Down), &mut s);
+        assert_eq!(
+            s.input, "wip",
+            "↓ past most recent must restore the captured draft"
+        );
+        assert!(s.history_pos.is_none());
+    }
+
+    #[test]
+    fn history_up_with_empty_history_is_noop() {
+        let mut s = populate(&[]);
+        s.input = "draft".into();
+        s.input_cursor = s.input.len();
+        let _ = handle_key(key(KeyCode::Up), &mut s);
+        // Nothing to recall — input unchanged, no history mode entered.
+        assert_eq!(s.input, "draft");
+        assert!(s.history_pos.is_none());
+    }
+
+    #[test]
+    fn record_submitted_prompt_appends_and_dedups_recent() {
+        let mut s = populate(&["one"]);
+        s.record_submitted_prompt("two");
+        assert_eq!(s.history, vec!["one", "two"]);
+        // Submitting the same line back-to-back doesn't grow history.
+        s.record_submitted_prompt("two");
+        assert_eq!(s.history, vec!["one", "two"]);
+        // But submitting a non-duplicate after does grow.
+        s.record_submitted_prompt("three");
+        assert_eq!(s.history, vec!["one", "two", "three"]);
     }
 }
