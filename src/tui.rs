@@ -2081,7 +2081,18 @@ fn draw(
             // whole transcript area.
             let max_input_height = (total_area.height / 2).max(3);
             let input_inner_width = total_area.width.saturating_sub(2);
-            let input_segments = char_grid_wrap(&state.input, input_inner_width);
+            // Sanitise the entire input once per draw and use that
+            // sanitised string for wrap, render, and cursor math.
+            // Per-segment sanitisation would diverge: an escape
+            // sequence split across wrap boundaries would leave a
+            // tail like "31m" rendered on the second row, and wrap
+            // / cursor offsets computed from the raw bytes wouldn't
+            // line up with the sanitised render.  The cost of this
+            // sanitise-per-draw is paid only when input contains
+            // control bytes; the common ASCII path is essentially
+            // memcpy.
+            let sanitized_input = crate::sanitize(&state.input);
+            let input_segments = char_grid_wrap(&sanitized_input, input_inner_width);
             let input_visual_rows = input_segments.len().max(1) as u16;
             let input_height = (input_visual_rows + 2).clamp(3, max_input_height);
 
@@ -2169,24 +2180,17 @@ fn draw(
             // Line, so ratatui draws them on consecutive rows
             // verbatim.  An empty input still emits one empty Line
             // so the box renders correctly.
-            // Sanitise rendered input slices: `state.input` could
-            // hold pasted text or a recalled history entry that
-            // contains ANSI/OSC/DCS escapes, and ratatui passes
-            // cell symbols through to crossterm verbatim.  Without
-            // this filter, a malicious paste / poisoned
-            // history.jsonl could inject `ESC ]52;c;…` (clipboard
-            // write), title rewrites, or cursor-control bytes via
-            // the input box.  Sanitising at the render boundary
-            // keeps the editor logic untouched (cursor positioning,
-            // line editing) while still scrubbing the rendered
-            // bytes; per-segment so `char_grid_wrap`'s offsets
-            // still match.
+            // Render slices come from the already-sanitised
+            // `sanitized_input` so wrap offsets, rendered bytes,
+            // and the cursor walk below all agree.  See the
+            // comment near `sanitized_input = …` for why we
+            // sanitise once per draw rather than per-segment.
             let mut input_lines: Vec<Line> = Vec::with_capacity(input_segments.len().max(1));
             if input_segments.is_empty() {
                 input_lines.push(Line::from(""));
             } else {
                 for &(s, e) in &input_segments {
-                    input_lines.push(Line::from(crate::sanitize(&state.input[s..e])));
+                    input_lines.push(Line::from(sanitized_input[s..e].to_string()));
                 }
             }
             let input_para = Paragraph::new(input_lines)
