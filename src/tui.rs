@@ -180,9 +180,13 @@ pub async fn run_chat_tui(
 
     push_banner(&mut state, &cwd);
     if is_resumed {
+        // Take the first 8 *chars* (not bytes) so a non-ASCII id —
+        // `session::resolve_resume` lets opaque non-UUID strings
+        // through — can't panic the slice.  Mirrors the status-bar
+        // truncation.
+        let session_short: String = session_id.chars().take(8).collect();
         state.push_system_line(format!(
-            "[resumed] daemon will rehydrate prior turns for session {}.",
-            &session_id[..8.min(session_id.len())]
+            "[resumed] daemon will rehydrate prior turns for session {session_short}."
         ));
     }
     state.push_system_line(
@@ -2194,8 +2198,17 @@ fn draw(
             // cursor lands exactly where the renderer placed the
             // matching character.
             let inner_width = chunks[2].width.saturating_sub(2);
+            // Sanitise `typed_so_far` for cursor math too.  The
+            // rendered input runs through `crate::sanitize`, so an
+            // ANSI/OSC byte in `state.input` would be invisible on
+            // screen but still counted by `wrapped_cursor_position`,
+            // landing the cursor past the rendered character.
+            // Sanitising both halves keeps the cursor where the
+            // user's typed glyphs actually appear.
             let typed_so_far = &state.input[..state.input_cursor.min(state.input.len())];
-            let (cursor_row, cursor_col) = wrapped_cursor_position(typed_so_far, inner_width);
+            let typed_so_far_clean = crate::sanitize(typed_so_far);
+            let (cursor_row, cursor_col) =
+                wrapped_cursor_position(&typed_so_far_clean, inner_width);
             let visible_rows = chunks[2].height.saturating_sub(2);
             let cursor_row = cursor_row.min(visible_rows.saturating_sub(1));
             frame.set_cursor_position((chunks[2].x + 1 + cursor_col, chunks[2].y + 1 + cursor_row));
