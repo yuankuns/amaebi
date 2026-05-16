@@ -522,53 +522,45 @@ impl AppState {
         self.history_draft.clear();
     }
 
+    /// Push `text` as one or more transcript entries, all of `kind`.
+    /// Splits on `\n` so a multi-line block (the synthesised
+    /// `[launched]` user turn, a multi-line `format_task_released`
+    /// release block, etc.) renders as separate visual rows instead
+    /// of one mashed paragraph that the wrap logic re-flows
+    /// arbitrarily.  Single-line text takes the fast path.
+    fn push_kind_line(&mut self, kind: LineKind, text: String) {
+        if text.contains('\n') {
+            for line in text.split('\n') {
+                self.transcript.push(TranscriptLine {
+                    kind,
+                    text: line.to_string(),
+                });
+            }
+        } else {
+            self.transcript.push(TranscriptLine { kind, text });
+        }
+    }
+
     fn push_system_line(&mut self, text: String) {
-        self.transcript.push(TranscriptLine {
-            kind: LineKind::System,
-            text,
-        });
+        self.push_kind_line(LineKind::System, text);
     }
-
     fn push_user_line(&mut self, text: String) {
-        self.transcript.push(TranscriptLine {
-            kind: LineKind::User,
-            text,
-        });
+        self.push_kind_line(LineKind::User, text);
     }
-
     fn push_error_line(&mut self, text: String) {
-        self.transcript.push(TranscriptLine {
-            kind: LineKind::Error,
-            text,
-        });
+        self.push_kind_line(LineKind::Error, text);
     }
-
     fn push_tool_line(&mut self, text: String) {
-        self.transcript.push(TranscriptLine {
-            kind: LineKind::Tool,
-            text,
-        });
+        self.push_kind_line(LineKind::Tool, text);
     }
-
     fn push_compacting_line(&mut self, text: String) {
-        self.transcript.push(TranscriptLine {
-            kind: LineKind::Compacting,
-            text,
-        });
+        self.push_kind_line(LineKind::Compacting, text);
     }
-
     fn push_steer_line(&mut self, text: String) {
-        self.transcript.push(TranscriptLine {
-            kind: LineKind::Steer,
-            text,
-        });
+        self.push_kind_line(LineKind::Steer, text);
     }
-
     fn push_launch_line(&mut self, text: String) {
-        self.transcript.push(TranscriptLine {
-            kind: LineKind::Launch,
-            text,
-        });
+        self.push_kind_line(LineKind::Launch, text);
     }
 
     /// Append an assistant text chunk, continuing the previous
@@ -907,6 +899,21 @@ fn handle_response(resp: Response, state: &mut AppState) -> ResponseOutcome {
             ResponseOutcome::Continuing
         }
         Response::Done => {
+            // If the user had pressed Ctrl-C and the daemon was
+            // still mid-stream when the turn finished cleanly (LLM
+            // hit end-of-turn before our Steer landed), Done is the
+            // signal that no SteerAck is coming — the steer
+            // injection happened past the daemon's turn boundary.
+            // Clear steer mode and flush whatever buffered up while
+            // the user was typing the correction so the user sees
+            // the final output instead of being stuck in a steer
+            // prompt forever.  Order matters: clear pending FIRST
+            // so flush_steer_buffer doesn't re-buffer.
+            if state.steer_pending {
+                state.steer_pending = false;
+                state.last_ctrl_c = None;
+                flush_steer_buffer(state);
+            }
             // Score any final checklist item the model emitted
             // without a trailing newline, then reset the tracker so
             // progress from this turn doesn't leak into the next
@@ -938,6 +945,15 @@ fn handle_response(resp: Response, state: &mut AppState) -> ResponseOutcome {
             ResponseOutcome::TurnEnded
         }
         Response::Error { message } => {
+            // Same as Done: an error before SteerAck means the
+            // steer never landed.  Clear steer mode + flush so the
+            // user isn't stranded in steer-pending UI on a turn that
+            // already failed.
+            if state.steer_pending {
+                state.steer_pending = false;
+                state.last_ctrl_c = None;
+                flush_steer_buffer(state);
+            }
             state.close_open_assistant_line();
             state.push_error_line(format!("error: {message}"));
             state.streaming = false;
@@ -1043,7 +1059,45 @@ fn handle_response(resp: Response, state: &mut AppState) -> ResponseOutcome {
             state.pending_claude = None;
             ResponseOutcome::Continuing
         }
+        Response::TaskReleased {
+            pane_id,
+            resources_freed,
+            tag,
+            summary,
+            worktree_path,
+            worktree_dirty,
+            pane_tail,
+            elapsed_ms,
+        } => {
+            // Reuse classic chat's `format_task_released` so the
+            // released-pane block looks identical between the two
+            // UIs.  Push it as a green Launch-kind block — release
+            // is the inverse of /claude launch and benefits from
+            // the same visual category.  format_task_released
+            // returns a multi-line string, and `push_launch_line`
+            // through the new newline-aware path one entry per
+            // logical line.
+            let formatted = crate::client::format_task_released(
+                &pane_id,
+                &resources_freed,
+                tag.as_deref(),
+                summary.as_deref(),
+                worktree_path.as_deref(),
+                worktree_dirty,
+                &pane_tail,
+                elapsed_ms,
+            );
+            // `push_launch_line` splits on '\n' so the multi-line
+            // formatted block lands as one transcript entry per
+            // logical line.
+            state.push_launch_line(formatted);
+            ResponseOutcome::Continuing
+        }
         other => {
+            // Anything we haven't classified surfaces as a debug-
+            // dumped system line so it doesn't get silently
+            // dropped — covers daemon protocol additions we haven't
+            // wired display for yet.
             state.push_system_line(format!("[{other:?}]"));
             ResponseOutcome::Continuing
         }
@@ -1657,7 +1711,16 @@ fn push_wrapped_transcript_line(
         LineKind::Steer => Style::default().fg(Color::Yellow),
         LineKind::Launch => Style::default().fg(Color::Green),
     };
+    // Continuation rows of a multi-line block (e.g. the [released]
+    // formatted output, where each logical row was split into its
+    // own TranscriptLine entry by push_kind_line) start with leading
+    // whitespace by convention (`  pane:`, `  | tail line`, etc.).
+    // Suppress the kind glyph on those so the visual marker only
+    // appears on the leading row of the block, instead of repeating
+    // 🚀 on every line.
+    let is_continuation = tl.text.starts_with(' ') || tl.text.starts_with('\t');
     let prefix: &'static str = match tl.kind {
+        _ if is_continuation => "",
         LineKind::System => "  ",
         LineKind::Error => "! ",
         LineKind::Tool => "🔧 ",
@@ -2231,6 +2294,87 @@ mod tests {
         s.steer_pending = true;
         let outcome = handle_key(key(KeyCode::Enter), &mut s);
         assert!(matches!(outcome, KeyOutcome::CancelSteer));
+    }
+
+    #[test]
+    fn done_during_steer_pending_flushes_buffer_and_clears_mode() {
+        // Regression for the 2026-05-16 manual-test bug: if the
+        // daemon's current turn finishes (Response::Done) before
+        // our Steer reaches a turn boundary — common when the LLM
+        // emits a long text-only stream with no tools — there'll
+        // never be a SteerAck, and the user must not be stranded
+        // in steer-pending UI.  Done in steer mode must flush the
+        // buffered Text frames AND clear the steer flag.
+        let mut s = test_state();
+        s.streaming = true;
+        s.steer_pending = true;
+        let _ = handle_response(
+            Response::Text {
+                chunk: "queued during steer\n".into(),
+            },
+            &mut s,
+        );
+        assert_eq!(s.steer_buffer.len(), 1);
+        let _ = handle_response(Response::Done, &mut s);
+        assert!(!s.steer_pending);
+        assert!(!s.streaming);
+        assert!(
+            s.transcript
+                .iter()
+                .any(|tl| tl.text.contains("queued during steer")),
+            "buffered chunk must surface on Done so the user sees the final output"
+        );
+    }
+
+    #[test]
+    fn error_during_steer_pending_flushes_buffer_and_clears_mode() {
+        // Same shape as the Done test, for the error path: a turn
+        // that errors before SteerAck must still clear steer mode.
+        let mut s = test_state();
+        s.streaming = true;
+        s.steer_pending = true;
+        let _ = handle_response(
+            Response::Text {
+                chunk: "queued\n".into(),
+            },
+            &mut s,
+        );
+        let _ = handle_response(
+            Response::Error {
+                message: "bedrock blew up".into(),
+            },
+            &mut s,
+        );
+        assert!(!s.steer_pending);
+        assert!(!s.streaming);
+        assert!(
+            s.transcript.iter().any(|tl| tl.text.contains("queued")),
+            "buffered frames must flush on Error too"
+        );
+    }
+
+    #[test]
+    fn push_kind_line_splits_multiline_block() {
+        // Regression: the synthesised /claude [launched] block was
+        // getting jammed onto a single TranscriptLine, then
+        // re-flowed by ratatui's wrap into one mashed paragraph.
+        // push_kind_line now emits one entry per logical line so
+        // the wrap logic respects line boundaries.
+        let mut s = test_state();
+        s.push_user_line("> a\n\nb\n  c".to_string());
+        let kinds_and_texts: Vec<(LineKind, &str)> = s
+            .transcript
+            .iter()
+            .map(|tl| (tl.kind, tl.text.as_str()))
+            .collect();
+        assert_eq!(kinds_and_texts.len(), 4);
+        assert_eq!(kinds_and_texts[0].1, "> a");
+        assert_eq!(kinds_and_texts[1].1, "");
+        assert_eq!(kinds_and_texts[2].1, "b");
+        assert_eq!(kinds_and_texts[3].1, "  c");
+        for (kind, _) in &kinds_and_texts {
+            assert!(matches!(kind, LineKind::User));
+        }
     }
 
     #[test]

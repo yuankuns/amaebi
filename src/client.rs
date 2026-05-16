@@ -607,7 +607,7 @@ fn render_replyreview_description(pr_number: u32) -> String {
 /// consistent no matter how the release was triggered (task_done, /release,
 /// socket break in a different conn, etc.).
 #[allow(clippy::too_many_arguments)] // mirrors `Response::TaskReleased`'s fields 1:1
-fn format_task_released(
+pub(crate) fn format_task_released(
     pane_id: &str,
     resources_freed: &[String],
     tag: Option<&str>,
