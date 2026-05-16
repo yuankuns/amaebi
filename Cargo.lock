@@ -50,7 +50,7 @@ checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 
 [[package]]
 name = "amaebi"
-version = "2026.5.28"
+version = "2026.5.29"
 dependencies = [
  "agent-client-protocol",
  "anyhow",
@@ -79,6 +79,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "unicode-width 0.2.0",
  "uuid",
 ]
 
@@ -568,6 +569,7 @@ dependencies = [
  "crossterm_winapi",
  "derive_more",
  "document-features",
+ "futures-core",
  "mio",
  "parking_lot",
  "rustix",

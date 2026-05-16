@@ -230,7 +230,7 @@ fn render_markdown(text: &str) -> String {
 /// terminal escape noise.  Matches the pattern used for other stderr
 /// UI in this file (`ToolUse`, `Compacting`, the SIGINT steer banner).
 #[derive(Default)]
-struct PlanProgressTracker {
+pub(crate) struct PlanProgressTracker {
     /// Unparsed tail of the stream — at most one partial (no-newline)
     /// line at any point, since `push` drains completed lines before
     /// returning.
@@ -249,14 +249,14 @@ struct PlanProgressTracker {
 }
 
 impl PlanProgressTracker {
-    fn new(render_enabled: bool) -> Self {
+    pub(crate) fn new(render_enabled: bool) -> Self {
         Self {
             render_enabled,
             ..Default::default()
         }
     }
 
-    fn push(&mut self, chunk: &str) {
+    pub(crate) fn push(&mut self, chunk: &str) {
         self.buf.push_str(chunk);
         // Only consume up to the last newline; any trailing partial
         // line stays buffered for next push.
@@ -280,7 +280,7 @@ impl PlanProgressTracker {
     /// when the checklist is the final thing in the reply — is still
     /// counted.  Idempotent: once called, `buf` is empty, so repeated
     /// calls are no-ops.
-    fn finalize_tail(&mut self) {
+    pub(crate) fn finalize_tail(&mut self) {
         if self.buf.is_empty() {
             return;
         }
@@ -312,7 +312,7 @@ impl PlanProgressTracker {
     /// `current` (still-open run) wins over `latest` (closed run) so
     /// the displayed progress always reflects the newest plan the LLM
     /// has emitted.
-    fn latest_progress(&self) -> Option<(usize, usize)> {
+    pub(crate) fn latest_progress(&self) -> Option<(usize, usize)> {
         self.current.or(self.latest)
     }
 
@@ -388,33 +388,41 @@ impl PlanProgressTracker {
 // ---------------------------------------------------------------------------
 
 /// A task for the `/claude` command.
+///
+/// `pub(crate)` (and fields too) so the new TUI dispatch in
+/// `crate::tui` can build a `TaskSpec` and snapshot description/tag
+/// without re-implementing the parser.  Classic chat populates
+/// these fields directly via `parse_claude`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ClaudeTask {
+pub(crate) struct ClaudeTask {
     /// Short task label derived from the description.
-    tag: String,
+    pub(crate) tag: String,
     /// Task description / opening prompt.
-    description: String,
+    pub(crate) description: String,
     /// Optional absolute worktree path.
-    worktree: Option<String>,
+    pub(crate) worktree: Option<String>,
     /// Whether to auto-send Enter after injecting the command into the pane.
-    auto_enter: bool,
+    pub(crate) auto_enter: bool,
     /// Override for the client working directory used to locate the git repo
     /// when auto-creating a worktree.  Maps to TaskSpec::client_cwd.
-    cwd: Option<String>,
+    pub(crate) cwd: Option<String>,
     /// Optional tmux pane id (e.g. `"%41"`) to reuse via `--resume-pane`.
     /// Mutually exclusive with `worktree`; checked at parse time.
-    resume_pane: Option<String>,
+    pub(crate) resume_pane: Option<String>,
     /// One or more resource specs passed via `--resource`.  Each string is
     /// either a resource name (e.g. `sim-9900`) or `class:<name>` /
     /// `any:<name>` for any-idle-of-class selection.  Parsed by the daemon.
-    resources: Vec<String>,
+    pub(crate) resources: Vec<String>,
     /// Seconds to wait for busy resources.  `None` / `0` → fail fast.
-    resource_timeout_secs: Option<u64>,
+    pub(crate) resource_timeout_secs: Option<u64>,
 }
 
 /// A parsed `/release` command.
+///
+/// `pub(crate)` for the same reason as `ClaudeTask`: keep
+/// `SlashCommand`'s type-level visibility consistent.
 #[derive(Debug, PartialEq, Clone)]
-enum ReleaseCmd {
+pub(crate) enum ReleaseCmd {
     Pane {
         pane_id: String,
         clean: bool,
@@ -426,8 +434,12 @@ enum ReleaseCmd {
 }
 
 /// A parsed slash command from user input.
+///
+/// `pub(crate)` so the new TUI loop (`src/tui.rs`) can dispatch the
+/// same way the classic chat loop does, without re-implementing the
+/// parser.  The variants are still owned here.
 #[derive(Debug, PartialEq)]
-enum SlashCommand {
+pub(crate) enum SlashCommand {
     /// `/model [<name>]` — switch model or show current.
     Model(Option<String>),
     /// `/claude "task" ...` — launch parallel Claude sessions.
@@ -445,7 +457,7 @@ enum SlashCommand {
 /// Parse a slash command from user input.
 ///
 /// Returns `None` if the input is not a recognised slash command.
-fn parse_slash_command(input: &str) -> Option<SlashCommand> {
+pub(crate) fn parse_slash_command(input: &str) -> Option<SlashCommand> {
     if let Some(cmd) = parse_model(input) {
         return Some(SlashCommand::Model(cmd));
     }
@@ -595,7 +607,7 @@ fn render_replyreview_description(pr_number: u32) -> String {
 /// consistent no matter how the release was triggered (task_done, /release,
 /// socket break in a different conn, etc.).
 #[allow(clippy::too_many_arguments)] // mirrors `Response::TaskReleased`'s fields 1:1
-fn format_task_released(
+pub(crate) fn format_task_released(
     pane_id: &str,
     resources_freed: &[String],
     tag: Option<&str>,
@@ -3112,7 +3124,7 @@ async fn resolve_one_replyreview_task(pr: u32) -> Result<ClaudeTask, String> {
 /// - the error message on failure should pinpoint exactly one PR, and
 /// - `git worktree add` touches the same repo metadata; concurrent
 ///   worktree creation would risk racing on `.git/worktrees/`.
-async fn resolve_replyreview_tasks(prs: &[u32]) -> Result<Vec<ClaudeTask>, String> {
+pub(crate) async fn resolve_replyreview_tasks(prs: &[u32]) -> Result<Vec<ClaudeTask>, String> {
     let mut out = Vec::with_capacity(prs.len());
     for &pr in prs {
         out.push(resolve_one_replyreview_task(pr).await?);
@@ -3126,7 +3138,7 @@ async fn resolve_replyreview_tasks(prs: &[u32]) -> Result<Vec<ClaudeTask>, Strin
 /// on ClaudeLaunch / SupervisePanes frames.  Any IPC failure propagates
 /// as `Err` to the caller; the caller is expected to surface the error
 /// to the user and skip the launch rather than ship an empty tag.
-async fn resolve_missing_tags(
+pub(crate) async fn resolve_missing_tags(
     socket: &std::path::Path,
     tasks: &mut [ClaudeTask],
     client_cwd: &str,
@@ -3175,9 +3187,42 @@ async fn resolve_missing_tags(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Re-exports for crate::tui
+//
+// The TUI input box (src/tui.rs) reuses the prompt_input module's
+// history machinery so both UIs read and write the same
+// `~/.amaebi/history.jsonl` file.  Wrapping here rather than making
+// `prompt_input` itself pub(crate) keeps the rustyline-specific
+// internals invisible to the rest of the crate.
+// ---------------------------------------------------------------------------
+
+/// Tag the running session id so subsequent `record_history_line`
+/// calls embed it in their JSON rows.  Idempotent.  Mirrors
+/// `prompt_input::set_session_id` for the TUI path.
+pub(crate) fn set_history_session_id(id: &str) {
+    prompt_input::set_session_id(id);
+}
+
+/// Append `display` to `~/.amaebi/history.jsonl` with the
+/// canonicalised current cwd and the session id set above.  Best-
+/// effort: an io error is swallowed by the caller; we never want a
+/// missing/locked history file to break a chat session.
+pub(crate) fn record_history_line(display: &str) -> std::io::Result<()> {
+    prompt_input::append_history_line(display)
+}
+
+/// Read the history file and return every prompt whose canonical
+/// cwd matches the current working directory, oldest-first.  Used by
+/// the TUI input box for ↑/↓ navigation; the empty vec is returned
+/// when the file is missing or unreadable.
+pub(crate) fn load_cwd_history() -> Vec<String> {
+    prompt_input::load_cwd_history()
+}
+
 /// `stdin`/`stdout`/`stderr` all redirected to `/dev/null`.  Connection is
 /// then retried with exponential back-off up to ~5 seconds before giving up.
-async fn connect_or_start_daemon(socket: &std::path::Path) -> Result<UnixStream> {
+pub(crate) async fn connect_or_start_daemon(socket: &std::path::Path) -> Result<UnixStream> {
     // Happy path: daemon is already running.
     if let Ok(stream) = UnixStream::connect(socket).await {
         return Ok(stream);
@@ -3632,7 +3677,7 @@ mod prompt_input {
     /// [`append_history_line_to_path`] issues exactly one `write(2)`
     /// syscall (no retry loop) so a short write surfaces as an error
     /// rather than silently producing a split/interleaved record.
-    fn append_history_line(display: &str) -> std::io::Result<()> {
+    pub(super) fn append_history_line(display: &str) -> std::io::Result<()> {
         let path = default_history_path()?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -3732,7 +3777,36 @@ mod prompt_input {
     fn load_history_for_current_cwd(editor: &mut rustyline::DefaultEditor) -> std::io::Result<()> {
         let path = default_history_path()?;
         let cwd = cwd_for_history();
-        load_history_from_path(&path, &cwd, editor)
+        load_history_from_path(&path, &cwd, |display| {
+            // `add_history_entry` dedups the most-recent entry for us.
+            let _ = editor.add_history_entry(display);
+        })
+    }
+
+    /// Read the history file and return every row whose canonical
+    /// `cwd` matches the current process's cwd, oldest-first.
+    /// Used by the TUI input box for ↑/↓ navigation.
+    ///
+    /// `pub(super)` so `crate::tui` can call it via the
+    /// `crate::client::load_cwd_history()` re-export.  Errors are
+    /// reported as the empty vec — history is best-effort and we'd
+    /// rather start with no history than refuse to render the TUI.
+    pub(super) fn load_cwd_history() -> Vec<String> {
+        let path = match default_history_path() {
+            Ok(p) => p,
+            Err(_) => return Vec::new(),
+        };
+        let cwd = cwd_for_history();
+        let mut out: Vec<String> = Vec::new();
+        let _ = load_history_from_path(&path, &cwd, |display| {
+            // Dedup the most-recent entry the same way rustyline
+            // would — saves the user from arrowing through three
+            // identical lines they typed last week.
+            if out.last().map(String::as_str) != Some(display) {
+                out.push(display.to_string());
+            }
+        });
+        out
     }
 
     /// Testable core of [`load_history_for_current_cwd`].  Empty `cwd` is
@@ -3753,11 +3827,10 @@ mod prompt_input {
     /// entirely — we keep consuming bytes (discarded) until we find the
     /// next `\n` and then resume parsing, so one bad row doesn't lose
     /// the rest of the file.
-    fn load_history_from_path(
-        path: &Path,
-        cwd: &str,
-        editor: &mut rustyline::DefaultEditor,
-    ) -> std::io::Result<()> {
+    fn load_history_from_path<F>(path: &Path, cwd: &str, mut consume: F) -> std::io::Result<()>
+    where
+        F: FnMut(&str),
+    {
         if cwd.is_empty() {
             return Ok(());
         }
@@ -3797,7 +3870,7 @@ mod prompt_input {
                 // EOF.  Flush whatever's in `buf` as a final line iff
                 // we weren't discarding and it's non-empty.
                 if !discarding && !buf.is_empty() {
-                    try_load_row(&buf, cwd, editor);
+                    try_load_row(&buf, cwd, &mut consume);
                 }
                 break;
             }
@@ -3811,7 +3884,7 @@ mod prompt_input {
                         let copy_bytes = remaining.min(idx);
                         buf.extend_from_slice(&chunk[..copy_bytes]);
                         if copy_bytes == idx {
-                            try_load_row(&buf, cwd, editor);
+                            try_load_row(&buf, cwd, &mut consume);
                         }
                         // Else: this line exceeded READ_CAP; we filled
                         // `buf` up to the cap and now discard the rest
@@ -3855,10 +3928,19 @@ mod prompt_input {
     }
 
     /// Parse one line (already trimmed of its trailing `\n`) and feed
-    /// the resulting row to `editor` if its `cwd` matches.  All parse
-    /// errors are swallowed — malformed lines are tolerated rather
-    /// than fatal.
-    fn try_load_row(line_bytes: &[u8], cwd: &str, editor: &mut rustyline::DefaultEditor) {
+    /// the resulting row's `display` field to `consume` if the row's
+    /// `cwd` matches.  All parse errors are swallowed — malformed
+    /// lines are tolerated rather than fatal.
+    ///
+    /// `consume` is a callback so the same scanning code can drive
+    /// either rustyline's `add_history_entry` (classic chat) or a
+    /// `Vec::push` (TUI history vector).  The callback only sees the
+    /// `display` string — pasted_contents / timestamp / session_id
+    /// are not exposed because no caller has needed them yet.
+    fn try_load_row<F>(line_bytes: &[u8], cwd: &str, mut consume: F)
+    where
+        F: FnMut(&str),
+    {
         // Drop a trailing '\r' if the file has CRLF endings.
         let end = if line_bytes.last() == Some(&b'\r') {
             line_bytes.len() - 1
@@ -3874,8 +3956,7 @@ mod prompt_input {
         if row.cwd != cwd {
             return;
         }
-        // `add_history_entry` dedups the most-recent entry for us.
-        let _ = editor.add_history_entry(row.display.as_str());
+        consume(row.display.as_str());
     }
 
     /// Best-effort restore of the terminal to its pre-raw-mode state.
@@ -3971,34 +4052,13 @@ mod prompt_input {
         }
 
         // ----- persistent history -----
-
-        /// Build a fresh editor with the same config as `read_line_raw`
-        /// uses on first-init, but without `Behavior::PreferTerm` (CI has
-        /// no TTY and the config field is irrelevant for history-only
-        /// tests anyway).
-        fn test_editor() -> rustyline::DefaultEditor {
-            let config = rustyline::Config::builder()
-                .max_history_size(HISTORY_CAP)
-                .expect("max_history_size > 0")
-                .build();
-            rustyline::DefaultEditor::with_config(config).expect("editor")
-        }
-
-        /// Collect the editor's history entries oldest-first.  Uses the
-        /// `History` trait's `get(index, Forward)` since rustyline v14
-        /// does not expose an iterator on its public history trait.
-        fn collect_history(editor: &rustyline::DefaultEditor) -> Vec<String> {
-            use rustyline::history::{History as _, SearchDirection};
-            let h = editor.history();
-            let len = h.len();
-            let mut out = Vec::with_capacity(len);
-            for i in 0..len {
-                if let Ok(Some(res)) = h.get(i, SearchDirection::Forward) {
-                    out.push(res.entry.into_owned());
-                }
-            }
-            out
-        }
+        //
+        // History tests now drive `load_history_from_path` with a
+        // `Vec::push` callback instead of a real `rustyline::Editor`.
+        // The two helpers that used to bridge the editor (`test_editor`
+        // / `collect_history`) were removed when the loader was
+        // refactored to take a `FnMut(&str)` consumer so it could
+        // serve both rustyline (classic chat) and the TUI input box.
 
         #[test]
         fn history_row_json_round_trip() {
@@ -4029,9 +4089,9 @@ mod prompt_input {
                 append_history_line_to_path(&path, row).expect("append");
             }
 
-            let mut editor = test_editor();
-            load_history_from_path(&path, "/project", &mut editor).expect("load");
-            let history = collect_history(&editor);
+            let mut history: Vec<String> = Vec::new();
+            load_history_from_path(&path, "/project", |s| history.push(s.to_string()))
+                .expect("load");
             assert_eq!(history, vec!["hello".to_string(), "/model".to_string()]);
         }
 
@@ -4047,12 +4107,9 @@ mod prompt_input {
             append_history_line_to_path(&path, "{not valid json\n").unwrap();
             append_history_line_to_path(&path, &valid_b).unwrap();
 
-            let mut editor = test_editor();
-            load_history_from_path(&path, "/p", &mut editor).expect("load");
-            assert_eq!(
-                collect_history(&editor),
-                vec!["good-1".to_string(), "good-2".to_string()]
-            );
+            let mut history: Vec<String> = Vec::new();
+            load_history_from_path(&path, "/p", |s| history.push(s.to_string())).expect("load");
+            assert_eq!(history, vec!["good-1".to_string(), "good-2".to_string()]);
         }
 
         #[test]
@@ -4076,9 +4133,10 @@ mod prompt_input {
             // history.jsonl yet.  Loader must succeed silently.
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("history.jsonl");
-            let mut editor = test_editor();
-            load_history_from_path(&path, "/cwd", &mut editor).expect("missing file is ok");
-            assert!(collect_history(&editor).is_empty());
+            let mut history: Vec<String> = Vec::new();
+            load_history_from_path(&path, "/cwd", |s| history.push(s.to_string()))
+                .expect("missing file is ok");
+            assert!(history.is_empty());
         }
 
         #[test]
@@ -4103,9 +4161,8 @@ mod prompt_input {
             let tail = build_history_line("tail-marker", "", "/p", "", u64::MAX);
             append_history_line_to_path(&path, &tail).unwrap();
 
-            let mut editor = test_editor();
-            load_history_from_path(&path, "/p", &mut editor).expect("load");
-            let loaded = collect_history(&editor);
+            let mut loaded: Vec<String> = Vec::new();
+            load_history_from_path(&path, "/p", |s| loaded.push(s.to_string())).expect("load");
             assert!(
                 loaded.last().map(|s| s.as_str()) == Some("tail-marker"),
                 "tail must be the last entry, got {:?}",
