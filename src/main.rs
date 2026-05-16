@@ -126,8 +126,10 @@ async fn main() -> Result<()> {
                 None
             };
             // `--tui` routes to the experimental split-screen UI
-            // (src/tui.rs).  Only a minimal loop is wired up today;
-            // without the flag we keep the classic line-based chat
+            // (src/tui.rs) — feature-complete for day-to-day use
+            // (slash commands, steer, --resume, history,
+            // scrollback, plan progress, inline markdown).
+            // Without the flag we keep the classic line-based chat
             // entirely untouched so nothing changes for default users.
             let result = if tui {
                 tui::run_chat_tui(socket, prompt, model, resumed).await
@@ -168,7 +170,7 @@ async fn main() -> Result<()> {
 /// String sequences (OSC/DCS/APC/PM) are terminated by BEL (0x07) or
 /// ST (`ESC \`).  This prevents stored user/assistant text from
 /// manipulating the terminal.
-fn sanitize(s: &str) -> String {
+pub(crate) fn sanitize(s: &str) -> String {
     enum State {
         Normal,
         Esc,

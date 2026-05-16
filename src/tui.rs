@@ -50,13 +50,10 @@
 //! - PgUp / PgDn scrollback inside the transcript.  Title bar
 //!   shows "↑ N rows from tail" while pinned; PgDn down to 0 (or
 //!   keep pressing) returns to follow-tail.
-//!
-//! Still on the to-do list (will land in subsequent commits on this
-//! same branch):
-//!
-//! - `/release` (recognised but parked behind a "not yet wired"
-//!   message; classic chat covers it for now).
-//! - Markdown rendering — assistant text is emitted verbatim.
+//! - `/release` (full release flow, same as classic chat).
+//! - Inline markdown rendering: backticks → `Code` style, `**bold**`,
+//!   `*italic*` / `_italic_`, plus heading-level prefixes for `# `,
+//!   `## `, `### `.
 
 use std::collections::VecDeque;
 use std::io::stdout;
@@ -297,8 +294,13 @@ enum SteerSource {
     /// already shipped, so cancel is a local-only operation.
     UserCtrlC,
     /// Daemon emitted `Response::WaitingForInput` — the daemon's
-    /// reply consumer is parked waiting for input, so cancel needs
-    /// to explicitly ship `Request::Interrupt` to unblock it.
+    /// reply consumer is parked waiting for the user's typed
+    /// reply.  A bare `Request::Interrupt` does NOT unblock it
+    /// (daemon explicitly ignores interrupts in that loop, see
+    /// `daemon.rs` "interrupt ignored while waiting for question
+    /// reply"); the only way out is a real Steer message, a
+    /// disconnect, or the daemon's 300s timeout.  `cancel_steer`
+    /// therefore leaves `steer_pending` set and just shows a hint.
     DaemonWaitingForInput,
 }
 
@@ -562,6 +564,14 @@ impl AppState {
     /// of one mashed paragraph that the wrap logic re-flows
     /// arbitrarily.  Single-line text takes the fast path.
     fn push_kind_line(&mut self, kind: LineKind, text: String) {
+        // Strip ANSI/VT escapes and other control characters before
+        // the text reaches the transcript.  ratatui passes our cell
+        // contents through to crossterm verbatim, so an unsanitised
+        // ESC `]52;c;…` from model output, tool detail, or pasted
+        // input would manipulate the host terminal (clipboard,
+        // window title, cursor state, etc.).  Same `sanitize` helper
+        // the classic CLI uses for stderr/stdout.
+        let text = crate::sanitize(&text);
         if text.contains('\n') {
             for line in text.split('\n') {
                 self.transcript.push(TranscriptLine {
@@ -599,9 +609,14 @@ impl AppState {
     /// Append an assistant text chunk, continuing the previous
     /// assistant line if it was left "open" (no trailing newline).
     fn push_assistant_chunk(&mut self, chunk: &str) {
-        // Split off any trailing newlines so we can correctly track
-        // which line is still open for the next chunk to append to.
-        let mut remaining = chunk;
+        // Strip ANSI/VT escapes from each chunk before it lands in
+        // the transcript — see `push_kind_line` for the rationale.
+        // Sanitising per-chunk can in theory split an escape across
+        // chunks; in practice model SSE chunks are line-oriented so
+        // this is fine, and the alternative (buffering until newline)
+        // would defeat streaming.
+        let sanitized = crate::sanitize(chunk);
+        let mut remaining = sanitized.as_str();
         loop {
             match remaining.find('\n') {
                 Some(idx) => {
@@ -705,7 +720,37 @@ fn handle_key(key: KeyEvent, state: &mut AppState) -> KeyOutcome {
         KeyCode::Char('c') if ctrl => {
             if state.streaming {
                 if state.steer_pending {
-                    // Second Ctrl-C while still pending → exit.
+                    // Two cases here:
+                    //
+                    // - `UserCtrlC` armed the steer.  The user's
+                    //   first Ctrl-C (which armed it) already
+                    //   committed to wanting out, so a second
+                    //   press is a real exit gesture — fall
+                    //   straight through.
+                    //
+                    // - `DaemonWaitingForInput` armed it.  The
+                    //   user never pressed Ctrl-C before this
+                    //   one; bailing on a single press would be
+                    //   surprising (and would silently drop the
+                    //   model's open question).  Require the
+                    //   same double-press window the idle path
+                    //   uses, with the same hint, so the gesture
+                    //   is symmetrical between idle and
+                    //   daemon-armed-steer states.
+                    if state.steer_source == SteerSource::DaemonWaitingForInput {
+                        if let Some(prev) = state.last_ctrl_c {
+                            if now.duration_since(prev) <= DOUBLE_CTRLC_WINDOW {
+                                return KeyOutcome::Exit;
+                            }
+                        }
+                        state.last_ctrl_c = Some(now);
+                        if state.transcript.last().map(|tl| tl.text.as_str())
+                            != Some(CTRLC_EXIT_HINT)
+                        {
+                            state.push_system_line(CTRLC_EXIT_HINT.to_string());
+                        }
+                        return KeyOutcome::Continue;
+                    }
                     return KeyOutcome::Exit;
                 }
                 state.last_ctrl_c = Some(now);
@@ -912,12 +957,13 @@ fn next_char_boundary(s: &str, idx: usize) -> usize {
 /// inside this synchronous handler.
 fn handle_response(resp: Response, state: &mut AppState) -> ResponseOutcome {
     // While the user is typing a steer correction, buffer streaming-
-    // content frames (Text / ToolUse / Compacting / WaitingForInput)
-    // so they don't fight the steer prompt for screen real estate.
-    // Control frames (Done / Error / SteerAck / ModelSwitched /
-    // PaneAssigned / CapacityError) bypass the buffer because they
-    // change the steer-pending state itself or carry information the
-    // user needs to see immediately.
+    // content frames (Text / ToolUse / Compacting — see
+    // `is_buffered_frame`) so they don't fight the steer prompt for
+    // screen real estate.  Control / state-changing frames (Done /
+    // Error / SteerAck / ModelSwitched / PaneAssigned /
+    // CapacityError / WaitingForInput) bypass the buffer because
+    // they either change the steer-pending state itself or carry
+    // information the user needs to see immediately.
     if state.steer_pending && is_buffered_frame(&resp) {
         if state.steer_buffer.len() >= STEER_BUFFER_MAX_FRAMES {
             // Evict oldest first so the freshest output survives.
@@ -1063,6 +1109,14 @@ fn handle_response(resp: Response, state: &mut AppState) -> ResponseOutcome {
             // (or Done if the LLM aborts) clears the flag.
             // streaming stays true so the input title shows the
             // steer prompt instead of "input (Enter to send…)".
+            //
+            // If steer is ALREADY pending — e.g. the user pressed
+            // Ctrl-C and is mid-correction when the model also
+            // emits a question — preserve the existing buffer and
+            // source.  Wiping them would lose any frames already
+            // captured during the user-armed steer (matches the
+            // classic chat path which buffers WaitingForInput in
+            // that case instead of re-arming).
             if !prompt.is_empty() {
                 state.push_steer_line(prompt);
             } else {
@@ -1070,10 +1124,12 @@ fn handle_response(resp: Response, state: &mut AppState) -> ResponseOutcome {
                     "model is waiting for your reply — type and Enter".to_string(),
                 );
             }
-            state.steer_pending = true;
-            state.steer_source = SteerSource::DaemonWaitingForInput;
-            state.steer_buffer.clear();
-            state.steer_buffer_truncated = false;
+            if !state.steer_pending {
+                state.steer_pending = true;
+                state.steer_source = SteerSource::DaemonWaitingForInput;
+                state.steer_buffer.clear();
+                state.steer_buffer_truncated = false;
+            }
             ResponseOutcome::Continuing
         }
         Response::PaneAssigned {
@@ -3020,14 +3076,42 @@ mod tests {
 
     #[test]
     fn second_ctrl_c_while_steer_pending_exits() {
-        // Second Ctrl-C while steer is already armed exits — matches
-        // classic chat's escape hatch when the user changes their
-        // mind mid-correction.
+        // Second Ctrl-C while steer is already armed by Ctrl-C
+        // exits — the user's first press already committed to
+        // wanting out, so the second is a real exit.
         let mut s = test_state();
         s.streaming = true;
         s.steer_pending = true;
+        s.steer_source = SteerSource::UserCtrlC;
         let outcome = handle_key(ctrl_key('c'), &mut s);
         assert!(matches!(outcome, KeyOutcome::Exit));
+    }
+
+    #[test]
+    fn ctrl_c_when_daemon_waiting_steer_armed_requires_double_press() {
+        // When steer was armed by Response::WaitingForInput (not by
+        // a user Ctrl-C), the user has NOT pressed Ctrl-C before.
+        // The first Ctrl-C must therefore behave like the idle
+        // empty-input case (arm double-press window + show hint),
+        // not like a "second press" exit.  A second press inside
+        // the window finally exits.
+        let mut s = test_state();
+        s.streaming = true;
+        s.steer_pending = true;
+        s.steer_source = SteerSource::DaemonWaitingForInput;
+
+        let first = handle_key(ctrl_key('c'), &mut s);
+        assert!(matches!(first, KeyOutcome::Continue));
+        assert!(s.last_ctrl_c.is_some());
+        assert_eq!(s.transcript.last().unwrap().text, CTRLC_EXIT_HINT);
+        assert!(
+            s.steer_pending,
+            "first Ctrl-C must not silently disarm steer mode"
+        );
+
+        // Second press while last_ctrl_c is still fresh → Exit.
+        let second = handle_key(ctrl_key('c'), &mut s);
+        assert!(matches!(second, KeyOutcome::Exit));
     }
 
     #[test]
