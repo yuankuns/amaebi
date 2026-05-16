@@ -48,14 +48,23 @@ async fn main() -> Result<()> {
     // Print a bell notification if there are unread cron reports.
     // Shown only for user-facing commands; silently skipped if the inbox db
     // does not exist yet (no cron tasks have ever run).
-    if matches!(
-        &cli.command,
-        cli::Command::Ask { .. }
-            | cli::Command::Chat { .. }
-            | cli::Command::Session { .. }
-            | cli::Command::Memory { .. }
-            | cli::Command::Cache { .. }
-    ) {
+    //
+    // SKIP for `chat --tui`: the eprintln would run before the TUI
+    // enters alt-screen, so the notification is then cleared by the
+    // first ratatui draw — invisible.  The TUI path re-emits the
+    // count itself via push_inbox_notification() into the
+    // transcript, where it survives.
+    let is_chat_tui = matches!(&cli.command, cli::Command::Chat { tui: true, .. });
+    if !is_chat_tui
+        && matches!(
+            &cli.command,
+            cli::Command::Ask { .. }
+                | cli::Command::Chat { .. }
+                | cli::Command::Session { .. }
+                | cli::Command::Memory { .. }
+                | cli::Command::Cache { .. }
+        )
+    {
         print_inbox_notification();
     }
 
@@ -293,27 +302,42 @@ async fn run_memory(action: cli::MemoryAction, socket: std::path::PathBuf) -> Re
 /// Silently no-ops if the inbox database does not yet exist or cannot be read,
 /// so a cold-start installation never creates dotfiles just from running `amaebi ask`.
 fn print_inbox_notification() {
+    if let Some(n) = unread_cron_count() {
+        let noun = if n == 1 { "report" } else { "reports" };
+        eprintln!("[🔔 You have {n} unread cron {noun}. Run `amaebi inbox list` to read.]");
+    }
+}
+
+/// Returns the number of unread cron reports, or `None` if there are
+/// none / the inbox db doesn't exist / a read error happened.  Used
+/// by both the classic banner path (via `print_inbox_notification`
+/// on stderr) and the TUI banner path (rendered into the transcript
+/// so it survives the alt-screen switch).
+pub(crate) fn unread_cron_count() -> Option<usize> {
     // Only open the DB if it already exists — avoids creating inbox.db on cold start.
     let db_path = match inbox::db_path() {
         Ok(p) => p,
         Err(e) => {
             tracing::debug!(error = %e, "could not resolve inbox db path for notification");
-            return;
+            return None;
         }
     };
     if !db_path.exists() {
-        return;
+        return None;
     }
     match inbox::InboxStore::open() {
         Ok(store) => match store.unread_count() {
-            Ok(0) => {}
-            Ok(n) => {
-                let noun = if n == 1 { "report" } else { "reports" };
-                eprintln!("[🔔 You have {n} unread cron {noun}. Run `amaebi inbox list` to read.]");
+            Ok(0) => None,
+            Ok(n) => Some(n),
+            Err(e) => {
+                tracing::debug!(error = %e, "could not check inbox unread count");
+                None
             }
-            Err(e) => tracing::debug!(error = %e, "could not check inbox unread count"),
         },
-        Err(e) => tracing::debug!(error = %e, "could not open inbox store for notification"),
+        Err(e) => {
+            tracing::debug!(error = %e, "could not open inbox store for notification");
+            None
+        }
     }
 }
 

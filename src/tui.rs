@@ -1265,6 +1265,19 @@ fn push_banner(state: &mut AppState, cwd: &std::path::Path) {
     state.push_system_line(format!("  session  {}", state.session_id));
     state.push_system_line(format!("  cwd      {}", cwd.display()));
     state.push_system_line(String::new());
+
+    // Re-emit the unread cron-report bell — the eprintln in main.rs
+    // gets cleared by the alt-screen flip in TUI mode (suppressed at
+    // the call site for that reason).  Rendering it as a transcript
+    // line keeps the notification visible above the input box until
+    // it scrolls off naturally.
+    if let Some(n) = crate::unread_cron_count() {
+        let noun = if n == 1 { "report" } else { "reports" };
+        state.push_steer_line(format!(
+            "🔔 You have {n} unread cron {noun}. Run `amaebi inbox list` to read."
+        ));
+        state.push_system_line(String::new());
+    }
 }
 
 async fn send_prompt(
