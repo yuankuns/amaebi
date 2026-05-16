@@ -1359,58 +1359,71 @@ enum ResponseOutcome {
 /// module.  Keeping a small bespoke version here is the lower-risk
 /// path while feat/tui is still being shaped.
 fn push_banner(state: &mut AppState, cwd: &std::path::Path) {
-    const LOGO: &str = "  ╔═╗╔╦╗╔═╗╔═╗╔╗ ╦
+    // Honour the same opt-out the classic chat path honours:
+    // `AMAEBI_NO_BANNER=1` suppresses the logo + version block.
+    // Reuse `crate::banner::should_show()` so any future tweak
+    // (e.g. detect non-tty) applies to both UIs.  The unread
+    // cron-bell still surfaces unconditionally below — that's a
+    // notification, not chrome, and `eprintln` in `main.rs`
+    // skips it under `--tui` because the alt-screen flip would
+    // erase it.
+    if crate::banner::should_show() {
+        const LOGO: &str = "  ╔═╗╔╦╗╔═╗╔═╗╔╗ ╦
   ╠═╣║║║╠═╣║╣ ╠╩╗║
   ╩ ╩╩ ╩╩ ╩╚═╝╚═╝╩";
-    for line in LOGO.lines() {
-        state.push_system_line(line.to_string());
-    }
-
-    let version = env!("CARGO_PKG_VERSION");
-    let commit = env!("AMAEBI_GIT_COMMIT");
-    let sandbox = match std::env::var("AMAEBI_SANDBOX").as_deref() {
-        Ok("docker") => {
-            let image = std::env::var("AMAEBI_SANDBOX_IMAGE")
-                .unwrap_or_else(|_| "amaebi-sandbox:bookworm-slim".to_string());
-            format!("docker ({image})")
+        for line in LOGO.lines() {
+            state.push_system_line(line.to_string());
         }
-        _ => "off".to_string(),
-    };
-    // Resolve user aliases the same way the classic banner does so
-    // /model output and the banner agree on what the daemon will see.
-    let user_aliases = crate::config::Config::load().model_aliases;
-    let spec = crate::provider::resolve_with_aliases(&state.model, &user_aliases);
-    let model_display =
-        if state.model.starts_with("copilot/") || state.model.starts_with("bedrock/") {
-            state.model.clone()
-        } else if let Some(target) = user_aliases
-            .get(state.model.trim_end_matches("[1m]"))
-            .filter(|_| {
-                !crate::provider::is_builtin_bedrock_alias(state.model.trim_end_matches("[1m]"))
-            })
-        {
-            let needs_1m = state.model.ends_with("[1m]") && !target.ends_with("[1m]");
-            if needs_1m {
-                format!("{} → {}[1m]", state.model, target)
-            } else {
-                format!("{} → {}", state.model, target)
-            }
-        } else {
-            format!("{}/{}", spec.provider, state.model)
-        };
 
-    state.push_system_line(format!("  version  {version} ({commit})"));
-    state.push_system_line(format!("  model    {model_display}"));
-    state.push_system_line(format!("  sandbox  {sandbox}"));
-    state.push_system_line(format!("  session  {}", state.session_id));
-    state.push_system_line(format!("  cwd      {}", cwd.display()));
-    state.push_system_line(String::new());
+        let version = env!("CARGO_PKG_VERSION");
+        let commit = env!("AMAEBI_GIT_COMMIT");
+        let sandbox = match std::env::var("AMAEBI_SANDBOX").as_deref() {
+            Ok("docker") => {
+                let image = std::env::var("AMAEBI_SANDBOX_IMAGE")
+                    .unwrap_or_else(|_| "amaebi-sandbox:bookworm-slim".to_string());
+                format!("docker ({image})")
+            }
+            _ => "off".to_string(),
+        };
+        // Resolve user aliases the same way the classic banner does
+        // so /model output and the banner agree on what the daemon
+        // will see.
+        let user_aliases = crate::config::Config::load().model_aliases;
+        let spec = crate::provider::resolve_with_aliases(&state.model, &user_aliases);
+        let model_display =
+            if state.model.starts_with("copilot/") || state.model.starts_with("bedrock/") {
+                state.model.clone()
+            } else if let Some(target) = user_aliases
+                .get(state.model.trim_end_matches("[1m]"))
+                .filter(|_| {
+                    !crate::provider::is_builtin_bedrock_alias(state.model.trim_end_matches("[1m]"))
+                })
+            {
+                let needs_1m = state.model.ends_with("[1m]") && !target.ends_with("[1m]");
+                if needs_1m {
+                    format!("{} → {}[1m]", state.model, target)
+                } else {
+                    format!("{} → {}", state.model, target)
+                }
+            } else {
+                format!("{}/{}", spec.provider, state.model)
+            };
+
+        state.push_system_line(format!("  version  {version} ({commit})"));
+        state.push_system_line(format!("  model    {model_display}"));
+        state.push_system_line(format!("  sandbox  {sandbox}"));
+        state.push_system_line(format!("  session  {}", state.session_id));
+        state.push_system_line(format!("  cwd      {}", cwd.display()));
+        state.push_system_line(String::new());
+    }
 
     // Re-emit the unread cron-report bell — the eprintln in main.rs
     // gets cleared by the alt-screen flip in TUI mode (suppressed at
     // the call site for that reason).  Rendering it as a transcript
     // line keeps the notification visible above the input box until
-    // it scrolls off naturally.
+    // it scrolls off naturally.  Independent of the banner opt-out:
+    // missing a notification because the user disabled the logo
+    // would be surprising.
     if let Some(n) = crate::unread_cron_count() {
         let noun = if n == 1 { "report" } else { "reports" };
         state.push_steer_line(format!(
