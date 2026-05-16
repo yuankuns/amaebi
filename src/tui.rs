@@ -43,15 +43,16 @@
 //! - Plan progress: shares the parser from PR #157, surfaces the
 //!   live `[plan N/M done]` count in the input box title and pins
 //!   the final state into the transcript on Done.
+//! - Per-kind transcript colour + glyph: ToolUse magenta with a
+//!   per-tool glyph (📄 read / ✏️ edit / ⌨️ tmux / 🔧 generic),
+//!   Compacting yellow with ⏳, Steer yellow with ↳, Launch
+//!   (PaneAssigned) green with 🚀, errors red with `!`.
 //!
 //! Still on the to-do list (will land in subsequent commits on this
 //! same branch):
 //!
 //! - `/release` (recognised but parked behind a "not yet wired"
 //!   message; classic chat covers it for now).
-//! - Plan progress indicator (`[plan N/M done]`).
-//! - Tool-notice colour styling (`ToolUse`, `Compacting`,
-//!   `WaitingForInput` are currently rendered as plain `[…]` lines).
 //! - Markdown rendering — assistant text is emitted verbatim.
 //! - TUI-internal scrollback (PgUp / mouse wheel); we always follow
 //!   the tail of the transcript.
@@ -276,10 +277,15 @@ pub async fn run_chat_tui(
 // ---------------------------------------------------------------------------
 
 /// Where a transcript line originated from — controls colour / prefix.
+///
+/// We deliberately keep the variant set compact: each one maps to a
+/// distinct (style, prefix-glyph) pair in `push_wrapped_transcript_line`,
+/// and a richer set is more visual noise than information.  Anything
+/// that doesn't fit one of the named buckets goes through `System`.
 #[derive(Clone, Copy)]
 enum LineKind {
-    /// Anything amaebi wants to show that isn't model output — greeting,
-    /// `[tool] ...` notices, compaction banners, etc.
+    /// Default amaebi metadata — greeting, banner, model switches,
+    /// session announcements, anything not specifically classified.
     System,
     /// A user prompt we just submitted.  Rendered in a distinct colour
     /// so the transcript is readable when scrolling.
@@ -288,8 +294,21 @@ enum LineKind {
     /// not end in a newline, so the next text delta should continue
     /// this line rather than start a new one.
     Assistant { is_open: bool },
-    /// Hard errors from the daemon or protocol.
+    /// Hard errors from the daemon or protocol.  Red `! ` prefix.
     Error,
+    /// `Response::ToolUse` notices.  Per-tool glyph + magenta tint to
+    /// distinguish tool activity from model text and from amaebi's
+    /// own system breadcrumbs.
+    Tool,
+    /// `Response::Compacting` background work.  Yellow.
+    Compacting,
+    /// Steer breadcrumbs ("[steer] type a correction…", etc.).
+    /// Yellow + `↳` glyph so the user can spot the steer mode change
+    /// at a glance.
+    Steer,
+    /// `Response::PaneAssigned` and the synthesised `[launched]`
+    /// announcement — green so successful launches stand out.
+    Launch,
 }
 
 struct TranscriptLine {
@@ -503,6 +522,34 @@ impl AppState {
     fn push_error_line(&mut self, text: String) {
         self.transcript.push(TranscriptLine {
             kind: LineKind::Error,
+            text,
+        });
+    }
+
+    fn push_tool_line(&mut self, text: String) {
+        self.transcript.push(TranscriptLine {
+            kind: LineKind::Tool,
+            text,
+        });
+    }
+
+    fn push_compacting_line(&mut self, text: String) {
+        self.transcript.push(TranscriptLine {
+            kind: LineKind::Compacting,
+            text,
+        });
+    }
+
+    fn push_steer_line(&mut self, text: String) {
+        self.transcript.push(TranscriptLine {
+            kind: LineKind::Steer,
+            text,
+        });
+    }
+
+    fn push_launch_line(&mut self, text: String) {
+        self.transcript.push(TranscriptLine {
+            kind: LineKind::Launch,
             text,
         });
     }
@@ -877,11 +924,19 @@ fn handle_response(resp: Response, state: &mut AppState) -> ResponseOutcome {
             ResponseOutcome::TurnEnded
         }
         Response::ToolUse { name, detail } => {
-            state.push_system_line(format!("[{name}] {detail}"));
+            // Render the tool name + detail as a single transcript
+            // line; the magenta colour + 🔧 glyph in
+            // `push_wrapped_transcript_line` make it stand out from
+            // model text and amaebi metadata.  We mirror classic
+            // chat's tool→glyph mapping where it adds extra signal
+            // (read/edit/tmux), and fall back to the generic 🔧
+            // for everything else by leaving the kind-level glyph
+            // alone.
+            state.push_tool_line(format!("{} {detail}", tool_label(&name)));
             ResponseOutcome::Continuing
         }
         Response::Compacting => {
-            state.push_system_line("[compacting conversation…]".to_string());
+            state.push_compacting_line("compacting conversation history…".to_string());
             ResponseOutcome::Continuing
         }
         Response::SteerAck => {
@@ -893,7 +948,7 @@ fn handle_response(resp: Response, state: &mut AppState) -> ResponseOutcome {
             // FIRST or it'll re-buffer everything we just popped.
             state.steer_pending = false;
             state.last_ctrl_c = None;
-            state.push_system_line("[steer acknowledged]".to_string());
+            state.push_steer_line("steer acknowledged".to_string());
             flush_steer_buffer(state);
             ResponseOutcome::Continuing
         }
@@ -926,7 +981,7 @@ fn handle_response(resp: Response, state: &mut AppState) -> ResponseOutcome {
             } else {
                 format!(" resources={}", resources.join(","))
             };
-            state.push_system_line(format!("[pane {pane_id}] tag={tag}{resources_blurb}"));
+            state.push_launch_line(format!("pane {pane_id}: tag={tag}{resources_blurb}"));
             // Buffer for the supervision prompt synthesised on Done.
             // If the user typed /claude but no pending state was set
             // (shouldn't happen on this path), defensively skip the
@@ -965,6 +1020,26 @@ fn handle_response(resp: Response, state: &mut AppState) -> ResponseOutcome {
             state.push_system_line(format!("[{other:?}]"));
             ResponseOutcome::Continuing
         }
+    }
+}
+
+/// Pretty-print a tool name as a short, distinctive label that
+/// distinguishes the most-common tools at a glance.  Mirrors classic
+/// chat's emoji choices (run_chat_loop's ToolUse handler) for read /
+/// edit / shell / tmux variants; everything else falls back to the
+/// plain tool name (the kind-level 🔧 prefix carries the "tool"
+/// signal).  Returning a String avoids forcing static lifetimes on
+/// the tool-name dispatch.
+fn tool_label(tool: &str) -> String {
+    match tool {
+        "shell_command" => "$".to_string(),
+        "read_file" => "📄 read".to_string(),
+        "edit_file" => "✏️  edit".to_string(),
+        "tmux_send_text" => "⌨️  send-text".to_string(),
+        "tmux_send_key" => "⌨️  send-key".to_string(),
+        "tmux_capture_pane" => "🖥️  capture".to_string(),
+        "tmux_wait" => "⏸️  wait".to_string(),
+        other => other.to_string(),
     }
 }
 
@@ -1109,8 +1184,8 @@ async fn send_interrupt_and_arm_steer(
     state.steer_pending = true;
     state.steer_buffer.clear();
     state.steer_buffer_truncated = false;
-    state.push_system_line(
-        "[steer] type a correction and press Enter, empty Enter to cancel, \
+    state.push_steer_line(
+        "type a correction and press Enter, empty Enter to cancel, \
          Ctrl-C again to exit"
             .to_string(),
     );
@@ -1164,7 +1239,7 @@ fn cancel_steer(state: &mut AppState) {
     // `state.steer_pending`).
     state.steer_pending = false;
     state.last_ctrl_c = None;
-    state.push_system_line("[steer cancelled]".to_string());
+    state.push_steer_line("steer cancelled".to_string());
     flush_steer_buffer(state);
 }
 
@@ -1180,8 +1255,8 @@ fn cancel_steer(state: &mut AppState) {
 /// arrange that ordering.
 fn flush_steer_buffer(state: &mut AppState) {
     if state.steer_buffer_truncated {
-        state.push_system_line(format!(
-            "[steer] buffer truncated — dropped older frames past {STEER_BUFFER_MAX_FRAMES}"
+        state.push_steer_line(format!(
+            "buffer truncated — dropped older frames past {STEER_BUFFER_MAX_FRAMES}"
         ));
         state.steer_buffer_truncated = false;
     }
@@ -1529,10 +1604,18 @@ fn push_wrapped_transcript_line(
             .add_modifier(Modifier::BOLD),
         LineKind::Assistant { .. } => Style::default(),
         LineKind::Error => Style::default().fg(Color::Red),
+        LineKind::Tool => Style::default().fg(Color::Magenta),
+        LineKind::Compacting => Style::default().fg(Color::Yellow),
+        LineKind::Steer => Style::default().fg(Color::Yellow),
+        LineKind::Launch => Style::default().fg(Color::Green),
     };
     let prefix: &'static str = match tl.kind {
         LineKind::System => "  ",
         LineKind::Error => "! ",
+        LineKind::Tool => "🔧 ",
+        LineKind::Compacting => "⏳ ",
+        LineKind::Steer => "↳ ",
+        LineKind::Launch => "🚀 ",
         LineKind::User | LineKind::Assistant { .. } => "",
     };
 
@@ -2138,6 +2221,64 @@ mod tests {
         let alpha_pos = texts.iter().position(|t| t.contains("alpha")).unwrap();
         let beta_pos = texts.iter().position(|t| t.contains("beta")).unwrap();
         assert!(alpha_pos < beta_pos, "alpha must precede beta");
+    }
+
+    #[test]
+    fn tool_label_specialises_known_tools() {
+        // Read / edit / shell / tmux pick up distinctive glyphs that
+        // make the tool obvious without reading the detail string.
+        assert!(tool_label("read_file").contains("📄"));
+        assert!(tool_label("edit_file").contains("✏"));
+        assert!(tool_label("tmux_send_text").contains("send-text"));
+        assert!(tool_label("tmux_capture_pane").contains("capture"));
+        // Unknown tool falls back to its bare name; the kind-level
+        // 🔧 prefix in `push_wrapped_transcript_line` carries the
+        // tool signal.
+        assert_eq!(tool_label("some_other_tool"), "some_other_tool");
+    }
+
+    #[test]
+    fn handle_response_routes_tool_use_to_tool_kind() {
+        // Regression guard: a refactor must keep ToolUse on the
+        // magenta + 🔧 path rather than dropping it back into the
+        // generic dim-grey System bucket.
+        let mut s = test_state();
+        s.streaming = true;
+        let _ = handle_response(
+            Response::ToolUse {
+                name: "read_file".into(),
+                detail: "src/foo.rs".into(),
+            },
+            &mut s,
+        );
+        let last = s.transcript.last().unwrap();
+        assert!(matches!(last.kind, LineKind::Tool));
+        assert!(last.text.contains("src/foo.rs"));
+        assert!(last.text.contains("📄"));
+    }
+
+    #[test]
+    fn handle_response_routes_pane_assigned_to_launch_kind() {
+        let mut s = test_state();
+        s.pending_claude = Some(PendingClaudeLaunch {
+            descriptions: [("t".to_string(), "desc".to_string())]
+                .into_iter()
+                .collect(),
+            launched: Vec::new(),
+        });
+        let _ = handle_response(
+            Response::PaneAssigned {
+                tag: "t".into(),
+                pane_id: "%41".into(),
+                session_id: "sid".into(),
+                worktree: None,
+                resources: vec!["sim-9900".into()],
+            },
+            &mut s,
+        );
+        let last = s.transcript.last().unwrap();
+        assert!(matches!(last.kind, LineKind::Launch));
+        assert!(last.text.contains("%41"));
     }
 
     #[test]
