@@ -3174,6 +3174,43 @@ mod tests {
     }
 
     #[test]
+    fn handle_response_routes_compacting_to_compacting_kind() {
+        // Daemon-side compaction signal — yellow + ⏳ in the
+        // transcript so the user knows a background summarisation
+        // ran (typically silent otherwise).  Covered here rather
+        // than via live test because triggering compaction needs
+        // a low AMAEBI_COMPACTION_THRESHOLD on a daemon restart.
+        let mut s = test_state();
+        s.streaming = true;
+        let _ = handle_response(Response::Compacting, &mut s);
+        let last = s.transcript.last().unwrap();
+        assert!(matches!(last.kind, LineKind::Compacting));
+        assert!(last.text.contains("compacting"));
+    }
+
+    #[test]
+    fn handle_response_routes_model_switched_updates_state() {
+        // Daemon-side `switch_model` tool fires Response::ModelSwitched.
+        // The TUI must mirror that to state.model so the next
+        // outgoing Request::Chat carries the new value, and the
+        // status bar reflects it on the next draw.
+        let mut s = test_state();
+        s.streaming = true;
+        let prev = s.model.clone();
+        let _ = handle_response(
+            Response::ModelSwitched {
+                model: "bedrock/claude-opus-4.7[1m]".to_string(),
+            },
+            &mut s,
+        );
+        assert_eq!(s.model, "bedrock/claude-opus-4.7[1m]");
+        assert_ne!(s.model, prev);
+        let last = s.transcript.last().unwrap();
+        assert!(matches!(last.kind, LineKind::System));
+        assert!(last.text.contains("model switched"));
+    }
+
+    #[test]
     fn handle_response_routes_pane_assigned_to_launch_kind() {
         let mut s = test_state();
         s.pending_claude = Some(PendingClaudeLaunch {
