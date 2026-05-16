@@ -1646,6 +1646,61 @@ async fn launch_claude_tasks(
     Ok(())
 }
 
+/// Render the dim one-row status bar between transcript and input.
+/// Layout: `model · cwd · session-prefix` truncated/elided to fit
+/// `width` so it never wraps.  When the row is too narrow even for
+/// the model name alone, just truncate to width with an ellipsis;
+/// the user can scroll the banner via PgUp to recover full info.
+fn render_status_bar(state: &AppState, width: u16) -> Paragraph<'static> {
+    let cwd_short = shorten_cwd(&state.cwd_str);
+    let session_short = &state.session_id[..8.min(state.session_id.len())];
+    let full = format!("{}  ·  {}  ·  {}", state.model, cwd_short, session_short);
+    let elided = elide_to_width(&full, width as usize);
+    Paragraph::new(Line::from(Span::styled(
+        elided,
+        Style::default().fg(Color::DarkGray),
+    )))
+}
+
+/// Replace a leading `$HOME` with `~` so the status bar fits in the
+/// common case (e.g. `~/.amaebi/worktrees/dev/tui-chat` rather than
+/// the full `/home/yuankuns/...`).  Falls back to the raw string if
+/// HOME isn't set or the cwd is outside it.
+fn shorten_cwd(cwd: &str) -> String {
+    if let Ok(home) = std::env::var("HOME") {
+        if !home.is_empty() && cwd.starts_with(&home) {
+            return format!("~{}", &cwd[home.len()..]);
+        }
+    }
+    cwd.to_string()
+}
+
+/// Truncate `s` to occupy at most `max_cols` terminal columns,
+/// appending `…` when truncation happens.  Returns `s` unchanged
+/// when it already fits.
+fn elide_to_width(s: &str, max_cols: usize) -> String {
+    if max_cols == 0 {
+        return String::new();
+    }
+    if unicode_width::UnicodeWidthStr::width(s) <= max_cols {
+        return s.to_string();
+    }
+    // Reserve one column for the trailing ellipsis.
+    let budget = max_cols.saturating_sub(1);
+    let mut out = String::with_capacity(s.len());
+    let mut col = 0usize;
+    for ch in s.chars() {
+        let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        if col + w > budget {
+            break;
+        }
+        out.push(ch);
+        col += w;
+    }
+    out.push('…');
+    out
+}
+
 /// Send `Request::ClaudeRelease` for the parsed /release command.
 /// The daemon responds with one `Response::TaskReleased` per
 /// released pane followed by `Response::Done`.  Our existing
@@ -1782,9 +1837,18 @@ fn draw(
             let input_visual_rows = input_segments.len().max(1) as u16;
             let input_height = (input_visual_rows + 2).clamp(3, max_input_height);
 
+            // Three-row layout: transcript (flex) → status bar
+            // (1 row, no border) → input box (input_height).  The
+            // status bar shows model + cwd + session at a glance so
+            // the user doesn't have to scroll back to the banner to
+            // see what they're talking to or where.
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([Constraint::Min(0), Constraint::Length(input_height)])
+                .constraints([
+                    Constraint::Min(0),
+                    Constraint::Length(1),
+                    Constraint::Length(input_height),
+                ])
                 .split(total_area);
 
             // Transcript: pre-wrap every entry into one Line per
@@ -1824,6 +1888,14 @@ fn draw(
                 .scroll((scroll_y, 0));
             frame.render_widget(transcript, chunks[0]);
 
+            // Status bar — single dim row between transcript and
+            // input box.  Shows what model we're talking to, what
+            // cwd we're in, and the truncated session id.  Built
+            // here (not at startup) so /model switches and any
+            // future cwd / session changes reflect immediately.
+            let status = render_status_bar(state, chunks[1].width);
+            frame.render_widget(status, chunks[1]);
+
             // Input: same pre-wrap.  Each segment becomes its own
             // Line, so ratatui draws them on consecutive rows
             // verbatim.  An empty input still emits one empty Line
@@ -1838,18 +1910,18 @@ fn draw(
             }
             let input_para = Paragraph::new(input_lines)
                 .block(Block::default().borders(Borders::ALL).title(input_title));
-            frame.render_widget(input_para, chunks[1]);
+            frame.render_widget(input_para, chunks[2]);
 
             // Cursor position inside the input box: walk the typed-
             // so-far prefix under the same char-grid wrap so the
             // cursor lands exactly where the renderer placed the
             // matching character.
-            let inner_width = chunks[1].width.saturating_sub(2);
+            let inner_width = chunks[2].width.saturating_sub(2);
             let typed_so_far = &state.input[..state.input_cursor.min(state.input.len())];
             let (cursor_row, cursor_col) = wrapped_cursor_position(typed_so_far, inner_width);
-            let visible_rows = chunks[1].height.saturating_sub(2);
+            let visible_rows = chunks[2].height.saturating_sub(2);
             let cursor_row = cursor_row.min(visible_rows.saturating_sub(1));
-            frame.set_cursor_position((chunks[1].x + 1 + cursor_col, chunks[1].y + 1 + cursor_row));
+            frame.set_cursor_position((chunks[2].x + 1 + cursor_col, chunks[2].y + 1 + cursor_row));
         })
         .map_err(|e| anyhow::anyhow!("terminal.draw: {e}"))?;
     Ok(())
@@ -2354,6 +2426,50 @@ mod tests {
             InputDispatch::SlashError(_) => {}
             other => panic!("expected SlashError, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn elide_to_width_returns_unchanged_when_fits() {
+        assert_eq!(elide_to_width("abc", 10), "abc");
+        assert_eq!(elide_to_width("你好", 10), "你好");
+    }
+
+    #[test]
+    fn elide_to_width_appends_ellipsis_when_too_long() {
+        // 20 ascii chars in a 10-col box → keep 9, add ellipsis.
+        let s = "abcdefghijklmnopqrst";
+        let out = elide_to_width(s, 10);
+        assert!(out.ends_with('…'));
+        assert_eq!(unicode_width::UnicodeWidthStr::width(out.as_str()), 10);
+    }
+
+    #[test]
+    fn elide_to_width_handles_cjk_widths() {
+        // 4 CJK glyphs = 8 cols.  In a 5-col box we keep 2 glyphs
+        // (4 cols) + ellipsis.
+        let s = "你好世界";
+        let out = elide_to_width(s, 5);
+        assert!(out.ends_with('…'));
+        assert!(unicode_width::UnicodeWidthStr::width(out.as_str()) <= 5);
+    }
+
+    #[test]
+    fn shorten_cwd_replaces_home_prefix() {
+        // We can't poke HOME safely from a test (it's process-wide),
+        // but we can at least call shorten_cwd and assert that a
+        // path beneath the current HOME picks up the ~.  If HOME is
+        // unset (CI quirks) the function falls through and returns
+        // input verbatim — this test then becomes vacuous, which is
+        // acceptable as it can't fail.
+        if let Ok(home) = std::env::var("HOME") {
+            if !home.is_empty() {
+                let inside = format!("{home}/projects/foo");
+                let short = shorten_cwd(&inside);
+                assert_eq!(short, "~/projects/foo");
+            }
+        }
+        // Outside-HOME path stays verbatim.
+        assert_eq!(shorten_cwd("/etc/hosts"), "/etc/hosts");
     }
 
     #[test]
