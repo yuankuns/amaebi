@@ -58,6 +58,7 @@
 //!   message; classic chat covers it for now).
 //! - Markdown rendering — assistant text is emitted verbatim.
 
+use std::collections::VecDeque;
 use std::io::stdout;
 use std::path::PathBuf;
 
@@ -380,17 +381,23 @@ struct AppState {
     /// "empty Enter cancels" path.  Ctrl-C-armed steer can simply
     /// drop the local flag (the daemon already received an
     /// Interrupt on the first Ctrl-C).  WaitingForInput-armed
-    /// steer must explicitly ship `Request::Interrupt` on cancel
-    /// because the daemon's reply consumer is still parked on
-    /// `steer_rx.recv()` waiting for either a message or an
-    /// Interrupt sentinel.
+    /// steer cannot be cancelled by an Interrupt at all: the
+    /// daemon's question-reply consumer (see `daemon.rs` —
+    /// "interrupt ignored while waiting for question reply")
+    /// drops bare interrupts and keeps blocking.  The TUI handles
+    /// that asymmetry in `cancel_steer_local` by leaving
+    /// `steer_pending = true` and pushing a hint instead of
+    /// shipping a useless Interrupt.
     steer_source: SteerSource,
     /// Frames received while `steer_pending`, replayed through
     /// `handle_response` once steering ends.  Capped at
     /// `STEER_BUFFER_MAX_FRAMES` (oldest-first eviction); when an
     /// eviction has happened the next flush prepends a truncation
     /// notice so the user knows some output was dropped.
-    steer_buffer: Vec<Response>,
+    /// `VecDeque` so cap-eviction is O(1) `pop_front` instead of
+    /// O(n) `Vec::remove(0)` — matters under heavy tool/stream
+    /// output that could otherwise touch the cap repeatedly.
+    steer_buffer: VecDeque<Response>,
     steer_buffer_truncated: bool,
     /// Timestamp of the last Ctrl-C press, used to detect the
     /// double-Ctrl-C-within-window exit gesture.  Cleared every time
@@ -464,7 +471,7 @@ impl AppState {
             history_draft: String::new(),
             steer_pending: false,
             steer_source: SteerSource::Idle,
-            steer_buffer: Vec::new(),
+            steer_buffer: VecDeque::new(),
             steer_buffer_truncated: false,
             last_ctrl_c: None,
             transcript_scroll_back: 0,
@@ -763,6 +770,13 @@ fn handle_key(key: KeyEvent, state: &mut AppState) -> KeyOutcome {
             KeyOutcome::Continue
         }
         KeyCode::Enter => {
+            // Mid-stream Enter (no steer pending) is a no-op: the
+            // event loop wouldn't dispatch SubmitInput anyway, and
+            // taking the buffer would silently drop whatever the
+            // user was typing for the next turn.  Leave it intact.
+            if state.streaming && !state.steer_pending {
+                return KeyOutcome::Continue;
+            }
             let text = std::mem::take(&mut state.input);
             state.input_cursor = 0;
             // Reset the double-Ctrl-C window any time Enter is pressed —
@@ -909,10 +923,10 @@ fn handle_response(resp: Response, state: &mut AppState) -> ResponseOutcome {
             // Evict oldest first so the freshest output survives.
             // Mark `steer_buffer_truncated` so the eventual flush can
             // tell the user some frames were dropped.
-            state.steer_buffer.remove(0);
+            state.steer_buffer.pop_front();
             state.steer_buffer_truncated = true;
         }
-        state.steer_buffer.push(resp);
+        state.steer_buffer.push_back(resp);
         return ResponseOutcome::Continuing;
     }
     match resp {
@@ -1448,7 +1462,7 @@ fn flush_steer_buffer(state: &mut AppState) {
         ));
         state.steer_buffer_truncated = false;
     }
-    let buffered: Vec<Response> = std::mem::take(&mut state.steer_buffer);
+    let buffered: VecDeque<Response> = std::mem::take(&mut state.steer_buffer);
     for frame in buffered {
         // Recurse into the normal handler.  Steer-pending is false
         // at this point so frames go to the transcript proper.  We
@@ -2054,7 +2068,12 @@ fn tokenize_inline_markdown(text: &str) -> Vec<MdToken> {
         // backtick (greedy on text, lazy on closer) so `foo` inside
         // `text with foo` doesn't lose the trailing foo.
         if bytes[i] == b'`' {
-            // Skip backslash-escaped backticks (rare but cheap).
+            // Pick the nearest closing backtick.  We deliberately do
+            // NOT honour backslash escaping here — paths like
+            // `foo\bar` and shell snippets like `printf '\n'` are far
+            // more common in our streamed output than literal
+            // backticks inside a code span, and CommonMark itself
+            // also doesn't treat `\` as an escape inside `` `…` ``.
             if let Some(close) = (i + 1..len).find(|&j| bytes[j] == b'`') {
                 let inside = &text[i + 1..close];
                 if !inside.is_empty() {

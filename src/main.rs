@@ -52,8 +52,8 @@ async fn main() -> Result<()> {
     // SKIP for `chat --tui`: the eprintln would run before the TUI
     // enters alt-screen, so the notification is then cleared by the
     // first ratatui draw — invisible.  The TUI path re-emits the
-    // count itself via push_inbox_notification() into the
-    // transcript, where it survives.
+    // count itself from `tui::push_banner` (which calls
+    // `unread_cron_count()`) into the transcript, where it survives.
     let is_chat_tui = matches!(&cli.command, cli::Command::Chat { tui: true, .. });
     if !is_chat_tui
         && matches!(
