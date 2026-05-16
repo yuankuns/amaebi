@@ -1213,9 +1213,23 @@ fn handle_response(resp: Response, state: &mut AppState) -> ResponseOutcome {
                 "[error] capacity limit reached: max_panes={max_panes}, busy={current_busy}, \
                  requested={requested}; free existing panes to continue"
             ));
-            // Clear pending state so we don't try to synth a
-            // supervision prompt for a launch that never happened.
+            // Daemon returns immediately after emitting `CapacityError`
+            // — no `Done` follows.  Treat this as turn-ending so the
+            // event loop unblocks: drop `streaming`, clear pending
+            // launch state, close any open assistant line, and reset
+            // the plan tracker.  Without this the input pump would
+            // sit on `state.streaming = true` forever and silently
+            // discard everything the user typed.
             state.pending_claude = None;
+            if state.steer_pending {
+                state.steer_pending = false;
+                state.steer_source = SteerSource::Idle;
+                state.last_ctrl_c = None;
+                flush_steer_buffer(state);
+            }
+            state.close_open_assistant_line();
+            state.plan_tracker = crate::client::PlanProgressTracker::new(false);
+            state.streaming = false;
             ResponseOutcome::Continuing
         }
         Response::TaskReleased {
@@ -3520,6 +3534,39 @@ mod tests {
         assert!(matches!(last.kind, LineKind::Tool));
         assert!(last.text.contains("src/foo.rs"));
         assert!(last.text.contains("📄"));
+    }
+
+    #[test]
+    fn capacity_error_clears_streaming_and_pending_launch() {
+        // Regression: the daemon does NOT send a `Done` after a
+        // CapacityError.  If the TUI leaves `streaming = true`, the
+        // event loop's `!state.streaming` gate makes the input pump
+        // permanently swallow user keystrokes.  CapacityError must
+        // therefore behave like a turn-ending frame.
+        let mut s = test_state();
+        s.streaming = true;
+        s.pending_claude = Some(PendingClaudeLaunch {
+            descriptions: Default::default(),
+            launched: Vec::new(),
+        });
+        let _ = handle_response(
+            Response::CapacityError {
+                requested: 4,
+                max_panes: 4,
+                current_busy: 4,
+            },
+            &mut s,
+        );
+        assert!(!s.streaming, "streaming must be cleared so input unblocks");
+        assert!(
+            s.pending_claude.is_none(),
+            "pending_claude must clear; no synth prompt for a launch that didn't happen"
+        );
+        // Error message should be visible to the user.
+        assert!(s
+            .transcript
+            .iter()
+            .any(|tl| tl.text.contains("capacity limit")));
     }
 
     #[test]
