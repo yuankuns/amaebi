@@ -1817,9 +1817,17 @@ async fn launch_claude_tasks(
 /// the user can scroll the banner via PgUp to recover full info.
 fn render_status_bar(state: &AppState, width: u16) -> Paragraph<'static> {
     // Left half: model · cwd · session-prefix.  Static, identifying.
-    let cwd_short = shorten_cwd(&state.cwd_str);
+    // Status-bar chrome (model, cwd, session id) is rendered straight
+    // into the terminal by ratatui, so any ANSI/OSC escape lurking in
+    // these strings would manipulate the host terminal even though
+    // transcript text is sanitised.  `state.model` can be flipped by
+    // `Response::ModelSwitched` (daemon-controlled) and `cwd_str`
+    // came from the filesystem; defence-in-depth strip them through
+    // `crate::sanitize` before composing the bar.
+    let model = crate::sanitize(&state.model);
+    let cwd_short = crate::sanitize(&shorten_cwd(&state.cwd_str));
     let session_short = &state.session_id[..8.min(state.session_id.len())];
-    let left = format!("{}  ·  {}  ·  {}", state.model, cwd_short, session_short);
+    let left = format!("{model}  ·  {cwd_short}  ·  {session_short}");
 
     // Right half: dynamic state.  Steer mode and plan progress are
     // both load-bearing signals while a turn is in flight; without
@@ -1882,10 +1890,27 @@ fn build_status_right(state: &AppState) -> String {
 /// common case (e.g. `~/.amaebi/worktrees/dev/tui-chat` rather than
 /// the full `/home/yuankuns/...`).  Falls back to the raw string if
 /// HOME isn't set or the cwd is outside it.
+///
+/// Match on a real path-component boundary, NOT a raw string prefix.
+/// Otherwise `HOME=/home/al` and `cwd=/home/alan/project` would
+/// rewrite to `~an/project`, which is wrong.
 fn shorten_cwd(cwd: &str) -> String {
-    if let Ok(home) = std::env::var("HOME") {
-        if !home.is_empty() && cwd.starts_with(&home) {
-            return format!("~{}", &cwd[home.len()..]);
+    let Ok(home) = std::env::var("HOME") else {
+        return cwd.to_string();
+    };
+    if home.is_empty() {
+        return cwd.to_string();
+    }
+    // Strip any trailing slashes so HOME=/home/al/ still matches
+    // /home/al exactly (and is still treated as a boundary on
+    // /home/al/foo).
+    let home_trimmed = home.trim_end_matches('/');
+    if cwd == home_trimmed {
+        return "~".to_string();
+    }
+    if let Some(rest) = cwd.strip_prefix(home_trimmed) {
+        if rest.starts_with('/') {
+            return format!("~{rest}");
         }
     }
     cwd.to_string()
@@ -2109,12 +2134,24 @@ fn draw(
             // Line, so ratatui draws them on consecutive rows
             // verbatim.  An empty input still emits one empty Line
             // so the box renders correctly.
+            // Sanitise rendered input slices: `state.input` could
+            // hold pasted text or a recalled history entry that
+            // contains ANSI/OSC/DCS escapes, and ratatui passes
+            // cell symbols through to crossterm verbatim.  Without
+            // this filter, a malicious paste / poisoned
+            // history.jsonl could inject `ESC ]52;c;…` (clipboard
+            // write), title rewrites, or cursor-control bytes via
+            // the input box.  Sanitising at the render boundary
+            // keeps the editor logic untouched (cursor positioning,
+            // line editing) while still scrubbing the rendered
+            // bytes; per-segment so `char_grid_wrap`'s offsets
+            // still match.
             let mut input_lines: Vec<Line> = Vec::with_capacity(input_segments.len().max(1));
             if input_segments.is_empty() {
                 input_lines.push(Line::from(""));
             } else {
                 for &(s, e) in &input_segments {
-                    input_lines.push(Line::from(state.input[s..e].to_string()));
+                    input_lines.push(Line::from(crate::sanitize(&state.input[s..e])));
                 }
             }
             let input_para = Paragraph::new(input_lines)
@@ -3032,9 +3069,19 @@ mod tests {
         // acceptable as it can't fail.
         if let Ok(home) = std::env::var("HOME") {
             if !home.is_empty() {
-                let inside = format!("{home}/projects/foo");
+                let home_trimmed = home.trim_end_matches('/');
+                let inside = format!("{home_trimmed}/projects/foo");
                 let short = shorten_cwd(&inside);
                 assert_eq!(short, "~/projects/foo");
+                // Exact-equal cwd shortens to bare `~`.
+                assert_eq!(shorten_cwd(home_trimmed), "~");
+                // Boundary check: a sibling directory whose name
+                // STARTS with HOME's last component must NOT match
+                // (regression for the old raw-prefix bug — e.g.
+                // HOME=/home/al + cwd=/home/alan/project should
+                // stay verbatim, not become ~an/project).
+                let sibling = format!("{home_trimmed}sibling/project");
+                assert_eq!(shorten_cwd(&sibling), sibling);
             }
         }
         // Outside-HOME path stays verbatim.
