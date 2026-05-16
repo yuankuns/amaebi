@@ -2211,6 +2211,14 @@ fn draw(
                 wrapped_cursor_position(&typed_so_far_clean, inner_width);
             let visible_rows = chunks[2].height.saturating_sub(2);
             let cursor_row = cursor_row.min(visible_rows.saturating_sub(1));
+            // Clamp cursor_col to inner_width.  `wrapped_cursor_position`
+            // can return `col > inner_width` when a glyph wider than
+            // the box overflows on the current row (the wrap path
+            // accepts that overflow rather than emit a leading blank
+            // row — see `char_grid_wrap_glyph_wider_than_inner_…` in
+            // tests).  Without this clamp `set_cursor_position` could
+            // place X past the box's right border.
+            let cursor_col = cursor_col.min(inner_width);
             frame.set_cursor_position((chunks[2].x + 1 + cursor_col, chunks[2].y + 1 + cursor_row));
         })
         .map_err(|e| anyhow::anyhow!("terminal.draw: {e}"))?;
