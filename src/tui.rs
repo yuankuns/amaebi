@@ -200,7 +200,7 @@ pub async fn run_chat_tui(
 
     // Render once before entering the event loop so the user sees the
     // chrome before any input/output happens.
-    draw(&mut terminal, &state)?;
+    draw(&mut terminal, &mut state)?;
 
     let mut key_events = EventStream::new();
 
@@ -231,10 +231,10 @@ pub async fn run_chat_tui(
                             }
                             KeyOutcome::Exit => break,
                         }
-                        draw(&mut terminal, &state)?;
+                        draw(&mut terminal, &mut state)?;
                     }
                     Some(Ok(Event::Resize(_, _))) => {
-                        draw(&mut terminal, &state)?;
+                        draw(&mut terminal, &mut state)?;
                     }
                     Some(Ok(_)) => {}
                     Some(Err(e)) => {
@@ -260,24 +260,24 @@ pub async fn run_chat_tui(
                                 if let ResponseOutcome::TurnEndedSendSynth(synth) = outcome {
                                     send_synth_prompt(&mut write_half, &mut state, synth).await?;
                                 }
-                                draw(&mut terminal, &state)?;
+                                draw(&mut terminal, &mut state)?;
                             }
                             Err(e) => {
                                 state.push_error_line(format!(
                                     "decode frame failed: {e}  raw={line}"
                                 ));
-                                draw(&mut terminal, &state)?;
+                                draw(&mut terminal, &mut state)?;
                             }
                         }
                     }
                     Ok(None) => {
                         state.push_error_line("daemon closed the connection".to_string());
-                        draw(&mut terminal, &state)?;
+                        draw(&mut terminal, &mut state)?;
                         break;
                     }
                     Err(e) => {
                         state.push_error_line(format!("daemon read error: {e}"));
-                        draw(&mut terminal, &state)?;
+                        draw(&mut terminal, &mut state)?;
                         break;
                     }
                 }
@@ -423,6 +423,13 @@ struct AppState {
     /// up and wants to stay there even as new content lands.
     /// PgDn down to 0 (or End) restores follow-tail.
     transcript_scroll_back: u16,
+    /// Total wrapped row count from the previous draw, used in
+    /// `draw()` to keep the viewport pinned while
+    /// `transcript_scroll_back > 0` and new content arrives.
+    /// Without this compensation, `tail_scroll` grows but
+    /// `transcript_scroll_back` stays constant, so the viewport
+    /// drifts toward the tail even though the user is scrolled up.
+    last_transcript_total_rows: u16,
     /// Per-turn parser for the LLM's `- [ ] / - [x]` checklist.
     /// Inherits the parser logic from classic chat (PR #157) but
     /// surfaces the result as a transient status line drawn in the
@@ -487,6 +494,7 @@ impl AppState {
             steer_buffer_truncated: false,
             last_ctrl_c: None,
             transcript_scroll_back: 0,
+            last_transcript_total_rows: 0,
             // `false` for render_enabled — the TUI doesn't use the
             // tracker's stderr-rendering half (we read
             // `latest_progress` from `draw` and stitch the result
@@ -1826,7 +1834,12 @@ fn render_status_bar(state: &AppState, width: u16) -> Paragraph<'static> {
     // `crate::sanitize` before composing the bar.
     let model = crate::sanitize(&state.model);
     let cwd_short = crate::sanitize(&shorten_cwd(&state.cwd_str));
-    let session_short = &state.session_id[..8.min(state.session_id.len())];
+    // `state.session_id` can come from `--resume <UUID>` (user
+    // input) or other daemon-controlled flows; sanitise before
+    // slicing so the rendered chrome can't carry escape bytes
+    // even if the upstream id was poisoned.  Take the first 8
+    // *chars* (not bytes) so a non-ASCII id won't panic the slice.
+    let session_short: String = crate::sanitize(&state.session_id).chars().take(8).collect();
     let left = format!("{model}  ·  {cwd_short}  ·  {session_short}");
 
     // Right half: dynamic state.  Steer mode and plan progress are
@@ -2030,7 +2043,7 @@ fn render_launched_block(launched: &[LaunchedPane]) -> String {
 // StdError` for anyhow, which doesn't hold for arbitrary backends.
 fn draw(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
-    state: &AppState,
+    state: &mut AppState,
 ) -> Result<()> {
     terminal
         .draw(|frame| {
@@ -2091,6 +2104,24 @@ fn draw(
             }
             let transcript_total_rows = transcript_lines.len() as u16;
             let transcript_visible_rows = chunks[0].height.saturating_sub(2);
+            // While the user is scrolled up (`transcript_scroll_back >
+            // 0`), keep the viewport pinned even as new content grows
+            // the transcript.  Without this compensation,
+            // `tail_scroll` increases each frame while
+            // `transcript_scroll_back` stays constant, so
+            // `scroll_y = tail_scroll - scroll_back` drifts toward
+            // the tail and the user's pinned view slides forward.
+            // Bumping `scroll_back` by the same delta cancels the
+            // drift so the absolute first-visible row stays put.
+            // Clamp to u16::MAX so a pathological streamed-content
+            // burst can't overflow.
+            if state.transcript_scroll_back > 0
+                && transcript_total_rows > state.last_transcript_total_rows
+            {
+                let delta = transcript_total_rows - state.last_transcript_total_rows;
+                state.transcript_scroll_back = state.transcript_scroll_back.saturating_add(delta);
+            }
+            state.last_transcript_total_rows = transcript_total_rows;
             // Tail-following base: how many rows we'd hide above the
             // viewport to keep the newest content at the bottom edge.
             let tail_scroll = transcript_total_rows.saturating_sub(transcript_visible_rows);
