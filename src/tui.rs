@@ -1665,14 +1665,66 @@ async fn launch_claude_tasks(
 /// the model name alone, just truncate to width with an ellipsis;
 /// the user can scroll the banner via PgUp to recover full info.
 fn render_status_bar(state: &AppState, width: u16) -> Paragraph<'static> {
+    // Left half: model · cwd · session-prefix.  Static, identifying.
     let cwd_short = shorten_cwd(&state.cwd_str);
     let session_short = &state.session_id[..8.min(state.session_id.len())];
-    let full = format!("{}  ·  {}  ·  {}", state.model, cwd_short, session_short);
-    let elided = elide_to_width(&full, width as usize);
-    Paragraph::new(Line::from(Span::styled(
-        elided,
-        Style::default().fg(Color::DarkGray),
-    )))
+    let left = format!("{}  ·  {}  ·  {}", state.model, cwd_short, session_short);
+
+    // Right half: dynamic state.  Steer mode and plan progress are
+    // both load-bearing signals while a turn is in flight; without
+    // surfacing them the user has to guess from input-box title
+    // whether anything is happening.  Pick the most-specific
+    // applicable signal so the right half stays short.
+    let right = build_status_right(state);
+
+    // Layout: left + (filler whitespace) + right, all on a single
+    // row coloured DarkGray.  When width is too small for both,
+    // elide the left half — the right half is short and dynamic, it
+    // shouldn't truncate.
+    let total_w = width as usize;
+    let right_w = unicode_width::UnicodeWidthStr::width(right.as_str());
+    // Reserve 2 columns of breathing room between left and right so
+    // they don't visually collide when the bar is just wide enough.
+    let reserved_for_right = if right.is_empty() { 0 } else { right_w + 2 };
+    let left_budget = total_w.saturating_sub(reserved_for_right);
+    let left_elided = elide_to_width(&left, left_budget);
+    let left_w = unicode_width::UnicodeWidthStr::width(left_elided.as_str());
+    // Pad between the two halves with spaces so the right edge of
+    // the bar lines up exactly with the right border above.
+    let gap = total_w.saturating_sub(left_w + right_w);
+    let padding = " ".repeat(gap);
+
+    let style = Style::default().fg(Color::DarkGray);
+    Paragraph::new(Line::from(vec![
+        Span::styled(left_elided, style),
+        Span::styled(padding, style),
+        Span::styled(right, style),
+    ]))
+}
+
+/// Build the right-hand status-bar text.  Returns the empty string
+/// when there's nothing dynamic to show (idle session, no scroll-
+/// back, no steer).  Picks the most specific signal:
+///
+/// - `steer (Ctrl-C exits)` while steer is pending
+/// - `streaming · [plan N/M done]` during a turn with a live plan
+/// - `streaming` during a plain turn
+///
+/// Does NOT show `↑ N rows` here because that's already on the
+/// transcript box title and would be redundant.
+fn build_status_right(state: &AppState) -> String {
+    if state.steer_pending {
+        return "steer (Enter submits, Ctrl-C exits)".to_string();
+    }
+    if state.streaming {
+        if let Some((d, t)) = state.plan_tracker.latest_progress() {
+            if t > 0 {
+                return format!("streaming · [plan {d}/{t} done]");
+            }
+        }
+        return "streaming".to_string();
+    }
+    String::new()
 }
 
 /// Replace a leading `$HOME` with `~` so the status bar fits in the
@@ -1821,24 +1873,14 @@ fn draw(
             let total_area = frame.area();
 
             // While streaming, splice the live `[plan N/M done]`
-            // counter into the title (when the LLM is maintaining a
-            // checklist) so the user sees progress without the
-            // tracker writing anything to stderr.  The title is a
-            // string that lives only as long as this draw closure;
-            // owning a `String` is cheaper than threading a Cow
-            // through ratatui's Block API.
-            let plan_blurb = state
-                .plan_tracker
-                .latest_progress()
-                .filter(|(_, total)| *total > 0)
-                .map(|(d, t)| format!(" [plan {d}/{t} done] "))
-                .unwrap_or_default();
-            let input_title: String = if state.steer_pending {
-                " steer (Enter to submit correction, empty Enter to cancel, Ctrl-C exits) ".into()
-            } else if state.streaming {
-                format!(" streaming…{plan_blurb}Ctrl-C to interrupt and steer ")
+            // The input box title now stays short — `[plan N/M done]`
+            // and the streaming indicator moved to the status bar
+            // (right-aligned), where they have more room and don't
+            // collide with the editing-help hint.
+            let input_title: &str = if state.steer_pending {
+                " steer (Enter submits, empty Enter cancels, Ctrl-C exits) "
             } else {
-                " input (Enter to send, Ctrl-C twice to exit) ".into()
+                " input (Enter to send, Ctrl-C twice to exit) "
             };
 
             // Floor at 3 so an empty input still shows a 1-row cavity;
@@ -2771,6 +2813,50 @@ mod tests {
         }
         // Outside-HOME path stays verbatim.
         assert_eq!(shorten_cwd("/etc/hosts"), "/etc/hosts");
+    }
+
+    #[test]
+    fn build_status_right_idle_returns_empty() {
+        let s = test_state();
+        assert_eq!(build_status_right(&s), "");
+    }
+
+    #[test]
+    fn build_status_right_streaming_shows_streaming() {
+        let mut s = test_state();
+        s.streaming = true;
+        assert_eq!(build_status_right(&s), "streaming");
+    }
+
+    #[test]
+    fn build_status_right_streaming_with_plan_shows_progress() {
+        // When the LLM has emitted a checklist mid-stream, the
+        // status bar splices the live count into the streaming
+        // indicator so the user sees plan progress without
+        // squinting at the input title.
+        let mut s = test_state();
+        s.streaming = true;
+        s.plan_tracker
+            .push("- [x] Step 1\n- [ ] Step 2\n- [ ] Step 3\n");
+        let right = build_status_right(&s);
+        assert!(
+            right.contains("[plan 1/3 done]"),
+            "right side must surface live plan progress; got {right:?}"
+        );
+        assert!(right.contains("streaming"));
+    }
+
+    #[test]
+    fn build_status_right_steer_overrides_streaming() {
+        // Steer mode is more specific than streaming; the right
+        // side should pivot to the steer hint rather than show
+        // both.
+        let mut s = test_state();
+        s.streaming = true;
+        s.steer_pending = true;
+        let right = build_status_right(&s);
+        assert!(right.starts_with("steer"));
+        assert!(!right.contains("streaming"));
     }
 
     #[test]
