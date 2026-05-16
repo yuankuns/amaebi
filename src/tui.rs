@@ -106,6 +106,16 @@ const PAGE_STEP_ROWS: u16 = 10;
 /// notice on flush so the user knows some frames were dropped.
 const STEER_BUFFER_MAX_FRAMES: usize = 1000;
 
+/// Cap on how many transcript lines we keep around in `state.transcript`.
+/// `draw()` re-wraps + re-tokenizes the entire transcript on every
+/// redraw (ratatui has no incremental text buffer), so an unbounded
+/// `Vec` makes a long session steadily more sluggish.  Past this cap
+/// we drop the oldest line on each push.  The number is generous: at
+/// ~100 lines/turn an active session needs ~80 turns before the cap
+/// kicks in, and even then PgUp scrollback still has ~8000 lines of
+/// context — comparable to a tmux scrollback default.
+const TRANSCRIPT_MAX_LINES: usize = 8000;
+
 /// Public entry — called from `main.rs` when `--tui` is set.
 ///
 /// Mirrors the `run_chat_loop` signature so the two paths are
@@ -582,6 +592,7 @@ impl AppState {
         } else {
             self.transcript.push(TranscriptLine { kind, text });
         }
+        self.cap_transcript();
     }
 
     fn push_system_line(&mut self, text: String) {
@@ -656,11 +667,25 @@ impl AppState {
             if let Some(last) = self.transcript.last_mut() {
                 last.text.push_str(piece);
             }
+            // No new line — extending an existing one — so no cap
+            // check needed.
         } else {
             self.transcript.push(TranscriptLine {
                 kind: LineKind::Assistant { is_open: true },
                 text: piece.to_string(),
             });
+            self.cap_transcript();
+        }
+    }
+
+    /// Drop the oldest transcript lines past `TRANSCRIPT_MAX_LINES`.
+    /// Called whenever a new line is pushed (single growth point);
+    /// keeps `draw()`'s per-redraw wrap cost bounded so a long
+    /// session doesn't gradually become sluggish.
+    fn cap_transcript(&mut self) {
+        if self.transcript.len() > TRANSCRIPT_MAX_LINES {
+            let excess = self.transcript.len() - TRANSCRIPT_MAX_LINES;
+            self.transcript.drain(..excess);
         }
     }
 
@@ -2317,15 +2342,22 @@ fn push_wrapped_assistant_line(out: &mut Vec<Line<'static>>, text: &str, inner_w
         let mut piece_start = 0usize;
         let mut piece_col = 0usize;
         let token_text = token.text();
-        let token_bytes = token_text.as_bytes();
         for (idx, ch) in token_text.char_indices() {
             let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
             if w == 0 {
                 continue;
             }
-            if current_col + piece_col + w > inner {
+            if current_col + piece_col + w > inner && current_col + piece_col > 0 {
                 // Emit any accumulated piece into the current row,
                 // then push the row out and start a new one.
+                //
+                // Only wrap when there is content on the current
+                // row (`current_col + piece_col > 0`).  When the
+                // row is empty AND a single glyph alone is wider
+                // than `inner` (width-2 glyph in a width-1
+                // viewport), wrapping would emit a spurious blank
+                // line; accept the overflow instead (`char_grid_wrap`
+                // does the same thing).
                 if piece_start < idx {
                     current_row.push(Span::styled(
                         token_text[piece_start..idx].to_string(),
@@ -2343,11 +2375,6 @@ fn push_wrapped_assistant_line(out: &mut Vec<Line<'static>>, text: &str, inner_w
                 // loop forever).
             }
             piece_col += w;
-            // Step over the codepoint we just accepted.  We don't
-            // need to track the byte offset of `idx + ch.len_utf8()`
-            // because the next iteration of char_indices will give
-            // us the next codepoint's start.
-            let _ = token_bytes;
         }
         // Emit the trailing piece into the current row.
         if piece_start < token_text.len() {
@@ -2476,7 +2503,13 @@ fn wrapped_cursor_position(typed: &str, inner_width: u16) -> (u16, u16) {
         if w == 0 {
             continue;
         }
-        if col + w > inner {
+        if col + w > inner && col > 0 {
+            // Wrap to a new row only when something is already
+            // there.  When `col == 0` and `w > inner` (width-2
+            // glyph in width-1 box) we accept the overflow to stay
+            // consistent with `char_grid_wrap`, which keeps the
+            // glyph on the current row instead of emitting a
+            // leading empty row.
             row = row.saturating_add(1);
             col = 0;
         }
@@ -2511,9 +2544,20 @@ fn char_grid_wrap(text: &str, inner_width: u16) -> Vec<(usize, usize)> {
         if col + w > inner {
             // Break: emit the current segment, start a new one
             // at this character.
-            out.push((start, idx));
-            start = idx;
-            col = 0;
+            //
+            // Only break when there is actually something to emit
+            // (`col > 0`).  If `col == 0`, the next glyph alone is
+            // wider than `inner_width` (e.g. a width-2 CJK glyph in
+            // a width-1 box).  Emitting an empty `(start, idx)`
+            // segment would produce a leading blank visual row, so
+            // accept the overflow on the current row instead — the
+            // viewport renderer will clip it to `inner_width`
+            // anyway.
+            if col > 0 {
+                out.push((start, idx));
+                start = idx;
+                col = 0;
+            }
         }
         col += w;
     }
@@ -2751,6 +2795,40 @@ mod tests {
     fn char_grid_wrap_empty_and_zero_width() {
         assert!(char_grid_wrap("", 10).is_empty());
         assert!(char_grid_wrap("nonempty", 0).is_empty());
+    }
+
+    #[test]
+    fn char_grid_wrap_glyph_wider_than_inner_no_empty_segment() {
+        // Pathological narrow viewport: inner_width=1 but every
+        // glyph is 2 cols wide.  The naive wrap path would emit
+        // an empty (start, idx) segment whenever `col == 0 && w >
+        // inner` — producing a leading blank visual row.  We
+        // accept overflow on the current row instead (the
+        // renderer clips it to inner_width), so each glyph still
+        // gets its own segment but no segment is empty.
+        //
+        // Note: this test deliberately does NOT call
+        // `assert_wrap_round_trips`, because the
+        // `width <= inner_width` invariant is the one we trade
+        // away to avoid the blank row in this degenerate case.
+        // The byte-concatenation half of round-trip still holds
+        // and is checked here.
+        let text = "你好";
+        let segs = char_grid_wrap(text, 1);
+        assert_eq!(segs.len(), 2);
+        assert!(segs.iter().all(|&(s, e)| s != e));
+        let glued: String = segs.iter().map(|&(s, e)| &text[s..e]).collect();
+        assert_eq!(glued, text);
+    }
+
+    #[test]
+    fn wrapped_cursor_position_glyph_wider_than_inner_no_extra_row() {
+        // Mirror of the wrap edge case above: inner_width=1, a
+        // single width-2 glyph.  The cursor must stay on row 0
+        // (we accept the overflow) instead of advancing to row 1
+        // because of a phantom break.
+        let (row, _col) = wrapped_cursor_position("你", 1);
+        assert_eq!(row, 0);
     }
 
     #[test]
@@ -3291,6 +3369,27 @@ mod tests {
         for (kind, _) in &kinds_and_texts {
             assert!(matches!(kind, LineKind::User));
         }
+    }
+
+    #[test]
+    fn transcript_cap_drops_oldest_lines_past_max() {
+        // `draw()` re-wraps the entire transcript on every redraw, so
+        // an unbounded `Vec` makes long sessions sluggish.  Lines past
+        // `TRANSCRIPT_MAX_LINES` are dropped from the front.  Verify
+        // the cap is applied and that the newest line survives.
+        let mut s = test_state();
+        let starting = s.transcript.len();
+        // Push enough lines to overshoot the cap by 100.
+        let target = TRANSCRIPT_MAX_LINES + 100 - starting;
+        for i in 0..target {
+            s.push_system_line(format!("line {i}"));
+        }
+        assert_eq!(s.transcript.len(), TRANSCRIPT_MAX_LINES);
+        // The newest line is still the tail.
+        assert_eq!(
+            s.transcript.last().unwrap().text,
+            format!("line {}", target - 1),
+        );
     }
 
     #[test]
