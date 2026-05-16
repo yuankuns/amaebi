@@ -1966,15 +1966,18 @@ impl MdToken {
     }
 
     /// Build the ratatui `Style` for this token, on top of `base`.
-    /// Code spans shift to a distinct foreground; bold/italic add
-    /// the corresponding modifier without changing the colour, so
-    /// they compose with kind-level tints.
+    /// Each variant adds BOTH a modifier AND a distinct foreground
+    /// so the styling is visible even when the terminal renders the
+    /// modifier subtly (Windows Terminal's bold-on-default-fg is
+    /// barely perceptible — observed 2026-05-16 — so we lean on
+    /// colour as the primary signal and treat the modifier as
+    /// secondary reinforcement).
     fn style_on(&self, base: Style) -> Style {
         match self {
             MdToken::Plain(_) => base,
             MdToken::Code(_) => base.fg(Color::Cyan),
-            MdToken::Bold(_) => base.add_modifier(Modifier::BOLD),
-            MdToken::Italic(_) => base.add_modifier(Modifier::ITALIC),
+            MdToken::Bold(_) => base.fg(Color::LightYellow).add_modifier(Modifier::BOLD),
+            MdToken::Italic(_) => base.fg(Color::LightMagenta).add_modifier(Modifier::ITALIC),
         }
     }
 }
