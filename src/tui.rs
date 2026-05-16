@@ -219,7 +219,7 @@ pub async fn run_chat_tui(
                                 send_steer(&mut write_half, &mut state, text).await?;
                             }
                             KeyOutcome::CancelSteer => {
-                                cancel_steer(&mut state);
+                                cancel_steer(&mut write_half, &mut state).await?;
                             }
                             KeyOutcome::Exit => break,
                         }
@@ -283,6 +283,23 @@ pub async fn run_chat_tui(
 // ---------------------------------------------------------------------------
 // Application state
 // ---------------------------------------------------------------------------
+
+/// What armed steer mode.  See `AppState::steer_source` for why it
+/// matters on the cancel path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SteerSource {
+    /// No steer in flight.  Default value; not all `steer_pending=false`
+    /// states explicitly reset this, but the field is only read when
+    /// `steer_pending=true` so the lingering value is harmless.
+    Idle,
+    /// User pressed Ctrl-C mid-stream — `Request::Interrupt` was
+    /// already shipped, so cancel is a local-only operation.
+    UserCtrlC,
+    /// Daemon emitted `Response::WaitingForInput` — the daemon's
+    /// reply consumer is parked waiting for input, so cancel needs
+    /// to explicitly ship `Request::Interrupt` to unblock it.
+    DaemonWaitingForInput,
+}
 
 /// Where a transcript line originated from — controls colour / prefix.
 ///
@@ -355,11 +372,19 @@ struct AppState {
     /// True between the first mid-turn Ctrl-C and either a successful
     /// steer (sent + `Response::SteerAck` received), an empty-Enter
     /// cancel, or a second Ctrl-C exit.  While set, `Response::Text`
-    /// / `ToolUse` / `Compacting` / `WaitingForInput` frames are
-    /// buffered into `steer_buffer` instead of going to the
-    /// transcript so they don't fight the steer prompt for screen
-    /// real estate.
+    /// / `ToolUse` / `Compacting` frames are buffered into
+    /// `steer_buffer` instead of going to the transcript so they
+    /// don't fight the steer prompt for screen real estate.
     steer_pending: bool,
+    /// What armed the steer mode — affects how we handle the
+    /// "empty Enter cancels" path.  Ctrl-C-armed steer can simply
+    /// drop the local flag (the daemon already received an
+    /// Interrupt on the first Ctrl-C).  WaitingForInput-armed
+    /// steer must explicitly ship `Request::Interrupt` on cancel
+    /// because the daemon's reply consumer is still parked on
+    /// `steer_rx.recv()` waiting for either a message or an
+    /// Interrupt sentinel.
+    steer_source: SteerSource,
     /// Frames received while `steer_pending`, replayed through
     /// `handle_response` once steering ends.  Capped at
     /// `STEER_BUFFER_MAX_FRAMES` (oldest-first eviction); when an
@@ -438,6 +463,7 @@ impl AppState {
             history_pos: None,
             history_draft: String::new(),
             steer_pending: false,
+            steer_source: SteerSource::Idle,
             steer_buffer: Vec::new(),
             steer_buffer_truncated: false,
             last_ctrl_c: None,
@@ -911,6 +937,7 @@ fn handle_response(resp: Response, state: &mut AppState) -> ResponseOutcome {
             // so flush_steer_buffer doesn't re-buffer.
             if state.steer_pending {
                 state.steer_pending = false;
+                state.steer_source = SteerSource::Idle;
                 state.last_ctrl_c = None;
                 flush_steer_buffer(state);
             }
@@ -951,6 +978,7 @@ fn handle_response(resp: Response, state: &mut AppState) -> ResponseOutcome {
             // already failed.
             if state.steer_pending {
                 state.steer_pending = false;
+                state.steer_source = SteerSource::Idle;
                 state.last_ctrl_c = None;
                 flush_steer_buffer(state);
             }
@@ -990,6 +1018,7 @@ fn handle_response(resp: Response, state: &mut AppState) -> ResponseOutcome {
             // re-enters `handle_response`, so we must clear the flag
             // FIRST or it'll re-buffer everything we just popped.
             state.steer_pending = false;
+            state.steer_source = SteerSource::Idle;
             state.last_ctrl_c = None;
             state.push_steer_line("steer acknowledged".to_string());
             flush_steer_buffer(state);
@@ -1005,11 +1034,33 @@ fn handle_response(resp: Response, state: &mut AppState) -> ResponseOutcome {
             ResponseOutcome::Continuing
         }
         Response::WaitingForInput { prompt } => {
+            // The daemon is asking the user for a clarifying reply
+            // mid-turn (e.g. the model wrote "which option do you
+            // prefer, A or B?").  The protocol expects the user's
+            // reply to come back as a Request::Steer so the daemon
+            // injects it as the next user message in the SAME
+            // agentic loop iteration — NOT as Request::Chat (which
+            // would start a fresh turn and break the LLM's
+            // context).
+            //
+            // We reuse the existing steer machinery: arming
+            // steer_pending = true makes Enter ship a
+            // Request::Steer, and the daemon's eventual SteerAck
+            // (or Done if the LLM aborts) clears the flag.
+            // streaming stays true so the input title shows the
+            // steer prompt instead of "input (Enter to send…)".
             if !prompt.is_empty() {
-                state.push_system_line(prompt);
+                state.push_steer_line(prompt);
+            } else {
+                state.push_steer_line(
+                    "model is waiting for your reply — type and Enter".to_string(),
+                );
             }
-            state.streaming = false;
-            ResponseOutcome::TurnEnded
+            state.steer_pending = true;
+            state.steer_source = SteerSource::DaemonWaitingForInput;
+            state.steer_buffer.clear();
+            state.steer_buffer_truncated = false;
+            ResponseOutcome::Continuing
         }
         Response::PaneAssigned {
             tag,
@@ -1127,14 +1178,12 @@ fn tool_label(tool: &str) -> String {
 /// True for `Response` variants we want to buffer while the user is
 /// composing a steer correction, false for control frames that need
 /// to be processed immediately (state changes, errors, the
-/// SteerAck that ends steer mode).
+/// SteerAck that ends steer mode, the WaitingForInput that ARMS
+/// steer mode).
 fn is_buffered_frame(resp: &Response) -> bool {
     matches!(
         resp,
-        Response::Text { .. }
-            | Response::ToolUse { .. }
-            | Response::Compacting
-            | Response::WaitingForInput { .. }
+        Response::Text { .. } | Response::ToolUse { .. } | Response::Compacting
     )
 }
 
@@ -1263,6 +1312,7 @@ async fn send_interrupt_and_arm_steer(
     state: &mut AppState,
 ) -> Result<()> {
     state.steer_pending = true;
+    state.steer_source = SteerSource::UserCtrlC;
     state.steer_buffer.clear();
     state.steer_buffer_truncated = false;
     state.push_steer_line(
@@ -1308,20 +1358,64 @@ async fn send_steer(
     Ok(())
 }
 
+/// Empty Enter while steer-pending.  Two cases, gated on
+/// `state.steer_source`:
+///
+/// - `UserCtrlC`: the user pressed Ctrl-C and decided not to
+///   correct anything.  The first Ctrl-C already shipped
+///   `Request::Interrupt`, so we just locally flush the buffer +
+///   clear the flags.
+///
+/// - `DaemonWaitingForInput`: the daemon is parked on
+///   `steer_rx.recv()` waiting for a real reply.  Per
+///   `daemon.rs:5225` it explicitly ignores interrupt sentinels
+///   while in this state — the only way out is a real Steer
+///   message, a disconnect, or a 300s timeout.  An empty Enter
+///   here is therefore a no-op; we leave steer_pending = true so
+///   the user keeps seeing the steer prompt and can type a real
+///   reply.  Pushing a faint "(empty Enter ignored …)" hint so
+///   the user knows what happened.
+///
+/// `Idle`: should never reach `cancel_steer` (no steer to cancel),
+/// but tolerate gracefully — silent no-op.
+fn cancel_steer_local(state: &mut AppState) -> bool {
+    match state.steer_source {
+        SteerSource::DaemonWaitingForInput => {
+            state.push_steer_line(
+                "(empty Enter ignored — type a reply for the model's question, or Ctrl-C twice to exit)"
+                    .to_string(),
+            );
+            // No state change; next Enter will be re-evaluated.
+            false
+        }
+        SteerSource::UserCtrlC => {
+            // Order matters: clear `steer_pending` BEFORE flushing,
+            // otherwise `flush_steer_buffer` re-enters
+            // `handle_response` which would re-buffer the very frames
+            // we just popped.
+            state.steer_pending = false;
+            state.steer_source = SteerSource::Idle;
+            state.last_ctrl_c = None;
+            state.push_steer_line("steer cancelled".to_string());
+            flush_steer_buffer(state);
+            false
+        }
+        SteerSource::Idle => false,
+    }
+}
+
 /// Empty Enter while `steer_pending`: roll back the steer mode and
-/// flush the buffered output into the transcript so the user can
-/// see what they Ctrl-C'd over.  Synchronous because there's no
-/// daemon round-trip — the daemon never knew we typed anything.
-fn cancel_steer(state: &mut AppState) {
-    // Order matters: clear `steer_pending` BEFORE flushing, otherwise
-    // `flush_steer_buffer` re-enters `handle_response` which would
-    // re-buffer the very frames we just popped (the steer-buffering
-    // guard at the top of `handle_response` is gated on
-    // `state.steer_pending`).
-    state.steer_pending = false;
-    state.last_ctrl_c = None;
-    state.push_steer_line("steer cancelled".to_string());
-    flush_steer_buffer(state);
+/// flush the buffered output.  See `cancel_steer_local` for the
+/// per-source logic.  Currently no source returns a "needs IPC" hint
+/// (true), so this wrapper is just an async-context shim — kept for
+/// symmetry with the other action helpers in case a future steer
+/// source needs to ship a frame.
+async fn cancel_steer(
+    _writer: &mut tokio::net::unix::OwnedWriteHalf,
+    state: &mut AppState,
+) -> Result<()> {
+    let _ = cancel_steer_local(state);
+    Ok(())
 }
 
 /// Replay every frame buffered while `steer_pending` was set, in
@@ -2297,6 +2391,32 @@ mod tests {
     }
 
     #[test]
+    fn waiting_for_input_arms_steer_mode_not_turn_end() {
+        // Daemon's `Response::WaitingForInput` means the model is
+        // asking the user a clarifying question and expects the
+        // reply via `Request::Steer` (not a fresh `Request::Chat`).
+        // Arming steer_pending = true causes the next Enter to
+        // route through send_steer; the existing SteerAck/Done
+        // handling clears the flag.
+        let mut s = test_state();
+        s.streaming = true;
+        let outcome = handle_response(
+            Response::WaitingForInput {
+                prompt: "which option do you prefer?".to_string(),
+            },
+            &mut s,
+        );
+        assert!(matches!(outcome, ResponseOutcome::Continuing));
+        assert!(s.steer_pending, "WaitingForInput must arm steer mode");
+        assert!(s.streaming, "streaming should stay true — same turn");
+        // The prompt text shows up as a Steer-kind line so the
+        // user sees the question above the input box.
+        let last = s.transcript.last().unwrap();
+        assert!(matches!(last.kind, LineKind::Steer));
+        assert!(last.text.contains("which option"));
+    }
+
+    #[test]
     fn done_during_steer_pending_flushes_buffer_and_clears_mode() {
         // Regression for the 2026-05-16 manual-test bug: if the
         // daemon's current turn finishes (Response::Done) before
@@ -2526,26 +2646,52 @@ mod tests {
     }
 
     #[test]
-    fn cancel_steer_flushes_buffer_and_clears_pending() {
-        // Empty-Enter cancel path also drains the buffer back into
-        // the transcript so the user can see what they Ctrl-C'd over,
-        // and clears the steer-pending flag.
+    fn cancel_steer_local_ctrlc_path_clears_state_and_flushes() {
+        // Ctrl-C-armed cancels: first Ctrl-C already shipped
+        // Interrupt, so this just flushes the buffer locally and
+        // clears the flags.
         let mut s = test_state();
         s.streaming = true;
         s.steer_pending = true;
+        s.steer_source = SteerSource::UserCtrlC;
         let _ = handle_response(
             Response::Text {
                 chunk: "queued chunk\n".into(),
             },
             &mut s,
         );
-        cancel_steer(&mut s);
+        let _ = cancel_steer_local(&mut s);
         assert!(!s.steer_pending);
+        assert_eq!(s.steer_source, SteerSource::Idle);
         assert!(
             s.transcript
                 .iter()
                 .any(|tl| tl.text.contains("queued chunk")),
             "buffered chunk must be flushed to the transcript on cancel"
+        );
+    }
+
+    #[test]
+    fn cancel_steer_local_waiting_for_input_is_ignored_with_hint() {
+        // WaitingForInput-armed cancels: daemon ignores Interrupt
+        // (per daemon.rs:5225 — it only accepts a real reply or
+        // disconnect).  Empty Enter is therefore a no-op; we leave
+        // steer_pending = true and push a hint so the user knows
+        // they need to type a real reply.
+        let mut s = test_state();
+        s.streaming = true;
+        s.steer_pending = true;
+        s.steer_source = SteerSource::DaemonWaitingForInput;
+        let _ = cancel_steer_local(&mut s);
+        assert!(s.steer_pending, "WaitingForInput steer must persist");
+        assert_eq!(s.steer_source, SteerSource::DaemonWaitingForInput);
+        assert!(
+            s.transcript
+                .last()
+                .unwrap()
+                .text
+                .contains("empty Enter ignored"),
+            "user must see a hint explaining why nothing happened"
         );
     }
 
