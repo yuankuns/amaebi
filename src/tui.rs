@@ -258,7 +258,7 @@ pub async fn run_chat_tui(
                                 // /claude's "send synthesised
                                 // supervision prompt" is the main one.
                                 if let ResponseOutcome::TurnEndedSendSynth(synth) = outcome {
-                                    send_prompt(&mut write_half, &mut state, synth).await?;
+                                    send_synth_prompt(&mut write_half, &mut state, synth).await?;
                                 }
                                 draw(&mut terminal, &state)?;
                             }
@@ -1263,13 +1263,16 @@ fn handle_response(resp: Response, state: &mut AppState) -> ResponseOutcome {
     }
 }
 
-/// Pretty-print a tool name as a short, distinctive label that
-/// distinguishes the most-common tools at a glance.  Mirrors classic
-/// chat's emoji choices (run_chat_loop's ToolUse handler) for read /
-/// edit / shell / tmux variants; everything else falls back to the
-/// plain tool name (the kind-level 🔧 prefix carries the "tool"
-/// signal).  Returning a String avoids forcing static lifetimes on
-/// the tool-name dispatch.
+/// Pretty-print a tool name as a short, distinctive label with a
+/// per-tool glyph so the user can scan `ToolUse` lines at a glance.
+/// Mirrors classic chat's emoji choices (run_chat_loop's ToolUse
+/// handler) for read / edit / shell / tmux variants; unknown tools
+/// fall back to a generic 🔧 prefix.  This is the SOLE source of
+/// the tool glyph in the TUI — `push_wrapped_transcript_line` no
+/// longer adds a kind-level prefix for `LineKind::Tool` (otherwise
+/// known tools would render with two glyphs, e.g. "🔧 📄 read …").
+/// Returning a String avoids forcing static lifetimes on the
+/// tool-name dispatch.
 fn tool_label(tool: &str) -> String {
     match tool {
         "shell_command" => "$".to_string(),
@@ -1279,7 +1282,7 @@ fn tool_label(tool: &str) -> String {
         "tmux_send_key" => "⌨️  send-key".to_string(),
         "tmux_capture_pane" => "🖥️  capture".to_string(),
         "tmux_wait" => "⏸️  wait".to_string(),
-        other => other.to_string(),
+        other => format!("🔧 {other}"),
     }
 }
 
@@ -1393,6 +1396,29 @@ async fn send_prompt(
     state: &mut AppState,
     prompt: String,
 ) -> Result<()> {
+    send_prompt_inner(writer, state, prompt, /* record_history */ true).await
+}
+
+/// Same as `send_prompt` but does NOT persist the prompt into ↑/↓
+/// history.  Used for synthesised prompts (e.g. the `[launched]`
+/// `/claude` supervision prompt) that the user never typed; recording
+/// them would pollute history with large internal blocks the user
+/// can't usefully recall.  Matches classic chat, which never persists
+/// the synthetic supervision prompt either.
+async fn send_synth_prompt(
+    writer: &mut tokio::net::unix::OwnedWriteHalf,
+    state: &mut AppState,
+    prompt: String,
+) -> Result<()> {
+    send_prompt_inner(writer, state, prompt, /* record_history */ false).await
+}
+
+async fn send_prompt_inner(
+    writer: &mut tokio::net::unix::OwnedWriteHalf,
+    state: &mut AppState,
+    prompt: String,
+    record_history: bool,
+) -> Result<()> {
     state.push_user_line(format!("> {prompt}"));
     state.streaming = true;
 
@@ -1400,10 +1426,13 @@ async fn send_prompt(
     // prompt becomes ↑-recallable both within this session and on the
     // next chat invocation in the same cwd.  Disk write is best-
     // effort: a missing / locked / full history file should not break
-    // the chat itself.
-    state.record_submitted_prompt(&prompt);
-    if let Err(e) = crate::client::record_history_line(&prompt) {
-        tracing::warn!(error = %e, "failed to persist prompt to history.jsonl");
+    // the chat itself.  Synthesised prompts (`/claude` supervision
+    // block, etc.) skip both halves of recording.
+    if record_history {
+        state.record_submitted_prompt(&prompt);
+        if let Err(e) = crate::client::record_history_line(&prompt) {
+            tracing::warn!(error = %e, "failed to persist prompt to history.jsonl");
+        }
     }
 
     let req = Request::Chat {
@@ -2427,7 +2456,11 @@ fn push_wrapped_transcript_line(
         _ if is_continuation => "",
         LineKind::System => "  ",
         LineKind::Error => "! ",
-        LineKind::Tool => "🔧 ",
+        // No kind-level prefix for Tool: `tool_label()` already
+        // emits a per-tool glyph (e.g. "📄 read", "✏️  edit",
+        // "🔧 some_tool" for unknown tools), so adding "🔧 " here
+        // would double the glyph on every known tool.
+        LineKind::Tool => "",
         LineKind::Compacting => "⏳ ",
         LineKind::Steer => "↳ ",
         LineKind::Launch => "🚀 ",
@@ -2436,9 +2469,13 @@ fn push_wrapped_transcript_line(
 
     // Empty text still produces an empty visual row so a deliberate
     // blank line in the transcript stays a blank line.
+    // Style the prefix glyph with the kind's own style — otherwise
+    // an error `! ` would render in the terminal default colour,
+    // and the tool/launch glyphs would be untinted, undermining
+    // the visual signal the kind colour is supposed to carry.
     if tl.text.is_empty() {
         out.push(Line::from(vec![
-            Span::raw(prefix),
+            Span::styled(prefix, style),
             Span::styled(String::new(), style),
         ]));
         return;
@@ -2452,7 +2489,7 @@ fn push_wrapped_transcript_line(
     let first_segments = char_grid_wrap(&tl.text, first_inner);
     if first_segments.is_empty() {
         out.push(Line::from(vec![
-            Span::raw(prefix),
+            Span::styled(prefix, style),
             Span::styled(String::new(), style),
         ]));
         return;
@@ -2460,7 +2497,7 @@ fn push_wrapped_transcript_line(
 
     let (s, e) = first_segments[0];
     out.push(Line::from(vec![
-        Span::raw(prefix),
+        Span::styled(prefix, style),
         Span::styled(tl.text[s..e].to_string(), style),
     ]));
     if first_segments.len() == 1 {
@@ -3457,17 +3494,19 @@ mod tests {
         assert!(tool_label("edit_file").contains("✏"));
         assert!(tool_label("tmux_send_text").contains("send-text"));
         assert!(tool_label("tmux_capture_pane").contains("capture"));
-        // Unknown tool falls back to its bare name; the kind-level
-        // 🔧 prefix in `push_wrapped_transcript_line` carries the
-        // tool signal.
-        assert_eq!(tool_label("some_other_tool"), "some_other_tool");
+        // Unknown tool gets the generic 🔧 prefix from `tool_label`
+        // itself (the kind-level prefix in
+        // `push_wrapped_transcript_line` is empty for `Tool` to
+        // avoid doubling the glyph on known tools).
+        assert_eq!(tool_label("some_other_tool"), "🔧 some_other_tool");
     }
 
     #[test]
     fn handle_response_routes_tool_use_to_tool_kind() {
         // Regression guard: a refactor must keep ToolUse on the
-        // magenta + 🔧 path rather than dropping it back into the
-        // generic dim-grey System bucket.
+        // magenta path with `tool_label`'s per-tool glyph rather
+        // than dropping it back into the generic dim-grey System
+        // bucket.
         let mut s = test_state();
         s.streaming = true;
         let _ = handle_response(
