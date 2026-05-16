@@ -1455,7 +1455,11 @@ fn flush_steer_buffer(state: &mut AppState) {
 /// `Claude` and `ReplyReview` carry the parser output verbatim;
 /// dispatching them runs async work (tag generation, ClaudeLaunch
 /// IPC) which we do directly in `dispatch_input`.
-#[derive(Debug, PartialEq, Eq)]
+// PartialEq only (not Eq) because ReleaseCmd carries a String
+// summary and other variants have nested Vecs of structs that
+// don't implement Eq either.  Tests use match-and-assert rather
+// than `assert_eq!` for variant comparison anyway.
+#[derive(Debug, PartialEq)]
 enum InputDispatch {
     /// `/model` (no arg): show current model in transcript.
     ShowModel,
@@ -1467,9 +1471,18 @@ enum InputDispatch {
     /// numbers.  Worktree + description resolution happens
     /// asynchronously via `crate::client::resolve_replyreview_tasks`.
     ReplyReview(Vec<u32>),
-    /// `/release` is recognised but not yet ported to --tui.  Tell
-    /// the user to fall back rather than silently shipping the
-    /// literal text to the daemon (window-6 footgun fixed in #163).
+    /// `/release %pane` or `/release all` — parser succeeded.
+    /// Carries the parsed ReleaseCmd verbatim; dispatch sends a
+    /// `Request::ClaudeRelease` and the existing `TaskReleased`
+    /// handler in `handle_response` renders each released-pane
+    /// block.
+    Release(crate::client::ReleaseCmd),
+    /// Reserved for future slash commands that aren't yet wired.
+    /// Currently unused — every recognised command has a real
+    /// dispatch path — but kept so a future addition (say
+    /// `/inbox` listing) can park behind a clear UX message
+    /// rather than fall through to chat.
+    #[allow(dead_code)]
     NotYetWired(&'static str),
     /// Slash command failed to parse; surface the parser error to
     /// the transcript.
@@ -1486,7 +1499,8 @@ fn classify_input(text: &str) -> InputDispatch {
         Some(SlashCommand::Claude(Err(msg))) => InputDispatch::SlashError(msg),
         Some(SlashCommand::ReplyReview(Ok(prs))) => InputDispatch::ReplyReview(prs),
         Some(SlashCommand::ReplyReview(Err(msg))) => InputDispatch::SlashError(msg),
-        Some(SlashCommand::Release(_)) => InputDispatch::NotYetWired("/release"),
+        Some(SlashCommand::Release(Ok(cmd))) => InputDispatch::Release(cmd),
+        Some(SlashCommand::Release(Err(msg))) => InputDispatch::SlashError(msg),
         None => InputDispatch::SendChat,
     }
 }
@@ -1528,6 +1542,9 @@ async fn dispatch_input(
                 Ok(tasks) => launch_claude_tasks(writer, state, tasks).await?,
                 Err(msg) => state.push_error_line(format!("/replyreview: {msg}")),
             }
+        }
+        InputDispatch::Release(cmd) => {
+            release_panes(writer, state, cmd).await?;
         }
         InputDispatch::NotYetWired(name) => {
             state.push_system_line(format!(
@@ -1626,6 +1643,60 @@ async fn launch_claude_tasks(
         launched: Vec::new(),
     });
     state.streaming = true;
+    Ok(())
+}
+
+/// Send `Request::ClaudeRelease` for the parsed /release command.
+/// The daemon responds with one `Response::TaskReleased` per
+/// released pane followed by `Response::Done`.  Our existing
+/// `handle_response` arms render those frames as green
+/// formatted blocks (see TaskReleased arm), so this dispatcher
+/// just ships the request and returns; no follow-up state is
+/// needed beyond surfacing a breadcrumb so the user knows the
+/// release is in flight.
+async fn release_panes(
+    writer: &mut tokio::net::unix::OwnedWriteHalf,
+    state: &mut AppState,
+    cmd: crate::client::ReleaseCmd,
+) -> Result<()> {
+    let (target, clean_worktree, summary) = match cmd {
+        crate::client::ReleaseCmd::Pane {
+            pane_id,
+            clean,
+            summary,
+        } => (
+            crate::ipc::ClaudeReleaseTarget::Pane { pane_id },
+            clean,
+            summary,
+        ),
+        crate::client::ReleaseCmd::All { clean } => {
+            (crate::ipc::ClaudeReleaseTarget::All, clean, None)
+        }
+    };
+    let target_blurb = match &target {
+        crate::ipc::ClaudeReleaseTarget::Pane { pane_id } => format!("pane {pane_id}"),
+        crate::ipc::ClaudeReleaseTarget::All => "all panes".to_string(),
+    };
+    state.push_system_line(format!(
+        "[release] requesting release of {target_blurb}{}…",
+        if clean_worktree {
+            " (clean worktree)"
+        } else {
+            ""
+        }
+    ));
+    let req = Request::ClaudeRelease {
+        target,
+        clean_worktree,
+        summary,
+    };
+    let mut frame = serde_json::to_string(&req).context("serializing ClaudeRelease")?;
+    frame.push('\n');
+    if let Err(e) = writer.write_all(frame.as_bytes()).await {
+        state.push_error_line(format!("[error] sending /release to daemon: {e}"));
+        return Ok(());
+    }
+    let _ = writer.flush().await;
     Ok(())
 }
 
@@ -2254,14 +2325,35 @@ mod tests {
     }
 
     #[test]
-    fn classify_input_routes_release_to_not_yet_wired() {
-        // /release is recognised but not yet ported.  Must NOT fall
-        // through to SendChat (window-6 footgun, #163).
-        assert_eq!(
-            classify_input("/release %54"),
-            InputDispatch::NotYetWired("/release"),
-            "/release must not silently send as chat"
-        );
+    fn classify_input_routes_release_pane() {
+        // /release with a real pane id parses into Release(Pane).
+        match classify_input("/release %54") {
+            InputDispatch::Release(crate::client::ReleaseCmd::Pane { pane_id, .. }) => {
+                assert_eq!(pane_id, "%54");
+            }
+            other => panic!("expected Release(Pane), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_input_routes_release_all() {
+        match classify_input("/release all --clean") {
+            InputDispatch::Release(crate::client::ReleaseCmd::All { clean }) => {
+                assert!(clean, "--clean must propagate");
+            }
+            other => panic!("expected Release(All), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_input_release_parse_error_is_slash_error() {
+        // A parser-level failure (e.g. /release alone with no
+        // target) must surface as SlashError, not fall through to
+        // SendChat — same shape as /claude error handling.
+        match classify_input("/release") {
+            InputDispatch::SlashError(_) => {}
+            other => panic!("expected SlashError, got {other:?}"),
+        }
     }
 
     #[test]
