@@ -433,7 +433,10 @@ struct AppState {
     /// Without this compensation, `tail_scroll` grows but
     /// `transcript_scroll_back` stays constant, so the viewport
     /// drifts toward the tail even though the user is scrolled up.
-    last_transcript_total_rows: u16,
+    /// `usize` (not `u16`) so a long-running session whose total
+    /// wrap count exceeds `u16::MAX` doesn't observe wrap-around
+    /// and break the pin compensation.
+    last_transcript_total_rows: usize,
     /// Per-turn parser for the LLM's `- [ ] / - [x]` checklist.
     /// Inherits the parser logic from classic chat (PR #157) but
     /// surfaces the result as a transient status line drawn in the
@@ -2117,8 +2120,16 @@ fn draw(
             for tl in &state.transcript {
                 push_wrapped_transcript_line(&mut transcript_lines, tl, transcript_inner_width);
             }
-            let transcript_total_rows = transcript_lines.len() as u16;
-            let transcript_visible_rows = chunks[0].height.saturating_sub(2);
+            // Track wrapped row count in `usize` so a long
+            // session whose total wrap count exceeds `u16::MAX`
+            // (~65k) doesn't silently wrap around and break
+            // pin-compensation arithmetic.  Convert to `u16` only
+            // at the boundary where ratatui's `Paragraph::scroll`
+            // requires it, saturating to `u16::MAX` if needed —
+            // any value past 65k is well beyond a realistic
+            // viewport.
+            let transcript_total_rows: usize = transcript_lines.len();
+            let transcript_visible_rows = chunks[0].height.saturating_sub(2) as usize;
             // While the user is scrolled up (`transcript_scroll_back >
             // 0`), keep the viewport pinned even as new content grows
             // the transcript.  Without this compensation,
@@ -2128,18 +2139,20 @@ fn draw(
             // the tail and the user's pinned view slides forward.
             // Bumping `scroll_back` by the same delta cancels the
             // drift so the absolute first-visible row stays put.
-            // Clamp to u16::MAX so a pathological streamed-content
-            // burst can't overflow.
             if state.transcript_scroll_back > 0
                 && transcript_total_rows > state.last_transcript_total_rows
             {
                 let delta = transcript_total_rows - state.last_transcript_total_rows;
-                state.transcript_scroll_back = state.transcript_scroll_back.saturating_add(delta);
+                let delta_u16 = u16::try_from(delta).unwrap_or(u16::MAX);
+                state.transcript_scroll_back =
+                    state.transcript_scroll_back.saturating_add(delta_u16);
             }
             state.last_transcript_total_rows = transcript_total_rows;
             // Tail-following base: how many rows we'd hide above the
             // viewport to keep the newest content at the bottom edge.
-            let tail_scroll = transcript_total_rows.saturating_sub(transcript_visible_rows);
+            let tail_scroll: u16 =
+                u16::try_from(transcript_total_rows.saturating_sub(transcript_visible_rows))
+                    .unwrap_or(u16::MAX);
             // User-requested scrollback subtracts from that base.  The
             // saturating arithmetic handles the boundary cleanly:
             // scroll_back ≥ tail_scroll lands us at the very top.
@@ -2193,10 +2206,6 @@ fn draw(
                     input_lines.push(Line::from(sanitized_input[s..e].to_string()));
                 }
             }
-            let input_para = Paragraph::new(input_lines)
-                .block(Block::default().borders(Borders::ALL).title(input_title));
-            frame.render_widget(input_para, chunks[2]);
-
             // Cursor position inside the input box: walk the typed-
             // so-far prefix under the same char-grid wrap so the
             // cursor lands exactly where the renderer placed the
@@ -2213,8 +2222,16 @@ fn draw(
             let typed_so_far_clean = crate::sanitize(typed_so_far);
             let (cursor_row, cursor_col) =
                 wrapped_cursor_position(&typed_so_far_clean, inner_width);
+            // Scroll the input paragraph so the cursor row stays
+            // visible.  Without this, an input that wraps past
+            // `input_height` would render its top rows while the
+            // cursor sat on a logical row past the box, and they'd
+            // visually disagree.  The scroll offset is whatever
+            // hides everything above (cursor_row - last_visible_row).
             let visible_rows = chunks[2].height.saturating_sub(2);
-            let cursor_row = cursor_row.min(visible_rows.saturating_sub(1));
+            let last_visible = visible_rows.saturating_sub(1);
+            let input_scroll = cursor_row.saturating_sub(last_visible);
+            let visible_cursor_row = cursor_row.saturating_sub(input_scroll);
             // Clamp cursor_col to inner_width.  `wrapped_cursor_position`
             // can return `col > inner_width` when a glyph wider than
             // the box overflows on the current row (the wrap path
@@ -2223,7 +2240,14 @@ fn draw(
             // tests).  Without this clamp `set_cursor_position` could
             // place X past the box's right border.
             let cursor_col = cursor_col.min(inner_width);
-            frame.set_cursor_position((chunks[2].x + 1 + cursor_col, chunks[2].y + 1 + cursor_row));
+            let input_para = Paragraph::new(input_lines)
+                .block(Block::default().borders(Borders::ALL).title(input_title))
+                .scroll((input_scroll, 0));
+            frame.render_widget(input_para, chunks[2]);
+            frame.set_cursor_position((
+                chunks[2].x + 1 + cursor_col,
+                chunks[2].y + 1 + visible_cursor_row,
+            ));
         })
         .map_err(|e| anyhow::anyhow!("terminal.draw: {e}"))?;
     Ok(())
