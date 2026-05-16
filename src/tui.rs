@@ -2589,10 +2589,22 @@ fn push_wrapped_transcript_line(
     let prefix_cols =
         unicode_width::UnicodeWidthStr::width(prefix).min(inner_width as usize) as u16;
     let first_inner = inner_width.saturating_sub(prefix_cols);
-    let first_segments = char_grid_wrap(&tl.text, first_inner);
+    // Degenerate-narrow fallback: when the prefix consumes all
+    // available columns (e.g. `inner_width == 1` and prefix is
+    // "🚀 "), `first_inner == 0` and `char_grid_wrap` returns
+    // empty, which would silently drop the entire transcript line.
+    // Drop the prefix and re-wrap at full inner_width instead so
+    // content stays visible — the kind colour on the spans still
+    // carries the visual signal.
+    let (effective_prefix, effective_first_inner) = if first_inner == 0 && !tl.text.is_empty() {
+        ("", inner_width)
+    } else {
+        (prefix, first_inner)
+    };
+    let first_segments = char_grid_wrap(&tl.text, effective_first_inner);
     if first_segments.is_empty() {
         out.push(Line::from(vec![
-            Span::styled(prefix, style),
+            Span::styled(effective_prefix, style),
             Span::styled(String::new(), style),
         ]));
         return;
@@ -2600,7 +2612,7 @@ fn push_wrapped_transcript_line(
 
     let (s, e) = first_segments[0];
     out.push(Line::from(vec![
-        Span::styled(prefix, style),
+        Span::styled(effective_prefix, style),
         Span::styled(tl.text[s..e].to_string(), style),
     ]));
     if first_segments.len() == 1 {
@@ -2668,6 +2680,18 @@ fn wrapped_cursor_position(typed: &str, inner_width: u16) -> (u16, u16) {
 /// finds inside the run.  The output is a list of byte ranges into
 /// `text`, one per visual row, allocation-free at call time apart
 /// from the Vec itself.  `Vec::is_empty()` if `text` is empty.
+///
+/// **Width contract — read this before relying on it.**  In the
+/// common case every emitted segment has `display_width <=
+/// inner_width`.  In one degenerate case the segment overflows: a
+/// glyph whose display width on its own exceeds `inner_width`
+/// (e.g. a width-2 CJK glyph in a width-1 box) keeps its segment
+/// on the current row instead of triggering an empty-segment
+/// break.  The alternative — emitting an empty `(start, idx)` —
+/// would produce a leading blank visual row.  The renderer clips
+/// to the box width anyway, so callers that need a strict
+/// `width <= inner_width` invariant must clamp explicitly (see
+/// the `cursor_col.min(inner_width)` clamp in `draw`).
 fn char_grid_wrap(text: &str, inner_width: u16) -> Vec<(usize, usize)> {
     if inner_width == 0 || text.is_empty() {
         return Vec::new();
