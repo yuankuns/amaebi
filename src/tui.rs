@@ -47,6 +47,9 @@
 //!   per-tool glyph (📄 read / ✏️ edit / ⌨️ tmux / 🔧 generic),
 //!   Compacting yellow with ⏳, Steer yellow with ↳, Launch
 //!   (PaneAssigned) green with 🚀, errors red with `!`.
+//! - PgUp / PgDn scrollback inside the transcript.  Title bar
+//!   shows "↑ N rows from tail" while pinned; PgDn down to 0 (or
+//!   keep pressing) returns to follow-tail.
 //!
 //! Still on the to-do list (will land in subsequent commits on this
 //! same branch):
@@ -54,8 +57,6 @@
 //! - `/release` (recognised but parked behind a "not yet wired"
 //!   message; classic chat covers it for now).
 //! - Markdown rendering — assistant text is emitted verbatim.
-//! - TUI-internal scrollback (PgUp / mouse wheel); we always follow
-//!   the tail of the transcript.
 
 use std::io::stdout;
 use std::path::PathBuf;
@@ -91,6 +92,13 @@ const DOUBLE_CTRLC_WINDOW: std::time::Duration = std::time::Duration::from_secs(
 /// when the user mashes Ctrl-C).
 const CTRLC_EXIT_HINT: &str =
     "press Ctrl-C again within 2s to exit (or type a message and Enter to continue)";
+
+/// Number of visual rows PgUp / PgDn step through the transcript.
+/// We don't know the live viewport height from inside `handle_key`,
+/// so the page step is a reasonable approximation that works on
+/// any normal-sized terminal — small enough that even a 20-row
+/// window scrolls usefully, big enough to feel like a real page.
+const PAGE_STEP_ROWS: u16 = 10;
 
 /// Cap on how many `Response` frames we buffer while `steer_pending`
 /// is true.  Mirrors classic chat's `STEER_BUFFER_MAX_FRAMES`.  A
@@ -363,6 +371,14 @@ struct AppState {
     /// double-Ctrl-C-within-window exit gesture.  Cleared every time
     /// we leave the steer/exit-pending state.
     last_ctrl_c: Option<std::time::Instant>,
+    /// User's scroll position in the transcript, expressed as
+    /// "rows above the tail-following position".  `0` (or any value
+    /// that would put us at or past the tail anyway) means "follow
+    /// tail" — every new frame auto-scrolls so the latest content
+    /// stays visible.  Any other value means the user has scrolled
+    /// up and wants to stay there even as new content lands.
+    /// PgDn down to 0 (or End) restores follow-tail.
+    transcript_scroll_back: u16,
     /// Per-turn parser for the LLM's `- [ ] / - [x]` checklist.
     /// Inherits the parser logic from classic chat (PR #157) but
     /// surfaces the result as a transient status line drawn in the
@@ -425,6 +441,7 @@ impl AppState {
             steer_buffer: Vec::new(),
             steer_buffer_truncated: false,
             last_ctrl_c: None,
+            transcript_scroll_back: 0,
             // `false` for render_enabled — the TUI doesn't use the
             // tracker's stderr-rendering half (we read
             // `latest_progress` from `draw` and stitch the result
@@ -791,6 +808,16 @@ fn handle_key(key: KeyEvent, state: &mut AppState) -> KeyOutcome {
         }
         KeyCode::Down => {
             state.history_next();
+            KeyOutcome::Continue
+        }
+        KeyCode::PageUp => {
+            state.transcript_scroll_back =
+                state.transcript_scroll_back.saturating_add(PAGE_STEP_ROWS);
+            KeyOutcome::Continue
+        }
+        KeyCode::PageDown => {
+            state.transcript_scroll_back =
+                state.transcript_scroll_back.saturating_sub(PAGE_STEP_ROWS);
             KeyOutcome::Continue
         }
         KeyCode::Char(c) => {
@@ -1550,10 +1577,31 @@ fn draw(
             }
             let transcript_total_rows = transcript_lines.len() as u16;
             let transcript_visible_rows = chunks[0].height.saturating_sub(2);
-            let scroll_y = transcript_total_rows.saturating_sub(transcript_visible_rows);
+            // Tail-following base: how many rows we'd hide above the
+            // viewport to keep the newest content at the bottom edge.
+            let tail_scroll = transcript_total_rows.saturating_sub(transcript_visible_rows);
+            // User-requested scrollback subtracts from that base.  The
+            // saturating arithmetic handles the boundary cleanly:
+            // scroll_back ≥ tail_scroll lands us at the very top.
+            let scroll_y = tail_scroll.saturating_sub(state.transcript_scroll_back);
+            // Title shows a "↑ N rows" indicator when the user has
+            // scrolled away from the tail, so they're never wondering
+            // why new content stopped appearing on screen.
+            let transcript_title: String = if state.transcript_scroll_back > 0 {
+                format!(
+                    " amaebi  ↑ {} rows from tail (PgDn / End to follow) ",
+                    state.transcript_scroll_back
+                )
+            } else {
+                " amaebi ".to_string()
+            };
 
             let transcript = Paragraph::new(transcript_lines)
-                .block(Block::default().borders(Borders::ALL).title(" amaebi "))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(transcript_title),
+                )
                 .scroll((scroll_y, 0));
             frame.render_widget(transcript, chunks[0]);
 
@@ -2221,6 +2269,25 @@ mod tests {
         let alpha_pos = texts.iter().position(|t| t.contains("alpha")).unwrap();
         let beta_pos = texts.iter().position(|t| t.contains("beta")).unwrap();
         assert!(alpha_pos < beta_pos, "alpha must precede beta");
+    }
+
+    #[test]
+    fn pageup_pagedown_steps_scroll_back() {
+        // PgUp grows scroll-back by PAGE_STEP_ROWS, PgDn shrinks it,
+        // and PgDn past 0 saturates at "follow tail" rather than
+        // wrapping or panicking.
+        let mut s = test_state();
+        let _ = handle_key(key(KeyCode::PageUp), &mut s);
+        assert_eq!(s.transcript_scroll_back, PAGE_STEP_ROWS);
+        let _ = handle_key(key(KeyCode::PageUp), &mut s);
+        assert_eq!(s.transcript_scroll_back, PAGE_STEP_ROWS * 2);
+        let _ = handle_key(key(KeyCode::PageDown), &mut s);
+        assert_eq!(s.transcript_scroll_back, PAGE_STEP_ROWS);
+        let _ = handle_key(key(KeyCode::PageDown), &mut s);
+        assert_eq!(s.transcript_scroll_back, 0);
+        // Past-zero PgDn must not underflow.
+        let _ = handle_key(key(KeyCode::PageDown), &mut s);
+        assert_eq!(s.transcript_scroll_back, 0);
     }
 
     #[test]
