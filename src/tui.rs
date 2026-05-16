@@ -38,13 +38,17 @@
 //!   prompts for a correction; Enter submits the correction as a
 //!   `Request::Steer`; empty Enter cancels and flushes the buffer
 //!   back into the transcript; second Ctrl-C exits.
+//! - `--resume <UUID>`: passes through to the daemon's session
+//!   rehydrate (same behaviour as `amaebi chat -r=<UUID>` classic).
+//! - Plan progress: shares the parser from PR #157, surfaces the
+//!   live `[plan N/M done]` count in the input box title and pins
+//!   the final state into the transcript on Done.
 //!
 //! Still on the to-do list (will land in subsequent commits on this
 //! same branch):
 //!
 //! - `/release` (recognised but parked behind a "not yet wired"
 //!   message; classic chat covers it for now).
-//! - `--resume` (UUID is accepted but treated like a new session).
 //! - Plan progress indicator (`[plan N/M done]`).
 //! - Tool-notice colour styling (`ToolUse`, `Compacting`,
 //!   `WaitingForInput` are currently rendered as plain `[…]` lines).
@@ -98,9 +102,12 @@ const STEER_BUFFER_MAX_FRAMES: usize = 1000;
 /// Public entry — called from `main.rs` when `--tui` is set.
 ///
 /// Mirrors the `run_chat_loop` signature so the two paths are
-/// interchangeable at the call site.  `resumed_session_id` is accepted
-/// but not yet used by the TUI path (Step 1 limitation; see module
-/// docstring).
+/// interchangeable at the call site.  When `resumed_session_id` is
+/// `Some`, the daemon reuses its in-memory + SQLite history for that
+/// session UUID on every `Request::Chat` (same behaviour as classic
+/// `amaebi chat -r=<UUID>` — the dedicated full-rehydrate path is
+/// `amaebi resume`, which is a separate one-shot subcommand and
+/// not exercised here).
 pub async fn run_chat_tui(
     socket: PathBuf,
     initial_prompt: Option<String>,
@@ -112,6 +119,10 @@ pub async fn run_chat_tui(
         .unwrap_or_else(|| provider::DEFAULT_MODEL.to_string());
 
     let cwd = std::env::current_dir().context("getting current directory")?;
+    // True iff the user passed `-r=<UUID>` and we'll resume that
+    // session.  Used purely for a startup breadcrumb; the daemon
+    // does the actual rehydrate based on session_id alone.
+    let is_resumed = resumed_session_id.is_some();
     let session_id = match resumed_session_id {
         Some(id) => id,
         None => {
@@ -151,6 +162,12 @@ pub async fn run_chat_tui(
         .unwrap_or_default();
 
     push_banner(&mut state, &cwd);
+    if is_resumed {
+        state.push_system_line(format!(
+            "[resumed] daemon will rehydrate prior turns for session {}.",
+            &session_id[..8.min(session_id.len())]
+        ));
+    }
     state.push_system_line(
         "Type a message and press Enter to send.  ↑/↓ for history.  Ctrl-C / Ctrl-D exits.".into(),
     );
@@ -327,6 +344,13 @@ struct AppState {
     /// double-Ctrl-C-within-window exit gesture.  Cleared every time
     /// we leave the steer/exit-pending state.
     last_ctrl_c: Option<std::time::Instant>,
+    /// Per-turn parser for the LLM's `- [ ] / - [x]` checklist.
+    /// Inherits the parser logic from classic chat (PR #157) but
+    /// surfaces the result as a transient status line drawn in the
+    /// input title, not as a stderr `\r\x1b[K` overwrite.  Reset
+    /// (`PlanProgressTracker::new(false)`) on every `Response::Done`
+    /// so progress from one turn doesn't leak into the next.
+    plan_tracker: crate::client::PlanProgressTracker,
     /// Set while a `/claude` (or `/replyreview`) launch is in flight.
     /// Holds the tag→description map needed to reconstitute the
     /// `[launched]` block once the daemon emits `Response::Done`,
@@ -382,6 +406,13 @@ impl AppState {
             steer_buffer: Vec::new(),
             steer_buffer_truncated: false,
             last_ctrl_c: None,
+            // `false` for render_enabled — the TUI doesn't use the
+            // tracker's stderr-rendering half (we read
+            // `latest_progress` from `draw` and stitch the result
+            // into the input box title).  The flag gates the async
+            // render/finish methods we never call, so its value is
+            // moot today; passing false documents intent.
+            plan_tracker: crate::client::PlanProgressTracker::new(false),
             pending_claude: None,
             socket_path,
             cwd_str,
@@ -794,10 +825,27 @@ fn handle_response(resp: Response, state: &mut AppState) -> ResponseOutcome {
     }
     match resp {
         Response::Text { chunk } => {
+            // Feed the plan tracker the raw chunk BEFORE we push it
+            // through the markdown buffer so the tracker sees the
+            // exact `- [ ]` / `- [x]` markers the LLM emitted.
+            state.plan_tracker.push(&chunk);
             state.push_assistant_chunk(&chunk);
             ResponseOutcome::Continuing
         }
         Response::Done => {
+            // Score any final checklist item the model emitted
+            // without a trailing newline, then reset the tracker so
+            // progress from this turn doesn't leak into the next
+            // (e.g. a follow-up turn with no checklist would otherwise
+            // keep showing the previous turn's [plan N/M done]).
+            state.plan_tracker.finalize_tail();
+            let final_progress = state.plan_tracker.latest_progress();
+            if let Some((done, total)) = final_progress {
+                if total > 0 {
+                    state.push_system_line(format!("[plan {done}/{total} done]"));
+                }
+            }
+            state.plan_tracker = crate::client::PlanProgressTracker::new(false);
             state.close_open_assistant_line();
             state.streaming = false;
             // If a /claude launch was in flight, this Done means the
@@ -823,6 +871,9 @@ fn handle_response(resp: Response, state: &mut AppState) -> ResponseOutcome {
             // a subsequent input doesn't leak it into a synthesised
             // supervision prompt.
             state.pending_claude = None;
+            // Reset the plan tracker too — a half-emitted checklist
+            // shouldn't survive into the next turn.
+            state.plan_tracker = crate::client::PlanProgressTracker::new(false);
             ResponseOutcome::TurnEnded
         }
         Response::ToolUse { name, detail } => {
@@ -1380,12 +1431,25 @@ fn draw(
             // has to wrap anything itself.
             let total_area = frame.area();
 
-            let input_title = if state.steer_pending {
-                " steer (Enter to submit correction, empty Enter to cancel, Ctrl-C exits) "
+            // While streaming, splice the live `[plan N/M done]`
+            // counter into the title (when the LLM is maintaining a
+            // checklist) so the user sees progress without the
+            // tracker writing anything to stderr.  The title is a
+            // string that lives only as long as this draw closure;
+            // owning a `String` is cheaper than threading a Cow
+            // through ratatui's Block API.
+            let plan_blurb = state
+                .plan_tracker
+                .latest_progress()
+                .filter(|(_, total)| *total > 0)
+                .map(|(d, t)| format!(" [plan {d}/{t} done] "))
+                .unwrap_or_default();
+            let input_title: String = if state.steer_pending {
+                " steer (Enter to submit correction, empty Enter to cancel, Ctrl-C exits) ".into()
             } else if state.streaming {
-                " streaming… Ctrl-C to interrupt and steer "
+                format!(" streaming…{plan_blurb}Ctrl-C to interrupt and steer ")
             } else {
-                " input (Enter to send, Ctrl-C twice to exit) "
+                " input (Enter to send, Ctrl-C twice to exit) ".into()
             };
 
             // Floor at 3 so an empty input still shows a 1-row cavity;
@@ -2074,6 +2138,39 @@ mod tests {
         let alpha_pos = texts.iter().position(|t| t.contains("alpha")).unwrap();
         let beta_pos = texts.iter().position(|t| t.contains("beta")).unwrap();
         assert!(alpha_pos < beta_pos, "alpha must precede beta");
+    }
+
+    #[test]
+    fn plan_tracker_updates_on_text_chunk() {
+        // Each Response::Text chunk feeds the parser before the
+        // chunk lands in the transcript, so the input box title can
+        // show live `[plan N/M done]` while streaming.
+        let mut s = test_state();
+        s.streaming = true;
+        let _ = handle_response(
+            Response::Text {
+                chunk: "- [x] step 1\n- [ ] step 2\n".into(),
+            },
+            &mut s,
+        );
+        assert_eq!(s.plan_tracker.latest_progress(), Some((1, 2)));
+    }
+
+    #[test]
+    fn plan_tracker_resets_on_done_so_next_turn_starts_clean() {
+        // Without the reset, a turn with no checklist would keep
+        // showing the previous turn's progress count.
+        let mut s = test_state();
+        s.streaming = true;
+        let _ = handle_response(
+            Response::Text {
+                chunk: "- [x] a\n- [x] b\n".into(),
+            },
+            &mut s,
+        );
+        assert_eq!(s.plan_tracker.latest_progress(), Some((2, 2)));
+        let _ = handle_response(Response::Done, &mut s);
+        assert_eq!(s.plan_tracker.latest_progress(), None);
     }
 
     #[test]

@@ -230,7 +230,7 @@ fn render_markdown(text: &str) -> String {
 /// terminal escape noise.  Matches the pattern used for other stderr
 /// UI in this file (`ToolUse`, `Compacting`, the SIGINT steer banner).
 #[derive(Default)]
-struct PlanProgressTracker {
+pub(crate) struct PlanProgressTracker {
     /// Unparsed tail of the stream — at most one partial (no-newline)
     /// line at any point, since `push` drains completed lines before
     /// returning.
@@ -249,14 +249,14 @@ struct PlanProgressTracker {
 }
 
 impl PlanProgressTracker {
-    fn new(render_enabled: bool) -> Self {
+    pub(crate) fn new(render_enabled: bool) -> Self {
         Self {
             render_enabled,
             ..Default::default()
         }
     }
 
-    fn push(&mut self, chunk: &str) {
+    pub(crate) fn push(&mut self, chunk: &str) {
         self.buf.push_str(chunk);
         // Only consume up to the last newline; any trailing partial
         // line stays buffered for next push.
@@ -280,7 +280,7 @@ impl PlanProgressTracker {
     /// when the checklist is the final thing in the reply — is still
     /// counted.  Idempotent: once called, `buf` is empty, so repeated
     /// calls are no-ops.
-    fn finalize_tail(&mut self) {
+    pub(crate) fn finalize_tail(&mut self) {
         if self.buf.is_empty() {
             return;
         }
@@ -312,7 +312,7 @@ impl PlanProgressTracker {
     /// `current` (still-open run) wins over `latest` (closed run) so
     /// the displayed progress always reflects the newest plan the LLM
     /// has emitted.
-    fn latest_progress(&self) -> Option<(usize, usize)> {
+    pub(crate) fn latest_progress(&self) -> Option<(usize, usize)> {
         self.current.or(self.latest)
     }
 
