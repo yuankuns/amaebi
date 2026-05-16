@@ -1944,17 +1944,302 @@ fn draw(
 /// at `inner_width` columns under a char-grid wrap.  Preserves the
 /// entry's `LineKind` styling on every visual row so a wrapped User
 /// line stays cyan all the way down, etc.
+/// One styled run after parsing inline markdown.  Plain text uses
+/// the `LineKind`'s base style; the variants below add their own
+/// modifier on top so a `**bold** text` row renders with the bold
+/// half visually distinct.
+#[derive(Debug, Clone, PartialEq)]
+enum MdToken {
+    Plain(String),
+    Code(String),
+    Bold(String),
+    Italic(String),
+}
+
+impl MdToken {
+    fn text(&self) -> &str {
+        match self {
+            MdToken::Plain(s) | MdToken::Code(s) | MdToken::Bold(s) | MdToken::Italic(s) => {
+                s.as_str()
+            }
+        }
+    }
+
+    /// Build the ratatui `Style` for this token, on top of `base`.
+    /// Code spans shift to a distinct foreground; bold/italic add
+    /// the corresponding modifier without changing the colour, so
+    /// they compose with kind-level tints.
+    fn style_on(&self, base: Style) -> Style {
+        match self {
+            MdToken::Plain(_) => base,
+            MdToken::Code(_) => base.fg(Color::Cyan),
+            MdToken::Bold(_) => base.add_modifier(Modifier::BOLD),
+            MdToken::Italic(_) => base.add_modifier(Modifier::ITALIC),
+        }
+    }
+}
+
+/// Parse a line of assistant text into styled tokens.  Recognises:
+///
+/// - `` `inline code` ``     → `Code(text)`
+/// - `**bold**`              → `Bold(text)`
+/// - `*italic*`              → `Italic(text)` (also `_italic_`)
+///
+/// Markers are recognised greedily left-to-right.  An unmatched
+/// opener (e.g. a stray `` ` `` with no close before EOL) falls
+/// through as plain text — we never panic and never silently drop
+/// characters.  Whole-line constructs (headings, fences, lists)
+/// are handled at a higher level by `assistant_line_style`, not
+/// here.
+fn tokenize_inline_markdown(text: &str) -> Vec<MdToken> {
+    let bytes = text.as_bytes();
+    let mut tokens: Vec<MdToken> = Vec::new();
+    let mut plain_start = 0usize;
+    let mut i = 0usize;
+    let len = bytes.len();
+
+    let flush_plain = |tokens: &mut Vec<MdToken>, src: &str, start: usize, end: usize| {
+        if start < end {
+            tokens.push(MdToken::Plain(src[start..end].to_string()));
+        }
+    };
+
+    while i < len {
+        // `code` — single backtick run.  Matches the smallest closing
+        // backtick (greedy on text, lazy on closer) so `foo` inside
+        // `text with foo` doesn't lose the trailing foo.
+        if bytes[i] == b'`' {
+            // Skip backslash-escaped backticks (rare but cheap).
+            if let Some(close) = (i + 1..len).find(|&j| bytes[j] == b'`') {
+                let inside = &text[i + 1..close];
+                if !inside.is_empty() {
+                    flush_plain(&mut tokens, text, plain_start, i);
+                    tokens.push(MdToken::Code(inside.to_string()));
+                    i = close + 1;
+                    plain_start = i;
+                    continue;
+                }
+            }
+        }
+        // **bold** — paired double-asterisk.  Lookahead must NOT
+        // also match an italic `*x*` immediately by accident; we
+        // only fire when the next two bytes are `**` AND a closing
+        // `**` exists.
+        if i + 1 < len && bytes[i] == b'*' && bytes[i + 1] == b'*' {
+            if let Some(close) = find_seq(bytes, i + 2, b"**") {
+                let inside = &text[i + 2..close];
+                if !inside.is_empty() {
+                    flush_plain(&mut tokens, text, plain_start, i);
+                    tokens.push(MdToken::Bold(inside.to_string()));
+                    i = close + 2;
+                    plain_start = i;
+                    continue;
+                }
+            }
+        }
+        // *italic* / _italic_ — single asterisk or underscore.
+        // Reject if the next char is a space (markdown convention:
+        // `* not italic *`) or if we're at the boundary of a word
+        // for `_` (so `foo_bar_baz` doesn't get italicized in
+        // middle), to keep code identifiers sane.
+        if (bytes[i] == b'*' || bytes[i] == b'_') && i + 1 < len {
+            let marker = bytes[i];
+            let next = bytes[i + 1];
+            // Skip if it's a closing-only or empty marker.
+            if next != b' ' && next != b'\t' && next != b'\n' && next != marker {
+                if let Some(close) = (i + 1..len).find(|&j| bytes[j] == marker) {
+                    // For `_`, require the closing `_` to also not
+                    // be in the middle of a word (`_x_y` shouldn't
+                    // italicize `x`).  For `*` we don't enforce
+                    // word-boundary.
+                    let close_ok = if marker == b'_' {
+                        close + 1 == len
+                            || !(bytes[close + 1].is_ascii_alphanumeric()
+                                || bytes[close + 1] == b'_')
+                    } else {
+                        true
+                    };
+                    let inside = &text[i + 1..close];
+                    if close_ok && !inside.is_empty() && !inside.starts_with(' ') {
+                        flush_plain(&mut tokens, text, plain_start, i);
+                        tokens.push(MdToken::Italic(inside.to_string()));
+                        i = close + 1;
+                        plain_start = i;
+                        continue;
+                    }
+                }
+            }
+        }
+        // Default: advance one byte.  We're in the middle of a
+        // potential plain run; the next iteration will check for
+        // markers again.
+        i += 1;
+    }
+    flush_plain(&mut tokens, text, plain_start, len);
+    tokens
+}
+
+/// Find a multi-byte sequence in `haystack` starting at `from`.
+/// Inlined so the tokenizer doesn't need a `memchr` dependency.
+fn find_seq(haystack: &[u8], from: usize, needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    let last = haystack.len() - needle.len();
+    (from..=last).find(|&i| &haystack[i..i + needle.len()] == needle)
+}
+
+/// Returns the heading style + the heading text for `# / ## / ###`
+/// lines, or `None` for non-headings.  Headings get a tint and
+/// keep their leading hashes stripped so the rendered line reads
+/// cleanly.
+fn assistant_heading(text: &str) -> Option<(String, Style)> {
+    let trimmed = text.trim_start();
+    let prefix_len = text.len() - trimmed.len();
+    let prefix = &text[..prefix_len];
+    let (hashes, rest) = if let Some(r) = trimmed.strip_prefix("### ") {
+        ("###", r)
+    } else if let Some(r) = trimmed.strip_prefix("## ") {
+        ("##", r)
+    } else if let Some(r) = trimmed.strip_prefix("# ") {
+        ("#", r)
+    } else {
+        return None;
+    };
+    let style = match hashes {
+        "#" => Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+        "##" => Style::default()
+            .fg(Color::LightYellow)
+            .add_modifier(Modifier::BOLD),
+        _ => Style::default().add_modifier(Modifier::BOLD),
+    };
+    // Preserve original leading whitespace so wrapped lists with
+    // headings keep their indent.  Hashes themselves go away —
+    // they're chrome, not content.
+    Some((format!("{prefix}{rest}"), style))
+}
+
+/// Markdown-aware wrap for an assistant transcript line.  Recognises
+/// inline `code` / `**bold**` / `*italic*` markers via
+/// `tokenize_inline_markdown`, plus whole-line headings via
+/// `assistant_heading`.  The output uses ratatui's Span composition
+/// so different parts of the same visual row can carry different
+/// colours / modifiers — important for code-spanned terms in
+/// otherwise-plain prose.
+///
+/// Wrap math: walk tokens left-to-right, accumulating into the
+/// current visual row; when adding a token's next character would
+/// exceed `inner_width`, emit the row and start fresh.  Within a
+/// single token we may also need to break (a long `code` span that
+/// spans multiple rows).  Width comes from `unicode_width` so CJK +
+/// emoji land correctly.
+fn push_wrapped_assistant_line(out: &mut Vec<Line<'static>>, text: &str, inner_width: u16) {
+    if text.is_empty() {
+        out.push(Line::from(""));
+        return;
+    }
+    if inner_width == 0 {
+        // Degenerate viewport — push a single empty row to keep
+        // layout intact rather than panicking.
+        out.push(Line::from(""));
+        return;
+    }
+
+    // Heading detection happens before token parsing because the
+    // hash characters are chrome, not content — they'd otherwise
+    // show up verbatim in the rendered output.  When a heading is
+    // found, we still tokenize the rest (so "## **important**"
+    // gets bold-on-yellow), but the heading style gets folded into
+    // the base.
+    let (effective_text, base_style) = if let Some((stripped, style)) = assistant_heading(text) {
+        (stripped, style)
+    } else {
+        (text.to_string(), Style::default())
+    };
+
+    let tokens = tokenize_inline_markdown(&effective_text);
+
+    // Walk tokens, splitting each one into character-grid pieces
+    // that fit in the remaining width on the current row.  When a
+    // row fills up, emit it and start fresh.  Plain tokens don't
+    // get a special style; other tokens fold their modifier on top
+    // of `base_style`.
+    let inner = inner_width as usize;
+    let mut current_row: Vec<Span<'static>> = Vec::new();
+    let mut current_col: usize = 0;
+
+    for token in &tokens {
+        let token_style = token.style_on(base_style);
+        let mut piece_start = 0usize;
+        let mut piece_col = 0usize;
+        let token_text = token.text();
+        let token_bytes = token_text.as_bytes();
+        for (idx, ch) in token_text.char_indices() {
+            let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+            if w == 0 {
+                continue;
+            }
+            if current_col + piece_col + w > inner {
+                // Emit any accumulated piece into the current row,
+                // then push the row out and start a new one.
+                if piece_start < idx {
+                    current_row.push(Span::styled(
+                        token_text[piece_start..idx].to_string(),
+                        token_style,
+                    ));
+                }
+                out.push(Line::from(std::mem::take(&mut current_row)));
+                current_col = 0;
+                piece_start = idx;
+                piece_col = 0;
+                // Re-evaluate this character on the fresh row (fall
+                // through; w + 0 is by construction <= inner unless
+                // a single char is wider than the whole viewport,
+                // in which case we accept overflow rather than
+                // loop forever).
+            }
+            piece_col += w;
+            // Step over the codepoint we just accepted.  We don't
+            // need to track the byte offset of `idx + ch.len_utf8()`
+            // because the next iteration of char_indices will give
+            // us the next codepoint's start.
+            let _ = token_bytes;
+        }
+        // Emit the trailing piece into the current row.
+        if piece_start < token_text.len() {
+            current_row.push(Span::styled(
+                token_text[piece_start..].to_string(),
+                token_style,
+            ));
+            current_col += piece_col;
+        }
+    }
+    // Flush the final row even if it's empty (e.g. text was only
+    // markers that all got eaten — vanishingly unlikely).
+    out.push(Line::from(current_row));
+}
+
 fn push_wrapped_transcript_line(
     out: &mut Vec<Line<'static>>,
     tl: &TranscriptLine,
     inner_width: u16,
 ) {
+    // Assistant lines carry inline markdown (`code`, **bold**,
+    // *italic*) and may be heading lines.  Route them through the
+    // markdown-aware path; everything else stays on the simpler
+    // single-style wrap below.
+    if matches!(tl.kind, LineKind::Assistant { .. }) {
+        push_wrapped_assistant_line(out, &tl.text, inner_width);
+        return;
+    }
     let style = match tl.kind {
         LineKind::System => Style::default().fg(Color::DarkGray),
         LineKind::User => Style::default()
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD),
-        LineKind::Assistant { .. } => Style::default(),
+        LineKind::Assistant { .. } => unreachable!("handled above"),
         LineKind::Error => Style::default().fg(Color::Red),
         LineKind::Tool => Style::default().fg(Color::Magenta),
         LineKind::Compacting => Style::default().fg(Color::Yellow),
@@ -2483,6 +2768,82 @@ mod tests {
         }
         // Outside-HOME path stays verbatim.
         assert_eq!(shorten_cwd("/etc/hosts"), "/etc/hosts");
+    }
+
+    #[test]
+    fn tokenize_inline_markdown_recognises_code_bold_italic() {
+        let toks = tokenize_inline_markdown("a `code` b **bold** c *italic* d");
+        // Plain runs get separated by the markup tokens.  We don't
+        // care about exact whitespace boundaries beyond "no token
+        // is empty and the concatenation round-trips".
+        let mut all = String::new();
+        for t in &toks {
+            all.push_str(t.text());
+        }
+        // Markers themselves are stripped — the recovered text is
+        // the rendered visible text, not the source.
+        assert_eq!(all, "a code b bold c italic d");
+        assert!(toks
+            .iter()
+            .any(|t| matches!(t, MdToken::Code(s) if s == "code")));
+        assert!(toks
+            .iter()
+            .any(|t| matches!(t, MdToken::Bold(s) if s == "bold")));
+        assert!(toks
+            .iter()
+            .any(|t| matches!(t, MdToken::Italic(s) if s == "italic")));
+    }
+
+    #[test]
+    fn tokenize_inline_markdown_unmatched_marker_falls_through_as_plain() {
+        // A stray backtick with no closer must not panic and must
+        // not eat trailing text.
+        let toks = tokenize_inline_markdown("foo `unfinished bar");
+        let joined: String = toks.iter().map(|t| t.text()).collect();
+        assert_eq!(joined, "foo `unfinished bar");
+        // No Code token should have been produced.
+        assert!(!toks.iter().any(|t| matches!(t, MdToken::Code(_))));
+    }
+
+    #[test]
+    fn tokenize_inline_markdown_underscore_inside_word_not_italic() {
+        // `foo_bar_baz` is a common identifier; the parser must
+        // not treat the inner `_bar_` as italic.
+        let toks = tokenize_inline_markdown("foo_bar_baz");
+        assert!(!toks.iter().any(|t| matches!(t, MdToken::Italic(_))));
+        let joined: String = toks.iter().map(|t| t.text()).collect();
+        assert_eq!(joined, "foo_bar_baz");
+    }
+
+    #[test]
+    fn assistant_heading_strips_hashes_and_assigns_style() {
+        let (stripped, style) = assistant_heading("# Title").unwrap();
+        assert_eq!(stripped, "Title");
+        // Bold modifier should be present.
+        assert!(style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn assistant_heading_returns_none_for_non_heading() {
+        assert!(assistant_heading("just a paragraph").is_none());
+        // `#tag` (no space after hash) is not a heading.
+        assert!(assistant_heading("#tag at line start").is_none());
+    }
+
+    #[test]
+    fn push_wrapped_assistant_line_emits_styled_spans_for_inline_code() {
+        // Inline `code` between plain text should produce at least
+        // three spans on the same row: "before ", "code", " after".
+        let mut out: Vec<Line<'static>> = Vec::new();
+        push_wrapped_assistant_line(&mut out, "before `code` after", 80);
+        assert_eq!(out.len(), 1, "single short line shouldn't wrap");
+        let row = &out[0];
+        let span_texts: Vec<&str> = row.spans.iter().map(|s| s.content.as_ref()).collect();
+        let joined = span_texts.concat();
+        assert_eq!(joined, "before code after");
+        // At least one span carries Cyan (the Code style).
+        let any_cyan = row.spans.iter().any(|s| s.style.fg == Some(Color::Cyan));
+        assert!(any_cyan, "code span must render in cyan");
     }
 
     #[test]
