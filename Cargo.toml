@@ -35,9 +35,11 @@ crossterm = { version = "0.29", features = ["event-stream"] }
 # Used by the TUI input box (src/tui.rs) to compute terminal-column
 # width of multi-byte input — CJK / fullwidth / emoji glyphs occupy
 # two columns in a terminal but one Unicode scalar each, so cursor
-# positioning needs the column count, not the char count.  Same major
-# version as ratatui's transitive copy to keep a single resolved
-# version in the lockfile.
+# positioning needs the column count, not the char count.  Pinned to
+# 0.2 to match the major used by ratatui (so cell-width math agrees
+# with how ratatui renders).  Cargo.lock still resolves a separate
+# 0.1 copy for rustyline + termimad — pulling those forward would
+# need upstream releases first; the duplicate is harmless.
 unicode-width = "0.2"
 rustyline = "14"
 toml = "0.8"

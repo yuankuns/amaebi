@@ -702,6 +702,7 @@ enum KeyOutcome {
 
 fn handle_key(key: KeyEvent, state: &mut AppState) -> KeyOutcome {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
     let now = std::time::Instant::now();
     match key.code {
         // Ctrl-C semantics — depends on what mode we're in:
@@ -872,7 +873,16 @@ fn handle_key(key: KeyEvent, state: &mut AppState) -> KeyOutcome {
             KeyOutcome::Continue
         }
         KeyCode::End => {
-            state.input_cursor = state.input.len();
+            // The transcript title hint advertises "PgDn / End to
+            // follow", so when the user has scrolled back, End jumps
+            // straight to the tail (priority over input cursor).
+            // When already at the tail, fall through to the normal
+            // line-editor behaviour (move cursor to end-of-line).
+            if state.transcript_scroll_back > 0 {
+                state.transcript_scroll_back = 0;
+            } else {
+                state.input_cursor = state.input.len();
+            }
             KeyOutcome::Continue
         }
         KeyCode::Up => {
@@ -898,11 +908,14 @@ fn handle_key(key: KeyEvent, state: &mut AppState) -> KeyOutcome {
             KeyOutcome::Continue
         }
         KeyCode::Char(c) => {
-            // Discard any other modifier combos we haven't handled —
-            // including Alt/Shift-space — rather than interpret them.
-            // This keeps the prototype predictable and leaves room for
-            // reedline (a possible later swap-in) to take over.
-            if ctrl {
+            // Discard any modifier combo we haven't explicitly
+            // handled — Ctrl, Alt (Meta), Ctrl-Alt — rather than
+            // interpret them as plain insertions.  Shift is allowed
+            // through (otherwise we'd swallow uppercase letters and
+            // shifted symbols).  This keeps the prototype
+            // predictable and leaves room for reedline (a possible
+            // later swap-in) to take over.
+            if ctrl || alt {
                 return KeyOutcome::Continue;
             }
             // Insert at cursor, not at the end.  Encoding in place
@@ -1991,15 +2004,18 @@ fn draw(
             // User-requested scrollback subtracts from that base.  The
             // saturating arithmetic handles the boundary cleanly:
             // scroll_back ≥ tail_scroll lands us at the very top.
+            //
+            // Clamp the *displayed* offset to `tail_scroll` so the
+            // title never claims "↑ 9999 rows" on a 12-row
+            // transcript just because the user mashed PgUp.  The
+            // raw `transcript_scroll_back` stays as the user typed
+            // it (no clobber on resize); we only show the effective
+            // distance from tail.
             let scroll_y = tail_scroll.saturating_sub(state.transcript_scroll_back);
-            // Title shows a "↑ N rows" indicator when the user has
-            // scrolled away from the tail, so they're never wondering
-            // why new content stopped appearing on screen.
-            let transcript_title: String = if state.transcript_scroll_back > 0 {
-                format!(
-                    " amaebi  ↑ {} rows from tail (PgDn / End to follow) ",
-                    state.transcript_scroll_back
-                )
+            let effective_scroll_back =
+                std::cmp::min(state.transcript_scroll_back as u32, tail_scroll as u32);
+            let transcript_title: String = if effective_scroll_back > 0 {
+                format!(" amaebi  ↑ {effective_scroll_back} rows from tail (PgDn / End to follow) ")
             } else {
                 " amaebi ".to_string()
             };
@@ -2273,11 +2289,17 @@ fn push_wrapped_assistant_line(out: &mut Vec<Line<'static>>, text: &str, inner_w
     // found, we still tokenize the rest (so "## **important**"
     // gets bold-on-yellow), but the heading style gets folded into
     // the base.
-    let (effective_text, base_style) = if let Some((stripped, style)) = assistant_heading(text) {
-        (stripped, style)
-    } else {
-        (text.to_string(), Style::default())
-    };
+    // Heading detection rebuilds the text (drops the hash chrome,
+    // preserves leading whitespace), so it owns a `String`.  The
+    // common case — plain assistant text — borrows the original
+    // `&str` via `Cow` to skip a per-redraw clone of every visible
+    // streamed line.
+    let (effective_text, base_style): (std::borrow::Cow<'_, str>, Style) =
+        if let Some((stripped, style)) = assistant_heading(text) {
+            (std::borrow::Cow::Owned(stripped), style)
+        } else {
+            (std::borrow::Cow::Borrowed(text), Style::default())
+        };
 
     let tokens = tokenize_inline_markdown(&effective_text);
 
