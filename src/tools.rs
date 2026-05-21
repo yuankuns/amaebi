@@ -343,7 +343,6 @@ async fn tmux_wait(args: serde_json::Value) -> Result<String> {
     let poll_secs = args["poll_interval_secs"].as_u64().unwrap_or(2).max(1);
 
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
-    let mut last_content = String::new();
     let mut last_normalized = String::new();
     let mut stable_since = tokio::time::Instant::now();
 
@@ -377,10 +376,9 @@ async fn tmux_wait(args: serde_json::Value) -> Result<String> {
 
         if normalized != last_normalized {
             last_normalized = normalized;
-            last_content = content;
             stable_since = tokio::time::Instant::now();
         } else if stable_since.elapsed().as_secs() >= idle_secs {
-            return Ok(last_content);
+            return Ok(content);
         }
 
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
