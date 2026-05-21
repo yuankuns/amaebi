@@ -295,6 +295,41 @@ async fn tmux_send_key(args: serde_json::Value) -> Result<String> {
     Ok(format!("sent key {key:?} to pane {target}"))
 }
 
+/// Normalize a pane capture so live-UI animations don't masquerade as
+/// activity.  Claude Code's TUI cycles a spinner glyph every poll and
+/// re-renders elapsed-time counters every second (`(4m 35s)`, `↓ 5.8k
+/// tokens`, `Running… (1m 6s)`); a byte-exact comparison therefore
+/// never converges and `tmux_wait` blocks until `timeout_secs`.
+///
+/// Strategy: collapse every run of ASCII digits to a single `0` and
+/// every known spinner glyph to `*`.  Real content changes (new lines,
+/// new tool calls, text generation) still differ after normalization
+/// because the surrounding non-digit, non-spinner characters change.
+fn normalize_for_idle_check(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut prev_digit = false;
+    for c in s.chars() {
+        match c {
+            '✶' | '✻' | '✷' | '✸' | '✹' | '✺' | '✦' | '✧' | '⠋' | '⠙' | '⠹' | '⠸' | '⠼' | '⠴'
+            | '⠦' | '⠧' | '⠇' | '⠏' => {
+                out.push('*');
+                prev_digit = false;
+            }
+            d if d.is_ascii_digit() => {
+                if !prev_digit {
+                    out.push('0');
+                }
+                prev_digit = true;
+            }
+            other => {
+                out.push(other);
+                prev_digit = false;
+            }
+        }
+    }
+    out
+}
+
 /// Poll a tmux pane until its output has been stable for `idle_secs`, then
 /// return the final pane content.
 ///
@@ -309,6 +344,7 @@ async fn tmux_wait(args: serde_json::Value) -> Result<String> {
 
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
     let mut last_content = String::new();
+    let mut last_normalized = String::new();
     let mut stable_since = tokio::time::Instant::now();
 
     loop {
@@ -337,8 +373,10 @@ async fn tmux_wait(args: serde_json::Value) -> Result<String> {
             );
         }
         let content = String::from_utf8_lossy(&output.stdout).into_owned();
+        let normalized = normalize_for_idle_check(&content);
 
-        if content != last_content {
+        if normalized != last_normalized {
+            last_normalized = normalized;
             last_content = content;
             stable_since = tokio::time::Instant::now();
         } else if stable_since.elapsed().as_secs() >= idle_secs {
@@ -1670,6 +1708,53 @@ mod tests {
         .await
         .unwrap();
         assert!(result.starts_with("timeout:"), "got: {result}");
+    }
+
+    // ---- tmux_wait normalize_for_idle_check --------------------------------
+
+    #[test]
+    fn normalize_collapses_elapsed_timer_runs() {
+        let a = "✻ Comparing… (4m 35s · ↓ 5.8k tokens)";
+        let b = "✻ Comparing… (4m 36s · ↓ 5.8k tokens)";
+        assert_eq!(
+            normalize_for_idle_check(a),
+            normalize_for_idle_check(b),
+            "ticking elapsed-time counter should not register as activity"
+        );
+    }
+
+    #[test]
+    fn normalize_collapses_spinner_glyph() {
+        let a = "✶ thinking…";
+        let b = "✻ thinking…";
+        let c = "✷ thinking…";
+        assert_eq!(normalize_for_idle_check(a), normalize_for_idle_check(b));
+        assert_eq!(normalize_for_idle_check(b), normalize_for_idle_check(c));
+    }
+
+    #[test]
+    fn normalize_collapses_running_timer() {
+        let a = "  ⎿  Running… (1m 1s)";
+        let b = "  ⎿  Running… (1m 6s)";
+        assert_eq!(normalize_for_idle_check(a), normalize_for_idle_check(b));
+    }
+
+    #[test]
+    fn normalize_preserves_real_text_changes() {
+        let a = "● Bash(echo hello)";
+        let b = "● Bash(echo world)";
+        assert_ne!(
+            normalize_for_idle_check(a),
+            normalize_for_idle_check(b),
+            "non-numeric, non-spinner text changes must still differ"
+        );
+    }
+
+    #[test]
+    fn normalize_treats_new_lines_as_activity() {
+        let a = "● step 1";
+        let b = "● step 1\n● step 2";
+        assert_ne!(normalize_for_idle_check(a), normalize_for_idle_check(b));
     }
 
     // ---- tmux_send_text / tmux_send_key split ------------------------------
