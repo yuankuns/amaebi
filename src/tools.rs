@@ -880,7 +880,13 @@ pub fn tool_schemas(include_spawn_agent: bool) -> Vec<serde_json::Value> {
                 "description": "Poll a tmux pane until its output has been stable for idle_secs, \
                                 then return the final pane content. Use this instead of calling \
                                 tmux_capture_pane in a loop while waiting for a long-running command \
-                                (e.g. a build) to finish.",
+                                (e.g. a build) to finish. Stability is measured against a normalized \
+                                view of the capture: spinner glyphs and runs of ASCII digits are \
+                                collapsed before comparison, so live TUI animations (spinners, \
+                                elapsed-time counters, token counts, percentage tickers) do not \
+                                count as activity. Real text changes — new lines, new tool-call \
+                                names, generated prose — still register and reset the idle timer. \
+                                The returned string is the raw, un-normalized capture.",
                 "parameters": {
                     "type": "object",
                     "properties": {
