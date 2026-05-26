@@ -590,9 +590,12 @@ impl AppState {
 
     /// Append `display` to in-memory history (so ↑ in this session
     /// can recall it without re-reading the file) and reset history
-    /// scroll state.  Called from `send_prompt` after a successful
-    /// dispatch.  Dedupes the most-recent entry the same way
-    /// `load_cwd_history` does.
+    /// scroll state.  Called from the input-handling site for every
+    /// Enter-submitted line — covering plain chat, slash commands,
+    /// and `SlashError` parse failures alike — and once more from the
+    /// initial-prompt path so `--tui PROMPT` is also ↑-recallable.
+    /// Dedupes the most-recent entry the same way `load_cwd_history`
+    /// does.
     fn record_submitted_prompt(&mut self, display: &str) {
         if self.history.last().map(String::as_str) != Some(display) {
             self.history.push(display.to_string());
