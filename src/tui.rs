@@ -195,9 +195,15 @@ pub async fn run_chat_tui(
     state.push_system_line(String::new());
 
     // Pump an optional opening prompt synthetically so the user doesn't
-    // have to re-type it after `--tui` is set.
+    // have to re-type it after `--tui` is set.  Persist it so ↑ recalls
+    // it on the next `--tui` invocation in the same cwd, matching the
+    // behaviour of typing it into the input box.
     if let Some(opening) = initial_prompt {
         if !opening.trim().is_empty() {
+            state.record_submitted_prompt(&opening);
+            if let Err(e) = crate::client::record_history_line(&opening) {
+                tracing::warn!(error = %e, "failed to persist initial prompt to history.jsonl");
+            }
             send_prompt(&mut write_half, &mut state, opening).await?;
         }
     }
@@ -221,6 +227,19 @@ pub async fn run_chat_tui(
                             KeyOutcome::Continue => {}
                             KeyOutcome::SubmitInput(text) => {
                                 if !text.trim().is_empty() && !state.streaming {
+                                    // Persist BEFORE dispatch so a `/claude` typo,
+                                    // a `/release` parse error, or a successful
+                                    // slash command all leave the line ↑-recallable.
+                                    // Recording at the call site is the only place
+                                    // that runs for every dispatch arm; send_prompt
+                                    // (the SendChat path) deliberately no longer
+                                    // records, so synth/`[launched]` prompts that
+                                    // also call send_prompt_inner stay out of the
+                                    // history file.
+                                    state.record_submitted_prompt(&text);
+                                    if let Err(e) = crate::client::record_history_line(&text) {
+                                        tracing::warn!(error = %e, "failed to persist prompt to history.jsonl");
+                                    }
                                     dispatch_input(&mut write_half, &mut state, text).await?;
                                 }
                             }
@@ -571,9 +590,12 @@ impl AppState {
 
     /// Append `display` to in-memory history (so ↑ in this session
     /// can recall it without re-reading the file) and reset history
-    /// scroll state.  Called from `send_prompt` after a successful
-    /// dispatch.  Dedupes the most-recent entry the same way
-    /// `load_cwd_history` does.
+    /// scroll state.  Called from the input-handling site for every
+    /// Enter-submitted line — covering plain chat, slash commands,
+    /// and `SlashError` parse failures alike — and once more from the
+    /// initial-prompt path so `--tui PROMPT` is also ↑-recallable.
+    /// Dedupes the most-recent entry the same way `load_cwd_history`
+    /// does.
     fn record_submitted_prompt(&mut self, display: &str) {
         if self.history.last().map(String::as_str) != Some(display) {
             self.history.push(display.to_string());
@@ -1438,44 +1460,31 @@ async fn send_prompt(
     state: &mut AppState,
     prompt: String,
 ) -> Result<()> {
-    send_prompt_inner(writer, state, prompt, /* record_history */ true).await
+    send_prompt_inner(writer, state, prompt).await
 }
 
-/// Same as `send_prompt` but does NOT persist the prompt into ↑/↓
-/// history.  Used for synthesised prompts (e.g. the `[launched]`
-/// `/claude` supervision prompt) that the user never typed; recording
-/// them would pollute history with large internal blocks the user
-/// can't usefully recall.  Matches classic chat, which never persists
-/// the synthetic supervision prompt either.
+/// Same shape as `send_prompt`.  Kept as a distinct symbol so call sites
+/// reading "synth" at the call site signal "the user never typed this —
+/// don't try to persist it into ↑/↓ history".  History persistence now
+/// happens at the input-handling site (so `/claude`, `/release`, parse
+/// errors, etc. all become ↑-recallable), so the only behavioural
+/// difference is that callers of `send_synth_prompt` skip that record
+/// step before calling.
 async fn send_synth_prompt(
     writer: &mut tokio::net::unix::OwnedWriteHalf,
     state: &mut AppState,
     prompt: String,
 ) -> Result<()> {
-    send_prompt_inner(writer, state, prompt, /* record_history */ false).await
+    send_prompt_inner(writer, state, prompt).await
 }
 
 async fn send_prompt_inner(
     writer: &mut tokio::net::unix::OwnedWriteHalf,
     state: &mut AppState,
     prompt: String,
-    record_history: bool,
 ) -> Result<()> {
     state.push_user_line(format!("> {prompt}"));
     state.streaming = true;
-
-    // Record in-memory + persist to ~/.amaebi/history.jsonl so this
-    // prompt becomes ↑-recallable both within this session and on the
-    // next chat invocation in the same cwd.  Disk write is best-
-    // effort: a missing / locked / full history file should not break
-    // the chat itself.  Synthesised prompts (`/claude` supervision
-    // block, etc.) skip both halves of recording.
-    if record_history {
-        state.record_submitted_prompt(&prompt);
-        if let Err(e) = crate::client::record_history_line(&prompt) {
-            tracing::warn!(error = %e, "failed to persist prompt to history.jsonl");
-        }
-    }
 
     let req = Request::Chat {
         prompt,
