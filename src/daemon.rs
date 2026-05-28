@@ -1654,8 +1654,16 @@ async fn handle_claude_launch(
             task.resume_pane
         {
             // --- resume-pane path ---
+            //
+            // The lease was already acquired by the `Request::ReservePane`
+            // pre-flight that wrapped distillation, so we don't call
+            // `acquire_lease` here — that would deadlock against ourselves
+            // (the lease is Busy, owned by the same caller).  We just
+            // validate the lease still describes a live `claude` pane,
+            // refresh the session_id to the launch-time placeholder, and
+            // bump the heartbeat.  On any probe failure we release the
+            // pre-flight lease so it doesn't sit Busy until TTL.
             let rp_owned = rp.clone();
-            let tid_for_lease = tag.clone();
             let sid_for_lease = sid_placeholder.clone();
             let probe = tokio::task::spawn_blocking(move || {
                     let state = pane_lease::read_state()?;
@@ -1712,12 +1720,10 @@ async fn handle_claude_launch(
                             "pane {rp_owned} is not currently running `claude` (tmux reports `{pane_current_command}`); drop --resume-pane and let the scheduler pick or start a new pane"
                         );
                     }
-                    pane_lease::acquire_lease(
-                        &rp_owned,
-                        &tid_for_lease,
-                        &sid_for_lease,
-                        Some(&wt),
-                    )?;
+                    // Refresh session_id + heartbeat on the existing lease.
+                    // Worktree/tag stay as written by ReservePane.
+                    pane_lease::update_session_id(&rp_owned, &sid_for_lease)?;
+                    pane_lease::heartbeat(&rp_owned)?;
                     Ok::<(String, bool, Option<String>), anyhow::Error>((rp_owned, true, Some(wt)))
                 })
                 .await
@@ -1726,6 +1732,11 @@ async fn handle_claude_launch(
             match probe {
                 Ok(triple) => triple,
                 Err(e) => {
+                    let pane_for_release = rp.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        pane_lease::release_lease(&pane_for_release)
+                    })
+                    .await;
                     let mut w = writer.lock().await;
                     write_frame(
                         &mut *w,
