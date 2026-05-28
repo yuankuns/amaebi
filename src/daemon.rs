@@ -981,6 +981,23 @@ async fn handle_connection_inner(
                 handle_claude_release(&writer, &state, conn_id, target, clean_worktree, summary)
                     .await?;
             }
+
+            Request::DistillClaudePrompt { brief, cwd, model } => {
+                handle_distill_claude_prompt(&writer, &state, conn_id, brief, cwd, model).await?;
+            }
+
+            Request::ReservePane {
+                pane_id,
+                tag,
+                session_id,
+                worktree,
+            } => {
+                handle_reserve_pane(&writer, pane_id, tag, session_id, worktree).await?;
+            }
+
+            Request::ReleasePane { pane_id } => {
+                handle_release_pane(&writer, pane_id).await?;
+            }
         }
     }
 
@@ -1176,6 +1193,175 @@ async fn handle_claude_release(
 
     let mut w = writer.lock().await;
     write_frame(&mut *w, &Response::Done).await?;
+    Ok(())
+}
+
+/// Handle `Request::DistillClaudePrompt`: run a bounded agentic loop
+/// in `cwd` with the read-only investigation toolset + the
+/// `emit_distilled_prompt` terminator, then ship the produced prompt
+/// back as `Response::DistilledPromptReady` followed by `Response::Done`.
+///
+/// Streams Text / ToolUse frames during the run so the user sees the
+/// investigation in real time (matching the chat UX).  Failure modes
+/// emit `Response::Error` then `Response::Done`.
+async fn handle_distill_claude_prompt(
+    writer: &Arc<tokio::sync::Mutex<tokio::net::unix::OwnedWriteHalf>>,
+    state: &Arc<DaemonState>,
+    conn_id: ConnId,
+    brief: String,
+    cwd: String,
+    model: String,
+) -> Result<()> {
+    let system_prompt = build_distillation_system_prompt(&cwd);
+    let user_msg = format!(
+        "User's brief description for /claude:\n\n{brief}\n\n\
+         Working directory: {cwd}\n\n\
+         Investigate the codebase, then call `emit_distilled_prompt` exactly once \
+         with the full Claude Code prompt."
+    );
+    let messages = vec![Message::system(system_prompt), Message::user(user_msg)];
+
+    // Open a private steer channel; distillation has no user steer surface yet.
+    let (_steer_tx, mut steer_rx) = tokio::sync::mpsc::channel::<Option<String>>(8);
+
+    // Hold the writer for the whole loop; run_agentic_loop streams frames
+    // through it.  The lock is taken exclusively for this distillation call.
+    let mut w = writer.lock().await;
+    let result = run_agentic_loop_with_mode(
+        state,
+        &model,
+        messages,
+        &mut *w,
+        &mut steer_rx,
+        tools::ToolMode::Distill,
+        None,
+        Some(conn_id),
+    )
+    .await;
+    drop(w);
+
+    match result {
+        Ok((final_text, _, _, _)) if !final_text.trim().is_empty() => {
+            let mut w = writer.lock().await;
+            write_frame(
+                &mut *w,
+                &Response::DistilledPromptReady { prompt: final_text },
+            )
+            .await
+            .ok();
+            write_frame(&mut *w, &Response::Done).await.ok();
+        }
+        Ok(_) => {
+            let mut w = writer.lock().await;
+            write_frame(
+                &mut *w,
+                &Response::Error {
+                    message: "distillation finished without emitting a prompt".to_string(),
+                },
+            )
+            .await
+            .ok();
+            write_frame(&mut *w, &Response::Done).await.ok();
+        }
+        Err(e) => {
+            let mut w = writer.lock().await;
+            write_frame(
+                &mut *w,
+                &Response::Error {
+                    message: format!("distillation failed: {e:#}"),
+                },
+            )
+            .await
+            .ok();
+            write_frame(&mut *w, &Response::Done).await.ok();
+        }
+    }
+    Ok(())
+}
+
+/// System prompt for the `/claude` distillation loop.  Tells the LLM
+/// what `/replyreview`-grade output should look like and what tools it
+/// has.  Kept outside the handler so it can be unit-tested for shape.
+fn build_distillation_system_prompt(cwd: &str) -> String {
+    format!(
+        "You are amaebi's prompt distiller.  The user typed `/claude \"<brief>\"` and your \
+         job is to convert that brief into a self-contained prompt that a downstream Claude \
+         Code session will execute.\n\n\
+         Working directory: {cwd}\n\n\
+         Procedure:\n\
+         1. Use `shell_command` and `read_file` to investigate the codebase.  Look for the \
+            files / functions / tests / scripts the brief actually touches.  Run `git status`, \
+            `git log --oneline -10`, `ls`, `grep`, etc.  Read the most relevant files in full.\n\
+         2. Decide concretely what Claude Code should do — file paths, key functions, the \
+            execution plan in steps, the verification commands (tests, benchmarks, builds), \
+            and the hard constraints (no force push, don't skip CI hooks, keep main repo on \
+            master, etc.).\n\
+         3. Call `emit_distilled_prompt` EXACTLY ONCE with the final prompt as a single \
+            string.  That call ends your work — no further turns will run after it.\n\n\
+         Output requirements for the distilled prompt:\n\
+         - Self-contained: the downstream Claude session does NOT see this conversation.\n\
+         - Concrete: name file paths and functions, not vague areas.\n\
+         - Action-oriented: numbered steps the inner Claude can follow.\n\
+         - Verification: at least one test / benchmark / build command Claude must run.\n\
+         - Constraints: list the hard rules (CI, branching, etc.) that apply.\n\
+         - No meta-commentary: the prompt is read by Claude as the FIRST user message; do \
+           not include phrases like 'I have analyzed your code' or 'here is the prompt'.\n\n\
+         You have NO write tools — `edit_file` and tmux pane mutators are not available.  \
+         You investigate; Claude executes."
+    )
+}
+
+/// Handle `Request::ReservePane`: acquire a pane lease so a long-running
+/// pre-launch flow can hold the slot.  Responds with `PaneReserved` + `Done`
+/// or `Error` + `Done`.
+async fn handle_reserve_pane(
+    writer: &Arc<tokio::sync::Mutex<tokio::net::unix::OwnedWriteHalf>>,
+    pane_id: String,
+    tag: String,
+    session_id: String,
+    worktree: Option<String>,
+) -> Result<()> {
+    let res = tokio::task::spawn_blocking(move || {
+        crate::pane_lease::acquire_lease(&pane_id, &tag, &session_id, worktree.as_deref())
+            .map(|_| pane_id)
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("reserve_pane spawn_blocking panicked: {e}"))?;
+
+    let mut w = writer.lock().await;
+    match res {
+        Ok(pane_id) => {
+            write_frame(&mut *w, &Response::PaneReserved { pane_id })
+                .await
+                .ok();
+            write_frame(&mut *w, &Response::Done).await.ok();
+        }
+        Err(e) => {
+            write_frame(
+                &mut *w,
+                &Response::Error {
+                    message: format!("reserve_pane failed: {e:#}"),
+                },
+            )
+            .await
+            .ok();
+            write_frame(&mut *w, &Response::Done).await.ok();
+        }
+    }
+    Ok(())
+}
+
+/// Handle `Request::ReleasePane`: release a previously reserved lease.
+/// Idempotent — releasing an already-idle pane succeeds silently.
+async fn handle_release_pane(
+    writer: &Arc<tokio::sync::Mutex<tokio::net::unix::OwnedWriteHalf>>,
+    pane_id: String,
+) -> Result<()> {
+    let _ = tokio::task::spawn_blocking(move || crate::pane_lease::release_lease(&pane_id))
+        .await
+        .map_err(|e| anyhow::anyhow!("release_pane spawn_blocking panicked: {e}"))?;
+    let mut w = writer.lock().await;
+    write_frame(&mut *w, &Response::Done).await.ok();
     Ok(())
 }
 
@@ -4854,7 +5040,7 @@ fn format_pane_alive_reminder(pane_ids: &[String]) -> String {
 pub(crate) async fn run_agentic_loop<W>(
     state: &DaemonState,
     model: &str,
-    mut messages: Vec<Message>,
+    messages: Vec<Message>,
     writer: &mut W,
     steer_rx: &mut tokio::sync::mpsc::Receiver<Option<String>>,
     include_spawn_agent: bool,
@@ -4864,11 +5050,44 @@ pub(crate) async fn run_agentic_loop<W>(
 where
     W: AsyncWriteExt + Unpin,
 {
-    let schemas = tools::tool_schemas(include_spawn_agent);
-    let final_text;
+    run_agentic_loop_with_mode(
+        state,
+        model,
+        messages,
+        writer,
+        steer_rx,
+        tools::ToolMode::Chat {
+            include_spawn_agent,
+        },
+        session_id,
+        conn_id,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_agentic_loop_with_mode<W>(
+    state: &DaemonState,
+    model: &str,
+    mut messages: Vec<Message>,
+    writer: &mut W,
+    steer_rx: &mut tokio::sync::mpsc::Receiver<Option<String>>,
+    tool_mode: tools::ToolMode,
+    session_id: Option<&str>,
+    conn_id: Option<ConnId>,
+) -> Result<(String, usize, Vec<Message>, String)>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    let schemas = tools::tool_schemas(tool_mode);
+    let mut final_text = String::new();
     let mut tools_were_used = false;
     let mut conclusion_nudge_sent = false;
-    let mut last_prompt_tokens: usize;
+    // Initialised to 0 to cover the early-exit path (distillation
+    // emits prompt before any model response sets this).  Overwritten
+    // on every model turn in the normal flow.
+    #[allow(unused_assignments)]
+    let mut last_prompt_tokens: usize = 0;
     // Mutable so switch_model tool calls can change the model mid-session.
     let mut current_model = model.to_string();
     // Circuit breaker: once we exhaust MAX_CONSECUTIVE_COMPACT_FAILURES in a row
@@ -4922,7 +5141,13 @@ where
     let mut read_cache: std::collections::HashMap<std::path::PathBuf, ((u128, u64), String)> =
         Default::default();
 
-    loop {
+    // Distillation early-exit accumulator: when the LLM (in
+    // ToolMode::Distill) calls `emit_distilled_prompt`, the post-op
+    // captures the prompt here and breaks 'outer.  Stays None on every
+    // other code path so the normal Chat flow is unaffected.
+    let mut distilled_capture: Option<String> = None;
+
+    'outer: loop {
         // Drain any steering corrections that arrived since the last model
         // call (covers non-tool turns and the time between tool completion
         // and the next iteration).
@@ -5643,6 +5868,17 @@ where
                             None
                         };
 
+                        // Snapshot emit_distilled_prompt args before execute consumes
+                        // them.  This tool is the distillation analogue of task_done:
+                        // pure-echo body, real side-effect (early-exit + ship payload
+                        // back to caller as final_text) lives here.
+                        let distilled_prompt: Option<String> = if tc.name == "emit_distilled_prompt"
+                        {
+                            args["prompt"].as_str().map(str::to_string)
+                        } else {
+                            None
+                        };
+
                         let result = match state.executor.execute(&tc.name, args).await {
                             Ok(output) => {
                                 tracing::debug!(
@@ -5681,6 +5917,16 @@ where
                         };
 
                         messages.push(Message::tool_result(&tc.id, result));
+
+                        // emit_distilled_prompt post-op: stash the prompt on the
+                        // outer accumulator and break the whole loop.  The caller
+                        // (handle_distill_claude_prompt) reads it from final_text.
+                        // Only triggered when the schema is exposed, i.e. when
+                        // ToolMode::Distill was passed in.
+                        if let Some(prompt) = distilled_prompt {
+                            distilled_capture = Some(prompt);
+                            break 'outer;
+                        }
 
                         // task_done post-op: the tool body is a pure echo, so the
                         // actual release of leases and TaskReleased streaming
@@ -5759,6 +6005,13 @@ where
                 break;
             }
         }
+    }
+
+    // Distillation path: the LLM called `emit_distilled_prompt`, the
+    // post-op stashed the payload and broke `'outer`.  Surface it via
+    // `final_text` so the caller can ship it as Response::DistilledPromptReady.
+    if let Some(prompt) = distilled_capture {
+        final_text = prompt;
     }
 
     Ok((final_text, last_prompt_tokens, messages, current_model))
@@ -8469,5 +8722,43 @@ mod tests {
     #[test]
     fn strip_tui_chrome_empty_input() {
         assert_eq!(strip_tui_chrome(""), "");
+    }
+
+    // ---- distillation system prompt -----------------------------------------
+
+    #[test]
+    fn distillation_system_prompt_mentions_emit_tool_and_cwd() {
+        let p = build_distillation_system_prompt("/tmp/repo");
+        // Working directory must be interpolated, not left as a placeholder.
+        assert!(p.contains("/tmp/repo"), "cwd must be in prompt: {p}");
+        // The terminator tool must be named explicitly so the LLM knows
+        // how to end its turn.
+        assert!(
+            p.contains("emit_distilled_prompt"),
+            "prompt must reference the emit tool: {p}"
+        );
+        // Investigation discipline cues — these guard against future
+        // edits that water down the instructions.
+        assert!(
+            p.to_lowercase().contains("investigate"),
+            "prompt must instruct investigation: {p}"
+        );
+        assert!(
+            p.to_lowercase().contains("verification"),
+            "prompt must instruct verification commands: {p}"
+        );
+    }
+
+    #[test]
+    fn distillation_system_prompt_forbids_meta_commentary() {
+        // Critical for downstream fidelity: the distilled output is
+        // injected as Claude's first user turn verbatim, so adding
+        // "here is the prompt I prepared:" wraps would break framing.
+        let p = build_distillation_system_prompt("/x");
+        assert!(
+            p.to_lowercase().contains("no meta-commentary")
+                || p.to_lowercase().contains("verbatim"),
+            "prompt must forbid meta-commentary or assert verbatim use: {p}"
+        );
     }
 }

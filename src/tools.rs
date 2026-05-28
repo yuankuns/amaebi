@@ -130,6 +130,7 @@ impl ToolExecutor for LocalExecutor {
                 ),
             },
             "task_done" => task_done(args),
+            "emit_distilled_prompt" => emit_distilled_prompt(args),
             other => anyhow::bail!("unknown tool: {other}"),
         }
     }
@@ -508,6 +509,25 @@ fn task_done(args: serde_json::Value) -> Result<String> {
     Ok(format!("[task_done signalled pane={pane_id}]\n{summary}"))
 }
 
+/// `emit_distilled_prompt` is the distillation analogue of `task_done`:
+/// the tool body only validates and echoes; the daemon's agentic-loop
+/// dispatch recognises `name == "emit_distilled_prompt"`, extracts the
+/// `prompt` field, ships it back to the client as
+/// `Response::DistilledPromptReady`, and exits the loop.
+///
+/// Only available in the distillation agentic loop launched by
+/// `Request::DistillClaudePrompt` — the schema is gated on
+/// `ToolMode::Distill` in `tool_schemas`.
+fn emit_distilled_prompt(args: serde_json::Value) -> Result<String> {
+    let prompt = args["prompt"]
+        .as_str()
+        .context("emit_distilled_prompt: missing string argument 'prompt'")?;
+    if prompt.trim().is_empty() {
+        anyhow::bail!("emit_distilled_prompt: 'prompt' must be non-empty");
+    }
+    Ok(format!("[distilled prompt emitted, len={}]", prompt.len()))
+}
+
 async fn spawn_agent(args: serde_json::Value, ctx: &SpawnContext) -> Result<String> {
     let task = args["task"]
         .as_str()
@@ -772,11 +792,80 @@ async fn edit_file(args: serde_json::Value) -> Result<String> {
 // Tool schemas (OpenAI function-calling format)
 // ---------------------------------------------------------------------------
 
-/// Return the JSON schema array to include in a chat request.
+/// Which set of tools to expose to the LLM.
 ///
-/// Pass `include_spawn_agent = true` for the parent (daemon) context.
-/// Pass `false` for child agent loops to prevent recursive spawning.
-pub fn tool_schemas(include_spawn_agent: bool) -> Vec<serde_json::Value> {
+/// `Chat` is the everyday agentic loop: full tool set, optional
+/// `spawn_agent` for the parent connection, includes `task_done` so a
+/// `/claude` supervisor can release a pane.
+///
+/// `Distill` is the bounded loop launched by
+/// `Request::DistillClaudePrompt`: read-only investigation tools plus
+/// `emit_distilled_prompt`.  Excludes `edit_file`, `task_done`,
+/// `spawn_agent`, and the tmux pane-mutation tools so the distiller
+/// cannot accidentally start work it's only supposed to plan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolMode {
+    Chat { include_spawn_agent: bool },
+    Distill,
+}
+
+/// Return the JSON schema array to include in a chat request.
+pub fn tool_schemas(mode: ToolMode) -> Vec<serde_json::Value> {
+    match mode {
+        ToolMode::Chat {
+            include_spawn_agent,
+        } => chat_tool_schemas(include_spawn_agent),
+        ToolMode::Distill => distill_tool_schemas(),
+    }
+}
+
+fn distill_tool_schemas() -> Vec<serde_json::Value> {
+    let all = chat_tool_schemas(false);
+    // Whitelist by name: investigation-only + the terminator.  The
+    // distiller is supposed to read code and produce a plan, not start
+    // editing or spawning.
+    let allowed = ["shell_command", "read_file", "emit_distilled_prompt"];
+    let mut filtered: Vec<serde_json::Value> = all
+        .into_iter()
+        .filter(|s| {
+            s["function"]["name"]
+                .as_str()
+                .map(|n| allowed.contains(&n))
+                .unwrap_or(false)
+        })
+        .collect();
+    // Append the distill-only emit tool (not present in the chat set).
+    filtered.push(serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": "emit_distilled_prompt",
+            "description": "Emit the FINAL distilled prompt that will be injected into the \
+                            downstream Claude Code pane.  Call this exactly ONCE, after you \
+                            have finished investigating the codebase and decided what \
+                            Claude should actually do.  The string you pass becomes the \
+                            opening user message for that Claude session — write it as a \
+                            self-contained instruction (file paths, key functions, \
+                            verification commands, hard constraints).  Do NOT call this \
+                            speculatively before reading code; do NOT call it more than \
+                            once per session — the first call ends the distillation loop.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "prompt": {
+                        "type": "string",
+                        "description": "The full prompt to inject into Claude Code.  No \
+                                        preamble, no meta-commentary — Claude will read \
+                                        this verbatim as its first user turn."
+                    }
+                },
+                "required": ["prompt"]
+            }
+        }
+    }));
+    filtered
+}
+
+fn chat_tool_schemas(include_spawn_agent: bool) -> Vec<serde_json::Value> {
     let mut schemas = vec![
         serde_json::json!({
             "type": "function",
@@ -1185,7 +1274,9 @@ mod tests {
 
     #[test]
     fn tool_schemas_have_expected_names() {
-        let schemas = tool_schemas(true);
+        let schemas = tool_schemas(ToolMode::Chat {
+            include_spawn_agent: true,
+        });
         let names: Vec<&str> = schemas
             .iter()
             .map(|s| s["function"]["name"].as_str().unwrap())
@@ -1208,7 +1299,9 @@ mod tests {
 
     #[test]
     fn tool_schemas_all_have_type_function() {
-        for schema in tool_schemas(true) {
+        for schema in tool_schemas(ToolMode::Chat {
+            include_spawn_agent: true,
+        }) {
             assert_eq!(
                 schema["type"].as_str().unwrap(),
                 "function",
@@ -1220,7 +1313,9 @@ mod tests {
 
     #[test]
     fn tool_schemas_all_have_parameters_with_required_array() {
-        for schema in tool_schemas(true) {
+        for schema in tool_schemas(ToolMode::Chat {
+            include_spawn_agent: true,
+        }) {
             let name = schema["function"]["name"].as_str().unwrap();
             assert!(
                 schema["function"]["parameters"]["required"].is_array(),
@@ -1233,7 +1328,9 @@ mod tests {
 
     #[test]
     fn spawn_agent_schema_has_extra_mounts() {
-        let schemas = tool_schemas(true);
+        let schemas = tool_schemas(ToolMode::Chat {
+            include_spawn_agent: true,
+        });
         let spawn = schemas
             .iter()
             .find(|s| s["function"]["name"].as_str() == Some("spawn_agent"))
@@ -1260,7 +1357,9 @@ mod tests {
 
     #[test]
     fn spawn_agent_schema_has_env() {
-        let schemas = tool_schemas(true);
+        let schemas = tool_schemas(ToolMode::Chat {
+            include_spawn_agent: true,
+        });
         let spawn = schemas
             .iter()
             .find(|s| s["function"]["name"].as_str() == Some("spawn_agent"))
@@ -1283,7 +1382,9 @@ mod tests {
 
     #[test]
     fn spawn_agent_schema_has_parallel() {
-        let schemas = tool_schemas(true);
+        let schemas = tool_schemas(ToolMode::Chat {
+            include_spawn_agent: true,
+        });
         let spawn = schemas
             .iter()
             .find(|s| s["function"]["name"].as_str() == Some("spawn_agent"))
@@ -1298,7 +1399,9 @@ mod tests {
 
     #[test]
     fn spawn_agent_schema_has_sandbox() {
-        let schemas = tool_schemas(true);
+        let schemas = tool_schemas(ToolMode::Chat {
+            include_spawn_agent: true,
+        });
         let spawn = schemas
             .iter()
             .find(|s| s["function"]["name"].as_str() == Some("spawn_agent"))
@@ -1533,7 +1636,9 @@ mod tests {
 
     #[test]
     fn tool_schemas_false_excludes_spawn_agent() {
-        let schemas = tool_schemas(false);
+        let schemas = tool_schemas(ToolMode::Chat {
+            include_spawn_agent: false,
+        });
         let names: Vec<&str> = schemas
             .iter()
             .map(|s| s["function"]["name"].as_str().unwrap())
@@ -1550,7 +1655,9 @@ mod tests {
 
     #[test]
     fn tool_schemas_true_includes_spawn_agent() {
-        let schemas = tool_schemas(true);
+        let schemas = tool_schemas(ToolMode::Chat {
+            include_spawn_agent: true,
+        });
         let names: Vec<&str> = schemas
             .iter()
             .map(|s| s["function"]["name"].as_str().unwrap())
@@ -1765,7 +1872,9 @@ mod tests {
 
     #[test]
     fn tmux_send_text_schema_exists_and_takes_text() {
-        let schemas = tool_schemas(true);
+        let schemas = tool_schemas(ToolMode::Chat {
+            include_spawn_agent: true,
+        });
         let schema = schemas
             .iter()
             .find(|s| s["function"]["name"] == "tmux_send_text")
@@ -1783,7 +1892,9 @@ mod tests {
 
     #[test]
     fn tmux_send_key_schema_exists_and_takes_key() {
-        let schemas = tool_schemas(true);
+        let schemas = tool_schemas(ToolMode::Chat {
+            include_spawn_agent: true,
+        });
         let schema = schemas
             .iter()
             .find(|s| s["function"]["name"] == "tmux_send_key")
@@ -1797,7 +1908,9 @@ mod tests {
 
     #[test]
     fn tmux_send_keys_schema_removed() {
-        let schemas = tool_schemas(true);
+        let schemas = tool_schemas(ToolMode::Chat {
+            include_spawn_agent: true,
+        });
         assert!(
             schemas
                 .iter()
@@ -1833,7 +1946,9 @@ mod tests {
     fn switch_model_schema_present_in_all_modes() {
         // switch_model must always be available, regardless of include_spawn_agent.
         for include in [true, false] {
-            let schemas = tool_schemas(include);
+            let schemas = tool_schemas(ToolMode::Chat {
+                include_spawn_agent: include,
+            });
             let names: Vec<&str> = schemas
                 .iter()
                 .map(|s| s["function"]["name"].as_str().unwrap())
@@ -1847,7 +1962,9 @@ mod tests {
 
     #[test]
     fn switch_model_schema_has_required_model_param() {
-        let schemas = tool_schemas(true);
+        let schemas = tool_schemas(ToolMode::Chat {
+            include_spawn_agent: true,
+        });
         let schema = schemas
             .iter()
             .find(|s| s["function"]["name"] == "switch_model")
@@ -1860,5 +1977,65 @@ mod tests {
             required_names.contains(&"model"),
             "switch_model must require 'model': {required_names:?}"
         );
+    }
+
+    // ---- emit_distilled_prompt + ToolMode::Distill schema gating -------------
+
+    #[test]
+    fn distill_mode_includes_emit_distilled_prompt_and_excludes_writes() {
+        let schemas = tool_schemas(ToolMode::Distill);
+        let names: Vec<&str> = schemas
+            .iter()
+            .map(|s| s["function"]["name"].as_str().unwrap())
+            .collect();
+        assert!(
+            names.contains(&"emit_distilled_prompt"),
+            "Distill mode must expose emit_distilled_prompt: {names:?}"
+        );
+        // Investigation tools allowed.
+        assert!(names.contains(&"shell_command"));
+        assert!(names.contains(&"read_file"));
+        // Mutation tools must NOT be present.
+        for forbidden in ["edit_file", "task_done", "spawn_agent", "tmux_send_text"] {
+            assert!(
+                !names.contains(&forbidden),
+                "Distill mode must NOT expose {forbidden}: {names:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn chat_mode_excludes_emit_distilled_prompt() {
+        // The terminator should ONLY appear in Distill mode — exposing it
+        // in Chat mode would let a regular agentic loop short-circuit
+        // itself by calling a tool meant for distillation.
+        for include in [true, false] {
+            let schemas = tool_schemas(ToolMode::Chat {
+                include_spawn_agent: include,
+            });
+            let names: Vec<&str> = schemas
+                .iter()
+                .map(|s| s["function"]["name"].as_str().unwrap())
+                .collect();
+            assert!(
+                !names.contains(&"emit_distilled_prompt"),
+                "Chat mode must NOT expose emit_distilled_prompt (include_spawn_agent={include}): {names:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn emit_distilled_prompt_validates_prompt_field() {
+        // Missing prompt → error
+        let r = emit_distilled_prompt(serde_json::json!({}));
+        assert!(r.is_err(), "missing prompt should error");
+        // Empty prompt → error (we don't want a no-op result)
+        let r = emit_distilled_prompt(serde_json::json!({"prompt": "   "}));
+        assert!(r.is_err(), "whitespace-only prompt should error");
+        // Valid prompt → echo with length
+        let r = emit_distilled_prompt(serde_json::json!({"prompt": "hello world"}));
+        assert!(r.is_ok());
+        let s = r.unwrap();
+        assert!(s.contains("len=11"), "result should report length: {s}");
     }
 }

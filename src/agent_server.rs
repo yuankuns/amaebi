@@ -338,8 +338,10 @@ impl acp::Agent for AmaebiAgent {
                 }
                 Response::PaneAssigned { .. }
                 | Response::CapacityError { .. }
-                | Response::TagGenerated { .. } => {
-                    // ACP mode never sends ClaudeLaunch/GenerateTag.
+                | Response::TagGenerated { .. }
+                | Response::DistilledPromptReady { .. }
+                | Response::PaneReserved { .. } => {
+                    // ACP mode never issues these scheduler / pre-launch flows.
                     tracing::debug!("unexpected pane/tag scheduler response in ACP mode");
                 }
                 Response::TaskReleased { .. } => {
