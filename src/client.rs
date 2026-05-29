@@ -1073,6 +1073,31 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
         // before ClaudeLaunch so pane/worktree/notebook all use the
         // resolved tag from the start.
         resolve_missing_tags(&socket, &mut tasks, &cwd_str).await?;
+        // Distill briefs into detailed prompts before launch.  Streams
+        // the LLM's investigation to stderr so the user sees what's
+        // happening.  One-shot ask has no chat session id; pass the
+        // task tag as a placeholder so reserve_pane works for
+        // --resume-pane.
+        let chat_session_for_distill = format!("ask-{}", uuid::Uuid::new_v4());
+        let mut sink = StderrDistillSink;
+        if let Err(e) = distill_claude_tasks(
+            &socket,
+            &mut tasks,
+            &cwd_str,
+            &chat_session_for_distill,
+            &model,
+            &mut sink,
+        )
+        .await
+        {
+            eprintln!("[error] distillation pre-flight: {e:#}");
+            return Ok(());
+        }
+        tasks.retain(|t| !t.description.trim().is_empty());
+        if tasks.is_empty() {
+            eprintln!("[error] all /claude tasks failed distillation");
+            return Ok(());
+        }
         // One-shot `amaebi ask "/claude ..."` never sends SupervisePanes,
         // so there is no holder lifecycle to tie a notebook lease to.
         // Skip the lease by leaving session_id/repo_dir as None — matches
@@ -1372,7 +1397,9 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
                     }
                     Response::PaneAssigned { .. }
                     | Response::CapacityError { .. }
-                    | Response::TagGenerated { .. } => {
+                    | Response::TagGenerated { .. }
+                    | Response::DistilledPromptReady { .. }
+                    | Response::PaneReserved { .. } => {
                         // Not expected in a normal Chat response stream.
                         tracing::debug!("unexpected pane/tag scheduler response in chat loop");
                     }
@@ -1713,7 +1740,34 @@ pub async fn run_chat_loop(
                     stdout.flush().await?;
                     continue 'session;
                 }
-                // Keyed by tag — used to look up the original description
+                // Distill briefs into detailed prompts before launch.
+                // Investigation streams to stderr so the user sees the
+                // model walk through the codebase before Claude starts.
+                let mut sink = StderrDistillSink;
+                if let Err(e) = distill_claude_tasks(
+                    &socket,
+                    &mut tasks,
+                    &cwd_str,
+                    &session_id,
+                    &model,
+                    &mut sink,
+                )
+                .await
+                {
+                    let msg = format!("[error] distillation pre-flight: {e:#}\n");
+                    stdout.write_all(msg.as_bytes()).await?;
+                    stdout.flush().await?;
+                    continue 'session;
+                }
+                tasks.retain(|t| !t.description.trim().is_empty());
+                if tasks.is_empty() {
+                    stdout
+                        .write_all(b"[error] all /claude tasks failed distillation\n")
+                        .await?;
+                    stdout.flush().await?;
+                    continue 'session;
+                }
+                // Keyed by tag — used to look up the distilled description
                 // when daemon replies with PaneAssigned.  Tag is resolved
                 // (Haiku or `--tag` override) before tasks land here, so
                 // it's a stable id for the supervision handoff.
@@ -2594,7 +2648,9 @@ pub async fn run_resume(
                     }
                     Response::PaneAssigned { .. }
                     | Response::CapacityError { .. }
-                    | Response::TagGenerated { .. } => {
+                    | Response::TagGenerated { .. }
+                    | Response::DistilledPromptReady { .. }
+                    | Response::PaneReserved { .. } => {
                         tracing::debug!("unexpected pane/tag scheduler response in resume loop");
                     }
                     Response::ModelSwitched { .. } => {
@@ -3182,6 +3238,281 @@ pub(crate) async fn resolve_missing_tags(
             other => {
                 anyhow::bail!("unexpected daemon frame for GenerateTag: {other:?}");
             }
+        }
+    }
+    Ok(())
+}
+
+/// Run the `/claude` pre-launch flow on each task: optionally reserve a
+/// `--resume-pane` slot, then distill the brief into a detailed Claude
+/// Code prompt.  On success replaces `task.description` with the
+/// distilled text.  On failure for any task surfaces the error via
+/// `sink.on_status` and skips that task (caller chooses whether to
+/// continue with remaining tasks or abort).  Reserved panes are
+/// released on distillation failure so leases never leak.
+///
+/// `model` is the client's current chat model — distillation runs on
+/// the same model so /model state is honoured.
+///
+/// Returns `Ok(())` when every task either succeeded or had its lease
+/// rolled back cleanly.  Returns `Err` only on an underlying IPC
+/// failure that prevented attempting the next task.
+pub(crate) async fn distill_claude_tasks(
+    socket: &std::path::Path,
+    tasks: &mut [ClaudeTask],
+    client_cwd: &str,
+    chat_session_id: &str,
+    model: &str,
+    sink: &mut dyn DistillSink,
+) -> Result<()> {
+    for task in tasks.iter_mut() {
+        let task_cwd = task.cwd.clone().unwrap_or_else(|| client_cwd.to_string());
+
+        // Reserve the resume pane up front so other commands can't grab
+        // it during the (potentially minutes-long) distillation run.
+        let reserved_pane: Option<String> = if let Some(pid) = task.resume_pane.clone() {
+            sink.on_status(&format!(
+                "[distill] reserving pane {pid} for tag {}",
+                task.tag
+            ));
+            match reserve_pane(
+                socket,
+                &pid,
+                &task.tag,
+                chat_session_id,
+                task.worktree.as_deref(),
+            )
+            .await
+            {
+                Ok(()) => Some(pid),
+                Err(e) => {
+                    sink.on_status(&format!("[distill] reserve {pid} failed: {e:#}"));
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
+
+        sink.on_status(&format!(
+            "[distill] investigating codebase for tag {} (this may take a minute)",
+            task.tag
+        ));
+        match distill_claude_prompt(socket, &task.description, &task_cwd, model, sink).await {
+            Ok(prompt) => {
+                task.description = prompt;
+                sink.on_status(&format!("[distill] tag {} done", task.tag));
+            }
+            Err(e) => {
+                sink.on_status(&format!(
+                    "[distill] tag {} failed: {e:#}; skipping launch",
+                    task.tag
+                ));
+                if let Some(pid) = reserved_pane {
+                    if let Err(re) = release_reserved_pane(socket, &pid).await {
+                        sink.on_status(&format!("[distill] also failed to release {pid}: {re:#}"));
+                    }
+                }
+                // Mark the task for skip via empty description; caller
+                // filters those out before ClaudeLaunch.  Empty was
+                // already invalid upstream of parse, so no risk of
+                // accidentally launching an empty task.
+                task.description.clear();
+                continue;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `DistillSink` impl for the classic CLI: prints Text/ToolUse to
+/// stderr in real time so the user sees the investigation as the
+/// model runs.  Used by `run_chat_loop` and the one-shot ask path so
+/// `/claude` distillation looks the same in both classic UIs.
+pub(crate) struct StderrDistillSink;
+impl DistillSink for StderrDistillSink {
+    fn on_text(&mut self, chunk: &str) {
+        eprint!("{chunk}");
+        let _ = std::io::Write::flush(&mut std::io::stderr());
+    }
+    fn on_tool_use(&mut self, name: &str, detail: &str) {
+        let line = if detail.is_empty() {
+            format!("\n[distill tool] {name}\n")
+        } else {
+            format!("\n[distill tool] {name} {detail}\n")
+        };
+        eprint!("{line}");
+        let _ = std::io::Write::flush(&mut std::io::stderr());
+    }
+    fn on_status(&mut self, line: &str) {
+        eprintln!("{line}");
+    }
+}
+
+/// Sink for streaming Text / ToolUse frames during a distillation run
+/// so the caller (CLI vs TUI) can route them to the appropriate UI.
+/// Both methods are best-effort — failure to display a frame must not
+/// abort the distillation.
+pub(crate) trait DistillSink {
+    fn on_text(&mut self, chunk: &str);
+    fn on_tool_use(&mut self, name: &str, detail: &str);
+    fn on_status(&mut self, line: &str);
+}
+
+/// Send `Request::DistillClaudePrompt` to the daemon, drain Text /
+/// ToolUse frames into `sink` so the user can watch the investigation,
+/// and return the distilled prompt on success.
+///
+/// Uses a dedicated short-lived connection — same pattern as
+/// `resolve_missing_tags` / `resolve_replyreview_tasks` — so the
+/// distillation traffic doesn't fight the main chat connection for
+/// stream multiplexing.
+pub(crate) async fn distill_claude_prompt(
+    socket: &std::path::Path,
+    brief: &str,
+    cwd: &str,
+    model: &str,
+    sink: &mut dyn DistillSink,
+) -> Result<String> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let stream = UnixStream::connect(socket)
+        .await
+        .context("connecting to daemon for DistillClaudePrompt")?;
+    let (reader, mut writer) = tokio::io::split(stream);
+    let req = Request::DistillClaudePrompt {
+        brief: brief.to_string(),
+        cwd: cwd.to_string(),
+        model: model.to_string(),
+    };
+    let mut line = serde_json::to_string(&req).context("serialising DistillClaudePrompt")?;
+    line.push('\n');
+    writer
+        .write_all(line.as_bytes())
+        .await
+        .context("sending DistillClaudePrompt")?;
+
+    let mut lines = BufReader::new(reader).lines();
+    let mut distilled: Option<String> = None;
+    let mut last_error: Option<String> = None;
+    loop {
+        let line_opt = lines
+            .next_line()
+            .await
+            .context("reading DistillClaudePrompt response")?;
+        let Some(reply) = line_opt else {
+            break;
+        };
+        let frame: Response =
+            serde_json::from_str(&reply).context("parsing DistillClaudePrompt frame")?;
+        match frame {
+            Response::Text { chunk } => sink.on_text(&chunk),
+            Response::ToolUse { name, detail } => sink.on_tool_use(&name, &detail),
+            Response::Compacting => sink.on_status("[compacting]"),
+            Response::ModelSwitched { model } => {
+                sink.on_status(&format!("[model switched: {model}]"))
+            }
+            Response::DistilledPromptReady { prompt } => {
+                distilled = Some(prompt);
+            }
+            Response::Done => break,
+            Response::Error { message } => {
+                last_error = Some(message);
+                // keep draining; daemon will follow with Done
+            }
+            // Other frame kinds (PaneAssigned, TagGenerated, etc.) are
+            // not expected on the distillation channel — ignore.
+            _ => {}
+        }
+    }
+    if let Some(prompt) = distilled {
+        return Ok(prompt);
+    }
+    if let Some(message) = last_error {
+        anyhow::bail!("distillation failed: {message}");
+    }
+    anyhow::bail!("distillation finished without emitting a prompt");
+}
+
+/// Reserve a pane via the daemon so a long pre-launch flow can hold the
+/// slot.  Mirrors `acquire_lease` shape so the eventual `ClaudeLaunch`
+/// is a no-op rather than a contention.  Caller must pair with
+/// `release_reserved_pane` on failure.
+pub(crate) async fn reserve_pane(
+    socket: &std::path::Path,
+    pane_id: &str,
+    tag: &str,
+    session_id: &str,
+    worktree: Option<&str>,
+) -> Result<()> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let stream = UnixStream::connect(socket)
+        .await
+        .context("connecting to daemon for ReservePane")?;
+    let (reader, mut writer) = tokio::io::split(stream);
+    let req = Request::ReservePane {
+        pane_id: pane_id.to_string(),
+        tag: tag.to_string(),
+        session_id: session_id.to_string(),
+        worktree: worktree.map(str::to_string),
+    };
+    let mut line = serde_json::to_string(&req).context("serialising ReservePane")?;
+    line.push('\n');
+    writer
+        .write_all(line.as_bytes())
+        .await
+        .context("sending ReservePane")?;
+    let mut lines = BufReader::new(reader).lines();
+    let mut reserved = false;
+    loop {
+        let Some(reply) = lines
+            .next_line()
+            .await
+            .context("reading ReservePane response")?
+        else {
+            break;
+        };
+        let frame: Response = serde_json::from_str(&reply).context("parsing ReservePane frame")?;
+        match frame {
+            Response::PaneReserved { .. } => reserved = true,
+            Response::Done => break,
+            Response::Error { message } => {
+                anyhow::bail!("reserve_pane: {message}");
+            }
+            _ => {}
+        }
+    }
+    if !reserved {
+        anyhow::bail!("reserve_pane: daemon closed without confirming reservation");
+    }
+    Ok(())
+}
+
+/// Release a previously reserved pane.  Idempotent on the daemon side,
+/// so a release on an already-idle pane is a no-op.
+pub(crate) async fn release_reserved_pane(socket: &std::path::Path, pane_id: &str) -> Result<()> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let stream = UnixStream::connect(socket)
+        .await
+        .context("connecting to daemon for ReleasePane")?;
+    let (reader, mut writer) = tokio::io::split(stream);
+    let req = Request::ReleasePane {
+        pane_id: pane_id.to_string(),
+    };
+    let mut line = serde_json::to_string(&req).context("serialising ReleasePane")?;
+    line.push('\n');
+    writer
+        .write_all(line.as_bytes())
+        .await
+        .context("sending ReleasePane")?;
+    let mut lines = BufReader::new(reader).lines();
+    while let Some(reply) = lines
+        .next_line()
+        .await
+        .context("reading ReleasePane response")?
+    {
+        let frame: Response = serde_json::from_str(&reply).context("parsing ReleasePane frame")?;
+        if matches!(frame, Response::Done) {
+            break;
         }
     }
     Ok(())

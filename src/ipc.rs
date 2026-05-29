@@ -214,6 +214,48 @@ pub enum Request {
         #[serde(default)]
         summary: Option<String>,
     },
+    /// Ask the daemon to expand the user's brief `/claude` description into
+    /// a fully-detailed Claude Code prompt.
+    ///
+    /// Daemon spins up a bounded agentic loop with a read-only tool subset
+    /// plus the `emit_distilled_prompt` terminator.  The LLM investigates
+    /// the codebase under `cwd`, produces a self-contained prompt for
+    /// Claude Code, and emits it via `emit_distilled_prompt`.  The daemon
+    /// streams Text / ToolUse frames so the user sees the investigation in
+    /// real time, then ships [`Response::DistilledPromptReady`] followed by
+    /// [`Response::Done`].  Failure modes (tool errors, model timeouts) end
+    /// the stream with [`Response::Error`].
+    DistillClaudePrompt {
+        /// The user's original short description (`/claude "..."` argument).
+        brief: String,
+        /// Working directory the distillation should reason about — the
+        /// repo / worktree the downstream Claude pane will run in.
+        cwd: String,
+        /// Chat model to use for the distillation loop.  Caller passes the
+        /// outer chat's current model so /model state is honoured.
+        model: String,
+    },
+    /// Reserve a tmux pane up-front so a long-running pre-launch flow
+    /// (notably `Request::DistillClaudePrompt` for `/claude --resume-pane
+    /// %N`) can hold the slot before the actual `Request::ClaudeLaunch`.
+    ///
+    /// Mirrors the lease shape `acquire_lease` would set in `ClaudeLaunch`,
+    /// so the eventual launch call is a no-op rather than a contention.
+    /// Released via [`Request::ReleasePane`] on failure or replaced by the
+    /// real launch on success.  Daemon responds with [`Response::PaneReserved`]
+    /// or [`Response::Error`].
+    ReservePane {
+        pane_id: String,
+        tag: String,
+        session_id: String,
+        worktree: Option<String>,
+    },
+    /// Release a pane previously reserved via [`Request::ReservePane`].
+    /// Used by the client when the pre-launch flow aborts (distillation
+    /// failure, user cancel) so the lease doesn't leak.  Daemon responds
+    /// with [`Response::Done`] regardless of whether the pane was actually
+    /// reserved — release is idempotent.
+    ReleasePane { pane_id: String },
 }
 
 /// A single frame streamed from the daemon back to the client.
@@ -348,6 +390,12 @@ pub enum Response {
         /// Number of panes currently in Busy state.
         current_busy: usize,
     },
+    /// Reply to [`Request::DistillClaudePrompt`] carrying the distilled
+    /// prompt the LLM produced.  Always followed by [`Response::Done`].
+    DistilledPromptReady { prompt: String },
+    /// Reply to [`Request::ReservePane`] confirming the lease was acquired.
+    /// Always followed by [`Response::Done`].
+    PaneReserved { pane_id: String },
 }
 
 // ---------------------------------------------------------------------------

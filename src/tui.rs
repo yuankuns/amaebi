@@ -1769,6 +1769,35 @@ async fn dispatch_input(
 /// `Response::Done`.  Any pre-launch error (tag generation failure,
 /// IPC error) is surfaced to the transcript and `pending_claude`
 /// stays None so the next user input isn't blocked.
+/// One event captured from the distillation sink for later replay
+/// into the transcript.  Buffering decouples sink lifetime from the
+/// `&mut state` that owns the transcript so the borrow checker is
+/// happy.
+enum DistillEvent {
+    Text(String),
+    Tool { name: String, detail: String },
+    Status(String),
+}
+
+struct BufferingDistillSink<'a> {
+    buffer: &'a mut Vec<DistillEvent>,
+}
+
+impl crate::client::DistillSink for BufferingDistillSink<'_> {
+    fn on_text(&mut self, chunk: &str) {
+        self.buffer.push(DistillEvent::Text(chunk.to_string()));
+    }
+    fn on_tool_use(&mut self, name: &str, detail: &str) {
+        self.buffer.push(DistillEvent::Tool {
+            name: name.to_string(),
+            detail: detail.to_string(),
+        });
+    }
+    fn on_status(&mut self, line: &str) {
+        self.buffer.push(DistillEvent::Status(line.to_string()));
+    }
+}
+
 async fn launch_claude_tasks(
     writer: &mut tokio::net::unix::OwnedWriteHalf,
     state: &mut AppState,
@@ -1788,7 +1817,50 @@ async fn launch_claude_tasks(
         return Ok(());
     }
 
-    // Snapshot tag → original description so the response handler
+    // Distill each task's brief into a detailed Claude Code prompt
+    // before launch.  Buffer all sink events into a Vec while the IPC
+    // helper holds an exclusive borrow on a sink, then drain into
+    // `state` once the helper returns — this lets us keep `&mut state`
+    // out of the sink (which would alias the live `&mut tasks`).
+    let mut buffered: Vec<DistillEvent> = Vec::new();
+    let pre = {
+        let mut sink = BufferingDistillSink {
+            buffer: &mut buffered,
+        };
+        let socket = state.socket_path.clone();
+        let cwd = state.cwd_str.clone();
+        let session_id = state.session_id.clone();
+        let model = state.model.clone();
+        crate::client::distill_claude_tasks(
+            &socket,
+            &mut tasks,
+            &cwd,
+            &session_id,
+            &model,
+            &mut sink,
+        )
+        .await
+    };
+    for ev in buffered {
+        match ev {
+            DistillEvent::Text(t) => state.push_assistant_chunk(&t),
+            DistillEvent::Tool { name, detail } => {
+                state.push_tool_line(format!("[distill tool] {name} {detail}"))
+            }
+            DistillEvent::Status(t) => state.push_system_line(t),
+        }
+    }
+    if let Err(e) = pre {
+        state.push_error_line(format!("[error] distillation pre-flight: {e:#}"));
+        return Ok(());
+    }
+    tasks.retain(|t| !t.description.trim().is_empty());
+    if tasks.is_empty() {
+        state.push_error_line("[error] all /claude tasks failed distillation".to_string());
+        return Ok(());
+    }
+
+    // Snapshot tag → distilled description so the response handler
     // can rebuild the [launched] block on Response::Done.
     let descriptions: std::collections::HashMap<String, String> = tasks
         .iter()

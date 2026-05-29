@@ -341,6 +341,14 @@ fn acquire_first_idle_locked(
 /// `worktree` conflicts with another Busy pane.  Used by
 /// `/claude --resume-pane <pane_id>` to target a specific pane instead of
 /// letting the scheduler pick one.
+///
+/// `worktree = None` means "do not change the existing worktree field".
+/// Passing `Some(_)` overwrites it.  This matters for the
+/// `Request::ReservePane` pre-flight (used by `/claude` distillation):
+/// the client doesn't know the resume-pane's worktree, and a previous
+/// `release_lease` deliberately preserved the field so resume-pane could
+/// find the worktree later.  An unconditional overwrite would clear that
+/// hint and break the subsequent `ClaudeLaunch` resume-pane probe.
 pub fn acquire_lease(
     pane_id: &str,
     tag: &str,
@@ -383,7 +391,9 @@ pub fn acquire_lease(
         lease.status = PaneStatus::Busy;
         lease.tag = Some(tag.to_string());
         lease.session_id = Some(session_id.to_string());
-        lease.worktree = worktree.map(str::to_string);
+        if let Some(wt) = worktree {
+            lease.worktree = Some(wt.to_string());
+        }
         lease.heartbeat_at = now_secs();
 
         write_state_unlocked(&state)?;
@@ -1143,6 +1153,50 @@ mod tests {
             let s = read_state_unlocked().expect("read back");
             assert_eq!(s["%0"].tag.as_deref(), Some("task-new"));
         }
+    }
+
+    #[test]
+    fn acquire_lease_with_none_worktree_preserves_existing() {
+        // Regression: `Request::ReservePane` (used by `/claude` distillation)
+        // calls `acquire_lease` with `worktree=None` because the client
+        // doesn't know the resume-pane's worktree.  An unconditional
+        // overwrite would clear the worktree set by a previous launch's
+        // `release_lease` (which intentionally preserves it) and break the
+        // subsequent `--resume-pane` probe with "pane has no associated
+        // worktree".
+        let _guard = crate::test_utils::with_temp_home();
+        let mut released = make_idle("%0", "@0");
+        released.worktree = Some("/tmp/wt-from-previous-launch".to_string());
+        released.has_claude = true;
+        let mut state: PaneState = HashMap::new();
+        state.insert("%0".to_string(), released);
+        write_state_unlocked(&state).expect("seed state");
+
+        acquire_lease("%0", "task-new", "sess-new", None).expect("acquire");
+
+        let s = read_state_unlocked().expect("read back");
+        assert_eq!(
+            s["%0"].worktree.as_deref(),
+            Some("/tmp/wt-from-previous-launch"),
+            "worktree must be preserved when caller passes None"
+        );
+        assert_eq!(s["%0"].tag.as_deref(), Some("task-new"));
+        assert_eq!(s["%0"].effective_status(), PaneStatus::Busy);
+    }
+
+    #[test]
+    fn acquire_lease_with_some_worktree_overwrites() {
+        let _guard = crate::test_utils::with_temp_home();
+        let mut prior = make_idle("%0", "@0");
+        prior.worktree = Some("/tmp/old".to_string());
+        let mut state: PaneState = HashMap::new();
+        state.insert("%0".to_string(), prior);
+        write_state_unlocked(&state).expect("seed state");
+
+        acquire_lease("%0", "task-new", "sess-new", Some("/tmp/new")).expect("acquire");
+
+        let s = read_state_unlocked().expect("read back");
+        assert_eq!(s["%0"].worktree.as_deref(), Some("/tmp/new"));
     }
 
     #[test]

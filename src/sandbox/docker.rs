@@ -357,11 +357,13 @@ mod tests {
     /// lives in `tests/integration_tests.rs::spawn_agent_child_cannot_spawn`.
     #[tokio::test]
     async fn docker_spawn_agent_no_recursion() {
-        use crate::tools::{tool_schemas, LocalExecutor, ToolExecutor};
+        use crate::tools::{tool_schemas, LocalExecutor, ToolExecutor, ToolMode};
 
         // (1) Schema layer: child agents are built with include_spawn_agent=false
         // (see `tools::spawn_agent` when constructing `child_state`).
-        let schemas = tool_schemas(false);
+        let schemas = tool_schemas(ToolMode::Chat {
+            include_spawn_agent: false,
+        });
         let has_spawn_agent = schemas
             .iter()
             .any(|s| s["function"]["name"].as_str() == Some("spawn_agent"));
