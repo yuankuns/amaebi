@@ -165,6 +165,9 @@ pub async fn run_chat_tui(
     let _guard = TerminalGuard::enter()?;
     let backend = CrosstermBackend::new(stdout());
     let mut terminal = Terminal::new(backend).context("creating ratatui terminal")?;
+    terminal
+        .clear()
+        .context("clearing terminal on alt-screen entry")?;
 
     let cwd_str = cwd.to_string_lossy().into_owned();
     let mut state = AppState::new(session_id.clone(), model.clone(), socket.clone(), cwd_str);
