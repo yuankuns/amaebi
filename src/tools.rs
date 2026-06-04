@@ -302,14 +302,85 @@ async fn tmux_send_key(args: serde_json::Value) -> Result<String> {
 /// tokens`, `Running… (1m 6s)`); a byte-exact comparison therefore
 /// never converges and `tmux_wait` blocks until `timeout_secs`.
 ///
-/// Strategy: collapse every run of ASCII digits to a single `0` and
-/// every known spinner glyph to `*`.  Real content changes (new lines,
-/// new tool calls, text generation) still differ after normalization
-/// because the surrounding non-digit, non-spinner characters change.
+/// Strategy:
+/// 1. Per-line: detect Claude Code's "thinking" status line — a line
+///    starting with a spinner glyph followed by `<Verb> for <duration>`
+///    where the verb cycles every few seconds (Baked, Cogitated,
+///    Worked, Brewed, Crunched, Mapping, Calculating, Comparing,
+///    Pondering, …).  Collapse the whole line to a fixed token so
+///    verb rotation does not register as activity.
+/// 2. Char-level: collapse every run of ASCII digits to a single `0`
+///    and every known spinner glyph to `*`.  Real content changes
+///    (new lines, new tool calls, text generation) still differ
+///    after normalization because the surrounding non-digit,
+///    non-spinner characters change.
 fn normalize_for_idle_check(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
+    for (i, line) in s.split('\n').enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        if is_claude_thinking_line(line) {
+            out.push_str("__claude_thinking__");
+        } else {
+            normalize_chars_into(line, &mut out);
+        }
+    }
+    out
+}
+
+/// Detect a Claude Code "thinking" status line so the verb-cycling
+/// animation (Baked / Cogitated / Worked / …) doesn't masquerade as
+/// activity.  The line shape is roughly:
+///   `<spinner> <Verb> for <duration>[ · <token info>][ · with <effort>]`
+/// All text after the leading whitespace + spinner glyph is volatile;
+/// the only stable signal is "this line exists at all" so we collapse
+/// it to a fixed token regardless of the surrounding content.
+fn is_claude_thinking_line(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    let mut chars = trimmed.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    let is_spinner = matches!(
+        first,
+        '✶' | '✻'
+            | '✷'
+            | '✸'
+            | '✹'
+            | '✺'
+            | '✦'
+            | '✧'
+            | '⠋'
+            | '⠙'
+            | '⠹'
+            | '⠸'
+            | '⠼'
+            | '⠴'
+            | '⠦'
+            | '⠧'
+            | '⠇'
+            | '⠏'
+    );
+    if !is_spinner {
+        return false;
+    }
+    // Skip whitespace after spinner.
+    let after_spinner = chars.as_str().trim_start();
+    // The thinking line always contains " for " followed by a duration
+    // such as "1h 28m 15s", "5s", "2m 30s".  Looking for ` for ` lets
+    // us match the verb-cycling line without enumerating every verb,
+    // and excludes the simpler "✻ Plan in progress" / similar lines
+    // that don't follow the timer pattern.
+    after_spinner.contains(" for ")
+}
+
+/// Char-level normalization shared by the thinking-line short-circuit
+/// path and every other line: collapse digit runs to `0` and known
+/// spinner glyphs to `*`.
+fn normalize_chars_into(line: &str, out: &mut String) {
     let mut prev_digit = false;
-    for c in s.chars() {
+    for c in line.chars() {
         match c {
             '✶' | '✻' | '✷' | '✸' | '✹' | '✺' | '✦' | '✧' | '⠋' | '⠙' | '⠹' | '⠸' | '⠼' | '⠴'
             | '⠦' | '⠧' | '⠇' | '⠏' => {
@@ -328,7 +399,6 @@ fn normalize_for_idle_check(s: &str) -> String {
             }
         }
     }
-    out
 }
 
 /// Poll a tmux pane until its output has been stable for `idle_secs`, then
@@ -1858,6 +1928,40 @@ mod tests {
             normalize_for_idle_check(a),
             normalize_for_idle_check(b),
             "non-numeric, non-spinner text changes must still differ"
+        );
+    }
+
+    #[test]
+    fn normalize_collapses_thinking_verb_rotation() {
+        // Claude Code rotates the activity verb every few seconds while
+        // the model is thinking — this is the hot bug that left
+        // tmux_wait blocked for 90+ minutes against an idle pane.
+        let a = "✻ Baked for 1h 28m 15s · 19 shells still running";
+        let b = "✻ Cogitated for 1h 28m 17s · 19 shells still running";
+        let c = "✷ Worked for 1h 28m 21s · 19 shells still running";
+        assert_eq!(normalize_for_idle_check(a), normalize_for_idle_check(b));
+        assert_eq!(normalize_for_idle_check(b), normalize_for_idle_check(c));
+    }
+
+    #[test]
+    fn normalize_collapses_thinking_with_token_counter() {
+        // The thinking line sometimes includes a token counter and an
+        // effort tag — both volatile.  Same collapse should apply.
+        let a = "✻ Mapping for 2m 4s · 1.2k tokens · with xhigh effort";
+        let b = "✻ Calculating for 2m 11s · 1.5k tokens · with xhigh effort";
+        assert_eq!(normalize_for_idle_check(a), normalize_for_idle_check(b));
+    }
+
+    #[test]
+    fn normalize_thinking_line_distinct_from_other_content() {
+        // Collapsing the thinking line must NOT make every line
+        // collapse to the same token — real new content (spinner-led
+        // tool-call lines, plain output) should still differ.
+        let thinking = "✻ Baked for 1h 28m 15s · 19 shells still running";
+        let other = "● Bash(echo hello)";
+        assert_ne!(
+            normalize_for_idle_check(thinking),
+            normalize_for_idle_check(other)
         );
     }
 
