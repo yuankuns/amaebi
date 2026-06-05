@@ -1287,7 +1287,16 @@ fn build_distillation_system_prompt(cwd: &str) -> String {
         "You are amaebi's prompt distiller.  The user typed `/claude \"<brief>\"` and your \
          job is to convert that brief into a self-contained prompt that a downstream Claude \
          Code session will execute.\n\n\
-         Working directory: {cwd}\n\n\
+         Your investigation directory: {cwd}\n\n\
+         CRITICAL — worktree isolation:\n\
+         The downstream Claude session will be launched in an auto-created git worktree \
+         (a fresh branch forked from the relevant base), NOT in {cwd} directly.  Therefore:\n\
+         - Do NOT include \"Working directory: {cwd}\" or any `cd` instructions in the \
+           distilled prompt.  The downstream Claude is already in the correct worktree.\n\
+         - Use RELATIVE file paths (from the repo root) when naming files to modify.\n\
+         - If the task references a specific branch, mention the branch name so the \
+           downstream Claude can verify it checked out correctly, but do NOT tell it to \
+           `cd` anywhere.\n\n\
          Procedure:\n\
          1. Use `shell_command` and `read_file` to investigate the codebase.  Look for the \
             files / functions / tests / scripts the brief actually touches.  Run `git status`, \
@@ -1304,6 +1313,7 @@ fn build_distillation_system_prompt(cwd: &str) -> String {
          - Action-oriented: numbered steps the inner Claude can follow.\n\
          - Verification: at least one test / benchmark / build command Claude must run.\n\
          - Constraints: list the hard rules (CI, branching, etc.) that apply.\n\
+         - No absolute paths to the source repo: use relative paths from repo root.\n\
          - No meta-commentary: the prompt is read by Claude as the FIRST user message; do \
            not include phrases like 'I have analyzed your code' or 'here is the prompt'.\n\n\
          You have NO write tools — `edit_file` and tmux pane mutators are not available.  \
