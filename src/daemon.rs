@@ -1311,7 +1311,20 @@ fn build_distillation_system_prompt(cwd: &str) -> String {
          - Self-contained: the downstream Claude session does NOT see this conversation.\n\
          - Concrete: name file paths and functions, not vague areas.\n\
          - Action-oriented: numbered steps the inner Claude can follow.\n\
-         - Verification: at least one test / benchmark / build command Claude must run.\n\
+         - Scope-preserving: if the user's brief specifies particular values, conditions, \
+           or configs (e.g. specific headdims, specific tile counts, specific endpoints), \
+           the distilled prompt MUST restrict changes to exactly those cases.  Do NOT \
+           generalize the scope beyond what the user explicitly stated.\n\
+         - Acceptance criteria: define what 'done' looks like — which tests must pass, \
+           what correctness / performance invariants must hold (no regression), and any \
+           numeric thresholds if applicable.  The downstream Claude must verify these \
+           BEFORE declaring the task complete.\n\
+         - Test environment: specify the exact commands, scripts, or environment the \
+           downstream Claude should use to run the acceptance tests (e.g. the test \
+           runner, the simulator, the benchmark script, relevant env vars).\n\
+         - Loop until green: instruct the downstream Claude to iterate — fix, test, \
+           and repeat — until ALL acceptance criteria pass.  A single attempt that \
+           fails the criteria is not acceptable; Claude must debug and retry.\n\
          - Constraints: list the hard rules (CI, branching, etc.) that apply.\n\
          - No absolute paths to the source repo: use relative paths from repo root.\n\
          - No meta-commentary: the prompt is read by Claude as the FIRST user message; do \
@@ -4895,7 +4908,10 @@ const LARGE_TOOL_RESULT_CHARS: usize = 50_000;
 /// is a live-safety issue (LLM might stop responding with tools) but still
 /// better than hanging the whole chat on a `.lock().ok()?` that would
 /// produce None.  The 24 h TTL also protects lease correctness.
-fn pane_alive_held_panes(state: &DaemonState, conn_id: ConnId) -> Option<Vec<String>> {
+fn pane_alive_held_panes(
+    state: &DaemonState,
+    conn_id: ConnId,
+) -> Option<Vec<(String, Option<String>)>> {
     let held = state.held.lock().unwrap_or_else(|poisoned| {
         tracing::warn!(
             conn_id,
@@ -4907,18 +4923,36 @@ fn pane_alive_held_panes(state: &DaemonState, conn_id: ConnId) -> Option<Vec<Str
     if list.is_empty() {
         return None;
     }
-    Some(list.iter().map(|e| e.pane_id.clone()).collect())
+    Some(
+        list.iter()
+            .map(|e| (e.pane_id.clone(), e.task_description.clone()))
+            .collect(),
+    )
 }
 
 /// Build the pane-alive reminder text injected at the tail of `messages`
 /// just before each model call while the connection still owns any
 /// `/claude` pane.  Names the live pane ids so the LLM can ground its
 /// next tool call in real state rather than invented pane numbers.
-fn format_pane_alive_reminder(pane_ids: &[String]) -> String {
-    let pane_list = pane_ids.join(", ");
+fn format_pane_alive_reminder(panes: &[(String, Option<String>)]) -> String {
+    let pane_list = panes
+        .iter()
+        .map(|(id, _)| id.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut task_section = String::new();
+    for (id, desc) in panes {
+        if let Some(d) = desc {
+            let truncated = truncate_chars(d, 800);
+            task_section.push_str(&format!(
+                "\n[Task for pane {id}]\n{truncated}\n"
+            ));
+        }
+    }
     format!(
         "[pane-alive invariant]\n\
          You currently own the following /claude pane(s): {pane_list}.\n\
+         {task_section}\n\
          \n\
          **You are a SUPERVISOR — watch, guide, verify.**  Each pane has \
          Claude Code running inside with the user's task description \
@@ -5030,6 +5064,21 @@ fn format_pane_alive_reminder(pane_ids: &[String]) -> String {
          are released, this reminder disappears and you can reply with \
          plain text again.  This is the ONLY way to exit supervision \
          cleanly.\n\
+         \n\
+         **Acceptance-driven verification.**  The task description above \
+         contains acceptance criteria (tests to pass, performance / \
+         correctness invariants, numeric thresholds).  You MUST judge \
+         `task_done` against THOSE criteria — not against Claude's \
+         self-reported summary.  Concretely:\n\
+         - Observe (via `tmux_capture_pane`) that the specified tests / \
+         benchmarks actually ran AND passed.\n\
+         - If the task specifies no-regression, compare the numbers you \
+         see in the pane against any baseline mentioned in the task.\n\
+         - If you cannot confirm the criteria from pane output alone, use \
+         `shell_command` (read-only: `git diff`, `grep`, run the test \
+         command yourself) to independently verify.\n\
+         - If criteria are NOT met, do NOT call `task_done`.  Instead \
+         steer Claude toward fixing the remaining failures.\n\
          \n\
          **Multi-step plan (≥3 steps).**  For tasks with three or more \
          distinct steps, maintain a plan as a markdown checklist inside \
@@ -5248,7 +5297,7 @@ where
         // so it applies only while the invariant is live — never persisted to
         // history, never bloats later compactions.  Removed immediately after
         // `invoke_model_with_cache` returns.
-        let pane_alive_injected: Option<Vec<String>> =
+        let pane_alive_injected: Option<Vec<(String, Option<String>)>> =
             conn_id.and_then(|cid| pane_alive_held_panes(state, cid));
         if let Some(held_panes) = &pane_alive_injected {
             messages.push(Message::system(format_pane_alive_reminder(held_panes)));
