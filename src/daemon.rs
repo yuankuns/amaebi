@@ -4944,9 +4944,7 @@ fn format_pane_alive_reminder(panes: &[(String, Option<String>)]) -> String {
     for (id, desc) in panes {
         if let Some(d) = desc {
             let truncated = truncate_chars(d, 800);
-            task_section.push_str(&format!(
-                "\n[Task for pane {id}]\n{truncated}\n"
-            ));
+            task_section.push_str(&format!("\n[Task for pane {id}]\n{truncated}\n"));
         }
     }
     format!(
