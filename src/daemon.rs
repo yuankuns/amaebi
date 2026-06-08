@@ -1876,7 +1876,7 @@ async fn handle_claude_launch(
             // --- normal path: auto-worktree + scheduler-picked pane ---
             let wt_val: Option<String> = match task.worktree.clone() {
                 Some(wt) => Some(wt),
-                None => {
+                None if task.client_cwd.is_some() => {
                     let tid = tag.clone();
                     let cwd = task.client_cwd.clone();
                     let base = ctx_start_branch.clone();
@@ -1897,6 +1897,7 @@ async fn handle_claude_launch(
                         }
                     }
                 }
+                None => None,
             };
 
             let tid_for_lease = tag.clone();
