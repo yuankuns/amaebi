@@ -1012,6 +1012,18 @@ async fn handle_connection_inner(
             Request::ReleasePane { pane_id } => {
                 handle_release_pane(&writer, pane_id).await?;
             }
+
+            Request::Unknown => {
+                let mut w = writer.lock().await;
+                write_frame(
+                    &mut *w,
+                    &Response::Error {
+                        message: "unsupported request type".into(),
+                    },
+                )
+                .await?;
+                write_frame(&mut *w, &Response::Done).await?;
+            }
         }
     }
 

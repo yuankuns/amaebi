@@ -276,6 +276,13 @@ pub enum Request {
     /// with [`Response::Done`] regardless of whether the pane was actually
     /// reserved — release is idempotent.
     ReleasePane { pane_id: String },
+    /// Catch-all for request types added in newer client versions.
+    ///
+    /// Older daemons that predate a new variant will deserialize it as
+    /// `Unknown` instead of a parse error, letting the handler respond
+    /// with a clean [`Response::Error`] rather than a noisy log warning.
+    #[serde(other)]
+    Unknown,
 }
 
 /// A single frame streamed from the daemon back to the client.
@@ -424,6 +431,13 @@ pub enum Response {
         /// Git branch name created for this worktree (e.g. `"fix-foo-ab12cd34"`).
         branch: String,
     },
+    /// Catch-all for response frames added in newer daemon versions.
+    ///
+    /// Older clients that predate a new variant will deserialize it as
+    /// `Unknown` instead of failing outright, letting them skip the frame
+    /// gracefully (most loops already have `_ => {}` catch-all arms).
+    #[serde(other)]
+    Unknown,
 }
 
 // ---------------------------------------------------------------------------
@@ -1317,5 +1331,21 @@ mod tests {
         };
         assert_eq!(path, "/home/user/.amaebi/worktrees/repo/fix-bug-ab12cd34");
         assert_eq!(branch, "fix-bug-ab12cd34");
+    }
+
+    // ---- Forward-compatibility (#[serde(other)]) ----------------------------
+
+    #[test]
+    fn response_unknown_type_deserializes_as_unknown() {
+        let json = r#"{"type":"some_future_variant","foo":"bar","baz":42}"#;
+        let r: Response = serde_json::from_str(json).unwrap();
+        assert!(matches!(r, Response::Unknown));
+    }
+
+    #[test]
+    fn request_unknown_type_deserializes_as_unknown() {
+        let json = r#"{"type":"some_future_request","data":"value"}"#;
+        let r: Request = serde_json::from_str(json).unwrap();
+        assert!(matches!(r, Request::Unknown));
     }
 }
