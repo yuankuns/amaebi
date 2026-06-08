@@ -2908,9 +2908,14 @@ async fn claude_launch_with_resources_dispatches_and_returns_capacity_error() {
     let home = setup_home().expect("setup_home");
     seed_full_pane_pool(home.path(), 16);
 
-    let (socket, mut child, _sd) = start_daemon_at_home_with_env(home.path(), &server.url(), &[])
-        .await
-        .expect("start_daemon_at_home_with_env");
+    let pane_ids: String = (0..16).map(|i| format!("%{i}")).collect::<Vec<_>>().join(" ");
+    let (socket, mut child, _sd) = start_daemon_at_home_with_env(
+        home.path(),
+        &server.url(),
+        &[("AMAEBI_TEST_TMUX_PANES_OVERRIDE", &pane_ids)],
+    )
+    .await
+    .expect("start_daemon_at_home_with_env");
 
     // Build the payload via the mirror struct and serialise ourselves so
     // the test actually exercises the wire-level `resources` field
@@ -2974,9 +2979,14 @@ async fn claude_launch_legacy_payload_without_resources_still_dispatches() {
     let home = setup_home().expect("setup_home");
     seed_full_pane_pool(home.path(), 16);
 
-    let (socket, mut child, _sd) = start_daemon_at_home_with_env(home.path(), &server.url(), &[])
-        .await
-        .expect("start_daemon_at_home_with_env");
+    let pane_ids: String = (0..16).map(|i| format!("%{i}")).collect::<Vec<_>>().join(" ");
+    let (socket, mut child, _sd) = start_daemon_at_home_with_env(
+        home.path(),
+        &server.url(),
+        &[("AMAEBI_TEST_TMUX_PANES_OVERRIDE", &pane_ids)],
+    )
+    .await
+    .expect("start_daemon_at_home_with_env");
 
     // Raw JSON mirrors exactly what a PR#124 client would emit: no
     // `resources` or `resource_timeout_secs` fields at all.

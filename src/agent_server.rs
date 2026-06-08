@@ -341,7 +341,6 @@ impl acp::Agent for AmaebiAgent {
                 | Response::TagGenerated { .. }
                 | Response::DistilledPromptReady { .. }
                 | Response::PaneReserved { .. }
-                | Response::WorktreeCreated { .. }
                 | Response::Unknown => {
                     tracing::debug!("unexpected/unknown response in ACP mode");
                 }

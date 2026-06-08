@@ -1400,7 +1400,6 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
                     | Response::TagGenerated { .. }
                     | Response::DistilledPromptReady { .. }
                     | Response::PaneReserved { .. }
-                    | Response::WorktreeCreated { .. }
                     | Response::Unknown => {
                         tracing::debug!("unexpected/unknown response in chat loop");
                     }
@@ -2652,7 +2651,6 @@ pub async fn run_resume(
                     | Response::TagGenerated { .. }
                     | Response::DistilledPromptReady { .. }
                     | Response::PaneReserved { .. }
-                    | Response::WorktreeCreated { .. }
                     | Response::Unknown => {
                         tracing::debug!("unexpected/unknown response in resume loop");
                     }
@@ -3297,47 +3295,11 @@ pub(crate) async fn distill_claude_tasks(
             None
         };
 
-        // Pre-create worktree so distillation investigates the same
-        // starting point the downstream Claude will operate in.
-        let mut branch: Option<String> = None;
-        let mut created_worktree = false;
-        if task.resume_pane.is_none() && task.worktree.is_none() {
-            sink.on_status(&format!("[distill] creating worktree for tag {}", task.tag));
-            match create_worktree_request(socket, &task.tag, &task_cwd, &task.description).await {
-                Ok((path, br)) => {
-                    task.worktree = Some(path);
-                    branch = Some(br);
-                    created_worktree = true;
-                }
-                Err(e) => {
-                    sink.on_status(&format!(
-                        "[distill] worktree creation failed: {e:#}; distilling from main repo"
-                    ));
-                }
-            }
-        } else if let Some(ref wt) = task.worktree {
-            // Resolve branch from pre-existing worktree so the distilled
-            // prompt can reference the correct branch name.
-            branch = resolve_worktree_branch(wt).await;
-        }
-
-        // Use the worktree as the investigation directory if available.
-        let distill_cwd = task.worktree.as_deref().unwrap_or(&task_cwd).to_string();
-
         sink.on_status(&format!(
             "[distill] investigating codebase for tag {} (this may take a minute)",
             task.tag
         ));
-        match distill_claude_prompt(
-            socket,
-            &task.description,
-            &distill_cwd,
-            model,
-            branch.as_deref(),
-            sink,
-        )
-        .await
-        {
+        match distill_claude_prompt(socket, &task.description, &task_cwd, model, sink).await {
             Ok(prompt) => {
                 task.description = prompt;
                 sink.on_status(&format!("[distill] tag {} done", task.tag));
@@ -3352,22 +3314,6 @@ pub(crate) async fn distill_claude_tasks(
                         sink.on_status(&format!("[distill] also failed to release {pid}: {re:#}"));
                     }
                 }
-                // Clean up auto-created worktree so it doesn't orphan.
-                if created_worktree {
-                    if let Some(ref wt) = task.worktree {
-                        let wt = wt.clone();
-                        let cwd = task_cwd.clone();
-                        let _ = tokio::task::spawn_blocking(move || {
-                            remove_worktree_and_branch(&wt, &cwd);
-                        })
-                        .await;
-                    }
-                    task.worktree = None;
-                }
-                // Mark the task for skip via empty description; caller
-                // filters those out before ClaudeLaunch.  Empty was
-                // already invalid upstream of parse, so no risk of
-                // accidentally launching an empty task.
                 task.description.clear();
                 continue;
             }
@@ -3423,7 +3369,6 @@ pub(crate) async fn distill_claude_prompt(
     brief: &str,
     cwd: &str,
     model: &str,
-    branch: Option<&str>,
     sink: &mut dyn DistillSink,
 ) -> Result<String> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -3435,7 +3380,6 @@ pub(crate) async fn distill_claude_prompt(
         brief: brief.to_string(),
         cwd: cwd.to_string(),
         model: model.to_string(),
-        branch: branch.map(String::from),
     };
     let mut line = serde_json::to_string(&req).context("serialising DistillClaudePrompt")?;
     line.push('\n');
@@ -3484,96 +3428,6 @@ pub(crate) async fn distill_claude_prompt(
         anyhow::bail!("distillation failed: {message}");
     }
     anyhow::bail!("distillation finished without emitting a prompt");
-}
-
-/// Pre-create a git worktree via the daemon.  Returns `(path, branch)`.
-pub(crate) async fn create_worktree_request(
-    socket: &std::path::Path,
-    tag: &str,
-    client_cwd: &str,
-    description: &str,
-) -> Result<(String, String)> {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-    let stream = UnixStream::connect(socket)
-        .await
-        .context("connecting to daemon for CreateWorktree")?;
-    let (reader, mut writer) = tokio::io::split(stream);
-    let req = Request::CreateWorktree {
-        tag: tag.to_string(),
-        client_cwd: client_cwd.to_string(),
-        description: description.to_string(),
-    };
-    let mut line = serde_json::to_string(&req).context("serialising CreateWorktree")?;
-    line.push('\n');
-    writer
-        .write_all(line.as_bytes())
-        .await
-        .context("sending CreateWorktree")?;
-    let mut lines = BufReader::new(reader).lines();
-    let mut result: Option<(String, String)> = None;
-    loop {
-        let Some(reply) = lines
-            .next_line()
-            .await
-            .context("reading CreateWorktree response")?
-        else {
-            break;
-        };
-        let frame: Response =
-            serde_json::from_str(&reply).context("parsing CreateWorktree frame")?;
-        match frame {
-            Response::WorktreeCreated { path, branch } => result = Some((path, branch)),
-            Response::Done => break,
-            Response::Error { message } => {
-                anyhow::bail!("create_worktree: {message}");
-            }
-            _ => {}
-        }
-    }
-    result.ok_or_else(|| anyhow::anyhow!("CreateWorktree: no WorktreeCreated frame received"))
-}
-
-/// Resolve the current branch of an existing worktree via `git rev-parse`.
-async fn resolve_worktree_branch(worktree: &str) -> Option<String> {
-    let wt = worktree.to_owned();
-    tokio::task::spawn_blocking(move || {
-        std::process::Command::new("git")
-            .args(["-C", &wt, "rev-parse", "--abbrev-ref", "HEAD"])
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .and_then(|o| {
-                let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
-                if s.is_empty() || s == "HEAD" {
-                    None
-                } else {
-                    Some(s)
-                }
-            })
-    })
-    .await
-    .ok()
-    .flatten()
-}
-
-/// Best-effort removal of a worktree and its associated branch.
-fn remove_worktree_and_branch(worktree: &str, repo_cwd: &str) {
-    let branch = std::path::Path::new(worktree)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .map(str::to_string);
-    let removed = std::process::Command::new("git")
-        .args(["-C", repo_cwd, "worktree", "remove", "--force", worktree])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-    if removed {
-        if let Some(ref br) = branch {
-            let _ = std::process::Command::new("git")
-                .args(["-C", repo_cwd, "branch", "-D", br])
-                .output();
-        }
-    }
 }
 
 /// Reserve a pane via the daemon so a long pre-launch flow can hold the
