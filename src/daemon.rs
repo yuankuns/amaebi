@@ -1312,7 +1312,7 @@ fn build_distillation_system_prompt(cwd: &str, branch: Option<&str>) -> String {
            distilled prompt.  The downstream Claude is already in the correct worktree.\n\
          - Use RELATIVE file paths (from the repo root) when naming files to modify.\n\
          - The downstream Claude must commit and push ONLY to branch `{branch_display}` — \
-           NEVER to master/main.  Include this constraint in the distilled prompt.\n\n\
+           NEVER to any other branch.  Include this constraint in the distilled prompt.\n\n\
          Procedure:\n\
          1. Use `shell_command` and `read_file` to investigate the codebase.  Look for the \
             files / functions / tests / scripts the brief actually touches.  Run `git status`, \
@@ -1343,8 +1343,8 @@ fn build_distillation_system_prompt(cwd: &str, branch: Option<&str>) -> String {
            fails the criteria is not acceptable; Claude must debug and retry.\n\
          - Constraints: list the hard rules (CI, branching, etc.) that apply.  \
            In particular, the downstream Claude is on branch `{branch_display}` — it \
-           must NEVER push or commit to the main branch (master/main).  All work stays \
-           on the feature branch; merging is the user's responsibility.\n\
+           must NEVER push or commit to any other branch.  All work stays on \
+           `{branch_display}`; merging is the user's responsibility.\n\
          - No absolute paths to the source repo: use relative paths from repo root.\n\
          - No meta-commentary: the prompt is read by Claude as the FIRST user message; do \
            not include phrases like 'I have analyzed your code' or 'here is the prompt'.\n\n\
