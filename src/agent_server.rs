@@ -340,7 +340,8 @@ impl acp::Agent for AmaebiAgent {
                 | Response::CapacityError { .. }
                 | Response::TagGenerated { .. }
                 | Response::DistilledPromptReady { .. }
-                | Response::PaneReserved { .. } => {
+                | Response::PaneReserved { .. }
+                | Response::WorktreeCreated { .. } => {
                     // ACP mode never issues these scheduler / pre-launch flows.
                     tracing::debug!("unexpected pane/tag scheduler response in ACP mode");
                 }

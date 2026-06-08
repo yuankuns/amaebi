@@ -234,6 +234,26 @@ pub enum Request {
         /// Chat model to use for the distillation loop.  Caller passes the
         /// outer chat's current model so /model state is honoured.
         model: String,
+        /// Feature branch name the downstream Claude session will operate on.
+        /// Injected into the distillation system prompt so the distilled
+        /// output can reference the correct branch.
+        #[serde(default)]
+        branch: Option<String>,
+    },
+    /// Pre-create a git worktree for a task before distillation.
+    ///
+    /// The daemon creates the worktree (using `create_task_worktree`) and
+    /// responds with [`Response::WorktreeCreated`].  The client can then
+    /// pass the worktree path as `cwd` to [`Request::DistillClaudePrompt`]
+    /// so the LLM investigates the correct starting point.
+    CreateWorktree {
+        /// Notebook tag — used as the worktree directory prefix.
+        tag: String,
+        /// Client working directory — the git repo to fork from.
+        client_cwd: String,
+        /// Task description — used to extract PR number and resolve the
+        /// base branch to fork from.
+        description: String,
     },
     /// Reserve a tmux pane up-front so a long-running pre-launch flow
     /// (notably `Request::DistillClaudePrompt` for `/claude --resume-pane
@@ -396,6 +416,14 @@ pub enum Response {
     /// Reply to [`Request::ReservePane`] confirming the lease was acquired.
     /// Always followed by [`Response::Done`].
     PaneReserved { pane_id: String },
+    /// A worktree was successfully created in response to
+    /// [`Request::CreateWorktree`].
+    WorktreeCreated {
+        /// Absolute path to the new worktree directory.
+        path: String,
+        /// Git branch name created for this worktree (e.g. `"fix-foo-ab12cd34"`).
+        branch: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
