@@ -103,6 +103,10 @@ pub enum Response {
         max_panes: usize,
         current_busy: usize,
     },
+    /// Catch-all for response types added by a newer daemon that this
+    /// test binary doesn't recognise.
+    #[serde(other)]
+    Unknown,
 }
 
 // ---------------------------------------------------------------------------
