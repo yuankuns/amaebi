@@ -3299,12 +3299,14 @@ pub(crate) async fn distill_claude_tasks(
         // Pre-create worktree so distillation investigates the same
         // starting point the downstream Claude will operate in.
         let mut branch: Option<String> = None;
+        let mut created_worktree = false;
         if task.resume_pane.is_none() && task.worktree.is_none() {
             sink.on_status(&format!("[distill] creating worktree for tag {}", task.tag));
             match create_worktree_request(socket, &task.tag, &task_cwd, &task.description).await {
                 Ok((path, br)) => {
                     task.worktree = Some(path);
                     branch = Some(br);
+                    created_worktree = true;
                 }
                 Err(e) => {
                     sink.on_status(&format!(
@@ -3312,6 +3314,10 @@ pub(crate) async fn distill_claude_tasks(
                     ));
                 }
             }
+        } else if let Some(ref wt) = task.worktree {
+            // Resolve branch from pre-existing worktree so the distilled
+            // prompt can reference the correct branch name.
+            branch = resolve_worktree_branch(wt).await;
         }
 
         // Use the worktree as the investigation directory if available.
@@ -3344,6 +3350,18 @@ pub(crate) async fn distill_claude_tasks(
                     if let Err(re) = release_reserved_pane(socket, &pid).await {
                         sink.on_status(&format!("[distill] also failed to release {pid}: {re:#}"));
                     }
+                }
+                // Clean up auto-created worktree so it doesn't orphan.
+                if created_worktree {
+                    if let Some(ref wt) = task.worktree {
+                        let wt = wt.clone();
+                        let cwd = task_cwd.clone();
+                        let _ = tokio::task::spawn_blocking(move || {
+                            remove_worktree_and_branch(&wt, &cwd);
+                        })
+                        .await;
+                    }
+                    task.worktree = None;
                 }
                 // Mark the task for skip via empty description; caller
                 // filters those out before ClaudeLaunch.  Empty was
@@ -3512,6 +3530,49 @@ pub(crate) async fn create_worktree_request(
         }
     }
     result.ok_or_else(|| anyhow::anyhow!("CreateWorktree: no WorktreeCreated frame received"))
+}
+
+/// Resolve the current branch of an existing worktree via `git rev-parse`.
+async fn resolve_worktree_branch(worktree: &str) -> Option<String> {
+    let wt = worktree.to_owned();
+    tokio::task::spawn_blocking(move || {
+        std::process::Command::new("git")
+            .args(["-C", &wt, "rev-parse", "--abbrev-ref", "HEAD"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .and_then(|o| {
+                let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                if s.is_empty() || s == "HEAD" {
+                    None
+                } else {
+                    Some(s)
+                }
+            })
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// Best-effort removal of a worktree and its associated branch.
+fn remove_worktree_and_branch(worktree: &str, repo_cwd: &str) {
+    let branch = std::path::Path::new(worktree)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(str::to_string);
+    let removed = std::process::Command::new("git")
+        .args(["-C", repo_cwd, "worktree", "remove", "--force", worktree])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if removed {
+        if let Some(ref br) = branch {
+            let _ = std::process::Command::new("git")
+                .args(["-C", repo_cwd, "branch", "-D", br])
+                .output();
+        }
+    }
 }
 
 /// Reserve a pane via the daemon so a long pre-launch flow can hold the
