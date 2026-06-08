@@ -276,6 +276,13 @@ pub enum Request {
     /// with [`Response::Done`] regardless of whether the pane was actually
     /// reserved — release is idempotent.
     ReleasePane { pane_id: String },
+    /// Catch-all for request types added in newer client versions.
+    ///
+    /// Older daemons that predate a new variant will deserialize it as
+    /// `Unknown` instead of a parse error, letting the handler respond
+    /// with a clean [`Response::Error`] rather than a noisy log warning.
+    #[serde(other)]
+    Unknown,
 }
 
 /// A single frame streamed from the daemon back to the client.
@@ -424,6 +431,13 @@ pub enum Response {
         /// Git branch name created for this worktree (e.g. `"fix-foo-ab12cd34"`).
         branch: String,
     },
+    /// Catch-all for response frames added in newer daemon versions.
+    ///
+    /// Older clients that predate a new variant will deserialize it as
+    /// `Unknown` instead of failing outright, letting them skip the frame
+    /// gracefully (most loops already have `_ => {}` catch-all arms).
+    #[serde(other)]
+    Unknown,
 }
 
 // ---------------------------------------------------------------------------
@@ -747,6 +761,10 @@ mod tests {
             r#"{"type":"capacity_error","requested":3,"max_panes":16,"current_busy":14}"#,
             r#"{"type":"model_switched","model":"bedrock/claude-opus-4.7"}"#,
             r#"{"type":"task_released","pane_id":"%54","resources_freed":[],"tag":null,"summary":null,"worktree_path":null,"worktree_dirty":false,"pane_tail":""}"#,
+            r#"{"type":"tag_generated","tag":"fix-login"}"#,
+            r#"{"type":"distilled_prompt_ready","prompt":"do X then Y"}"#,
+            r#"{"type":"pane_reserved","pane_id":"%7"}"#,
+            r#"{"type":"worktree_created","path":"/tmp/wt","branch":"feat-ab12cd34"}"#,
         ];
         for frame in frames {
             let r: Response = serde_json::from_str(frame).unwrap();
@@ -765,6 +783,10 @@ mod tests {
                     | Response::CapacityError { .. }
                     | Response::ModelSwitched { .. }
                     | Response::TaskReleased { .. }
+                    | Response::TagGenerated { .. }
+                    | Response::DistilledPromptReady { .. }
+                    | Response::PaneReserved { .. }
+                    | Response::WorktreeCreated { .. }
             ));
         }
     }
@@ -923,6 +945,24 @@ mod tests {
         assert_eq!(tasks.len(), 2);
         assert_eq!(session_id.as_deref(), Some("sess-123"));
         assert_eq!(repo_dir.as_deref(), Some("/home/user/repo"));
+    }
+
+    #[test]
+    fn request_claude_launch_legacy_without_session_and_repo() {
+        let legacy = r#"{"type":"claude_launch","tasks":[{"tag":"t1","description":"d","worktree":null,"client_cwd":null,"auto_enter":true}]}"#;
+        let back: Request = serde_json::from_str(legacy).expect("legacy ClaudeLaunch must parse");
+        let Request::ClaudeLaunch {
+            tasks,
+            session_id,
+            repo_dir,
+        } = back
+        else {
+            panic!("expected ClaudeLaunch");
+        };
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].tag, "t1");
+        assert!(session_id.is_none(), "session_id must default to None");
+        assert!(repo_dir.is_none(), "repo_dir must default to None");
     }
 
     #[test]
@@ -1317,5 +1357,21 @@ mod tests {
         };
         assert_eq!(path, "/home/user/.amaebi/worktrees/repo/fix-bug-ab12cd34");
         assert_eq!(branch, "fix-bug-ab12cd34");
+    }
+
+    // ---- Forward-compatibility (#[serde(other)]) ----------------------------
+
+    #[test]
+    fn response_unknown_type_deserializes_as_unknown() {
+        let json = r#"{"type":"some_future_variant","foo":"bar","baz":42}"#;
+        let r: Response = serde_json::from_str(json).unwrap();
+        assert!(matches!(r, Response::Unknown));
+    }
+
+    #[test]
+    fn request_unknown_type_deserializes_as_unknown() {
+        let json = r#"{"type":"some_future_request","data":"value"}"#;
+        let r: Request = serde_json::from_str(json).unwrap();
+        assert!(matches!(r, Request::Unknown));
     }
 }
