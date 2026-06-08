@@ -2906,11 +2906,21 @@ async fn send_claude_launch_raw(socket: &std::path::Path, req_json: &str) -> Vec
 async fn claude_launch_with_resources_dispatches_and_returns_capacity_error() {
     let server = MockLlmServer::start().await;
     let home = setup_home().expect("setup_home");
-    seed_full_pane_pool(home.path(), 16);
+    let count = seed_full_pane_pool(home.path(), 16);
+    // Tell the daemon which panes are "live" so zombie reaping doesn't
+    // remove our seeded entries when a real tmux server is running.
+    let pane_ids: String = (0..count)
+        .map(|i| format!("%{i}"))
+        .collect::<Vec<_>>()
+        .join(" ");
 
-    let (socket, mut child, _sd) = start_daemon_at_home_with_env(home.path(), &server.url(), &[])
-        .await
-        .expect("start_daemon_at_home_with_env");
+    let (socket, mut child, _sd) = start_daemon_at_home_with_env(
+        home.path(),
+        &server.url(),
+        &[("AMAEBI_TEST_TMUX_PANES_OVERRIDE", &pane_ids)],
+    )
+    .await
+    .expect("start_daemon_at_home_with_env");
 
     // Build the payload via the mirror struct and serialise ourselves so
     // the test actually exercises the wire-level `resources` field
@@ -2924,6 +2934,8 @@ async fn claude_launch_with_resources_dispatches_and_returns_capacity_error() {
             resource_timeout_secs: Some(5),
             ..Default::default()
         }],
+        session_id: None,
+        repo_dir: None,
     };
     let json = serde_json::to_string(&req).expect("serialise ClaudeLaunch");
     // Sanity-check the wire-level shape before sending — guards the test
@@ -2972,11 +2984,21 @@ async fn claude_launch_with_resources_dispatches_and_returns_capacity_error() {
 async fn claude_launch_legacy_payload_without_resources_still_dispatches() {
     let server = MockLlmServer::start().await;
     let home = setup_home().expect("setup_home");
-    seed_full_pane_pool(home.path(), 16);
+    let count = seed_full_pane_pool(home.path(), 16);
+    // Tell the daemon which panes are "live" so zombie reaping doesn't
+    // remove our seeded entries when a real tmux server is running.
+    let pane_ids: String = (0..count)
+        .map(|i| format!("%{i}"))
+        .collect::<Vec<_>>()
+        .join(" ");
 
-    let (socket, mut child, _sd) = start_daemon_at_home_with_env(home.path(), &server.url(), &[])
-        .await
-        .expect("start_daemon_at_home_with_env");
+    let (socket, mut child, _sd) = start_daemon_at_home_with_env(
+        home.path(),
+        &server.url(),
+        &[("AMAEBI_TEST_TMUX_PANES_OVERRIDE", &pane_ids)],
+    )
+    .await
+    .expect("start_daemon_at_home_with_env");
 
     // Raw JSON mirrors exactly what a PR#124 client would emit: no
     // `resources` or `resource_timeout_secs` fields at all.
@@ -3026,9 +3048,13 @@ async fn claude_launch_resume_pane_with_resources_is_not_rejected_outright() {
     )
     .expect("seed tmux-state");
 
-    let (socket, mut child, _sd) = start_daemon_at_home_with_env(home.path(), &server.url(), &[])
-        .await
-        .expect("start_daemon_at_home_with_env");
+    let (socket, mut child, _sd) = start_daemon_at_home_with_env(
+        home.path(),
+        &server.url(),
+        &[("AMAEBI_TEST_TMUX_PANES_OVERRIDE", "%41")],
+    )
+    .await
+    .expect("start_daemon_at_home_with_env");
 
     let req = Request::ClaudeLaunch {
         tasks: vec![ClaudeLaunchTaskSpec {
@@ -3039,6 +3065,8 @@ async fn claude_launch_resume_pane_with_resources_is_not_rejected_outright() {
             resources: vec!["sim-9900".to_string()],
             ..Default::default()
         }],
+        session_id: None,
+        repo_dir: None,
     };
     let json = serde_json::to_string(&req).expect("serialise");
     let responses = send_claude_launch_raw(&socket, &json).await;

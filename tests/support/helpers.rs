@@ -39,6 +39,10 @@ pub enum Request {
     /// wire shape of the production struct — keep in sync if fields change.
     ClaudeLaunch {
         tasks: Vec<ClaudeLaunchTaskSpec>,
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        session_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        repo_dir: Option<String>,
     },
 }
 
@@ -94,6 +98,10 @@ pub enum Response {
         tag: String,
         pane_id: String,
         session_id: String,
+        #[serde(default)]
+        worktree: Option<String>,
+        #[serde(default)]
+        resources: Vec<String>,
     },
     /// Failure frame when the pane pool is full and the daemon cannot
     /// allocate more.  Surfaces BEFORE any tmux interaction so this path
@@ -103,6 +111,12 @@ pub enum Response {
         max_panes: usize,
         current_busy: usize,
     },
+    WorktreeCreated {
+        path: String,
+        branch: String,
+    },
+    #[serde(other)]
+    Unknown,
 }
 
 // ---------------------------------------------------------------------------
