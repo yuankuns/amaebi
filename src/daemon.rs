@@ -1298,21 +1298,51 @@ async fn handle_distill_claude_prompt(
 /// what `/replyreview`-grade output should look like and what tools it
 /// has.  Kept outside the handler so it can be unit-tested for shape.
 fn build_distillation_system_prompt(cwd: &str, branch: Option<&str>) -> String {
-    let branch_display = branch.unwrap_or("(auto-created feature branch)");
+    let branch_header = match branch {
+        Some(br) => format!("Feature branch: `{br}`\n\n"),
+        None => String::new(),
+    };
+    let isolation_block = match branch {
+        Some(br) => format!(
+            "CRITICAL — worktree isolation:\n\
+             The downstream Claude session will run in this SAME worktree on branch \
+             `{br}`, NOT in the main repository directly.  Therefore:\n\
+             - Do NOT include \"Working directory: ...\" or any `cd` instructions in the \
+               distilled prompt.  The downstream Claude is already in the correct worktree.\n\
+             - Use RELATIVE file paths (from the repo root) when naming files to modify.\n\
+             - The downstream Claude must commit and push ONLY to branch `{br}` — \
+               NEVER to any other branch.  Include this constraint in the distilled prompt.\n\n"
+        ),
+        None => format!(
+            "CRITICAL — worktree isolation:\n\
+             The downstream Claude session will be launched in an auto-created git worktree \
+             (a fresh branch forked from the relevant base), NOT in {cwd} directly.  Therefore:\n\
+             - Do NOT include \"Working directory: {cwd}\" or any `cd` instructions in the \
+               distilled prompt.  The downstream Claude is already in the correct worktree.\n\
+             - Use RELATIVE file paths (from the repo root) when naming files to modify.\n\
+             - The downstream Claude must NEVER push to main or master — only push to \
+               the current feature branch for its task.  Include this constraint in the \
+               distilled prompt.\n\n"
+        ),
+    };
+    let branch_constraint = match branch {
+        Some(br) => format!(
+            "In particular, the downstream Claude is on branch `{br}` — it \
+             must NEVER push or commit to any other branch.  All work stays on \
+             `{br}`; merging is the user's responsibility."
+        ),
+        None => "In particular, the downstream Claude must NEVER push to main or \
+                 master — only push to the current feature branch for its task; \
+                 merging is the user's responsibility."
+            .to_string(),
+    };
     format!(
         "You are amaebi's prompt distiller.  The user typed `/claude \"<brief>\"` and your \
          job is to convert that brief into a self-contained prompt that a downstream Claude \
          Code session will execute.\n\n\
          Your investigation directory: {cwd}\n\
-         Feature branch: `{branch_display}`\n\n\
-         CRITICAL — worktree isolation:\n\
-         The downstream Claude session will run in this SAME worktree on branch \
-         `{branch_display}`, NOT in the main repository directly.  Therefore:\n\
-         - Do NOT include \"Working directory: ...\" or any `cd` instructions in the \
-           distilled prompt.  The downstream Claude is already in the correct worktree.\n\
-         - Use RELATIVE file paths (from the repo root) when naming files to modify.\n\
-         - The downstream Claude must commit and push ONLY to branch `{branch_display}` — \
-           NEVER to any other branch.  Include this constraint in the distilled prompt.\n\n\
+         {branch_header}\
+         {isolation_block}\
          Procedure:\n\
          1. Use `shell_command` and `read_file` to investigate the codebase.  Look for the \
             files / functions / tests / scripts the brief actually touches.  Run `git status`, \
@@ -1342,9 +1372,7 @@ fn build_distillation_system_prompt(cwd: &str, branch: Option<&str>) -> String {
            and repeat — until ALL acceptance criteria pass.  A single attempt that \
            fails the criteria is not acceptable; Claude must debug and retry.\n\
          - Constraints: list the hard rules (CI, branching, etc.) that apply.  \
-           In particular, the downstream Claude is on branch `{branch_display}` — it \
-           must NEVER push or commit to any other branch.  All work stays on \
-           `{branch_display}`; merging is the user's responsibility.\n\
+           {branch_constraint}\n\
          - No absolute paths to the source repo: use relative paths from repo root.\n\
          - No meta-commentary: the prompt is read by Claude as the FIRST user message; do \
            not include phrases like 'I have analyzed your code' or 'here is the prompt'.\n\n\
