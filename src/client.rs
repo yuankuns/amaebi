@@ -1399,9 +1399,10 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
                     | Response::CapacityError { .. }
                     | Response::TagGenerated { .. }
                     | Response::DistilledPromptReady { .. }
-                    | Response::PaneReserved { .. } => {
-                        // Not expected in a normal Chat response stream.
-                        tracing::debug!("unexpected pane/tag scheduler response in chat loop");
+                    | Response::PaneReserved { .. }
+                    | Response::WorktreeCreated { .. }
+                    | Response::Unknown => {
+                        tracing::debug!("unexpected/unknown response in chat loop");
                     }
                     Response::ModelSwitched { .. } => {
                         // ask mode has no persistent model variable to update.
@@ -2650,8 +2651,10 @@ pub async fn run_resume(
                     | Response::CapacityError { .. }
                     | Response::TagGenerated { .. }
                     | Response::DistilledPromptReady { .. }
-                    | Response::PaneReserved { .. } => {
-                        tracing::debug!("unexpected pane/tag scheduler response in resume loop");
+                    | Response::PaneReserved { .. }
+                    | Response::WorktreeCreated { .. }
+                    | Response::Unknown => {
+                        tracing::debug!("unexpected/unknown response in resume loop");
                     }
                     Response::ModelSwitched { .. } => {
                         // resume mode has no persistent model variable to update.
@@ -3294,11 +3297,40 @@ pub(crate) async fn distill_claude_tasks(
             None
         };
 
+        // Pre-create worktree so distillation investigates the same
+        // starting point the downstream Claude will operate in.
+        let mut branch: Option<String> = None;
+        if task.resume_pane.is_none() && task.worktree.is_none() {
+            sink.on_status(&format!("[distill] creating worktree for tag {}", task.tag));
+            match create_worktree(socket, &task.tag, &task_cwd, &task.description).await {
+                Ok((path, br)) => {
+                    task.worktree = Some(path);
+                    branch = Some(br);
+                }
+                Err(e) => {
+                    sink.on_status(&format!(
+                        "[distill] worktree creation failed: {e:#}; distilling from main repo"
+                    ));
+                }
+            }
+        }
+
+        let distill_cwd = task.worktree.as_deref().unwrap_or(&task_cwd).to_string();
+
         sink.on_status(&format!(
             "[distill] investigating codebase for tag {} (this may take a minute)",
             task.tag
         ));
-        match distill_claude_prompt(socket, &task.description, &task_cwd, model, sink).await {
+        match distill_claude_prompt(
+            socket,
+            &task.description,
+            &distill_cwd,
+            model,
+            branch.as_deref(),
+            sink,
+        )
+        .await
+        {
             Ok(prompt) => {
                 task.description = prompt;
                 sink.on_status(&format!("[distill] tag {} done", task.tag));
@@ -3372,6 +3404,7 @@ pub(crate) async fn distill_claude_prompt(
     brief: &str,
     cwd: &str,
     model: &str,
+    branch: Option<&str>,
     sink: &mut dyn DistillSink,
 ) -> Result<String> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -3383,6 +3416,7 @@ pub(crate) async fn distill_claude_prompt(
         brief: brief.to_string(),
         cwd: cwd.to_string(),
         model: model.to_string(),
+        branch: branch.map(str::to_string),
     };
     let mut line = serde_json::to_string(&req).context("serialising DistillClaudePrompt")?;
     line.push('\n');
@@ -3516,6 +3550,54 @@ pub(crate) async fn release_reserved_pane(socket: &std::path::Path, pane_id: &st
         }
     }
     Ok(())
+}
+
+/// Pre-create a git worktree for a task before distillation.
+/// Returns `(path, branch)` on success.
+pub(crate) async fn create_worktree(
+    socket: &std::path::Path,
+    tag: &str,
+    client_cwd: &str,
+    description: &str,
+) -> Result<(String, String)> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let stream = UnixStream::connect(socket)
+        .await
+        .context("connecting to daemon for CreateWorktree")?;
+    let (reader, mut writer) = tokio::io::split(stream);
+    let req = Request::CreateWorktree {
+        tag: tag.to_string(),
+        client_cwd: client_cwd.to_string(),
+        description: description.to_string(),
+    };
+    let mut line = serde_json::to_string(&req).context("serialising CreateWorktree")?;
+    line.push('\n');
+    writer
+        .write_all(line.as_bytes())
+        .await
+        .context("sending CreateWorktree")?;
+    let mut lines = BufReader::new(reader).lines();
+    let mut result: Option<(String, String)> = None;
+    loop {
+        let Some(reply) = lines
+            .next_line()
+            .await
+            .context("reading CreateWorktree response")?
+        else {
+            break;
+        };
+        let frame: Response =
+            serde_json::from_str(&reply).context("parsing CreateWorktree frame")?;
+        match frame {
+            Response::WorktreeCreated { path, branch } => result = Some((path, branch)),
+            Response::Done => break,
+            Response::Error { message } => {
+                anyhow::bail!("create_worktree: {message}");
+            }
+            _ => {}
+        }
+    }
+    result.context("create_worktree: daemon closed without WorktreeCreated response")
 }
 
 // ---------------------------------------------------------------------------
