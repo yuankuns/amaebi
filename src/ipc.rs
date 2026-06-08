@@ -761,6 +761,10 @@ mod tests {
             r#"{"type":"capacity_error","requested":3,"max_panes":16,"current_busy":14}"#,
             r#"{"type":"model_switched","model":"bedrock/claude-opus-4.7"}"#,
             r#"{"type":"task_released","pane_id":"%54","resources_freed":[],"tag":null,"summary":null,"worktree_path":null,"worktree_dirty":false,"pane_tail":""}"#,
+            r#"{"type":"tag_generated","tag":"fix-bug"}"#,
+            r#"{"type":"distilled_prompt_ready","prompt":"do the thing"}"#,
+            r#"{"type":"pane_reserved","pane_id":"%7"}"#,
+            r#"{"type":"worktree_created","path":"/tmp/wt","branch":"fix-abc123"}"#,
         ];
         for frame in frames {
             let r: Response = serde_json::from_str(frame).unwrap();
@@ -779,6 +783,10 @@ mod tests {
                     | Response::CapacityError { .. }
                     | Response::ModelSwitched { .. }
                     | Response::TaskReleased { .. }
+                    | Response::TagGenerated { .. }
+                    | Response::DistilledPromptReady { .. }
+                    | Response::PaneReserved { .. }
+                    | Response::WorktreeCreated { .. }
             ));
         }
     }
