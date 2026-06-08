@@ -1221,7 +1221,8 @@ mod tests {
 
     #[test]
     fn legacy_create_worktree_deserializes_as_unknown() {
-        let json = r#"{"type":"create_worktree","tag":"fix-bug","client_cwd":"/repo","description":"d"}"#;
+        let json =
+            r#"{"type":"create_worktree","tag":"fix-bug","client_cwd":"/repo","description":"d"}"#;
         let r: Request = serde_json::from_str(json).unwrap();
         assert!(matches!(r, Request::Unknown));
     }

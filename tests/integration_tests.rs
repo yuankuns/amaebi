@@ -2908,7 +2908,10 @@ async fn claude_launch_with_resources_dispatches_and_returns_capacity_error() {
     let home = setup_home().expect("setup_home");
     seed_full_pane_pool(home.path(), 16);
 
-    let pane_ids: String = (0..16).map(|i| format!("%{i}")).collect::<Vec<_>>().join(" ");
+    let pane_ids: String = (0..16)
+        .map(|i| format!("%{i}"))
+        .collect::<Vec<_>>()
+        .join(" ");
     let (socket, mut child, _sd) = start_daemon_at_home_with_env(
         home.path(),
         &server.url(),
@@ -2979,7 +2982,10 @@ async fn claude_launch_legacy_payload_without_resources_still_dispatches() {
     let home = setup_home().expect("setup_home");
     seed_full_pane_pool(home.path(), 16);
 
-    let pane_ids: String = (0..16).map(|i| format!("%{i}")).collect::<Vec<_>>().join(" ");
+    let pane_ids: String = (0..16)
+        .map(|i| format!("%{i}"))
+        .collect::<Vec<_>>()
+        .join(" ");
     let (socket, mut child, _sd) = start_daemon_at_home_with_env(
         home.path(),
         &server.url(),
