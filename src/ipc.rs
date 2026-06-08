@@ -948,6 +948,24 @@ mod tests {
     }
 
     #[test]
+    fn request_claude_launch_legacy_without_session_and_repo() {
+        let legacy = r#"{"type":"claude_launch","tasks":[{"tag":"t1","description":"d","worktree":null,"client_cwd":null,"auto_enter":true}]}"#;
+        let back: Request = serde_json::from_str(legacy).expect("legacy ClaudeLaunch must parse");
+        let Request::ClaudeLaunch {
+            tasks,
+            session_id,
+            repo_dir,
+        } = back
+        else {
+            panic!("expected ClaudeLaunch");
+        };
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].tag, "t1");
+        assert!(session_id.is_none(), "session_id must default to None");
+        assert!(repo_dir.is_none(), "repo_dir must default to None");
+    }
+
+    #[test]
     fn response_pane_assigned_round_trip() {
         let r = Response::PaneAssigned {
             tag: "pr-123".into(),
