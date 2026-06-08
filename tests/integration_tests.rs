@@ -2917,7 +2917,10 @@ async fn claude_launch_with_resources_dispatches_and_returns_capacity_error() {
     let (socket, mut child, _sd) = start_daemon_at_home_with_env(
         home.path(),
         &server.url(),
-        &[("AMAEBI_TEST_TMUX_PANES_OVERRIDE", &pane_ids)],
+        &[
+            ("AMAEBI_TEST_TMUX_PANES_OVERRIDE", &pane_ids),
+            ("GIT_CEILING_DIRECTORIES", "/"),
+        ],
     )
     .await
     .expect("start_daemon_at_home_with_env");
@@ -2995,7 +2998,10 @@ async fn claude_launch_legacy_payload_without_resources_still_dispatches() {
     let (socket, mut child, _sd) = start_daemon_at_home_with_env(
         home.path(),
         &server.url(),
-        &[("AMAEBI_TEST_TMUX_PANES_OVERRIDE", &pane_ids)],
+        &[
+            ("AMAEBI_TEST_TMUX_PANES_OVERRIDE", &pane_ids),
+            ("GIT_CEILING_DIRECTORIES", "/"),
+        ],
     )
     .await
     .expect("start_daemon_at_home_with_env");
@@ -3051,7 +3057,10 @@ async fn claude_launch_resume_pane_with_resources_is_not_rejected_outright() {
     let (socket, mut child, _sd) = start_daemon_at_home_with_env(
         home.path(),
         &server.url(),
-        &[("AMAEBI_TEST_TMUX_PANES_OVERRIDE", "%41")],
+        &[
+            ("AMAEBI_TEST_TMUX_PANES_OVERRIDE", "%41"),
+            ("GIT_CEILING_DIRECTORIES", "/"),
+        ],
     )
     .await
     .expect("start_daemon_at_home_with_env");
