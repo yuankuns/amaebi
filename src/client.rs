@@ -1400,9 +1400,9 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
                     | Response::TagGenerated { .. }
                     | Response::DistilledPromptReady { .. }
                     | Response::PaneReserved { .. }
-                    | Response::WorktreeCreated { .. } => {
-                        // Not expected in a normal Chat response stream.
-                        tracing::debug!("unexpected pane/tag scheduler response in chat loop");
+                    | Response::WorktreeCreated { .. }
+                    | Response::Unknown => {
+                        tracing::debug!("unexpected/unknown response in chat loop");
                     }
                     Response::ModelSwitched { .. } => {
                         // ask mode has no persistent model variable to update.
@@ -2652,8 +2652,9 @@ pub async fn run_resume(
                     | Response::TagGenerated { .. }
                     | Response::DistilledPromptReady { .. }
                     | Response::PaneReserved { .. }
-                    | Response::WorktreeCreated { .. } => {
-                        tracing::debug!("unexpected pane/tag scheduler response in resume loop");
+                    | Response::WorktreeCreated { .. }
+                    | Response::Unknown => {
+                        tracing::debug!("unexpected/unknown response in resume loop");
                     }
                     Response::ModelSwitched { .. } => {
                         // resume mode has no persistent model variable to update.

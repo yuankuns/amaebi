@@ -341,13 +341,11 @@ impl acp::Agent for AmaebiAgent {
                 | Response::TagGenerated { .. }
                 | Response::DistilledPromptReady { .. }
                 | Response::PaneReserved { .. }
-                | Response::WorktreeCreated { .. } => {
-                    // ACP mode never issues these scheduler / pre-launch flows.
-                    tracing::debug!("unexpected pane/tag scheduler response in ACP mode");
+                | Response::WorktreeCreated { .. }
+                | Response::Unknown => {
+                    tracing::debug!("unexpected/unknown response in ACP mode");
                 }
                 Response::TaskReleased { .. } => {
-                    // ACP mode never issues Request::ClaudeRelease; explicit
-                    // arm keeps future enum additions a compile error.
                     tracing::debug!("unexpected TaskReleased in ACP mode");
                 }
             }
