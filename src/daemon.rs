@@ -982,8 +982,22 @@ async fn handle_connection_inner(
                     .await?;
             }
 
-            Request::DistillClaudePrompt { brief, cwd, model } => {
-                handle_distill_claude_prompt(&writer, &state, conn_id, brief, cwd, model).await?;
+            Request::DistillClaudePrompt {
+                brief,
+                cwd,
+                model,
+                branch,
+            } => {
+                handle_distill_claude_prompt(&writer, &state, conn_id, brief, cwd, model, branch)
+                    .await?;
+            }
+
+            Request::CreateWorktree {
+                tag,
+                client_cwd,
+                description,
+            } => {
+                handle_create_worktree(&writer, tag, client_cwd, description).await?;
             }
 
             Request::ReservePane {
@@ -1211,8 +1225,9 @@ async fn handle_distill_claude_prompt(
     brief: String,
     cwd: String,
     model: String,
+    branch: Option<String>,
 ) -> Result<()> {
-    let system_prompt = build_distillation_system_prompt(&cwd);
+    let system_prompt = build_distillation_system_prompt(&cwd, branch.as_deref());
     let user_msg = format!(
         "User's brief description for /claude:\n\n{brief}\n\n\
          Working directory: {cwd}\n\n\
@@ -1282,21 +1297,22 @@ async fn handle_distill_claude_prompt(
 /// System prompt for the `/claude` distillation loop.  Tells the LLM
 /// what `/replyreview`-grade output should look like and what tools it
 /// has.  Kept outside the handler so it can be unit-tested for shape.
-fn build_distillation_system_prompt(cwd: &str) -> String {
+fn build_distillation_system_prompt(cwd: &str, branch: Option<&str>) -> String {
+    let branch_display = branch.unwrap_or("(auto-created feature branch)");
     format!(
         "You are amaebi's prompt distiller.  The user typed `/claude \"<brief>\"` and your \
          job is to convert that brief into a self-contained prompt that a downstream Claude \
          Code session will execute.\n\n\
-         Your investigation directory: {cwd}\n\n\
+         Your investigation directory: {cwd}\n\
+         Feature branch: `{branch_display}`\n\n\
          CRITICAL — worktree isolation:\n\
-         The downstream Claude session will be launched in an auto-created git worktree \
-         (a fresh branch forked from the relevant base), NOT in {cwd} directly.  Therefore:\n\
-         - Do NOT include \"Working directory: {cwd}\" or any `cd` instructions in the \
+         The downstream Claude session will run in this SAME worktree on branch \
+         `{branch_display}`, NOT in the main repository directly.  Therefore:\n\
+         - Do NOT include \"Working directory: ...\" or any `cd` instructions in the \
            distilled prompt.  The downstream Claude is already in the correct worktree.\n\
          - Use RELATIVE file paths (from the repo root) when naming files to modify.\n\
-         - If the task references a specific branch, mention the branch name so the \
-           downstream Claude can verify it checked out correctly, but do NOT tell it to \
-           `cd` anywhere.\n\n\
+         - The downstream Claude must commit and push ONLY to branch `{branch_display}` — \
+           NEVER to master/main.  Include this constraint in the distilled prompt.\n\n\
          Procedure:\n\
          1. Use `shell_command` and `read_file` to investigate the codebase.  Look for the \
             files / functions / tests / scripts the brief actually touches.  Run `git status`, \
@@ -1325,7 +1341,10 @@ fn build_distillation_system_prompt(cwd: &str) -> String {
          - Loop until green: instruct the downstream Claude to iterate — fix, test, \
            and repeat — until ALL acceptance criteria pass.  A single attempt that \
            fails the criteria is not acceptable; Claude must debug and retry.\n\
-         - Constraints: list the hard rules (CI, branching, etc.) that apply.\n\
+         - Constraints: list the hard rules (CI, branching, etc.) that apply.  \
+           In particular, the downstream Claude is on branch `{branch_display}` — it \
+           must NEVER push or commit to the main branch (master/main).  All work stays \
+           on the feature branch; merging is the user's responsibility.\n\
          - No absolute paths to the source repo: use relative paths from repo root.\n\
          - No meta-commentary: the prompt is read by Claude as the FIRST user message; do \
            not include phrases like 'I have analyzed your code' or 'here is the prompt'.\n\n\
@@ -1385,6 +1404,46 @@ async fn handle_release_pane(
         .map_err(|e| anyhow::anyhow!("release_pane spawn_blocking panicked: {e}"))?;
     let mut w = writer.lock().await;
     write_frame(&mut *w, &Response::Done).await.ok();
+    Ok(())
+}
+
+/// Handle `Request::CreateWorktree`: pre-create a git worktree before
+/// distillation so the LLM can investigate inside it.
+async fn handle_create_worktree(
+    writer: &Arc<tokio::sync::Mutex<tokio::net::unix::OwnedWriteHalf>>,
+    tag: String,
+    client_cwd: String,
+    description: String,
+) -> Result<()> {
+    let result = tokio::task::spawn_blocking(move || {
+        let ctx = gather_task_context(Some(&client_cwd), &description);
+        let wt_path = create_task_worktree(&tag, Some(&client_cwd), ctx.start_branch.as_deref())?;
+        let branch = wt_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(&tag)
+            .to_owned();
+        Ok::<_, anyhow::Error>((wt_path.to_string_lossy().into_owned(), branch))
+    })
+    .await
+    .context("create_worktree spawn_blocking panicked")?;
+
+    let mut w = writer.lock().await;
+    match result {
+        Ok((path, branch)) => {
+            write_frame(&mut *w, &Response::WorktreeCreated { path, branch }).await?;
+        }
+        Err(e) => {
+            write_frame(
+                &mut *w,
+                &Response::Error {
+                    message: format!("CreateWorktree failed: {e:#}"),
+                },
+            )
+            .await?;
+        }
+    }
+    write_frame(&mut *w, &Response::Done).await?;
     Ok(())
 }
 
@@ -8796,9 +8855,14 @@ mod tests {
 
     #[test]
     fn distillation_system_prompt_mentions_emit_tool_and_cwd() {
-        let p = build_distillation_system_prompt("/tmp/repo");
+        let p = build_distillation_system_prompt("/tmp/repo", Some("fix-foo-abc123"));
         // Working directory must be interpolated, not left as a placeholder.
         assert!(p.contains("/tmp/repo"), "cwd must be in prompt: {p}");
+        // Branch name must be injected when provided.
+        assert!(
+            p.contains("fix-foo-abc123"),
+            "branch name must be in prompt: {p}"
+        );
         // The terminator tool must be named explicitly so the LLM knows
         // how to end its turn.
         assert!(
@@ -8822,7 +8886,7 @@ mod tests {
         // Critical for downstream fidelity: the distilled output is
         // injected as Claude's first user turn verbatim, so adding
         // "here is the prompt I prepared:" wraps would break framing.
-        let p = build_distillation_system_prompt("/x");
+        let p = build_distillation_system_prompt("/x", None);
         assert!(
             p.to_lowercase().contains("no meta-commentary")
                 || p.to_lowercase().contains("verbatim"),
