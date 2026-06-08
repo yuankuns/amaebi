@@ -1223,4 +1223,99 @@ mod tests {
             "1h 4m 27s"
         );
     }
+
+    // ---- CreateWorktree / WorktreeCreated legacy compat ----------------------
+
+    #[test]
+    fn distill_claude_prompt_legacy_without_branch_field() {
+        // A client built before the `branch` field was added sends
+        // DistillClaudePrompt without it.  The new daemon must accept
+        // this payload via `#[serde(default)]` and default to None.
+        let legacy = r#"{"type":"distill_claude_prompt","brief":"fix the bug","cwd":"/tmp/repo","model":"sonnet"}"#;
+        let back: Request = serde_json::from_str(legacy).expect("legacy must parse");
+        let Request::DistillClaudePrompt {
+            brief,
+            cwd,
+            model,
+            branch,
+        } = back
+        else {
+            panic!("expected DistillClaudePrompt");
+        };
+        assert_eq!(brief, "fix the bug");
+        assert_eq!(cwd, "/tmp/repo");
+        assert_eq!(model, "sonnet");
+        assert!(branch.is_none(), "branch must default to None");
+    }
+
+    #[test]
+    fn distill_claude_prompt_with_branch_round_trip() {
+        let req = Request::DistillClaudePrompt {
+            brief: "add feature".into(),
+            cwd: "/wt/feat-xyz".into(),
+            model: "opus".into(),
+            branch: Some("feat-xyz-ab12cd34".into()),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["type"], "distill_claude_prompt");
+        assert_eq!(v["branch"], "feat-xyz-ab12cd34");
+
+        let back: Request = serde_json::from_str(&json).unwrap();
+        let Request::DistillClaudePrompt { branch, .. } = back else {
+            panic!("expected DistillClaudePrompt");
+        };
+        assert_eq!(branch.as_deref(), Some("feat-xyz-ab12cd34"));
+    }
+
+    #[test]
+    fn create_worktree_request_round_trip() {
+        let req = Request::CreateWorktree {
+            tag: "fix-bug".into(),
+            client_cwd: "/home/user/repo".into(),
+            description: "fix the crash on startup".into(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["type"], "create_worktree");
+        assert_eq!(v["tag"], "fix-bug");
+        assert_eq!(v["client_cwd"], "/home/user/repo");
+        assert_eq!(v["description"], "fix the crash on startup");
+
+        let back: Request = serde_json::from_str(&json).unwrap();
+        let Request::CreateWorktree {
+            tag,
+            client_cwd,
+            description,
+        } = back
+        else {
+            panic!("expected CreateWorktree");
+        };
+        assert_eq!(tag, "fix-bug");
+        assert_eq!(client_cwd, "/home/user/repo");
+        assert_eq!(description, "fix the crash on startup");
+    }
+
+    #[test]
+    fn worktree_created_response_round_trip() {
+        let r = Response::WorktreeCreated {
+            path: "/home/user/.amaebi/worktrees/repo/fix-bug-ab12cd34".into(),
+            branch: "fix-bug-ab12cd34".into(),
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["type"], "worktree_created");
+        assert_eq!(
+            v["path"],
+            "/home/user/.amaebi/worktrees/repo/fix-bug-ab12cd34"
+        );
+        assert_eq!(v["branch"], "fix-bug-ab12cd34");
+
+        let back: Response = serde_json::from_str(&json).unwrap();
+        let Response::WorktreeCreated { path, branch } = back else {
+            panic!("expected WorktreeCreated");
+        };
+        assert_eq!(path, "/home/user/.amaebi/worktrees/repo/fix-bug-ab12cd34");
+        assert_eq!(branch, "fix-bug-ab12cd34");
+    }
 }
