@@ -829,12 +829,14 @@ pub fn mark_claude_started(pane_id: &str) -> Result<()> {
 /// `AMAEBI_TEST_TMUX_PANES_OVERRIDE` env var to a whitespace-separated
 /// list of pane ids (e.g. `"%0 %1 %2"`).  Empty string means "tmux
 /// reports no live panes", which lets tests exercise the all-zombies
-/// path without shelling out.  The override is gated behind `#[cfg(test)]`
-/// so production builds always shell out to real tmux — a stray env var
-/// in the daemon's environment must never be able to drop legitimate
-/// lease records.
+/// path without shelling out.  The override is gated behind
+/// `#[cfg(debug_assertions)]` so release builds always shell out to
+/// real tmux — a stray env var in the daemon's environment must never
+/// be able to drop legitimate lease records.  Debug builds (including
+/// `cargo test` integration tests) honour it so they can run without
+/// a live tmux server.
 fn tmux_list_all_panes_sync() -> Result<std::collections::HashSet<String>> {
-    #[cfg(test)]
+    #[cfg(debug_assertions)]
     if let Ok(override_str) = std::env::var("AMAEBI_TEST_TMUX_PANES_OVERRIDE") {
         return Ok(override_str
             .split_whitespace()
