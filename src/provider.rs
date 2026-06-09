@@ -50,14 +50,25 @@ pub struct ModelSpec {
 
 /// Friendly alias → full Bedrock model ID.
 ///
-/// **Maintenance note**: when new Claude models are released on Bedrock,
+/// **Maintenance note**: when new Bedrock models are released,
 /// add a new entry here.  The alias is the short name users type on the
-/// CLI (e.g. `claude-sonnet-4.6`); the value is the cross-region
-/// inference model ID (with `us.` prefix).
+/// CLI (e.g. `claude-sonnet-4.6` or `gpt-oss-120b`); the value is the
+/// provider model ID used by the selected Bedrock endpoint.
 ///
 /// To find the correct model ID, check the Bedrock console or run:
 ///   `aws bedrock list-foundation-models --by-provider Anthropic`
 const BEDROCK_ALIASES: &[(&str, &str)] = &[
+    // OpenAI family.
+    //
+    // gpt-5.x is only available through Bedrock Mantle's OpenAI Responses API,
+    // while gpt-oss aliases use the bedrock-runtime model IDs so they continue
+    // to work through ConverseStream.  Users can still pass the Mantle IDs
+    // directly (for example, `bedrock/openai.gpt-oss-120b`) when they want the
+    // OpenAI-compatible endpoint.
+    ("gpt-5.5", "openai.gpt-5.5"),
+    ("gpt-5.4", "openai.gpt-5.4"),
+    ("gpt-oss-120b", "openai.gpt-oss-120b-1:0"),
+    ("gpt-oss-20b", "openai.gpt-oss-20b-1:0"),
     // Claude 4.7 family
     ("claude-opus-4.7", "us.anthropic.claude-opus-4-7"),
     // Claude 4.6 family (cross-region inference profiles — no `:0` suffix)
@@ -329,6 +340,24 @@ mod tests {
             resolve_bedrock_alias("claude-opus-4.6"),
             "us.anthropic.claude-opus-4-6-v1"
         );
+    }
+
+    #[test]
+    fn alias_openai_gpt_oss_runtime_models() {
+        assert_eq!(
+            resolve_bedrock_alias("gpt-oss-120b"),
+            "openai.gpt-oss-120b-1:0"
+        );
+        assert_eq!(
+            resolve_bedrock_alias("gpt-oss-20b"),
+            "openai.gpt-oss-20b-1:0"
+        );
+    }
+
+    #[test]
+    fn alias_openai_gpt_5_mantle_models() {
+        assert_eq!(resolve_bedrock_alias("gpt-5.5"), "openai.gpt-5.5");
+        assert_eq!(resolve_bedrock_alias("gpt-5.4"), "openai.gpt-5.4");
     }
 
     #[test]

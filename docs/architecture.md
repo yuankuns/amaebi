@@ -170,6 +170,11 @@ Unprefixed names first consult `~/.amaebi/config.json` user aliases, then
 the built-in Bedrock alias table (`src/provider.rs:64`), and otherwise
 default to Bedrock (see `resolve_with_aliases` in `src/provider.rs`).
 
+Bedrock OpenAI aliases follow AWS's split endpoints: `gpt-oss-20b` and
+`gpt-oss-120b` resolve to `bedrock-runtime` ConverseStream IDs, while
+`gpt-5.4` and `gpt-5.5` route through Bedrock Mantle's OpenAI-compatible
+Responses path.
+
 The default (`DEFAULT_MODEL` at `src/provider.rs:105`) is
 `claude-sonnet-4.6[1m]`. The `[1m]` suffix opts into Bedrock's 1M-context
 beta. Copilot ignores the suffix.

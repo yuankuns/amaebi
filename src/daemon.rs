@@ -4824,7 +4824,7 @@ where
         Ok(r) => Ok(r),
         Err(e) => {
             let is_auth = e
-                .downcast_ref::<copilot::CopilotHttpError>()
+                .downcast_ref::<crate::responses::ResponsesHttpError>()
                 .is_some_and(|he| matches!(he.status.as_u16(), 401 | 403));
             if is_auth {
                 tracing::warn!(

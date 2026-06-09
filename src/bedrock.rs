@@ -86,6 +86,46 @@ fn converse_stream_endpoint(region: &str, model_id: &str) -> String {
     format!("https://bedrock-runtime.{region}.amazonaws.com/model/{encoded_model}/converse-stream")
 }
 
+/// Returns true for OpenAI models that must use Bedrock Mantle Responses.
+fn requires_mantle_responses(model_id: &str) -> bool {
+    model_id == "openai.gpt-5" || model_id.starts_with("openai.gpt-5.")
+}
+
+/// Returns true for OpenAI gpt-oss Mantle model IDs.
+///
+/// The bedrock-runtime IDs include a version suffix (`-1:0`) and continue to
+/// use ConverseStream.  The suffix-free IDs are Mantle IDs and should go to
+/// the OpenAI-compatible Responses endpoint.
+fn is_mantle_gpt_oss_model(model_id: &str) -> bool {
+    matches!(model_id, "openai.gpt-oss-20b" | "openai.gpt-oss-120b")
+}
+
+/// Returns true when a Bedrock model ID should be invoked through the
+/// OpenAI-compatible Bedrock Mantle Responses API.
+fn uses_bedrock_mantle_responses(model_id: &str) -> bool {
+    requires_mantle_responses(model_id) || is_mantle_gpt_oss_model(model_id)
+}
+
+/// Build the Bedrock Mantle base URL consumed by `responses::stream_openai_compatible`.
+///
+/// Most Mantle models use `https://bedrock-mantle.{region}.api.aws/v1`, but
+/// OpenAI GPT-5.x model cards specify the distinct `/openai/v1/responses`
+/// path.  Because the shared Responses client appends `/responses` to a
+/// `/v1` base URL, this function returns `/openai/v1` for GPT-5.x models.
+fn bedrock_mantle_base_url(region: &str, model_id: &str) -> String {
+    if let Ok(url) = std::env::var("AMAEBI_BEDROCK_MANTLE_URL") {
+        let trimmed = url.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    if requires_mantle_responses(model_id) {
+        format!("https://bedrock-mantle.{region}.api.aws/openai/v1")
+    } else {
+        format!("https://bedrock-mantle.{region}.api.aws/v1")
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Message format conversion: internal → Bedrock Converse
 // ---------------------------------------------------------------------------
@@ -1242,6 +1282,50 @@ where
     let token = read_bearer_token()?;
     let region = aws_region();
 
+    if uses_bedrock_mantle_responses(&spec.model_id) {
+        if spec.use_1m {
+            tracing::warn!(
+                display = %spec.display_name,
+                "1M context is not supported via Bedrock Mantle; proceeding with the model's standard context window"
+            );
+            write_frame(
+                writer,
+                &Response::Text {
+                    chunk: "[warning] 1M context ([1m]) is not supported via Bedrock Mantle; \
+                            proceeding with the model's standard context window.\n"
+                        .into(),
+                },
+            )
+            .await?;
+        }
+        if cache_ttl.is_some() {
+            tracing::debug!(
+                model_id = %spec.model_id,
+                "prompt cache TTL ignored for Bedrock Mantle Responses API"
+            );
+        }
+        let base_url = bedrock_mantle_base_url(&region, &spec.model_id);
+        tracing::debug!(
+            messages = messages.len(),
+            model = %spec.display_name,
+            model_id = %spec.model_id,
+            base_url = %base_url,
+            region = %region,
+            "sending Bedrock Mantle Responses request"
+        );
+        return crate::responses::stream_openai_compatible(
+            http,
+            &token,
+            &base_url,
+            &spec.model_id,
+            messages,
+            tools,
+            max_tokens,
+            writer,
+        )
+        .await;
+    }
+
     tracing::debug!(
         messages = messages.len(),
         model = %spec.display_name,
@@ -1358,6 +1442,53 @@ mod tests {
         ));
         assert!(!supports_1m_context("gpt-4o"));
         assert!(!supports_1m_context(""));
+    }
+
+    // ---- Bedrock Mantle routing -------------------------------------------
+
+    #[test]
+    fn mantle_routing_for_openai_responses_models() {
+        assert!(uses_bedrock_mantle_responses("openai.gpt-5.5"));
+        assert!(uses_bedrock_mantle_responses("openai.gpt-5.4"));
+        assert!(uses_bedrock_mantle_responses("openai.gpt-oss-120b"));
+        assert!(uses_bedrock_mantle_responses("openai.gpt-oss-20b"));
+
+        // Runtime IDs include the version suffix and should keep using
+        // bedrock-runtime ConverseStream.
+        assert!(!uses_bedrock_mantle_responses("openai.gpt-oss-120b-1:0"));
+        assert!(!uses_bedrock_mantle_responses("openai.gpt-oss-20b-1:0"));
+        assert!(!uses_bedrock_mantle_responses(
+            "us.anthropic.claude-sonnet-4-6"
+        ));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn mantle_base_url_uses_openai_path_for_gpt_5() {
+        std::env::remove_var("AMAEBI_BEDROCK_MANTLE_URL");
+        assert_eq!(
+            bedrock_mantle_base_url("us-east-2", "openai.gpt-5.5"),
+            "https://bedrock-mantle.us-east-2.api.aws/openai/v1"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn mantle_base_url_uses_standard_path_for_gpt_oss() {
+        std::env::remove_var("AMAEBI_BEDROCK_MANTLE_URL");
+        assert_eq!(
+            bedrock_mantle_base_url("us-east-1", "openai.gpt-oss-120b"),
+            "https://bedrock-mantle.us-east-1.api.aws/v1"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn mantle_base_url_test_override() {
+        std::env::set_var("AMAEBI_BEDROCK_MANTLE_URL", "http://mock:9999/openai/v1");
+        let url = bedrock_mantle_base_url("us-east-1", "openai.gpt-5.5");
+        std::env::remove_var("AMAEBI_BEDROCK_MANTLE_URL");
+        assert_eq!(url, "http://mock:9999/openai/v1");
     }
 
     // ---- build_additional_model_request_fields ------------------------------

@@ -13,7 +13,7 @@ use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use tokio::io::AsyncWriteExt;
 
-use crate::copilot::{CopilotHttpError, CopilotResponse, FinishReason, Message, ToolCall};
+use crate::copilot::{CopilotResponse, FinishReason, Message, ToolCall};
 use crate::ipc::{write_frame, Response};
 use crate::retry::{backoff_delay, parse_retry_after_header};
 
@@ -44,9 +44,40 @@ fn responses_endpoint(base_url: &str) -> String {
             return format!("{base}/v1/responses");
         }
     }
-    format!("{}/v1/responses", base_url.trim_end_matches('/'))
+    let base = base_url.trim_end_matches('/');
+    if base.ends_with("/responses") {
+        base.to_owned()
+    } else if base.ends_with("/v1") {
+        format!("{base}/responses")
+    } else {
+        format!("{base}/v1/responses")
+    }
 }
 const MAX_RETRIES: u32 = 3;
+
+/// An HTTP error response from an OpenAI-compatible Responses API.
+#[derive(Debug)]
+pub struct ResponsesHttpError {
+    pub status: reqwest::StatusCode,
+    pub body: String,
+}
+
+impl std::fmt::Display for ResponsesHttpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let body = &self.body;
+        match body.char_indices().nth(200) {
+            None => write!(f, "Responses API returned {}: {}", self.status, body),
+            Some((byte_idx, _)) => write!(
+                f,
+                "Responses API returned {}: {}...",
+                self.status,
+                &body[..byte_idx]
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ResponsesHttpError {}
 
 // ---------------------------------------------------------------------------
 // Message format conversion: Chat Completions → Responses API
@@ -189,6 +220,7 @@ async fn send_with_retry(
     messages: &[Message],
     tools: &[serde_json::Value],
     max_tokens: usize,
+    use_copilot_headers: bool,
 ) -> Result<reqwest::Response> {
     let input = to_responses_input(messages);
     let responses_tools = to_responses_tools(tools);
@@ -210,19 +242,20 @@ async fn send_with_retry(
 
     let mut attempt = 0u32;
     loop {
-        let result = http
+        let mut req = http
             .post(&url)
             .header("Authorization", format!("Bearer {token}"))
             .header("Content-Type", "application/json")
             .header("Accept", "application/json")
-            .header("User-Agent", concat!("amaebi/", env!("CARGO_PKG_VERSION")))
-            .header("Copilot-Integration-Id", "vscode-chat")
-            .header("Editor-Version", "vscode/1.90.0")
-            .header("X-Initiator", initiator)
-            .header("Openai-Intent", "conversation-edits")
-            .json(&body)
-            .send()
-            .await;
+            .header("User-Agent", concat!("amaebi/", env!("CARGO_PKG_VERSION")));
+        if use_copilot_headers {
+            req = req
+                .header("Copilot-Integration-Id", "vscode-chat")
+                .header("Editor-Version", "vscode/1.90.0")
+                .header("X-Initiator", initiator)
+                .header("Openai-Intent", "conversation-edits");
+        }
+        let result = req.json(&body).send().await;
 
         match result {
             Ok(resp) if resp.status().is_success() => return Ok(resp),
@@ -231,7 +264,7 @@ async fn send_with_retry(
                 if attempt >= MAX_RETRIES {
                     let status = resp.status();
                     let body_text = resp.text().await.unwrap_or_default();
-                    return Err(anyhow::Error::new(CopilotHttpError {
+                    return Err(anyhow::Error::new(ResponsesHttpError {
                         status,
                         body: body_text,
                     }));
@@ -253,7 +286,7 @@ async fn send_with_retry(
                 if attempt >= MAX_RETRIES {
                     let status = resp.status();
                     let body_text = resp.text().await.unwrap_or_default();
-                    return Err(anyhow::Error::new(CopilotHttpError {
+                    return Err(anyhow::Error::new(ResponsesHttpError {
                         status,
                         body: body_text,
                     }));
@@ -273,7 +306,7 @@ async fn send_with_retry(
             Ok(resp) => {
                 let status = resp.status();
                 let body_text = resp.text().await.unwrap_or_default();
-                return Err(anyhow::Error::new(CopilotHttpError {
+                return Err(anyhow::Error::new(ResponsesHttpError {
                     status,
                     body: body_text,
                 }));
@@ -540,7 +573,41 @@ where
         model,
         "sending chat request via Responses API"
     );
-    let resp = send_with_retry(http, token, base_url, model, messages, tools, max_tokens).await?;
+    let resp = send_with_retry(
+        http, token, base_url, model, messages, tools, max_tokens, true,
+    )
+    .await?;
+    parse_responses_stream(resp, writer).await
+}
+
+/// Send a streaming request to an OpenAI-compatible Responses API endpoint.
+///
+/// This is used for Amazon Bedrock Mantle, whose wire format is OpenAI
+/// Responses-compatible but does not accept Copilot-specific request headers.
+#[allow(clippy::too_many_arguments)]
+pub async fn stream_openai_compatible<W>(
+    http: &reqwest::Client,
+    token: &str,
+    base_url: &str,
+    model: &str,
+    messages: &[Message],
+    tools: &[serde_json::Value],
+    max_tokens: usize,
+    writer: &mut W,
+) -> Result<CopilotResponse>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    tracing::debug!(
+        messages = messages.len(),
+        model,
+        base_url,
+        "sending chat request via OpenAI-compatible Responses API"
+    );
+    let resp = send_with_retry(
+        http, token, base_url, model, messages, tools, max_tokens, false,
+    )
+    .await?;
     parse_responses_stream(resp, writer).await
 }
 
@@ -552,6 +619,38 @@ where
 mod tests {
     use super::*;
     use crate::copilot::{ApiToolCall, ApiToolCallFunction};
+
+    // ---- responses_endpoint ------------------------------------------------
+
+    #[test]
+    #[serial_test::serial]
+    fn responses_endpoint_appends_v1_for_root_base_url() {
+        std::env::remove_var("AMAEBI_COPILOT_URL");
+        assert_eq!(
+            responses_endpoint("https://bedrock-mantle.us-east-1.api.aws"),
+            "https://bedrock-mantle.us-east-1.api.aws/v1/responses"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn responses_endpoint_accepts_v1_base_url() {
+        std::env::remove_var("AMAEBI_COPILOT_URL");
+        assert_eq!(
+            responses_endpoint("https://bedrock-mantle.us-east-2.api.aws/openai/v1"),
+            "https://bedrock-mantle.us-east-2.api.aws/openai/v1/responses"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn responses_endpoint_accepts_full_responses_url() {
+        std::env::remove_var("AMAEBI_COPILOT_URL");
+        assert_eq!(
+            responses_endpoint("http://mock:9999/openai/v1/responses"),
+            "http://mock:9999/openai/v1/responses"
+        );
+    }
 
     // ---- to_responses_input ------------------------------------------------
 
