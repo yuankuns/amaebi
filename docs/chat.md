@@ -30,8 +30,9 @@ amaebi ask --model gpt-5.5 "hello"
 amaebi chat --model copilot/gpt-4o
 ```
 
-The default is `claude-sonnet-4.6[1m]` (see `src/provider.rs:105`). The `[1m]`
-suffix opts into Bedrock's 1M-context beta. Copilot ignores the suffix.
+The default is `claude-sonnet-4.6[1m]` (see `DEFAULT_MODEL` in
+`src/provider.rs`). The `[1m]` suffix opts into Bedrock's 1M-context beta.
+Copilot ignores the suffix.
 
 OpenAI models on Bedrock are available as built-in aliases. `gpt-oss-20b` and
 `gpt-oss-120b` use the `bedrock-runtime` ConverseStream model IDs. `gpt-5.4`

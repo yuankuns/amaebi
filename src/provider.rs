@@ -56,7 +56,7 @@ pub struct ModelSpec {
 /// provider model ID used by the selected Bedrock endpoint.
 ///
 /// To find the correct model ID, check the Bedrock console or run:
-///   `aws bedrock list-foundation-models --by-provider Anthropic`
+///   `aws bedrock list-foundation-models`
 const BEDROCK_ALIASES: &[(&str, &str)] = &[
     // OpenAI family.
     //
