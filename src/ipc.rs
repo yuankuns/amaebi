@@ -243,8 +243,8 @@ pub enum Request {
         #[serde(default)]
         summary: Option<String>,
     },
-    /// Ask the daemon to expand the user's brief `/claude` description into
-    /// a fully-detailed Claude Code prompt.
+    /// Ask the daemon to expand the user's brief agent-launch description into
+    /// a fully-detailed prompt for the downstream coding agent.
     ///
     /// Daemon spins up a bounded agentic loop with a read-only tool subset
     /// plus the `emit_distilled_prompt` terminator.  The LLM investigates
@@ -258,15 +258,16 @@ pub enum Request {
         /// Agent runtime that will consume the distilled prompt.
         #[serde(default)]
         agent: AgentKind,
-        /// The user's original short description (`/claude "..."` argument).
+        /// The user's original short description (`/claude "..."` or
+        /// `/codex "..."` argument).
         brief: String,
         /// Working directory the distillation should reason about — the
-        /// repo / worktree the downstream Claude pane will run in.
+        /// repo / worktree the downstream agent pane will run in.
         cwd: String,
         /// Chat model to use for the distillation loop.  Caller passes the
         /// outer chat's current model so /model state is honoured.
         model: String,
-        /// Feature branch name the downstream Claude session will operate on.
+        /// Feature branch name the downstream agent session will operate on.
         /// Injected into the distillation system prompt so the distilled
         /// output can reference the correct branch.
         #[serde(default)]
@@ -289,7 +290,8 @@ pub enum Request {
     },
     /// Reserve a tmux pane up-front so a long-running pre-launch flow
     /// (notably `Request::DistillClaudePrompt` for `/claude --resume-pane
-    /// %N`) can hold the slot before the actual `Request::ClaudeLaunch`.
+    /// %N` or `/codex --resume-pane %N`) can hold the slot before the actual
+    /// `Request::ClaudeLaunch`.
     ///
     /// Mirrors the lease shape `acquire_lease` would set in `ClaudeLaunch`,
     /// so the eventual launch call is a no-op rather than a contention.
@@ -297,6 +299,11 @@ pub enum Request {
     /// real launch on success.  Daemon responds with [`Response::PaneReserved`]
     /// or [`Response::Error`].
     ReservePane {
+        /// Agent runtime expected to be active in the reserved pane. Defaults
+        /// to Claude Code for backwards compatibility with clients that
+        /// predate `/codex`.
+        #[serde(default)]
+        agent: AgentKind,
         pane_id: String,
         tag: String,
         session_id: String,
@@ -1352,6 +1359,54 @@ mod tests {
             panic!("expected DistillClaudePrompt");
         };
         assert_eq!(branch.as_deref(), Some("feat-xyz-ab12cd34"));
+    }
+
+    #[test]
+    fn reserve_pane_legacy_without_agent_field() {
+        let legacy = r#"{
+            "type":"reserve_pane",
+            "pane_id":"%7",
+            "tag":"task",
+            "session_id":"sess",
+            "worktree":"/tmp/wt"
+        }"#;
+        let back: Request = serde_json::from_str(legacy).expect("legacy must parse");
+        let Request::ReservePane {
+            agent,
+            pane_id,
+            tag,
+            session_id,
+            worktree,
+        } = back
+        else {
+            panic!("expected ReservePane");
+        };
+        assert_eq!(agent, AgentKind::ClaudeCode);
+        assert_eq!(pane_id, "%7");
+        assert_eq!(tag, "task");
+        assert_eq!(session_id, "sess");
+        assert_eq!(worktree.as_deref(), Some("/tmp/wt"));
+    }
+
+    #[test]
+    fn reserve_pane_with_agent_round_trip() {
+        let req = Request::ReservePane {
+            agent: AgentKind::Codex,
+            pane_id: "%8".into(),
+            tag: "task".into(),
+            session_id: "sess".into(),
+            worktree: None,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["type"], "reserve_pane");
+        assert_eq!(v["agent"], "codex");
+
+        let back: Request = serde_json::from_str(&json).unwrap();
+        let Request::ReservePane { agent, .. } = back else {
+            panic!("expected ReservePane");
+        };
+        assert_eq!(agent, AgentKind::Codex);
     }
 
     #[test]

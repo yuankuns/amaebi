@@ -761,15 +761,15 @@ fn parse_model(input: &str) -> Option<Option<String>> {
     }
 }
 
-/// Parse `/claude [--worktree <path>] [--cwd <path>] [--no-enter] "task" ["task2" ...]`.
+/// Parse an agent launch command such as `/claude ...` or `/codex ...`.
 ///
 /// Task splitting rules:
 /// - All tokens quoted → each quoted string is a separate task
-///   (`/claude "fix bug" "add tests"` → two tasks)
+///   (`/claude "fix bug" "add tests"` or `/codex "fix bug" "add tests"` → two tasks)
 /// - Any unquoted token → all tokens joined into one task
-///   (`/claude fix the bug` or `/claude "fix" the bug` → one task)
+///   (`/claude fix the bug` or `/codex "fix" the bug` → one task)
 ///
-/// - `None` → not a `/claude` command
+/// - `None` → not the requested agent command
 /// - `Some(Err(msg))` → parse error
 /// - `Some(Ok(tasks))` → one or more tasks
 fn parse_claude(input: &str) -> Option<Result<Vec<ClaudeTask>, String>> {
@@ -949,7 +949,7 @@ fn parse_agent_tasks(
     // is process-independent), we just skip env injection and rely on
     // the worktree's AGENTS.md (auto-generated on first launch) to keep
     // the LLM aware of its resource assignment.  See the daemon's
-    // `handle_claude_launch` for the had_claude-branch that skips
+    // `handle_claude_launch` for the had_agent branch that skips
     // env/prompt_hint rendering.
 
     // Description is required in the normal path, but optional with
@@ -3287,9 +3287,9 @@ pub(crate) async fn resolve_missing_tags(
     Ok(())
 }
 
-/// Run the `/claude` pre-launch flow on each task: optionally reserve a
-/// `--resume-pane` slot, then distill the brief into a detailed Claude
-/// Code prompt.  On success replaces `task.description` with the
+/// Run the agent pre-launch flow on each task: optionally reserve a
+/// `--resume-pane` slot, then distill the brief into a detailed prompt for
+/// the selected agent. On success replaces `task.description` with the
 /// distilled text.  On failure for any task surfaces the error via
 /// `sink.on_status` and skips that task (caller chooses whether to
 /// continue with remaining tasks or abort).  Reserved panes are
@@ -3322,6 +3322,7 @@ pub(crate) async fn distill_claude_tasks(
             ));
             match reserve_pane(
                 socket,
+                agent,
                 &pid,
                 &task.tag,
                 chat_session_id,
@@ -3340,7 +3341,7 @@ pub(crate) async fn distill_claude_tasks(
         };
 
         // Pre-create worktree so distillation investigates the same
-        // starting point the downstream Claude will operate in.
+        // starting point the downstream agent will operate in.
         let mut branch: Option<String> = None;
         let mut created_worktree = false;
         if task.resume_pane.is_none() && task.worktree.is_none() {
@@ -3627,6 +3628,7 @@ fn remove_worktree_and_branch(worktree: &str, repo_cwd: &str) {
 /// `release_reserved_pane` on failure.
 pub(crate) async fn reserve_pane(
     socket: &std::path::Path,
+    agent: crate::ipc::AgentKind,
     pane_id: &str,
     tag: &str,
     session_id: &str,
@@ -3638,6 +3640,7 @@ pub(crate) async fn reserve_pane(
         .context("connecting to daemon for ReservePane")?;
     let (reader, mut writer) = tokio::io::split(stream);
     let req = Request::ReservePane {
+        agent,
         pane_id: pane_id.to_string(),
         tag: tag.to_string(),
         session_id: session_id.to_string(),
@@ -5217,10 +5220,10 @@ mod tests {
     #[test]
     fn parse_claude_resume_pane_with_resource_is_allowed() {
         // Regression: the combo used to be rejected at parse time because
-        // env-var injection can't run against an already-launched claude.
+        // env-var injection can't run against an already-launched agent.
         // We now accept it — the daemon acquires the resource lock (which
         // is process-independent) and skips env/prompt_hint rendering on
-        // the had_claude branch.  AGENTS.md carries the constraint forward
+        // the had_agent branch. AGENTS.md carries the constraint forward
         // across /compact.
         let tasks = claude_tasks("/claude --resume-pane %41 --resource sim-9900 \"work\"");
         assert_eq!(tasks.len(), 1);

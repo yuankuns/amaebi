@@ -1015,12 +1015,13 @@ async fn handle_connection_inner(
             }
 
             Request::ReservePane {
+                agent,
                 pane_id,
                 tag,
                 session_id,
                 worktree,
             } => {
-                handle_reserve_pane(&writer, pane_id, tag, session_id, worktree).await?;
+                handle_reserve_pane(&writer, agent, pane_id, tag, session_id, worktree).await?;
             }
 
             Request::ReleasePane { pane_id } => {
@@ -1446,14 +1447,21 @@ fn build_distillation_system_prompt(
 /// or `Error` + `Done`.
 async fn handle_reserve_pane(
     writer: &Arc<tokio::sync::Mutex<tokio::net::unix::OwnedWriteHalf>>,
+    agent: crate::ipc::AgentKind,
     pane_id: String,
     tag: String,
     session_id: String,
     worktree: Option<String>,
 ) -> Result<()> {
     let res = tokio::task::spawn_blocking(move || {
-        crate::pane_lease::acquire_lease(&pane_id, &tag, &session_id, worktree.as_deref())
-            .map(|_| pane_id)
+        crate::pane_lease::acquire_lease_for_agent(
+            agent,
+            &pane_id,
+            &tag,
+            &session_id,
+            worktree.as_deref(),
+        )
+        .map(|_| pane_id)
     })
     .await
     .map_err(|e| anyhow::anyhow!("reserve_pane spawn_blocking panicked: {e}"))?;
@@ -1703,8 +1711,9 @@ async fn handle_claude_launch(
         // to the description so Claude knows where to start, what branch it is
         // on, and how to push when done.
         // For the resume-pane path we may need to pull the description from
-        // the lease first (when the user typed `/claude --resume-pane %N`
-        // with no description).  So resolve `raw_description` BEFORE running
+        // the lease first (when the user typed `/claude --resume-pane %N` or
+        // `/codex --resume-pane %N` with no description). So resolve
+        // `raw_description` BEFORE running
         // the git-context prefix step.  In the normal path `task.description`
         // is always non-empty (parser guards it).
         let resume_prefetched_desc: Option<String> = if let Some(ref rp) = task.resume_pane {
@@ -2397,12 +2406,14 @@ async fn handle_claude_launch(
         }
 
         // Persist the raw (user-typed) task description on the lease so that
-        // `/claude --resume-pane <pid>` can reuse it without the user
+        // `/claude --resume-pane <pid>` or `/codex --resume-pane <pid>` can
+        // reuse it without the user
         // retyping on subsequent rounds.  Uses `raw_desc` (not `description`)
         // to avoid storing the git-context preamble; that gets re-derived on
         // each launch.  Skipped when resume-pane reused the lease's existing
         // description (no new info to write).  Awaited (not fire-and-forget)
-        // so an immediate follow-up `/claude --resume-pane <pid>` is
+        // so an immediate follow-up `/claude --resume-pane <pid>` or
+        // `/codex --resume-pane <pid>` is
         // guaranteed to observe the persisted description instead of racing
         // a background write.  Failures are logged but do not block pane
         // assignment — the user still gets a working pane; resume-pane just

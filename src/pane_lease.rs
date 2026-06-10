@@ -86,7 +86,8 @@ pub struct PaneLease {
     #[serde(default)]
     pub active_agent: Option<AgentKind>,
     /// Full task description last injected into this pane, persisted so
-    /// `/claude --resume-pane <pid>` can reuse it without the user retyping.
+    /// `/claude --resume-pane <pid>` or `/codex --resume-pane <pid>` can
+    /// reuse it without the user retyping.
     /// Preserved by `release_lease` (alongside `worktree` / `has_claude`) so
     /// the pane remembers what it was working on across supervision exits.
     #[serde(default)]
@@ -368,12 +369,37 @@ fn acquire_first_idle_locked(
 ///
 /// `worktree = None` means "do not change the existing worktree field".
 /// Passing `Some(_)` overwrites it.  This matters for the
-/// `Request::ReservePane` pre-flight (used by `/claude` distillation):
+/// `Request::ReservePane` pre-flight (used by agent distillation):
 /// the client doesn't know the resume-pane's worktree, and a previous
 /// `release_lease` deliberately preserved the field so resume-pane could
 /// find the worktree later.  An unconditional overwrite would clear that
 /// hint and break the subsequent `ClaudeLaunch` resume-pane probe.
+#[allow(dead_code)]
 pub fn acquire_lease(
+    pane_id: &str,
+    tag: &str,
+    session_id: &str,
+    worktree: Option<&str>,
+) -> Result<()> {
+    acquire_lease_inner(None, pane_id, tag, session_id, worktree)
+}
+
+/// Acquire a specific pane only when it already hosts the requested agent.
+///
+/// Used by `ReservePane` for `--resume-pane` pre-flight so a `/codex` launch
+/// cannot temporarily lock a Claude pane, or vice versa, during distillation.
+pub fn acquire_lease_for_agent(
+    agent: AgentKind,
+    pane_id: &str,
+    tag: &str,
+    session_id: &str,
+    worktree: Option<&str>,
+) -> Result<()> {
+    acquire_lease_inner(Some(agent), pane_id, tag, session_id, worktree)
+}
+
+fn acquire_lease_inner(
+    required_agent: Option<AgentKind>,
     pane_id: &str,
     tag: &str,
     session_id: &str,
@@ -392,6 +418,16 @@ pub fn acquire_lease(
 
         if lease.effective_status() == PaneStatus::Busy {
             anyhow::bail!("pane {} is busy (task: {:?})", pane_id, lease.tag);
+        }
+
+        if let Some(agent) = required_agent {
+            if lease.effective_agent() != Some(agent) {
+                anyhow::bail!(
+                    "pane {} is not marked as having `{}` started; drop --resume-pane and let the scheduler pick or start a new pane",
+                    pane_id,
+                    agent.command()
+                );
+            }
         }
 
         // Worktree uniqueness check.
@@ -443,12 +479,13 @@ pub fn release_lease(pane_id: &str) -> Result<()> {
             lease.tag = None;
             lease.session_id = None;
             // Intentionally keep `worktree`, `has_claude`, and
-            // `task_description` so `/claude --resume-pane <pid>` can re-acquire
-            // the pane and continue the same work with `/compact + original
+            // `task_description` so `/claude --resume-pane <pid>` or
+            // `/codex --resume-pane <pid>` can re-acquire the pane and
+            // continue the same work with `/compact + original
             // description` (tier-1 reuse) when those fields still describe the
             // current pane state.  Depending on why the lease was released
             // (e.g. early startup or tmux injection failures), these fields may
-            // be absent or stale rather than proving that `claude` is still
+            // be absent or stale rather than proving that the agent is still
             // running on the same task — callers of resume-pane must treat
             // them as hints and validate before reuse.  They are cleared only
             // when the pane is destroyed or explicitly reset to a blank shell.
@@ -780,10 +817,10 @@ pub fn ensure_and_acquire_idle_for_agent(
 /// Record the full task description on the pane's lease.
 ///
 /// Called by `handle_claude_launch` after successfully injecting the
-/// description, so subsequent `/claude --resume-pane <pid>` calls can
-/// retrieve it without the user retyping.  Best-effort: if the pane is no
-/// longer in the state map (e.g. removed by a concurrent cleanup), the call
-/// is a no-op.
+/// description, so subsequent `/claude --resume-pane <pid>` or
+/// `/codex --resume-pane <pid>` calls can retrieve it without the user
+/// retyping. Best-effort: if the pane is no longer in the state map (e.g.
+/// removed by a concurrent cleanup), the call is a no-op.
 pub fn set_task_description(pane_id: &str, description: &str) -> Result<()> {
     let lock = open_lock_file()?;
     lock.lock_exclusive()
@@ -1198,7 +1235,7 @@ mod tests {
 
     #[test]
     fn acquire_lease_with_none_worktree_preserves_existing() {
-        // Regression: `Request::ReservePane` (used by `/claude` distillation)
+        // Regression: `Request::ReservePane` (used by agent distillation)
         // calls `acquire_lease` with `worktree=None` because the client
         // doesn't know the resume-pane's worktree.  An unconditional
         // overwrite would clear the worktree set by a previous launch's
@@ -1238,6 +1275,50 @@ mod tests {
 
         let s = read_state_unlocked().expect("read back");
         assert_eq!(s["%0"].worktree.as_deref(), Some("/tmp/new"));
+    }
+
+    #[test]
+    fn acquire_lease_for_agent_rejects_mismatched_agent() {
+        let _guard = crate::test_utils::with_temp_home();
+        let mut claude = make_idle("%0", "@0");
+        claude.has_claude = true;
+        claude.active_agent = Some(AgentKind::ClaudeCode);
+        let mut state: PaneState = HashMap::new();
+        state.insert("%0".to_string(), claude);
+        write_state_unlocked(&state).expect("seed state");
+
+        let err = acquire_lease_for_agent(AgentKind::Codex, "%0", "task", "sess", None)
+            .expect_err("codex must not reserve a claude pane");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("codex"),
+            "error should name expected agent: {msg}"
+        );
+        assert!(
+            msg.contains("--resume-pane"),
+            "error should explain recovery: {msg}"
+        );
+
+        let s = read_state_unlocked().expect("read back");
+        assert_eq!(s["%0"].effective_status(), PaneStatus::Idle);
+    }
+
+    #[test]
+    fn acquire_lease_for_agent_accepts_legacy_claude_marker() {
+        let _guard = crate::test_utils::with_temp_home();
+        let mut legacy = make_idle("%0", "@0");
+        legacy.has_claude = true;
+        legacy.active_agent = None;
+        let mut state: PaneState = HashMap::new();
+        state.insert("%0".to_string(), legacy);
+        write_state_unlocked(&state).expect("seed state");
+
+        acquire_lease_for_agent(AgentKind::ClaudeCode, "%0", "task", "sess", None)
+            .expect("legacy has_claude marker should reserve as Claude Code");
+
+        let s = read_state_unlocked().expect("read back");
+        assert_eq!(s["%0"].effective_status(), PaneStatus::Busy);
+        assert_eq!(s["%0"].tag.as_deref(), Some("task"));
     }
 
     #[test]
