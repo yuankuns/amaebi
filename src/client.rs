@@ -415,6 +415,9 @@ pub(crate) struct ClaudeTask {
     pub(crate) resources: Vec<String>,
     /// Seconds to wait for busy resources.  `None` / `0` → fail fast.
     pub(crate) resource_timeout_secs: Option<u64>,
+    /// Set by pre-launch checks when this parsed task should be omitted from
+    /// the eventual launch request.
+    pub(crate) skip_launch: bool,
 }
 
 /// A parsed `/release` command.
@@ -1001,6 +1004,7 @@ fn parse_agent_tasks(
             resume_pane: resume_pane.clone(),
             resources: resources.clone(),
             resource_timeout_secs,
+            skip_launch: false,
         })
         .collect();
 
@@ -1120,9 +1124,9 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
             eprintln!("[error] distillation pre-flight: {e:#}");
             return Ok(());
         }
-        tasks.retain(|t| !t.description.trim().is_empty());
+        tasks.retain(|t| !t.skip_launch);
         if tasks.is_empty() {
-            eprintln!("[error] all /{} tasks failed distillation", agent.label());
+            eprintln!("[error] all /{} tasks failed pre-launch", agent.label());
             return Ok(());
         }
         // One-shot `amaebi ask "/claude ..."` never sends SupervisePanes,
@@ -1797,11 +1801,11 @@ pub async fn run_chat_loop(
                     stdout.flush().await?;
                     continue 'session;
                 }
-                tasks.retain(|t| !t.description.trim().is_empty());
+                tasks.retain(|t| !t.skip_launch);
                 if tasks.is_empty() {
                     stdout
                         .write_all(
-                            format!("[error] all /{} tasks failed distillation\n", agent.label())
+                            format!("[error] all /{} tasks failed pre-launch\n", agent.label())
                                 .as_bytes(),
                         )
                         .await?;
@@ -3218,6 +3222,7 @@ async fn resolve_one_replyreview_task(pr: u32) -> Result<ClaudeTask, String> {
         resume_pane: None,
         resources: Vec::new(),
         resource_timeout_secs: None,
+        skip_launch: false,
     })
 }
 
@@ -3251,6 +3256,10 @@ pub(crate) async fn resolve_missing_tags(
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     for t in tasks.iter_mut() {
         if !t.tag.is_empty() {
+            continue;
+        }
+        if t.resume_pane.is_some() && t.description.trim().is_empty() {
+            t.tag = resume_pane_fallback_tag(t.resume_pane.as_deref().unwrap_or_default());
             continue;
         }
         let repo_dir = crate::session::canonical_key(std::path::Path::new(
@@ -3290,6 +3299,18 @@ pub(crate) async fn resolve_missing_tags(
         }
     }
     Ok(())
+}
+
+fn resume_pane_fallback_tag(pane_id: &str) -> String {
+    let suffix: String = pane_id
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .collect();
+    if suffix.is_empty() {
+        "resume-pane".to_string()
+    } else {
+        format!("resume-pane-{suffix}")
+    }
 }
 
 /// Run the agent pre-launch flow on each task: optionally reserve a
@@ -3338,12 +3359,21 @@ pub(crate) async fn distill_claude_tasks(
                 Ok(()) => Some(pid),
                 Err(e) => {
                     sink.on_status(&format!("[distill] reserve {pid} failed: {e:#}"));
+                    task.skip_launch = true;
                     continue;
                 }
             }
         } else {
             None
         };
+
+        if task.resume_pane.is_some() && task.description.trim().is_empty() {
+            sink.on_status(&format!(
+                "[distill] tag {} reuses the pane lease description",
+                task.tag
+            ));
+            continue;
+        }
 
         // Pre-create worktree so distillation investigates the same
         // starting point the downstream agent will operate in.
@@ -3388,8 +3418,16 @@ pub(crate) async fn distill_claude_tasks(
         .await
         {
             Ok(prompt) => {
-                task.description = prompt;
-                sink.on_status(&format!("[distill] tag {} done", task.tag));
+                if prompt.trim().is_empty() {
+                    sink.on_status(&format!(
+                        "[distill] tag {} produced an empty prompt; skipping launch",
+                        task.tag
+                    ));
+                    task.skip_launch = true;
+                } else {
+                    task.description = prompt;
+                    sink.on_status(&format!("[distill] tag {} done", task.tag));
+                }
             }
             Err(e) => {
                 sink.on_status(&format!(
@@ -3413,11 +3451,7 @@ pub(crate) async fn distill_claude_tasks(
                     }
                     task.worktree = None;
                 }
-                // Mark the task for skip via empty description; caller
-                // filters those out before ClaudeLaunch.  Empty was
-                // already invalid upstream of parse, so no risk of
-                // accidentally launching an empty task.
-                task.description.clear();
+                task.skip_launch = true;
                 continue;
             }
         }
@@ -5451,6 +5485,13 @@ mod tests {
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].description, "");
         assert_eq!(tasks[0].resume_pane.as_deref(), Some("%41"));
+        assert!(!tasks[0].skip_launch);
+    }
+
+    #[test]
+    fn resume_pane_fallback_tag_uses_pane_id() {
+        assert_eq!(resume_pane_fallback_tag("%41"), "resume-pane-41");
+        assert_eq!(resume_pane_fallback_tag("%pane.1"), "resume-pane-pane1");
     }
 
     #[test]

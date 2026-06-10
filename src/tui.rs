@@ -1872,10 +1872,10 @@ async fn launch_agent_tasks(
         state.push_error_line(format!("[error] distillation pre-flight: {e:#}"));
         return Ok(());
     }
-    tasks.retain(|t| !t.description.trim().is_empty());
+    tasks.retain(|t| !t.skip_launch);
     if tasks.is_empty() {
         state.push_error_line(format!(
-            "[error] all /{} tasks failed distillation",
+            "[error] all /{} tasks failed pre-launch",
             agent.label()
         ));
         return Ok(());
