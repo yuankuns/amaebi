@@ -481,10 +481,11 @@ struct AppState {
     cwd_str: String,
 }
 
-/// One pane that the daemon has assigned to us during a /claude
+/// One pane that the daemon has assigned to us during an agent
 /// launch.  Used to synthesise the post-launch user turn.
 #[derive(Debug, Clone)]
 struct LaunchedPane {
+    agent: crate::ipc::AgentKind,
     pane_id: String,
     description: String,
     tag: String,
@@ -497,6 +498,8 @@ struct LaunchedPane {
 /// `Response::Done` (success path) or `Response::Error` (failure).
 #[derive(Debug, Clone)]
 struct PendingClaudeLaunch {
+    /// Agent runtime launched for this batch.
+    agent: crate::ipc::AgentKind,
     /// tag → original task description, used to look up the
     /// description when daemon replies with `PaneAssigned { tag }`.
     descriptions: std::collections::HashMap<String, String>,
@@ -1235,6 +1238,7 @@ fn handle_response(resp: Response, state: &mut AppState) -> ResponseOutcome {
                     .cloned()
                     .unwrap_or_else(|| tag.clone());
                 pending.launched.push(LaunchedPane {
+                    agent: pending.agent,
                     pane_id,
                     description,
                     tag,
@@ -1931,6 +1935,7 @@ async fn launch_agent_tasks(
         descriptions.len()
     ));
     state.pending_claude = Some(PendingClaudeLaunch {
+        agent,
         descriptions,
         launched: Vec::new(),
     });
@@ -2141,6 +2146,7 @@ fn render_launched_block(launched: &[LaunchedPane]) -> String {
         }
         synth.push_str(l.description.trim_end());
         synth.push_str("\n\n[launched]\n");
+        synth.push_str(&format!("  agent: {}\n", l.agent.label()));
         synth.push_str(&format!("  pane: {}\n", l.pane_id));
         if let Some(wt) = l.worktree.as_deref() {
             synth.push_str(&format!("  worktree: {wt}\n"));
@@ -3455,6 +3461,7 @@ mod tests {
         // (and Claude prompts) expect.
         let launched = vec![
             LaunchedPane {
+                agent: crate::ipc::AgentKind::Codex,
                 pane_id: "%41".into(),
                 description: "do the thing".into(),
                 tag: "thing-1".into(),
@@ -3462,6 +3469,7 @@ mod tests {
                 resources: vec!["sim-9900".into()],
             },
             LaunchedPane {
+                agent: crate::ipc::AgentKind::ClaudeCode,
                 pane_id: "%42".into(),
                 description: "do the other".into(),
                 tag: "other-2".into(),
@@ -3471,11 +3479,13 @@ mod tests {
         ];
         let synth = render_launched_block(&launched);
         assert!(synth.contains("[launched]"));
+        assert!(synth.contains("  agent: codex"));
         assert!(synth.contains("  pane: %41"));
         assert!(synth.contains("  worktree: /tmp/wt-thing"));
         assert!(synth.contains("  resources: sim-9900"));
         assert!(synth.contains("  tag: thing-1"));
         assert!(synth.contains("---"));
+        assert!(synth.contains("  agent: claude"));
         assert!(synth.contains("  pane: %42"));
         assert!(synth.contains("  tag: other-2"));
         // Single-pane case (no separator).
@@ -3822,6 +3832,7 @@ mod tests {
         let mut s = test_state();
         s.streaming = true;
         s.pending_claude = Some(PendingClaudeLaunch {
+            agent: crate::ipc::AgentKind::ClaudeCode,
             descriptions: Default::default(),
             launched: Vec::new(),
         });
@@ -3886,6 +3897,7 @@ mod tests {
     fn handle_response_routes_pane_assigned_to_launch_kind() {
         let mut s = test_state();
         s.pending_claude = Some(PendingClaudeLaunch {
+            agent: crate::ipc::AgentKind::Codex,
             descriptions: [("t".to_string(), "desc".to_string())]
                 .into_iter()
                 .collect(),
@@ -3904,6 +3916,10 @@ mod tests {
         let last = s.transcript.last().unwrap();
         assert!(matches!(last.kind, LineKind::Launch));
         assert!(last.text.contains("%41"));
+        assert_eq!(
+            s.pending_claude.as_ref().unwrap().launched[0].agent,
+            crate::ipc::AgentKind::Codex
+        );
     }
 
     #[test]

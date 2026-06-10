@@ -1852,6 +1852,7 @@ pub async fn run_chat_loop(
                 // turn below carries the exact context the LLM needs to start
                 // supervising without any additional round-trip.
                 struct Launched {
+                    agent: crate::ipc::AgentKind,
                     pane_id: String,
                     description: String,
                     tag: String,
@@ -1886,6 +1887,7 @@ pub async fn run_chat_loop(
                                 .cloned()
                                 .unwrap_or_else(|| tag.clone());
                             launched.push(Launched {
+                                agent,
                                 pane_id,
                                 description,
                                 tag,
@@ -1926,6 +1928,7 @@ pub async fn run_chat_loop(
                         }
                         synth.push_str(l.description.trim_end());
                         synth.push_str("\n\n[launched]\n");
+                        synth.push_str(&format!("  agent: {}\n", l.agent.label()));
                         synth.push_str(&format!("  pane: {}\n", l.pane_id));
                         if let Some(wt) = l.worktree.as_deref() {
                             synth.push_str(&format!("  worktree: {wt}\n"));
