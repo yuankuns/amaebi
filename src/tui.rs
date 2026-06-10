@@ -493,7 +493,7 @@ struct LaunchedPane {
     resources: Vec<String>,
 }
 
-/// Per-launch in-flight state.  Built when `/claude` ships
+/// Per-launch in-flight state. Built when an agent command ships
 /// `Request::ClaudeLaunch`, drained when the daemon emits
 /// `Response::Done` (success path) or `Response::Error` (failure).
 #[derive(Debug, Clone)]
