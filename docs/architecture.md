@@ -94,11 +94,11 @@ concurrent-reader pattern demands JSON.
 The worktree is created on a new branch named `<tag>-<uuid8>`. If the user
 passes `--worktree <existing-path>` the auto-create is skipped.
 
-## `/claude` request lifecycle
+## Supervised agent request lifecycle
 
 ```
 ┌───────────────────────────────────────────────────────────────────┐
-│  Client:  parse  /claude flags                                    │
+│  Client:  parse /claude or /codex flags                           │
 │             ↓                                                     │
 │           GenerateTag (Haiku, if --tag not given)                 │
 │             ↓                                                     │
@@ -200,8 +200,8 @@ The socket speaks newline-delimited JSON. Requests and responses are
 typed enums defined in `src/ipc.rs`. The main request types:
 
 - `Ask { prompt, session_id, model, ... }` — one-shot or chat turn.
-- `ClaudeLaunch { tasks, session_id, repo_dir }` — launch one or more
-  supervised Claude Code panes.
+- `ClaudeLaunch { agent, tasks, session_id, repo_dir }` — launch one or more
+  supervised Claude Code or Codex panes.
 - `SupervisePanes { panes, model }` — re-attach supervision to existing
   panes (used by the `chat` REPL).
 - `Memory { op, ... }` — memory reads/writes (routed via the daemon so only

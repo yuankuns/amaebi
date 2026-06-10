@@ -1,3 +1,28 @@
+/// External coding agent runtime managed in a tmux pane.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentKind {
+    #[default]
+    ClaudeCode,
+    Codex,
+}
+
+impl AgentKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ClaudeCode => "claude",
+            Self::Codex => "codex",
+        }
+    }
+
+    pub fn command(self) -> &'static str {
+        match self {
+            Self::ClaudeCode => "claude",
+            Self::Codex => "codex",
+        }
+    }
+}
+
 /// A single task specification for [`Request::ClaudeLaunch`].
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct TaskSpec {
@@ -176,6 +201,10 @@ pub enum Request {
     /// per task followed by [`Response::Done`].  If the pane capacity limit
     /// would be exceeded it responds with [`Response::CapacityError`] instead.
     ClaudeLaunch {
+        /// Agent runtime to launch.  Defaults to Claude Code for backwards
+        /// compatibility with clients that predate `/codex`.
+        #[serde(default)]
+        agent: AgentKind,
         /// The tasks to launch in parallel.
         tasks: Vec<TaskSpec>,
         /// Chat session UUID issuing this launch.  Used together with
@@ -226,6 +255,9 @@ pub enum Request {
     /// [`Response::Done`].  Failure modes (tool errors, model timeouts) end
     /// the stream with [`Response::Error`].
     DistillClaudePrompt {
+        /// Agent runtime that will consume the distilled prompt.
+        #[serde(default)]
+        agent: AgentKind,
         /// The user's original short description (`/claude "..."` argument).
         brief: String,
         /// Working directory the distillation should reason about — the
@@ -900,6 +932,7 @@ mod tests {
     #[test]
     fn request_claude_launch_round_trip() {
         let req = Request::ClaudeLaunch {
+            agent: AgentKind::ClaudeCode,
             tasks: vec![
                 TaskSpec {
                     tag: "t1".into(),
@@ -935,6 +968,7 @@ mod tests {
 
         let back: Request = serde_json::from_str(&json).unwrap();
         let Request::ClaudeLaunch {
+            agent,
             tasks,
             session_id,
             repo_dir,
@@ -942,6 +976,7 @@ mod tests {
         else {
             panic!("expected ClaudeLaunch");
         };
+        assert_eq!(agent, AgentKind::ClaudeCode);
         assert_eq!(tasks.len(), 2);
         assert_eq!(session_id.as_deref(), Some("sess-123"));
         assert_eq!(repo_dir.as_deref(), Some("/home/user/repo"));
@@ -1256,6 +1291,7 @@ mod tests {
         let legacy = r#"{"type":"distill_claude_prompt","brief":"fix the bug","cwd":"/tmp/repo","model":"sonnet"}"#;
         let back: Request = serde_json::from_str(legacy).expect("legacy must parse");
         let Request::DistillClaudePrompt {
+            agent,
             brief,
             cwd,
             model,
@@ -1267,12 +1303,14 @@ mod tests {
         assert_eq!(brief, "fix the bug");
         assert_eq!(cwd, "/tmp/repo");
         assert_eq!(model, "sonnet");
+        assert_eq!(agent, AgentKind::ClaudeCode);
         assert!(branch.is_none(), "branch must default to None");
     }
 
     #[test]
     fn distill_claude_prompt_with_branch_round_trip() {
         let req = Request::DistillClaudePrompt {
+            agent: AgentKind::ClaudeCode,
             brief: "add feature".into(),
             cwd: "/wt/feat-xyz".into(),
             model: "opus".into(),

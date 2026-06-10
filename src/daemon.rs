@@ -956,11 +956,13 @@ async fn handle_connection_inner(
             }
 
             Request::ClaudeLaunch {
+                agent,
                 tasks,
                 session_id,
                 repo_dir,
             } => {
-                handle_claude_launch(&writer, tasks, session_id, repo_dir, &state, conn_id).await?;
+                handle_claude_launch(&writer, agent, tasks, session_id, repo_dir, &state, conn_id)
+                    .await?;
             }
 
             Request::GenerateTag {
@@ -983,13 +985,25 @@ async fn handle_connection_inner(
             }
 
             Request::DistillClaudePrompt {
+                agent,
                 brief,
                 cwd,
                 model,
                 branch,
             } => {
-                handle_distill_claude_prompt(&writer, &state, conn_id, brief, cwd, model, branch)
-                    .await?;
+                handle_distill_claude_prompt(
+                    &writer,
+                    &state,
+                    conn_id,
+                    DistillPromptRequest {
+                        agent,
+                        brief,
+                        cwd,
+                        model,
+                        branch,
+                    },
+                )
+                .await?;
             }
 
             Request::CreateWorktree {
@@ -1230,21 +1244,38 @@ async fn handle_claude_release(
 /// Streams Text / ToolUse frames during the run so the user sees the
 /// investigation in real time (matching the chat UX).  Failure modes
 /// emit `Response::Error` then `Response::Done`.
-async fn handle_distill_claude_prompt(
-    writer: &Arc<tokio::sync::Mutex<tokio::net::unix::OwnedWriteHalf>>,
-    state: &Arc<DaemonState>,
-    conn_id: ConnId,
+struct DistillPromptRequest {
+    agent: crate::ipc::AgentKind,
     brief: String,
     cwd: String,
     model: String,
     branch: Option<String>,
+}
+
+async fn handle_distill_claude_prompt(
+    writer: &Arc<tokio::sync::Mutex<tokio::net::unix::OwnedWriteHalf>>,
+    state: &Arc<DaemonState>,
+    conn_id: ConnId,
+    req: DistillPromptRequest,
 ) -> Result<()> {
-    let system_prompt = build_distillation_system_prompt(&cwd, branch.as_deref());
+    let DistillPromptRequest {
+        agent,
+        brief,
+        cwd,
+        model,
+        branch,
+    } = req;
+    let system_prompt = build_distillation_system_prompt(agent, &cwd, branch.as_deref());
+    let command = match agent {
+        crate::ipc::AgentKind::ClaudeCode => "/claude",
+        crate::ipc::AgentKind::Codex => "/codex",
+    };
+    let agent_name = agent_display_name(agent);
     let user_msg = format!(
-        "User's brief description for /claude:\n\n{brief}\n\n\
+        "User's brief description for {command}:\n\n{brief}\n\n\
          Working directory: {cwd}\n\n\
          Investigate the codebase, then call `emit_distilled_prompt` exactly once \
-         with the full Claude Code prompt."
+         with the full {agent_name} prompt."
     );
     let messages = vec![Message::system(system_prompt), Message::user(user_msg)];
 
@@ -1306,10 +1337,26 @@ async fn handle_distill_claude_prompt(
     Ok(())
 }
 
-/// System prompt for the `/claude` distillation loop.  Tells the LLM
+fn agent_display_name(agent: crate::ipc::AgentKind) -> &'static str {
+    match agent {
+        crate::ipc::AgentKind::ClaudeCode => "Claude Code",
+        crate::ipc::AgentKind::Codex => "Codex",
+    }
+}
+
+/// System prompt for the external-agent distillation loop.  Tells the LLM
 /// what `/replyreview`-grade output should look like and what tools it
 /// has.  Kept outside the handler so it can be unit-tested for shape.
-fn build_distillation_system_prompt(cwd: &str, branch: Option<&str>) -> String {
+fn build_distillation_system_prompt(
+    agent: crate::ipc::AgentKind,
+    cwd: &str,
+    branch: Option<&str>,
+) -> String {
+    let command = match agent {
+        crate::ipc::AgentKind::ClaudeCode => "/claude",
+        crate::ipc::AgentKind::Codex => "/codex",
+    };
+    let agent_name = agent_display_name(agent);
     let branch_header = match branch {
         Some(br) => format!("Feature branch: `{br}`\n\n"),
         None => String::new(),
@@ -1317,41 +1364,42 @@ fn build_distillation_system_prompt(cwd: &str, branch: Option<&str>) -> String {
     let isolation_block = match branch {
         Some(br) => format!(
             "CRITICAL — worktree isolation:\n\
-             The downstream Claude session will run in this SAME worktree on branch \
+             The downstream {agent_name} session will run in this SAME worktree on branch \
              `{br}`, NOT in the main repository directly.  Therefore:\n\
              - Do NOT include \"Working directory: ...\" or any `cd` instructions in the \
-               distilled prompt.  The downstream Claude is already in the correct worktree.\n\
+               distilled prompt.  The downstream {agent_name} is already in the correct worktree.\n\
              - Use RELATIVE file paths (from the repo root) when naming files to modify.\n\
-             - The downstream Claude must commit and push ONLY to branch `{br}` — \
+             - The downstream {agent_name} must commit and push ONLY to branch `{br}` — \
                NEVER to any other branch.  Include this constraint in the distilled prompt.\n\n"
         ),
         None => format!(
             "CRITICAL — worktree isolation:\n\
-             The downstream Claude session will be launched in an auto-created git worktree \
+             The downstream {agent_name} session will be launched in an auto-created git worktree \
              (a fresh branch forked from the relevant base), NOT in {cwd} directly.  Therefore:\n\
              - Do NOT include \"Working directory: {cwd}\" or any `cd` instructions in the \
-               distilled prompt.  The downstream Claude is already in the correct worktree.\n\
+               distilled prompt.  The downstream {agent_name} is already in the correct worktree.\n\
              - Use RELATIVE file paths (from the repo root) when naming files to modify.\n\
-             - The downstream Claude must NEVER push to main or master — only push to \
+             - The downstream {agent_name} must NEVER push to main or master — only push to \
                the current feature branch for its task.  Include this constraint in the \
                distilled prompt.\n\n"
         ),
     };
     let branch_constraint = match branch {
         Some(br) => format!(
-            "In particular, the downstream Claude is on branch `{br}` — it \
+            "In particular, the downstream {agent_name} is on branch `{br}` — it \
              must NEVER push or commit to any other branch.  All work stays on \
              `{br}`; merging is the user's responsibility."
         ),
-        None => "In particular, the downstream Claude must NEVER push to main or \
+        None => format!(
+            "In particular, the downstream {agent_name} must NEVER push to main or \
                  master — only push to the current feature branch for its task; \
                  merging is the user's responsibility."
-            .to_string(),
+        ),
     };
     format!(
-        "You are amaebi's prompt distiller.  The user typed `/claude \"<brief>\"` and your \
-         job is to convert that brief into a self-contained prompt that a downstream Claude \
-         Code session will execute.\n\n\
+        "You are amaebi's prompt distiller.  The user typed `{command} \"<brief>\"` and your \
+         job is to convert that brief into a self-contained prompt that a downstream {agent_name} \
+         session will execute.\n\n\
          Your investigation directory: {cwd}\n\
          {branch_header}\
          {isolation_block}\
@@ -1359,37 +1407,37 @@ fn build_distillation_system_prompt(cwd: &str, branch: Option<&str>) -> String {
          1. Use `shell_command` and `read_file` to investigate the codebase.  Look for the \
             files / functions / tests / scripts the brief actually touches.  Run `git status`, \
             `git log --oneline -10`, `ls`, `grep`, etc.  Read the most relevant files in full.\n\
-         2. Decide concretely what Claude Code should do — file paths, key functions, the \
+         2. Decide concretely what {agent_name} should do — file paths, key functions, the \
             execution plan in steps, the verification commands (tests, benchmarks, builds), \
             and the hard constraints (no force push, don't skip CI hooks, keep main repo on \
             master, etc.).\n\
          3. Call `emit_distilled_prompt` EXACTLY ONCE with the final prompt as a single \
             string.  That call ends your work — no further turns will run after it.\n\n\
          Output requirements for the distilled prompt:\n\
-         - Self-contained: the downstream Claude session does NOT see this conversation.\n\
+         - Self-contained: the downstream {agent_name} session does NOT see this conversation.\n\
          - Concrete: name file paths and functions, not vague areas.\n\
-         - Action-oriented: numbered steps the inner Claude can follow.\n\
+         - Action-oriented: numbered steps the inner {agent_name} can follow.\n\
          - Scope-preserving: if the user's brief specifies particular values, conditions, \
            or configs (e.g. specific headdims, specific tile counts, specific endpoints), \
            the distilled prompt MUST restrict changes to exactly those cases.  Do NOT \
            generalize the scope beyond what the user explicitly stated.\n\
          - Acceptance criteria: define what 'done' looks like — which tests must pass, \
            what correctness / performance invariants must hold (no regression), and any \
-           numeric thresholds if applicable.  The downstream Claude must verify these \
+           numeric thresholds if applicable.  The downstream {agent_name} must verify these \
            BEFORE declaring the task complete.\n\
          - Test environment: specify the exact commands, scripts, or environment the \
-           downstream Claude should use to run the acceptance tests (e.g. the test \
+           downstream {agent_name} should use to run the acceptance tests (e.g. the test \
            runner, the simulator, the benchmark script, relevant env vars).\n\
-         - Loop until green: instruct the downstream Claude to iterate — fix, test, \
+         - Loop until green: instruct the downstream {agent_name} to iterate — fix, test, \
            and repeat — until ALL acceptance criteria pass.  A single attempt that \
-           fails the criteria is not acceptable; Claude must debug and retry.\n\
+           fails the criteria is not acceptable; {agent_name} must debug and retry.\n\
          - Constraints: list the hard rules (CI, branching, etc.) that apply.  \
            {branch_constraint}\n\
          - No absolute paths to the source repo: use relative paths from repo root.\n\
-         - No meta-commentary: the prompt is read by Claude as the FIRST user message; do \
+         - No meta-commentary: the prompt is read by {agent_name} as the FIRST user message; do \
            not include phrases like 'I have analyzed your code' or 'here is the prompt'.\n\n\
          You have NO write tools — `edit_file` and tmux pane mutators are not available.  \
-         You investigate; Claude executes."
+         You investigate; {agent_name} executes."
     )
 }
 
@@ -1498,8 +1546,16 @@ async fn handle_create_worktree(
 ///    prompt.  Otherwise launch `claude` (with optional `cd <worktree>`) via
 ///    `tmux send-keys`, then inject `description` as a second keystroke.
 /// 4. Stream `Response::PaneAssigned` for each task, then `Response::Done`.
+fn agent_launch_command(agent: crate::ipc::AgentKind) -> &'static str {
+    match agent {
+        crate::ipc::AgentKind::ClaudeCode => "claude --dangerously-skip-permissions",
+        crate::ipc::AgentKind::Codex => "codex --dangerously-bypass-approvals-and-sandbox",
+    }
+}
+
 async fn handle_claude_launch(
     writer: &Arc<tokio::sync::Mutex<tokio::net::unix::OwnedWriteHalf>>,
+    agent: crate::ipc::AgentKind,
     tasks: Vec<crate::ipc::TaskSpec>,
     session_id: Option<String>,
     repo_dir: Option<String>,
@@ -1608,8 +1664,8 @@ async fn handle_claude_launch(
     }
 
     // For each task: acquire a pane (auto-expanding the pool if needed), then
-    // launch `claude` (or inject a prompt into an already-running session) via
-    // tmux send-keys.
+    // launch the requested coding agent (or inject a prompt into an
+    // already-running matching session) via tmux send-keys.
     // `ensure_and_acquire_idle` holds a single LOCK_EX for both expansion and
     // acquisition, eliminating the TOCTOU race.
     //
@@ -1772,7 +1828,7 @@ async fn handle_claude_launch(
         let was_explicit_worktree = task.worktree.is_some() || task.resume_pane.is_some();
         let sid_placeholder = uuid::Uuid::new_v4().to_string();
 
-        let (pane_id, had_claude, worktree): (String, bool, Option<String>) = if let Some(ref rp) =
+        let (pane_id, had_agent, worktree): (String, bool, Option<String>) = if let Some(ref rp) =
             task.resume_pane
         {
             // --- resume-pane path ---
@@ -1787,6 +1843,7 @@ async fn handle_claude_launch(
             // pre-flight lease so it doesn't sit Busy until TTL.
             let rp_owned = rp.clone();
             let sid_for_lease = sid_placeholder.clone();
+            let agent_for_probe = agent;
             let probe = tokio::task::spawn_blocking(move || {
                     let state = pane_lease::read_state()?;
                     let lease = state.get(&rp_owned).ok_or_else(|| {
@@ -1794,9 +1851,10 @@ async fn handle_claude_launch(
                             "pane {rp_owned} not found in lease state; run `amaebi dashboard` to list active panes"
                         )
                     })?;
-                    if !lease.has_claude {
+                    if lease.effective_agent() != Some(agent_for_probe) {
                         anyhow::bail!(
-                            "pane {rp_owned} is not marked in lease state as having `claude` started; drop --resume-pane and let the scheduler pick or start a new pane"
+                            "pane {rp_owned} is not marked in lease state as having `{}` started; drop --resume-pane and let the scheduler pick or start a new pane",
+                            agent_for_probe.command()
                         );
                     }
                     let wt = lease.worktree.clone().ok_or_else(|| {
@@ -1819,7 +1877,8 @@ async fn handle_claude_launch(
                         .output()
                         .with_context(|| {
                             format!(
-                                "failed to inspect tmux pane {rp_owned}; cannot verify that `claude` is running"
+                                "failed to inspect tmux pane {rp_owned}; cannot verify that `{}` is running",
+                                agent_for_probe.command()
                             )
                         })?;
                     if !tmux_probe.status.success() {
@@ -1827,19 +1886,22 @@ async fn handle_claude_launch(
                             String::from_utf8_lossy(&tmux_probe.stderr).trim().to_string();
                         if stderr.is_empty() {
                             anyhow::bail!(
-                                "failed to inspect tmux pane {rp_owned}; cannot verify that `claude` is running"
+                                "failed to inspect tmux pane {rp_owned}; cannot verify that `{}` is running",
+                                agent_for_probe.command()
                             );
                         } else {
                             anyhow::bail!(
-                                "failed to inspect tmux pane {rp_owned}; cannot verify that `claude` is running: {stderr}"
+                                "failed to inspect tmux pane {rp_owned}; cannot verify that `{}` is running: {stderr}",
+                                agent_for_probe.command()
                             );
                         }
                     }
                     let pane_current_command =
                         String::from_utf8_lossy(&tmux_probe.stdout).trim().to_string();
-                    if pane_current_command != "claude" {
+                    if pane_current_command != agent_for_probe.command() {
                         anyhow::bail!(
-                            "pane {rp_owned} is not currently running `claude` (tmux reports `{pane_current_command}`); drop --resume-pane and let the scheduler pick or start a new pane"
+                            "pane {rp_owned} is not currently running `{}` (tmux reports `{pane_current_command}`); drop --resume-pane and let the scheduler pick or start a new pane",
+                            agent_for_probe.command()
                         );
                     }
                     // Refresh session_id + heartbeat on the existing lease.
@@ -1904,7 +1966,8 @@ async fn handle_claude_launch(
             let wt_for_lease = wt_val.clone();
             let sid_for_lease = sid_placeholder.clone();
             let pane_result = tokio::task::spawn_blocking(move || {
-                pane_lease::ensure_and_acquire_idle(
+                pane_lease::ensure_and_acquire_idle_for_agent(
+                    agent,
                     &tid_for_lease,
                     &sid_for_lease,
                     wt_for_lease.as_deref(),
@@ -2006,7 +2069,14 @@ async fn handle_claude_launch(
         // (strip the leading '%' from e.g. "%5") to keep the title short.
         let rename_pane = pane_id.clone();
         let pane_num = pane_id.trim_start_matches('%');
-        let rename_title = format!("cc-{}", pane_num);
+        let rename_title = format!(
+            "{}-{}",
+            match agent {
+                crate::ipc::AgentKind::ClaudeCode => "cc",
+                crate::ipc::AgentKind::Codex => "cx",
+            },
+            pane_num
+        );
         tokio::task::spawn_blocking(move || {
             // Best-effort — ignore errors (non-tmux environments).
             let _ = pane_lease::rename_pane(&rename_pane, &rename_title);
@@ -2114,7 +2184,7 @@ async fn handle_claude_launch(
         // the task description here; that channel was replaced by the
         // per-worktree AGENTS.md (see `ensure_worktree_agents_md` below),
         // which claude loads at session start and survives `/compact`.
-        let resource_env: Vec<(String, String)> = if had_claude {
+        let resource_env: Vec<(String, String)> = if had_agent {
             Vec::new()
         } else {
             resource_lease::render_env(&resource_leases, &resource_pool)
@@ -2143,7 +2213,7 @@ async fn handle_claude_launch(
         //    as a second keystroke so it lands at the Claude Code prompt.
         //
         // Each element is (keys, press_enter).
-        let key_sequence: Vec<(String, bool)> = if had_claude {
+        let key_sequence: Vec<(String, bool)> = if had_agent {
             // Reusing an existing claude session in the same worktree: inject
             // the new task description directly into the existing conversation.
             // No automatic `/compact` — resume is meant to *continue* where the
@@ -2170,11 +2240,12 @@ async fn handle_claude_launch(
             };
             let launch_cmd = if let Some(ref wt) = worktree {
                 format!(
-                    "{env_prefix}cd {} && claude --dangerously-skip-permissions",
-                    shell_escape(wt)
+                    "{env_prefix}cd {} && {}",
+                    shell_escape(wt),
+                    agent_launch_command(agent)
                 )
             } else {
-                format!("{env_prefix}claude --dangerously-skip-permissions")
+                format!("{env_prefix}{}", agent_launch_command(agent))
             };
             vec![(launch_cmd, true), (description.clone(), auto_enter)]
         };
@@ -2230,7 +2301,7 @@ async fn handle_claude_launch(
                 // path (inject task into existing claude) skips because the
                 // trust dialog was already accepted when the pane was first
                 // launched.
-                if idx > 0 && !had_claude {
+                if idx > 0 && !had_agent && agent == crate::ipc::AgentKind::ClaudeCode {
                     std::thread::sleep(std::time::Duration::from_secs(2));
                     let _ = std::process::Command::new("tmux")
                         .args(["send-keys", "-t", &send_pane, "Enter"])
@@ -2314,10 +2385,10 @@ async fn handle_claude_launch(
 
         // If we just launched `claude` in a blank pane, record that so
         // future task assignments can inject prompts directly.
-        if !had_claude {
+        if !had_agent {
             let started_pane = pane_id.clone();
             tokio::task::spawn_blocking(move || {
-                let _ = pane_lease::mark_claude_started(&started_pane);
+                let _ = pane_lease::mark_agent_started(&started_pane, agent);
             })
             .await
             .ok();
@@ -8165,9 +8236,17 @@ mod tests {
             resource_timeout_secs: None,
         };
         let state = test_minimal_daemon_state();
-        handle_claude_launch(&writer, vec![task], None, None, &state, 0)
-            .await
-            .expect("launch returns ok even on per-task error");
+        handle_claude_launch(
+            &writer,
+            crate::ipc::AgentKind::ClaudeCode,
+            vec![task],
+            None,
+            None,
+            &state,
+            0,
+        )
+        .await
+        .expect("launch returns ok even on per-task error");
         drop(writer);
 
         let responses = collect_responses(client_reader).await;
@@ -8201,6 +8280,7 @@ mod tests {
             worktree: Some("/tmp/fake-worktree/resume".to_string()),
             heartbeat_at: now,
             has_claude: true,
+            active_agent: Some(crate::ipc::AgentKind::ClaudeCode),
             task_description: None,
         };
         pane_lease::seed_state_for_test(seed).expect("seed pane state");
@@ -8227,9 +8307,17 @@ mod tests {
             resource_timeout_secs: None,
         };
         let state = test_minimal_daemon_state();
-        handle_claude_launch(&writer, vec![task], None, None, &state, 0)
-            .await
-            .expect("launch returns ok even on per-task error");
+        handle_claude_launch(
+            &writer,
+            crate::ipc::AgentKind::ClaudeCode,
+            vec![task],
+            None,
+            None,
+            &state,
+            0,
+        )
+        .await
+        .expect("launch returns ok even on per-task error");
         drop(writer);
 
         let responses = collect_responses(client_reader).await;
@@ -8270,6 +8358,7 @@ mod tests {
             worktree: Some("/tmp/fake-worktree/resume-probe".to_string()),
             heartbeat_at: now,
             has_claude: true,
+            active_agent: Some(crate::ipc::AgentKind::ClaudeCode),
             task_description: Some("old task".to_string()),
         };
         pane_lease::seed_state_for_test(seed).expect("seed pane state");
@@ -8294,9 +8383,17 @@ mod tests {
             resource_timeout_secs: None,
         };
         let state = test_minimal_daemon_state();
-        handle_claude_launch(&writer, vec![task], None, None, &state, 0)
-            .await
-            .expect("launch returns ok even on per-task error");
+        handle_claude_launch(
+            &writer,
+            crate::ipc::AgentKind::ClaudeCode,
+            vec![task],
+            None,
+            None,
+            &state,
+            0,
+        )
+        .await
+        .expect("launch returns ok even on per-task error");
         drop(writer);
 
         let responses = collect_responses(client_reader).await;
@@ -8896,7 +8993,11 @@ mod tests {
 
     #[test]
     fn distillation_system_prompt_mentions_emit_tool_and_cwd() {
-        let p = build_distillation_system_prompt("/tmp/repo", Some("fix-foo-abc123"));
+        let p = build_distillation_system_prompt(
+            crate::ipc::AgentKind::ClaudeCode,
+            "/tmp/repo",
+            Some("fix-foo-abc123"),
+        );
         // Working directory must be interpolated, not left as a placeholder.
         assert!(p.contains("/tmp/repo"), "cwd must be in prompt: {p}");
         // Branch name must be injected when provided.
@@ -8927,11 +9028,24 @@ mod tests {
         // Critical for downstream fidelity: the distilled output is
         // injected as Claude's first user turn verbatim, so adding
         // "here is the prompt I prepared:" wraps would break framing.
-        let p = build_distillation_system_prompt("/x", None);
+        let p = build_distillation_system_prompt(crate::ipc::AgentKind::ClaudeCode, "/x", None);
         assert!(
             p.to_lowercase().contains("no meta-commentary")
                 || p.to_lowercase().contains("verbatim"),
             "prompt must forbid meta-commentary or assert verbatim use: {p}"
+        );
+    }
+
+    #[test]
+    fn distillation_system_prompt_mentions_codex_for_codex_agent() {
+        let p = build_distillation_system_prompt(crate::ipc::AgentKind::Codex, "/x", None);
+        assert!(
+            p.contains("`/codex \"<brief>\"`"),
+            "prompt must name /codex: {p}"
+        );
+        assert!(
+            p.contains("downstream Codex"),
+            "prompt must name Codex: {p}"
         );
     }
 }

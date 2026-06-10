@@ -1669,8 +1669,8 @@ enum InputDispatch {
     ShowModel,
     /// `/model <name>`: update `state.model` to this name.
     SwitchModel(String),
-    /// `/claude "task" ...` — parser succeeded with the given tasks.
-    Claude(Vec<crate::client::ClaudeTask>),
+    /// `/claude "task" ...` or `/codex "task" ...`.
+    Agent(crate::ipc::AgentKind, Vec<crate::client::ClaudeTask>),
     /// `/replyreview <PR> ...` — parser succeeded with these PR
     /// numbers.  Worktree + description resolution happens
     /// asynchronously via `crate::client::resolve_replyreview_tasks`.
@@ -1699,8 +1699,14 @@ fn classify_input(text: &str) -> InputDispatch {
     match parse_slash_command(text) {
         Some(SlashCommand::Model(None)) => InputDispatch::ShowModel,
         Some(SlashCommand::Model(Some(name))) => InputDispatch::SwitchModel(name),
-        Some(SlashCommand::Claude(Ok(tasks))) => InputDispatch::Claude(tasks),
+        Some(SlashCommand::Claude(Ok(tasks))) => {
+            InputDispatch::Agent(crate::ipc::AgentKind::ClaudeCode, tasks)
+        }
         Some(SlashCommand::Claude(Err(msg))) => InputDispatch::SlashError(msg),
+        Some(SlashCommand::Codex(Ok(tasks))) => {
+            InputDispatch::Agent(crate::ipc::AgentKind::Codex, tasks)
+        }
+        Some(SlashCommand::Codex(Err(msg))) => InputDispatch::SlashError(msg),
         Some(SlashCommand::ReplyReview(Ok(prs))) => InputDispatch::ReplyReview(prs),
         Some(SlashCommand::ReplyReview(Err(msg))) => InputDispatch::SlashError(msg),
         Some(SlashCommand::Release(Ok(cmd))) => InputDispatch::Release(cmd),
@@ -1729,8 +1735,8 @@ async fn dispatch_input(
             state.push_system_line(format!("[model] {} → {}", state.model, name));
             state.model = name;
         }
-        InputDispatch::Claude(tasks) => {
-            launch_claude_tasks(writer, state, tasks).await?;
+        InputDispatch::Agent(agent, tasks) => {
+            launch_agent_tasks(writer, state, agent, tasks).await?;
         }
         InputDispatch::ReplyReview(prs) => {
             // /replyreview is normalised into the same Vec<ClaudeTask>
@@ -1743,7 +1749,10 @@ async fn dispatch_input(
                 prs.len()
             ));
             match crate::client::resolve_replyreview_tasks(&prs).await {
-                Ok(tasks) => launch_claude_tasks(writer, state, tasks).await?,
+                Ok(tasks) => {
+                    launch_agent_tasks(writer, state, crate::ipc::AgentKind::ClaudeCode, tasks)
+                        .await?
+                }
                 Err(msg) => state.push_error_line(format!("/replyreview: {msg}")),
             }
         }
@@ -1801,9 +1810,10 @@ impl crate::client::DistillSink for BufferingDistillSink<'_> {
     }
 }
 
-async fn launch_claude_tasks(
+async fn launch_agent_tasks(
     writer: &mut tokio::net::unix::OwnedWriteHalf,
     state: &mut AppState,
+    agent: crate::ipc::AgentKind,
     mut tasks: Vec<crate::client::ClaudeTask>,
 ) -> Result<()> {
     if tasks.is_empty() {
@@ -1836,6 +1846,7 @@ async fn launch_claude_tasks(
         let model = state.model.clone();
         crate::client::distill_claude_tasks(
             &socket,
+            agent,
             &mut tasks,
             &cwd,
             &session_id,
@@ -1859,7 +1870,10 @@ async fn launch_claude_tasks(
     }
     tasks.retain(|t| !t.description.trim().is_empty());
     if tasks.is_empty() {
-        state.push_error_line("[error] all /claude tasks failed distillation".to_string());
+        state.push_error_line(format!(
+            "[error] all /{} tasks failed distillation",
+            agent.label()
+        ));
         return Ok(());
     }
 
@@ -1896,6 +1910,7 @@ async fn launch_claude_tasks(
         .collect();
 
     let req = Request::ClaudeLaunch {
+        agent,
         tasks: task_specs,
         session_id: Some(state.session_id.clone()),
         repo_dir: invocation_repo_dir,
@@ -1911,7 +1926,8 @@ async fn launch_claude_tasks(
     // Tell the user we shipped the launch, and hand the rest of the
     // flow to the main response loop via `pending_claude`.
     state.push_system_line(format!(
-        "[claude] launching {} task(s); waiting for pane assignment…",
+        "[{}] launching {} task(s); waiting for pane assignment…",
+        agent.label(),
         descriptions.len()
     ));
     state.pending_claude = Some(PendingClaudeLaunch {
@@ -3170,15 +3186,27 @@ mod tests {
     #[test]
     fn classify_input_routes_claude_with_tasks() {
         // /claude carries the parser output verbatim through
-        // InputDispatch::Claude so the dispatcher can hand them off
-        // to launch_claude_tasks without re-parsing.
+        // InputDispatch::Agent so the dispatcher can hand them off
+        // to launch_agent_tasks without re-parsing.
         let dispatched = classify_input("/claude \"do X\"");
         match dispatched {
-            InputDispatch::Claude(tasks) => {
+            InputDispatch::Agent(crate::ipc::AgentKind::ClaudeCode, tasks) => {
                 assert_eq!(tasks.len(), 1);
                 assert_eq!(tasks[0].description, "do X");
             }
-            other => panic!("expected Claude(_), got {other:?}"),
+            other => panic!("expected Agent(ClaudeCode, _), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_input_routes_codex_with_tasks() {
+        let dispatched = classify_input("/codex \"do X\"");
+        match dispatched {
+            InputDispatch::Agent(crate::ipc::AgentKind::Codex, tasks) => {
+                assert_eq!(tasks.len(), 1);
+                assert_eq!(tasks[0].description, "do X");
+            }
+            other => panic!("expected Agent(Codex, _), got {other:?}"),
         }
     }
 

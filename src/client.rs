@@ -444,6 +444,8 @@ pub(crate) enum SlashCommand {
     Model(Option<String>),
     /// `/claude "task" ...` — launch parallel Claude sessions.
     Claude(Result<Vec<ClaudeTask>, String>),
+    /// `/codex "task" ...` — launch parallel Codex sessions.
+    Codex(Result<Vec<ClaudeTask>, String>),
     /// `/release %pane [--clean] [--summary "..."]` or `/release all [--clean]`.
     Release(Result<ReleaseCmd, String>),
     /// `/replyreview <PR> [<PR> ...]` — launch one Claude pane per PR,
@@ -453,6 +455,8 @@ pub(crate) enum SlashCommand {
     /// async `gh` / `git` shell-outs).
     ReplyReview(Result<Vec<u32>, String>),
 }
+
+type AgentTaskParseResult = (crate::ipc::AgentKind, Result<Vec<ClaudeTask>, String>);
 
 /// Parse a slash command from user input.
 ///
@@ -471,6 +475,9 @@ pub(crate) fn parse_slash_command(input: &str) -> Option<SlashCommand> {
     }
     if let Some(result) = parse_claude(input) {
         return Some(SlashCommand::Claude(result));
+    }
+    if let Some(result) = parse_codex(input) {
+        return Some(SlashCommand::Codex(result));
     }
     if let Some(result) = parse_release(input) {
         return Some(SlashCommand::Release(result));
@@ -766,28 +773,41 @@ fn parse_model(input: &str) -> Option<Option<String>> {
 /// - `Some(Err(msg))` → parse error
 /// - `Some(Ok(tasks))` → one or more tasks
 fn parse_claude(input: &str) -> Option<Result<Vec<ClaudeTask>, String>> {
-    // Require "/claude" followed by end-of-string or whitespace to avoid
+    parse_agent_tasks(input, "/claude")
+}
+
+fn parse_codex(input: &str) -> Option<Result<Vec<ClaudeTask>, String>> {
+    parse_agent_tasks(input, "/codex")
+}
+
+fn parse_agent_tasks(
+    input: &str,
+    command: &'static str,
+) -> Option<Result<Vec<ClaudeTask>, String>> {
+    // Require the command followed by end-of-string or whitespace to avoid
     // false positives like "/claudefoo" or "/claude--help".  Whitespace
     // handling accepts any Unicode whitespace — Chinese IMEs may insert
     // U+3000 ideographic space.
-    let rest = input.strip_prefix("/claude")?;
+    let rest = input.strip_prefix(command)?;
     if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
         return None;
     }
     let rest = rest.trim_start();
-    let usage = "usage: /claude [--worktree <path> | --resume-pane <pane_id>] \
-                 [--cwd <path>] [--no-enter] \
-                 [--resource <name|class:name>]... [--resource-timeout <secs>] \
-                 [\"task description\" [\"task2\" ...]] \
-                 (--resume-pane supports at most one optional task description; \
-                 omitting the task description is only valid with --resume-pane)";
+    let usage = format!(
+        "usage: {command} [--worktree <path> | --resume-pane <pane_id>] \
+         [--cwd <path>] [--no-enter] \
+         [--resource <name|class:name>]... [--resource-timeout <secs>] \
+         [\"task description\" [\"task2\" ...]] \
+         (--resume-pane supports at most one optional task description; \
+         omitting the task description is only valid with --resume-pane)"
+    );
     if rest.is_empty() {
-        return Some(Err(usage.to_string()));
+        return Some(Err(usage));
     }
 
     let tokens = parse_quoted_args(rest);
     if tokens.is_empty() {
-        return Some(Err(usage.to_string()));
+        return Some(Err(usage));
     }
 
     let mut worktree: Option<String> = None;
@@ -936,7 +956,7 @@ fn parse_claude(input: &str) -> Option<Result<Vec<ClaudeTask>, String>> {
     // --resume-pane: if omitted, the daemon reuses the description
     // previously persisted on the pane's lease.
     if desc_tokens.is_empty() && resume_pane.is_none() {
-        return Some(Err(usage.to_string()));
+        return Some(Err(usage));
     }
 
     // Build task list.  Quoted tokens each become a separate task.  Unquoted
@@ -1057,7 +1077,11 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
 
     // Intercept slash commands before session::get_or_create to avoid
     // unnecessary disk I/O for commands that don't use the chat session.
-    if let Some(SlashCommand::Claude(parse_result)) = parse_slash_command(&prompt) {
+    if let Some((agent, parse_result)) = match parse_slash_command(&prompt) {
+        Some(SlashCommand::Claude(r)) => Some((crate::ipc::AgentKind::ClaudeCode, r)),
+        Some(SlashCommand::Codex(r)) => Some((crate::ipc::AgentKind::Codex, r)),
+        _ => None,
+    } {
         let mut tasks = match parse_result {
             Ok(t) => t,
             Err(msg) => {
@@ -1082,6 +1106,7 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
         let mut sink = StderrDistillSink;
         if let Err(e) = distill_claude_tasks(
             &socket,
+            agent,
             &mut tasks,
             &cwd_str,
             &chat_session_for_distill,
@@ -1095,7 +1120,7 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
         }
         tasks.retain(|t| !t.description.trim().is_empty());
         if tasks.is_empty() {
-            eprintln!("[error] all /claude tasks failed distillation");
+            eprintln!("[error] all /{} tasks failed distillation", agent.label());
             return Ok(());
         }
         // One-shot `amaebi ask "/claude ..."` never sends SupervisePanes,
@@ -1105,6 +1130,7 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
         // interactive chat loop (below, in run_chat_loop) supplies both
         // and is where the race-safe acquire actually runs.
         let req = Request::ClaudeLaunch {
+            agent,
             tasks: tasks
                 .into_iter()
                 .map(|t| TaskSpec {
@@ -1708,21 +1734,28 @@ pub async fn run_chat_loop(
         // partial-move borrow error where the later `match slash`
         // would observe a moved-out String from the ReplyReview(Err)
         // arm.
-        let (claude_tasks_result, other_slash): (
-            Option<Result<Vec<ClaudeTask>, String>>,
+        let (agent_tasks_result, other_slash): (
+            Option<AgentTaskParseResult>,
             Option<SlashCommand>,
         ) = match parse_slash_command(&prompt) {
-            Some(SlashCommand::Claude(r)) => (Some(r), None),
-            Some(SlashCommand::ReplyReview(Ok(prs))) => {
-                (Some(resolve_replyreview_tasks(&prs).await), None)
+            Some(SlashCommand::Claude(r)) => (Some((crate::ipc::AgentKind::ClaudeCode, r)), None),
+            Some(SlashCommand::Codex(r)) => (Some((crate::ipc::AgentKind::Codex, r)), None),
+            Some(SlashCommand::ReplyReview(Ok(prs))) => (
+                Some((
+                    crate::ipc::AgentKind::ClaudeCode,
+                    resolve_replyreview_tasks(&prs).await,
+                )),
+                None,
+            ),
+            Some(SlashCommand::ReplyReview(Err(msg))) => {
+                (Some((crate::ipc::AgentKind::ClaudeCode, Err(msg))), None)
             }
-            Some(SlashCommand::ReplyReview(Err(msg))) => (Some(Err(msg)), None),
             other => (None, other),
         };
         // Re-dispatch: if we produced tasks via the normalisation above,
         // run the Claude-launch flow; otherwise fall back to the other
         // slash-command arms.
-        if let Some(parse_result) = claude_tasks_result {
+        if let Some((agent, parse_result)) = agent_tasks_result {
             {
                 let mut tasks = match parse_result {
                     Ok(t) => t,
@@ -1748,6 +1781,7 @@ pub async fn run_chat_loop(
                 let mut sink = StderrDistillSink;
                 if let Err(e) = distill_claude_tasks(
                     &socket,
+                    agent,
                     &mut tasks,
                     &cwd_str,
                     &session_id,
@@ -1764,7 +1798,10 @@ pub async fn run_chat_loop(
                 tasks.retain(|t| !t.description.trim().is_empty());
                 if tasks.is_empty() {
                     stdout
-                        .write_all(b"[error] all /claude tasks failed distillation\n")
+                        .write_all(
+                            format!("[error] all /{} tasks failed distillation\n", agent.label())
+                                .as_bytes(),
+                        )
                         .await?;
                     stdout.flush().await?;
                     continue 'session;
@@ -1790,6 +1827,7 @@ pub async fn run_chat_loop(
                     crate::session::canonical_key(std::path::Path::new(&effective_cwd))
                 });
                 let req = Request::ClaudeLaunch {
+                    agent,
                     tasks: tasks
                         .into_iter()
                         .map(|t| TaskSpec {
@@ -1907,11 +1945,13 @@ pub async fn run_chat_loop(
             }
         }
         match other_slash {
-            // Both Claude and ReplyReview variants were siphoned off
-            // into `claude_tasks_result` above, so they can never
+            // Agent launch and ReplyReview variants were siphoned off
+            // into `agent_tasks_result` above, so they can never
             // appear here at runtime.
-            Some(SlashCommand::Claude(_)) | Some(SlashCommand::ReplyReview(_)) => {
-                unreachable!("Claude/ReplyReview variants are consumed above")
+            Some(SlashCommand::Claude(_))
+            | Some(SlashCommand::Codex(_))
+            | Some(SlashCommand::ReplyReview(_)) => {
+                unreachable!("agent/ReplyReview variants are consumed above")
             }
             Some(SlashCommand::Model(new_model)) => {
                 match new_model {
@@ -3263,6 +3303,7 @@ pub(crate) async fn resolve_missing_tags(
 /// failure that prevented attempting the next task.
 pub(crate) async fn distill_claude_tasks(
     socket: &std::path::Path,
+    agent: crate::ipc::AgentKind,
     tasks: &mut [ClaudeTask],
     client_cwd: &str,
     chat_session_id: &str,
@@ -3331,6 +3372,7 @@ pub(crate) async fn distill_claude_tasks(
         ));
         match distill_claude_prompt(
             socket,
+            agent,
             &task.description,
             &distill_cwd,
             model,
@@ -3421,6 +3463,7 @@ pub(crate) trait DistillSink {
 /// stream multiplexing.
 pub(crate) async fn distill_claude_prompt(
     socket: &std::path::Path,
+    agent: crate::ipc::AgentKind,
     brief: &str,
     cwd: &str,
     model: &str,
@@ -3433,6 +3476,7 @@ pub(crate) async fn distill_claude_prompt(
         .context("connecting to daemon for DistillClaudePrompt")?;
     let (reader, mut writer) = tokio::io::split(stream);
     let req = Request::DistillClaudePrompt {
+        agent,
         brief: brief.to_string(),
         cwd: cwd.to_string(),
         model: model.to_string(),
@@ -4989,6 +5033,13 @@ mod tests {
         }
     }
 
+    fn codex_tasks(input: &str) -> Vec<ClaudeTask> {
+        match parse_slash_command(input) {
+            Some(SlashCommand::Codex(Ok(tasks))) => tasks,
+            other => panic!("expected Codex tasks, got {other:?}"),
+        }
+    }
+
     fn claude_err(input: &str) -> String {
         match parse_slash_command(input) {
             Some(SlashCommand::Claude(Err(msg))) => msg,
@@ -5007,6 +5058,13 @@ mod tests {
     #[test]
     fn parse_claude_single_quoted_task() {
         let tasks = claude_tasks(r#"/claude "implement something""#);
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].description, "implement something");
+    }
+
+    #[test]
+    fn parse_codex_single_quoted_task() {
+        let tasks = codex_tasks(r#"/codex "implement something""#);
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].description, "implement something");
     }

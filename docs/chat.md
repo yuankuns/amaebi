@@ -130,12 +130,12 @@ to `~/.amaebi/history.jsonl` (one JSON object per line — `display`,
 `amaebi chat` opens, it seeds the in-memory ring with rows whose
 canonicalised `cwd` matches the current working directory, so pressing
 ↑ in a given project shows prior commands from that same project
-(including slash commands like `/claude` and `/model`). The filter is
+(including slash commands like `/claude`, `/codex`, and `/model`). The filter is
 intentional: a chat started in `~/projectA` does not replay prompts
 from `~/projectB`. Canonicalisation handles symlink / `..` / bind-mount
 variants of the same directory. To inspect every line across every
 project use `cat ~/.amaebi/history.jsonl`; to search, pass a pattern
-(e.g. `grep -F /claude ~/.amaebi/history.jsonl`).
+(e.g. `grep -F /codex ~/.amaebi/history.jsonl`).
 
 Note: only `amaebi chat`'s interactive prompt feeds this file.
 `amaebi ask` reads its single prompt + any steer-correction text via a

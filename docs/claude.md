@@ -1,10 +1,14 @@
-# /claude — supervised Claude Code subprocesses
+# /claude and /codex — supervised coding-agent subprocesses
 
-`/claude` is a slash command (not a subcommand: you type it inside `amaebi
-chat` or pass it as the prompt to `amaebi ask`). It does four things:
+`/claude` and `/codex` are slash commands (not subcommands: you type them
+inside `amaebi chat` or pass them as the prompt to `amaebi ask`). They share
+the same pane/worktree/resource management; the command selects which coding
+agent runtime is launched.
 
 1. Creates a git worktree under `~/.amaebi/worktrees/<repo>/<tag>-<uuid8>/`.
-2. Allocates a tmux pane and starts `claude` (the Claude Code TUI) inside it.
+2. Allocates a tmux pane and starts the selected agent inside it:
+   `claude --dangerously-skip-permissions` for `/claude`, or
+   `codex --dangerously-bypass-approvals-and-sandbox` for `/codex`.
 3. Emits `Response::PaneAssigned { tag, pane_id, session_id, worktree, resources }`.
 4. Client synthesises a single `[launched]` user turn that hands the
    description + pane context to the chat agentic loop, which then drives
@@ -13,8 +17,7 @@ chat` or pass it as the prompt to `amaebi ask`). It does four things:
    [design/claude-chat-takeover.md](design/claude-chat-takeover.md) for
    the frozen contract.
 
-Parsing lives in `src/client.rs:280` (`parse_claude`); launch handling is in
-`src/daemon.rs` (`handle_claude_launch`).
+Parsing lives in `src/client.rs`; launch handling is in `src/daemon.rs`.
 
 ## Quick examples
 
@@ -24,6 +27,9 @@ Parsing lives in `src/client.rs:280` (`parse_claude`); launch handling is in
 /claude --tag kernel-opt "optimise the attention kernel"
 /claude --resume-pane %41                                          # reuse existing pane
 /claude --resource sim-9902 "run the new testbench"
+/codex "fix the flaky test in tests/auth_test.rs"
+/codex --tag kernel-opt "optimise the attention kernel"
+/codex --resume-pane %41                                           # reuse existing Codex pane
 ```
 
 ## Flags
@@ -34,7 +40,7 @@ Parsing lives in `src/client.rs:280` (`parse_claude`); launch handling is in
 | `--cwd <path>` | Client working directory (used to locate the git repo for auto-worktree) |
 | `--no-enter` | Inject the task description but do not press Enter |
 | `--tag <name>` | Persistent task notebook identifier |
-| `--resume-pane <pane_id>` | Reuse an existing pane (e.g. `%41`) — inject task into existing claude |
+| `--resume-pane <pane_id>` | Reuse an existing pane (e.g. `%41`) whose active agent matches the command |
 | `--resource <spec>` | Acquire a resource lease and inject its env vars |
 | `--resource-timeout <secs>` | How long to wait for a busy resource before failing |
 

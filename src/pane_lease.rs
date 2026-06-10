@@ -35,6 +35,7 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
 use crate::auth::amaebi_home;
+use crate::ipc::AgentKind;
 
 /// Maximum total number of panes (Idle + Busy) that the daemon will manage.
 pub const MAX_PANES: usize = 16;
@@ -79,6 +80,11 @@ pub struct PaneLease {
     /// the scheduler injects just the prompt rather than launching a new session.
     #[serde(default)]
     pub has_claude: bool,
+    /// Agent runtime currently active in this pane.  Older state files only
+    /// have `has_claude`; those deserialize with `active_agent = None` and are
+    /// treated as Claude Code when `has_claude` is true.
+    #[serde(default)]
+    pub active_agent: Option<AgentKind>,
     /// Full task description last injected into this pane, persisted so
     /// `/claude --resume-pane <pid>` can reuse it without the user retyping.
     /// Preserved by `release_lease` (alongside `worktree` / `has_claude`) so
@@ -98,6 +104,7 @@ impl PaneLease {
             worktree: None,
             heartbeat_at: now_secs(),
             has_claude: false,
+            active_agent: None,
             task_description: None,
         }
     }
@@ -111,6 +118,11 @@ impl PaneLease {
         } else {
             self.status.clone()
         }
+    }
+
+    pub fn effective_agent(&self) -> Option<AgentKind> {
+        self.active_agent
+            .or_else(|| self.has_claude.then_some(AgentKind::ClaudeCode))
     }
 }
 
@@ -248,11 +260,20 @@ pub fn acquire_first_idle(
     session_id: &str,
     worktree: Option<&str>,
 ) -> Result<(String, bool)> {
+    acquire_first_idle_for_agent(AgentKind::ClaudeCode, tag, session_id, worktree)
+}
+
+pub fn acquire_first_idle_for_agent(
+    agent: AgentKind,
+    tag: &str,
+    session_id: &str,
+    worktree: Option<&str>,
+) -> Result<(String, bool)> {
     let lock = open_lock_file()?;
     lock.lock_exclusive()
         .context("acquiring flock for acquire_first_idle")?;
 
-    let result = acquire_first_idle_locked(tag, session_id, worktree);
+    let result = acquire_first_idle_locked(agent, tag, session_id, worktree);
 
     lock.unlock()
         .context("releasing flock after acquire_first_idle")?;
@@ -267,6 +288,7 @@ pub fn acquire_first_idle(
 /// Priority: idle panes with `has_claude = true` are preferred so that
 /// existing Claude sessions absorb new tasks before blank panes are used.
 fn acquire_first_idle_locked(
+    agent: AgentKind,
     tag: &str,
     session_id: &str,
     worktree: Option<&str>,
@@ -307,6 +329,7 @@ fn acquire_first_idle_locked(
         .find(|(_, l)| {
             l.effective_status() == PaneStatus::Idle
                 && l.has_claude
+                && l.effective_agent() == Some(agent)
                 && worktree.is_some()
                 && l.worktree.as_deref() == worktree
         })
@@ -323,8 +346,9 @@ fn acquire_first_idle_locked(
         .ok_or_else(|| anyhow::anyhow!("pane {pane_id} disappeared after selection"))?;
     // `had_claude` is only true when the pane has a known matching worktree.
     // worktree.is_some() prevents None==None from triggering tier-1 reuse.
-    let had_claude =
-        lease.has_claude && worktree.is_some() && lease.worktree.as_deref() == worktree;
+    let had_claude = lease.effective_agent() == Some(agent)
+        && worktree.is_some()
+        && lease.worktree.as_deref() == worktree;
     lease.status = PaneStatus::Busy;
     lease.tag = Some(tag.to_string());
     lease.session_id = Some(session_id.to_string());
@@ -686,7 +710,17 @@ fn ensure_idle_panes_locked(needed: usize) -> Result<()> {
 /// This eliminates the TOCTOU race between `ensure_idle_panes` and
 /// `acquire_first_idle` when multiple `ClaudeLaunch` requests arrive
 /// concurrently.
+#[allow(dead_code)]
 pub fn ensure_and_acquire_idle(
+    tag: &str,
+    session_id: &str,
+    worktree: Option<&str>,
+) -> Result<(String, bool)> {
+    ensure_and_acquire_idle_for_agent(AgentKind::ClaudeCode, tag, session_id, worktree)
+}
+
+pub fn ensure_and_acquire_idle_for_agent(
+    agent: AgentKind,
     tag: &str,
     session_id: &str,
     worktree: Option<&str>,
@@ -716,7 +750,10 @@ pub fn ensure_and_acquire_idle(
             .values()
             .filter(|l| {
                 l.effective_status() == PaneStatus::Idle
-                    && (!l.has_claude || (worktree.is_some() && l.worktree.as_deref() == worktree))
+                    && (!l.has_claude
+                        || (l.effective_agent() == Some(agent)
+                            && worktree.is_some()
+                            && l.worktree.as_deref() == worktree))
             })
             .count();
         if available == 0 {
@@ -732,7 +769,7 @@ pub fn ensure_and_acquire_idle(
             ensure_idle_panes_locked(total_idle + 1)?;
         }
         // Acquire the first usable idle pane.
-        acquire_first_idle_locked(tag, session_id, worktree)
+        acquire_first_idle_locked(agent, tag, session_id, worktree)
     })();
 
     lock.unlock()
@@ -796,7 +833,12 @@ pub fn update_session_id(pane_id: &str, session_id: &str) -> Result<()> {
 /// Called after successfully launching `claude` into a blank pane so
 /// that future task assignments can inject prompts directly instead of
 /// launching a new session.
+#[allow(dead_code)]
 pub fn mark_claude_started(pane_id: &str) -> Result<()> {
+    mark_agent_started(pane_id, AgentKind::ClaudeCode)
+}
+
+pub fn mark_agent_started(pane_id: &str, agent: AgentKind) -> Result<()> {
     let lock = open_lock_file()?;
     lock.lock_exclusive()
         .context("acquiring flock for mark_claude_started")?;
@@ -805,6 +847,7 @@ pub fn mark_claude_started(pane_id: &str) -> Result<()> {
         let mut state = read_state_unlocked()?;
         if let Some(lease) = state.get_mut(pane_id) {
             lease.has_claude = true;
+            lease.active_agent = Some(agent);
         }
         write_state_unlocked(&state)
     })();
@@ -1026,6 +1069,7 @@ mod tests {
             worktree: worktree.map(str::to_string),
             heartbeat_at: now_secs(),
             has_claude: false,
+            active_agent: None,
             task_description: None,
         }
     }
@@ -1247,6 +1291,50 @@ mod tests {
                 acquire_first_idle("t", "s", Some("/repo/wt/task1")).expect("acquire");
             assert_eq!(pane, "%0", "should prefer matching has_claude pane");
             assert!(had_claude, "had_claude should be true for reused pane");
+        }
+    }
+
+    #[test]
+    fn acquire_first_idle_for_agent_requires_matching_agent() {
+        {
+            let _guard = crate::test_utils::with_temp_home();
+            let mut state: PaneState = HashMap::new();
+            let mut claude = make_idle("%0", "@0");
+            claude.has_claude = true;
+            claude.active_agent = Some(AgentKind::ClaudeCode);
+            claude.worktree = Some("/repo/wt/task1".to_string());
+            let blank = make_idle("%1", "@0");
+            state.insert("%0".to_string(), claude);
+            state.insert("%1".to_string(), blank);
+            write_state_unlocked(&state).expect("seed state");
+
+            let (pane, had_agent) =
+                acquire_first_idle_for_agent(AgentKind::Codex, "t", "s", Some("/repo/wt/task1"))
+                    .expect("acquire");
+            assert_eq!(pane, "%1", "codex must not reuse a claude pane");
+            assert!(!had_agent);
+        }
+    }
+
+    #[test]
+    fn acquire_first_idle_for_agent_reuses_matching_codex_pane() {
+        {
+            let _guard = crate::test_utils::with_temp_home();
+            let mut state: PaneState = HashMap::new();
+            let mut codex = make_idle("%0", "@0");
+            codex.has_claude = true;
+            codex.active_agent = Some(AgentKind::Codex);
+            codex.worktree = Some("/repo/wt/task1".to_string());
+            let blank = make_idle("%1", "@0");
+            state.insert("%0".to_string(), codex);
+            state.insert("%1".to_string(), blank);
+            write_state_unlocked(&state).expect("seed state");
+
+            let (pane, had_agent) =
+                acquire_first_idle_for_agent(AgentKind::Codex, "t", "s", Some("/repo/wt/task1"))
+                    .expect("acquire");
+            assert_eq!(pane, "%0", "codex should reuse matching codex pane");
+            assert!(had_agent);
         }
     }
 

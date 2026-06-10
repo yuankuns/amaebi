@@ -827,6 +827,7 @@ mod tests {
             worktree: None,
             heartbeat_at: heartbeat,
             has_claude,
+            active_agent: has_claude.then_some(crate::ipc::AgentKind::ClaudeCode),
             task_description: None,
         }
     }
