@@ -1,9 +1,10 @@
 /// External coding agent runtime managed in a tmux pane.
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
-#[serde(rename_all = "snake_case")]
 pub enum AgentKind {
     #[default]
+    #[serde(rename = "claude", alias = "claude_code")]
     ClaudeCode,
+    #[serde(rename = "codex")]
     Codex,
 }
 
@@ -30,29 +31,29 @@ pub struct TaskSpec {
     /// sending: either the user's `--tag <name>` verbatim, or the
     /// result of an earlier [`Request::GenerateTag`] round-trip.  The
     /// tag is used as the pane lease holder id, the worktree directory
-    /// name (`<tag>-<uuid8>`), the tmux window title (`cc-<tag>`), and
-    /// the notebook key in `~/.amaebi/tasks.db`.
+    /// name (`<tag>-<uuid8>`), and the notebook key in
+    /// `~/.amaebi/tasks.db`.
     pub tag: String,
-    /// Description sent to the Claude session as the opening prompt.
+    /// Description sent to the selected agent session as the opening prompt.
     pub description: String,
     /// Optional absolute path to a git worktree for this task.
     /// Enforced as unique across all currently Busy panes.
     pub worktree: Option<String>,
-    /// Absolute path to the client's working directory at the time `/claude`
-    /// was invoked.  Used by the daemon to locate the correct git repository
-    /// for auto-worktree creation, since the daemon may have been started from
-    /// a different directory.
+    /// Absolute path to the client's working directory at the time the
+    /// agent-launch command was invoked. Used by the daemon to locate the
+    /// correct git repository for auto-worktree creation, since the daemon may
+    /// have been started from a different directory.
     pub client_cwd: Option<String>,
     /// If `false`, the command is injected into the pane without a trailing
     /// Enter key (useful for commands the user wants to review first).
     pub auto_enter: bool,
     /// Optional tmux pane id (e.g. `"%41"`) to reuse instead of allocating a
-    /// new one.  When `Some`, the daemon validates the pane exists and has
-    /// `has_claude=true` in the lease map, acquires THAT pane specifically
-    /// (not a scheduler-picked one), inherits its existing worktree, and
-    /// injects `/compact + description` (tier-1 reuse path).  Mutually
-    /// exclusive with `worktree` at the CLI parser; the daemon treats a
-    /// `Some(resume_pane)` as authoritative and ignores any stray `worktree`.
+    /// new one. When `Some`, the daemon validates the pane exists, is marked
+    /// with the selected active agent in the lease map, inherits its existing
+    /// worktree, and injects the description into that running agent session.
+    /// Mutually exclusive with `worktree` at the CLI parser; the daemon treats
+    /// a `Some(resume_pane)` as authoritative and ignores any stray
+    /// `worktree`.
     #[serde(default)]
     pub resume_pane: Option<String>,
     /// Resource specs to acquire for this task.
@@ -833,6 +834,15 @@ mod tests {
     // ---- ClaudeLaunch / TaskSpec ------------------------------------------
 
     #[test]
+    fn agent_kind_serializes_claude_code_as_claude() {
+        let json = serde_json::to_string(&AgentKind::ClaudeCode).unwrap();
+        assert_eq!(json, r#""claude""#);
+
+        let alias: AgentKind = serde_json::from_str(r#""claude_code""#).unwrap();
+        assert_eq!(alias, AgentKind::ClaudeCode);
+    }
+
+    #[test]
     fn task_spec_round_trip() {
         let spec = TaskSpec {
             tag: "pr-123".into(),
@@ -968,6 +978,7 @@ mod tests {
         let json = serde_json::to_string(&req).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["type"], "claude_launch");
+        assert_eq!(v["agent"], "claude");
         assert_eq!(v["tasks"][0]["tag"], "t1");
         assert_eq!(v["tasks"][1]["worktree"], "/wt/b");
         assert_eq!(v["session_id"], "sess-123");

@@ -793,21 +793,23 @@ fn parse_agent_tasks(
         return None;
     }
     let rest = rest.trim_start();
-    let usage = format!(
-        "usage: {command} [--worktree <path> | --resume-pane <pane_id>] \
+    let usage = || {
+        format!(
+            "usage: {command} [--worktree <path> | --resume-pane <pane_id>] \
          [--cwd <path>] [--no-enter] \
          [--resource <name|class:name>]... [--resource-timeout <secs>] \
          [\"task description\" [\"task2\" ...]] \
          (--resume-pane supports at most one optional task description; \
          omitting the task description is only valid with --resume-pane)"
-    );
+        )
+    };
     if rest.is_empty() {
-        return Some(Err(usage));
+        return Some(Err(usage()));
     }
 
     let tokens = parse_quoted_args(rest);
     if tokens.is_empty() {
-        return Some(Err(usage));
+        return Some(Err(usage()));
     }
 
     let mut worktree: Option<String> = None;
@@ -956,7 +958,7 @@ fn parse_agent_tasks(
     // --resume-pane: if omitted, the daemon reuses the description
     // previously persisted on the pane's lease.
     if desc_tokens.is_empty() && resume_pane.is_none() {
-        return Some(Err(usage));
+        return Some(Err(usage()));
     }
 
     // Build task list.  Quoted tokens each become a separate task.  Unquoted

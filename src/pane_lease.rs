@@ -75,9 +75,11 @@ pub struct PaneLease {
     pub worktree: Option<String>,
     /// Unix timestamp of the last heartbeat (or acquisition time).
     pub heartbeat_at: u64,
-    /// Whether `claude` has been started in this pane.  Idle panes with
-    /// `has_claude = true` are preferred over blank panes when assigning tasks:
-    /// the scheduler injects just the prompt rather than launching a new session.
+    /// Whether an agent has been started in this pane. The field name is
+    /// legacy; Codex panes set it too. Idle panes with `has_claude = true`
+    /// and a matching `active_agent` are preferred over blank panes when
+    /// assigning tasks: the scheduler injects just the prompt rather than
+    /// launching a new session.
     #[serde(default)]
     pub has_claude: bool,
     /// Agent runtime currently active in this pane.  Older state files only
@@ -478,12 +480,11 @@ pub fn release_lease(pane_id: &str) -> Result<()> {
             lease.status = PaneStatus::Idle;
             lease.tag = None;
             lease.session_id = None;
-            // Intentionally keep `worktree`, `has_claude`, and
-            // `task_description` so `/claude --resume-pane <pid>` or
-            // `/codex --resume-pane <pid>` can re-acquire the pane and
-            // continue the same work with `/compact + original
-            // description` (tier-1 reuse) when those fields still describe the
-            // current pane state.  Depending on why the lease was released
+            // Intentionally keep `worktree`, `has_claude`, `active_agent`,
+            // and `task_description` so `/claude --resume-pane <pid>` or
+            // `/codex --resume-pane <pid>` can re-acquire the pane and inject
+            // a follow-up description when those fields still describe the
+            // current pane state. Depending on why the lease was released
             // (e.g. early startup or tmux injection failures), these fields may
             // be absent or stale rather than proving that the agent is still
             // running on the same task — callers of resume-pane must treat
