@@ -851,7 +851,7 @@ mod tests {
     #[test]
     fn collect_pane_events_one_per_pane() {
         let now = now_secs();
-        let panes = vec![
+        let panes = [
             pane("%1", PaneStatus::Busy, true, now, Some("pr-1")),
             pane("%2", PaneStatus::Idle, false, now, None),
         ];
@@ -1036,7 +1036,15 @@ mod tests {
 
     /// Serialize a `ResourceLease` map via serde so tests can't drift from
     /// the real on-disk schema — construct typed structs, not JSON literals.
-    fn seed_resource_state(records: Vec<(&str, &str, LeaseStatus, Option<&str>, Option<&str>)>) {
+    type ResourceStateRecord<'a> = (
+        &'a str,
+        &'a str,
+        LeaseStatus,
+        Option<&'a str>,
+        Option<&'a str>,
+    );
+
+    fn seed_resource_state(records: Vec<ResourceStateRecord<'_>>) {
         let dir = crate::auth::amaebi_home().expect("home");
         std::fs::create_dir_all(&dir).expect("mkdir");
         let now = now_secs();

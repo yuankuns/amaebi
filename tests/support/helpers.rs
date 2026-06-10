@@ -645,6 +645,7 @@ impl LongChatConnection {
     }
 
     /// Send a Steer request on this connection (same socket as the Chat).
+    #[allow(dead_code)]
     pub async fn steer(&mut self, session_id: &str, message: &str) -> Result<()> {
         let req = Request::Steer {
             session_id: session_id.to_string(),
