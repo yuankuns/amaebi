@@ -3313,6 +3313,23 @@ fn resume_pane_fallback_tag(pane_id: &str) -> String {
     }
 }
 
+async fn load_resume_pane_description(pane_id: &str) -> Result<Option<String>> {
+    let pane_id = pane_id.to_string();
+    tokio::task::spawn_blocking(move || {
+        let state = crate::pane_lease::read_state()?;
+        Ok(state.get(&pane_id).and_then(|lease| {
+            lease
+                .task_description
+                .as_deref()
+                .map(str::trim)
+                .filter(|description| !description.is_empty())
+                .map(ToOwned::to_owned)
+        }))
+    })
+    .await
+    .context("joining pane lease description lookup")?
+}
+
 /// Run the agent pre-launch flow on each task: optionally reserve a
 /// `--resume-pane` slot, then distill the brief into a detailed prompt for
 /// the selected agent. On success replaces `task.description` with the
@@ -3368,10 +3385,29 @@ pub(crate) async fn distill_claude_tasks(
         };
 
         if task.resume_pane.is_some() && task.description.trim().is_empty() {
-            sink.on_status(&format!(
-                "[distill] tag {} reuses the pane lease description",
-                task.tag
-            ));
+            if let Some(pid) = task.resume_pane.clone() {
+                match load_resume_pane_description(&pid).await {
+                    Ok(Some(description)) => {
+                        task.description = description;
+                        sink.on_status(&format!(
+                            "[distill] tag {} reuses the pane lease description",
+                            task.tag
+                        ));
+                    }
+                    Ok(None) => {
+                        sink.on_status(&format!(
+                            "[distill] tag {} will ask daemon to resolve pane lease description",
+                            task.tag
+                        ));
+                    }
+                    Err(e) => {
+                        sink.on_status(&format!(
+                            "[distill] tag {} could not prefetch pane lease description: {e:#}",
+                            task.tag
+                        ));
+                    }
+                }
+            }
             continue;
         }
 
