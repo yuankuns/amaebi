@@ -1918,7 +1918,7 @@ async fn launch_agent_tasks(
     let mut frame = serde_json::to_string(&req).context("serializing ClaudeLaunch")?;
     frame.push('\n');
     if let Err(e) = writer.write_all(frame.as_bytes()).await {
-        state.push_error_line(format!("[error] sending /claude to daemon: {e}"));
+        state.push_error_line(format!("[error] sending /{} to daemon: {e}", agent.label()));
         return Ok(());
     }
     let _ = writer.flush().await;

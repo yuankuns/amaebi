@@ -1535,16 +1535,18 @@ async fn handle_create_worktree(
     Ok(())
 }
 
-/// Handle `Request::ClaudeLaunch`: assign tmux panes and launch `claude`
-/// (Claude Code CLI) sessions for each task.
+/// Handle `Request::ClaudeLaunch`: assign tmux panes and launch the requested
+/// coding agent session for each task.
 ///
 /// Steps for each task:
 /// 1. `ensure_and_acquire_idle` — atomically expand the pane pool if needed
 ///    and acquire an idle pane.
-/// 2. Rename the pane title to `"cc-{N}"` (tmux pane numeric index).
-/// 3. If the pane already has `claude` running, inject `description` as a new
-///    prompt.  Otherwise launch `claude` (with optional `cd <worktree>`) via
-///    `tmux send-keys`, then inject `description` as a second keystroke.
+/// 2. Rename the pane title to `"cc-{N}"` for Claude Code or `"cx-{N}"` for
+///    Codex (tmux pane numeric index).
+/// 3. If the pane already has the same agent running, inject `description` as
+///    a new prompt. Otherwise launch the requested agent (with optional
+///    `cd <worktree>`) via `tmux send-keys`, then inject `description` as a
+///    second keystroke.
 /// 4. Stream `Response::PaneAssigned` for each task, then `Response::Done`.
 fn agent_launch_command(agent: crate::ipc::AgentKind) -> &'static str {
     match agent {
@@ -1568,10 +1570,10 @@ async fn handle_claude_launch(
         return Ok(());
     }
 
-    // Acquire notebook leases BEFORE any pane allocation or `claude`
+    // Acquire notebook leases BEFORE any pane allocation or agent
     // startup.  Without this, a tag-conflict rejection would fire from
     // `handle_supervision_inner` long after the racing launch has
-    // already created worktrees and kicked off claude in real panes —
+    // already created worktrees and kicked off agents in real panes —
     // leaving an uncontrolled session behind.  All-or-nothing: on
     // conflict, roll back whatever we've acquired and return without
     // touching tmux.  Skipped when the caller didn't opt into the
@@ -1693,7 +1695,7 @@ async fn handle_claude_launch(
         // `--resume-pane` + `--resource` is allowed: we still need the
         // lock in resource-state.json even on the reuse path so two
         // tasks can't race for the same simulator.  The env/prompt_hint
-        // parts are skipped further down, guarded by `!had_claude`.
+        // parts are skipped further down, guarded by `!had_agent`.
 
         // Gather git context from the client's working directory: current
         // branch, remote URL, recent commits, and PR-specific information if
@@ -1810,13 +1812,13 @@ async fn handle_claude_launch(
         // Determine worktree + acquire pane.  Two paths:
         //
         // 1. `--resume-pane <pid>` path: reuse a specific pane whose lease
-        //    already records a worktree and `has_claude = true`.  The CLI
+        //    already records a worktree and a matching active agent. The CLI
         //    parser rejects `--resume-pane` combined with `--worktree`, so
         //    `task.worktree` is always None here.  We read the lease, inherit
         //    its worktree, and acquire THAT pane specifically via
-        //    `pane_lease::acquire_lease`.  `had_claude` is forced true so
+        //    `pane_lease::acquire_lease`. `had_agent` is forced true so
         //    `handle_claude_launch` runs the tier-1 reuse path (inject task
-        //    into existing claude) instead of launching a fresh `claude`
+        //    into the existing agent) instead of launching a fresh agent
         //    process.
         //
         // 2. Normal path: auto-create a worktree if the caller didn't pass
@@ -1837,7 +1839,7 @@ async fn handle_claude_launch(
             // pre-flight that wrapped distillation, so we don't call
             // `acquire_lease` here — that would deadlock against ourselves
             // (the lease is Busy, owned by the same caller).  We just
-            // validate the lease still describes a live `claude` pane,
+            // validate the lease still describes a live matching-agent pane,
             // refresh the session_id to the launch-time placeholder, and
             // bump the heartbeat.  On any probe failure we release the
             // pre-flight lease so it doesn't sit Busy until TTL.
@@ -1862,8 +1864,8 @@ async fn handle_claude_launch(
                             "pane {rp_owned} has no associated worktree; cannot resume"
                         )
                     })?;
-                    // The lease's `has_claude` flag is persisted state and can
-                    // go stale (e.g. user `Ctrl-C`'d claude without the daemon
+                    // The lease's active-agent marker is persisted state and can
+                    // go stale (e.g. user `Ctrl-C`'d the agent without the daemon
                     // noticing).  Cross-check at the tmux layer so we don't
                     // inject a task prompt into a bare shell.
                     let tmux_probe = std::process::Command::new("tmux")
@@ -1953,7 +1955,7 @@ async fn handle_claude_launch(
                             tracing::warn!(
                                 tag = %tag,
                                 error = %e,
-                                "auto-worktree creation failed; launching claude without worktree isolation"
+                                "auto-worktree creation failed; launching agent without worktree isolation"
                             );
                             None
                         }
@@ -2177,13 +2179,13 @@ async fn handle_claude_launch(
         };
 
         // Render resource env vars ONLY on the fresh-launch path.  On the
-        // reuse path (`had_claude == true`) claude is already running and
+        // reuse path (`had_agent == true`) the agent is already running and
         // its shell is gone, so `export SIM_PORT=...` can no longer be
         // applied — the leases are still held (for scheduling) but env
         // injection is a no-op.  The prompt_hint used to be prepended to
         // the task description here; that channel was replaced by the
         // per-worktree AGENTS.md (see `ensure_worktree_agents_md` below),
-        // which claude loads at session start and survives `/compact`.
+        // which the agent loads at session start and survives `/compact`.
         let resource_env: Vec<(String, String)> = if had_agent {
             Vec::new()
         } else {
@@ -2206,28 +2208,28 @@ async fn handle_claude_launch(
         // Build the key sequences to inject into the pane.
         //
         // Priority:
-        //  - `had_claude = true`: pane already has `claude` running at its
+        //  - `had_agent = true`: pane already has the requested agent running at its
         //    prompt → send just the description as a new user message.
-        //  - `had_claude = false`: pane is blank (freshly created or at a
-        //    shell prompt) → launch `claude` first, then send the description
-        //    as a second keystroke so it lands at the Claude Code prompt.
+        //  - `had_agent = false`: pane is blank (freshly created or at a
+        //    shell prompt) → launch the requested agent first, then send the
+        //    description as a second keystroke so it lands at the agent prompt.
         //
         // Each element is (keys, press_enter).
         let key_sequence: Vec<(String, bool)> = if had_agent {
-            // Reusing an existing claude session in the same worktree: inject
+            // Reusing an existing agent session in the same worktree: inject
             // the new task description directly into the existing conversation.
             // No automatic `/compact` — resume is meant to *continue* where the
             // pane left off.  The user can run `/compact` manually if they
             // decide stale context needs pruning.
             vec![(description.clone(), auto_enter)]
         } else {
-            // Fresh pane: launch claude with --dangerously-skip-permissions so
+            // Fresh pane: launch the requested agent with non-interactive flags so
             // the autonomous session never blocks on an interactive approval
             // prompt, then inject the description as the opening message.
-            // Resource env vars go on an `export` line ahead of the cd/claude
+            // Resource env vars go on an `export` line ahead of the cd/agent
             // command — keeping them shell-level so both any `cd` into the
-            // worktree and Claude itself inherit them.  (Injecting them after
-            // claude starts is impossible: claude intercepts all keystrokes
+            // worktree and the agent itself inherit them. (Injecting them after
+            // the agent starts is impossible: it intercepts all keystrokes
             // and would treat `export FOO=bar` as a chat message.)
             let env_prefix = if resource_env.is_empty() {
                 String::new()
@@ -2297,8 +2299,8 @@ async fn handle_claude_launch(
                 // state where it was discarded — the 2 s pads are the
                 // minimum that proved stable in manual testing.
                 //
-                // Only runs on fresh-pane launches (`!had_claude`); reuse
-                // path (inject task into existing claude) skips because the
+                // Only runs on fresh-pane launches (`!had_agent`); reuse
+                // path (inject task into an existing agent) skips because the
                 // trust dialog was already accepted when the pane was first
                 // launched.
                 if idx > 0 && !had_agent && agent == crate::ipc::AgentKind::ClaudeCode {

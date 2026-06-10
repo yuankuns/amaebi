@@ -251,8 +251,8 @@ pub fn read_state() -> Result<PaneState> {
 
 /// Acquire a lease on the **first available idle pane** for the given task.
 ///
-/// Returns `(pane_id, had_claude)`.  If `worktree` is provided it is checked
-/// against all currently Busy panes for uniqueness.  Prefer
+/// Returns `(pane_id, had_agent)`. If `worktree` is provided it is checked
+/// against all currently Busy panes for uniqueness. Prefer
 /// [`ensure_and_acquire_idle`] for production use to avoid TOCTOU races.
 #[allow(dead_code)]
 pub fn acquire_first_idle(
@@ -280,13 +280,13 @@ pub fn acquire_first_idle_for_agent(
     result
 }
 
-/// Returns `(pane_id, had_claude)` where `had_claude` indicates whether
-/// `claude` was already running in the pane.  Callers use this to decide
-/// whether to inject only the prompt (`had_claude = true`) or to launch a
-/// fresh `claude` session (`had_claude = false`).
+/// Returns `(pane_id, had_agent)` where `had_agent` indicates whether the
+/// requested agent was already running in the pane. Callers use this to decide
+/// whether to inject only the prompt (`had_agent = true`) or to launch a fresh
+/// agent session (`had_agent = false`).
 ///
-/// Priority: idle panes with `has_claude = true` are preferred so that
-/// existing Claude sessions absorb new tasks before blank panes are used.
+/// Priority: idle panes with a matching active agent are preferred so existing
+/// Claude/Codex sessions absorb new tasks before blank panes are used.
 fn acquire_first_idle_locked(
     agent: AgentKind,
     tag: &str,
@@ -311,18 +311,18 @@ fn acquire_first_idle_locked(
 
     // Priority order for pane selection:
     //
-    // 1. Idle pane with `claude` running in the *same* worktree → safe to
+    // 1. Idle pane with the requested agent running in the *same* worktree → safe to
     //    inject a prompt directly (after /compact).
-    // 2. Idle pane with no `claude` running (blank shell) → fresh launch.
-    // 3. Idle pane with `claude` running in a *different* worktree → skip.
-    //    Sending shell commands to a pane where claude is already intercepting
+    // 2. Idle pane with no agent running (blank shell) → fresh launch.
+    // 3. Idle pane with an agent running in a *different* worktree → skip.
+    //    Sending shell commands to a pane where an agent is already intercepting
     //    input would deliver them as chat messages, not shell commands.  Leave
     //    those panes alone and let auto-expansion create a new blank one.
     // Use state.iter() so the HashMap key is carried through the selection,
     // avoiding a second get_mut lookup (and the unwrap it would require).
     // Tier-1 reuse requires a known, non-None worktree to match against.
     // When worktree is None (auto-creation failed), None==None would match any
-    // pane with worktree=None, injecting a prompt into an arbitrary claude
+    // pane with worktree=None, injecting a prompt into an arbitrary agent
     // session with unknown directory context.  Guard with worktree.is_some().
     let pane_id = state
         .iter()
@@ -344,9 +344,9 @@ fn acquire_first_idle_locked(
     let lease = state
         .get_mut(&pane_id)
         .ok_or_else(|| anyhow::anyhow!("pane {pane_id} disappeared after selection"))?;
-    // `had_claude` is only true when the pane has a known matching worktree.
+    // `had_agent` is only true when the pane has a known matching worktree.
     // worktree.is_some() prevents None==None from triggering tier-1 reuse.
-    let had_claude = lease.effective_agent() == Some(agent)
+    let had_agent = lease.effective_agent() == Some(agent)
         && worktree.is_some()
         && lease.worktree.as_deref() == worktree;
     lease.status = PaneStatus::Busy;
@@ -356,7 +356,7 @@ fn acquire_first_idle_locked(
     lease.heartbeat_at = now_secs();
 
     write_state_unlocked(&state)?;
-    Ok((pane_id, had_claude))
+    Ok((pane_id, had_agent))
 }
 
 /// Acquire a lease on a **specific pane** by ID.
@@ -702,10 +702,10 @@ fn ensure_idle_panes_locked(needed: usize) -> Result<()> {
 /// Atomically ensure at least one idle pane exists **and** acquire it for
 /// the given task — all within a single `LOCK_EX`.
 ///
-/// Returns `(pane_id, had_claude)`.  `had_claude = true` means the pane
-/// already had `claude` running; the caller should inject just the
-/// prompt.  `had_claude = false` means the pane is blank; the caller should
-/// launch `claude`.
+/// Returns `(pane_id, had_agent)`. `had_agent = true` means the pane already
+/// had the requested agent running; the caller should inject just the prompt.
+/// `had_agent = false` means the pane is blank; the caller should launch the
+/// requested agent.
 ///
 /// This eliminates the TOCTOU race between `ensure_idle_panes` and
 /// `acquire_first_idle` when multiple `ClaudeLaunch` requests arrive
@@ -732,9 +732,9 @@ pub fn ensure_and_acquire_idle_for_agent(
     let result = (|| {
         // Count panes that can actually serve this request:
         //   - blank panes (has_claude = false): always usable
-        //   - same-worktree claude panes: reusable via /compact + inject,
+        //   - same-worktree matching-agent panes: reusable via /compact + inject,
         //     but only when worktree.is_some() — when worktree is None,
-        //     None==None would match any no-worktree claude pane, but
+        //     None==None would match any no-worktree agent pane, but
         //     acquire_first_idle_locked guards tier-1 reuse with
         //     worktree.is_some(), so those panes won't actually be selected.
         //     Counting them as available suppresses expansion and leads to
@@ -757,8 +757,8 @@ pub fn ensure_and_acquire_idle_for_agent(
             })
             .count();
         if available == 0 {
-            // No usable idle pane exists (all idle panes have claude running in
-            // a different worktree and cannot receive shell commands).  Force
+            // No usable idle pane exists (all idle panes have agents running in
+            // different worktrees and cannot receive shell commands). Force
             // ensure_idle_panes_locked to create a new blank pane by requesting
             // one more than the current total idle count — it would otherwise
             // see the existing (unusable) idle panes and skip expansion.
@@ -1249,7 +1249,7 @@ mod tests {
             state.insert("%1".to_string(), make_idle("%1", "@0"));
             write_state_unlocked(&state).expect("seed state");
 
-            let (pane, _had_claude) =
+            let (pane, _had_agent) =
                 acquire_first_idle("t", "s", None).expect("acquire first idle");
             assert_eq!(pane, "%1");
         }
@@ -1277,20 +1277,20 @@ mod tests {
         {
             let _guard = crate::test_utils::with_temp_home();
             let mut state: PaneState = HashMap::new();
-            // Pane with claude already running in the target worktree — should be preferred.
+            // Pane with an agent already running in the target worktree — should be preferred.
             let mut has_claude_matching = make_idle("%0", "@0");
             has_claude_matching.has_claude = true;
             has_claude_matching.worktree = Some("/repo/wt/task1".to_string());
-            // Plain idle pane (no claude).
+            // Plain idle pane (no agent).
             let blank = make_idle("%1", "@0");
             state.insert("%0".to_string(), has_claude_matching);
             state.insert("%1".to_string(), blank);
             write_state_unlocked(&state).expect("seed state");
 
-            let (pane, had_claude) =
+            let (pane, had_agent) =
                 acquire_first_idle("t", "s", Some("/repo/wt/task1")).expect("acquire");
             assert_eq!(pane, "%0", "should prefer matching has_claude pane");
-            assert!(had_claude, "had_claude should be true for reused pane");
+            assert!(had_agent, "had_agent should be true for reused pane");
         }
     }
 
@@ -1343,26 +1343,26 @@ mod tests {
         {
             let _guard = crate::test_utils::with_temp_home();
             let mut state: PaneState = HashMap::new();
-            // Pane with claude in a *different* worktree — must not be preferred.
+            // Pane with an agent in a *different* worktree — must not be preferred.
             let mut has_claude_other = make_idle("%0", "@0");
             has_claude_other.has_claude = true;
             has_claude_other.worktree = Some("/repo/wt/other".to_string());
-            // Plain idle pane (no claude, no worktree).
+            // Plain idle pane (no agent, no worktree).
             let blank = make_idle("%1", "@0");
             state.insert("%0".to_string(), has_claude_other);
             state.insert("%1".to_string(), blank);
             write_state_unlocked(&state).expect("seed state");
 
-            let (pane, had_claude) =
+            let (pane, had_agent) =
                 acquire_first_idle("t", "s", Some("/repo/wt/task1")).expect("acquire");
-            // Must select the blank pane (%1), not the mismatched claude pane (%0).
-            // Sending shell commands to a pane where claude is running in a different
+            // Must select the blank pane (%1), not the mismatched agent pane (%0).
+            // Sending shell commands to a pane where an agent is running in a different
             // worktree would deliver them as chat messages, not shell commands.
             assert_eq!(
                 pane, "%1",
                 "must skip has_claude pane with different worktree"
             );
-            assert!(!had_claude, "had_claude must be false for blank pane");
+            assert!(!had_agent, "had_agent must be false for blank pane");
         }
     }
 
@@ -1389,9 +1389,9 @@ mod tests {
             write_state_unlocked(&state).expect("seed state");
 
             match ensure_and_acquire_idle("t", "s", None) {
-                Ok((_, had_claude)) => {
+                Ok((_, had_agent)) => {
                     assert!(
-                        !had_claude,
+                        !had_agent,
                         "None-worktree pane must not trigger tier-1 reuse"
                     );
                 }
@@ -1408,8 +1408,8 @@ mod tests {
 
     #[test]
     fn ensure_and_acquire_expands_when_only_mismatched_claude_panes_exist() {
-        // All idle panes have claude running in a different worktree — none
-        // are usable for a fresh task.  ensure_and_acquire_idle must attempt
+        // All idle panes have an agent running in a different worktree — none
+        // are usable for a fresh task. ensure_and_acquire_idle must attempt
         // expansion rather than returning "no idle panes available" immediately.
         //
         // Skip inside a live tmux session: ensure_and_acquire_idle calls
@@ -1428,9 +1428,9 @@ mod tests {
             write_state_unlocked(&state).expect("seed state");
 
             match ensure_and_acquire_idle("t", "s", Some("/repo/wt/task1")) {
-                Ok((pane_id, had_claude)) => {
+                Ok((pane_id, had_agent)) => {
                     assert_ne!(pane_id, "%0", "must not acquire mismatched claude pane");
-                    assert!(!had_claude, "new pane must not have had_claude");
+                    assert!(!had_agent, "new pane must not have had_agent");
                 }
                 Err(e) => {
                     let msg = format!("{e:#}");
@@ -1637,10 +1637,10 @@ mod tests {
 
         let _override = TmuxOverride::set("%live");
 
-        let (pane_id, had_claude) = ensure_and_acquire_idle("t", "s", None).expect("acquire");
+        let (pane_id, had_agent) = ensure_and_acquire_idle("t", "s", None).expect("acquire");
 
         assert_eq!(pane_id, "%live", "must pick the live pane, not a zombie");
-        assert!(!had_claude);
+        assert!(!had_agent);
 
         let reloaded = read_state_unlocked().expect("reload");
         assert!(

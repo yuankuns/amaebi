@@ -193,7 +193,7 @@ pub enum Request {
     /// The daemon responds with zero or more [`Response::MemoryEntry`] frames
     /// followed by a single [`Response::Done`] frame.
     RetrieveContext { prompt: String },
-    /// Launch one or more independent `chat ↔ Claude` pairs in separate tmux
+    /// Launch one or more independent `chat ↔ agent` pairs in separate tmux
     /// panes.
     ///
     /// The daemon acquires pane leases (auto-expanding tmux panes if needed),
@@ -980,6 +980,32 @@ mod tests {
         assert_eq!(tasks.len(), 2);
         assert_eq!(session_id.as_deref(), Some("sess-123"));
         assert_eq!(repo_dir.as_deref(), Some("/home/user/repo"));
+    }
+
+    #[test]
+    fn request_claude_launch_legacy_without_agent_field() {
+        let legacy = r#"{
+            "type":"claude_launch",
+            "tasks":[{
+                "tag":"t1",
+                "description":"do A",
+                "worktree":null,
+                "client_cwd":"/home/user/repo",
+                "auto_enter":true,
+                "resume_pane":null,
+                "resources":[],
+                "resource_timeout_secs":null
+            }],
+            "session_id":"sess-123",
+            "repo_dir":"/home/user/repo"
+        }"#;
+        let back: Request = serde_json::from_str(legacy).expect("legacy must parse");
+        let Request::ClaudeLaunch { agent, tasks, .. } = back else {
+            panic!("expected ClaudeLaunch");
+        };
+        assert_eq!(agent, AgentKind::ClaudeCode);
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].tag, "t1");
     }
 
     #[test]
