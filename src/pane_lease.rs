@@ -879,7 +879,7 @@ pub fn mark_claude_started(pane_id: &str) -> Result<()> {
 pub fn mark_agent_started(pane_id: &str, agent: AgentKind) -> Result<()> {
     let lock = open_lock_file()?;
     lock.lock_exclusive()
-        .context("acquiring flock for mark_claude_started")?;
+        .context("acquiring flock for mark_agent_started")?;
 
     let result = (|| {
         let mut state = read_state_unlocked()?;
@@ -891,7 +891,7 @@ pub fn mark_agent_started(pane_id: &str, agent: AgentKind) -> Result<()> {
     })();
 
     lock.unlock()
-        .context("releasing flock after mark_claude_started")?;
+        .context("releasing flock after mark_agent_started")?;
     result
 }
 
