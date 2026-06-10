@@ -3459,6 +3459,24 @@ pub(crate) async fn distill_claude_tasks(
                         "[distill] tag {} produced an empty prompt; skipping launch",
                         task.tag
                     ));
+                    if let Some(pid) = reserved_pane.as_deref() {
+                        if let Err(re) = release_reserved_pane(socket, pid).await {
+                            sink.on_status(&format!(
+                                "[distill] also failed to release {pid}: {re:#}"
+                            ));
+                        }
+                    }
+                    if created_worktree {
+                        if let Some(ref wt) = task.worktree {
+                            let wt = wt.clone();
+                            let cwd = task_cwd.clone();
+                            let _ = tokio::task::spawn_blocking(move || {
+                                remove_worktree_and_branch(&wt, &cwd);
+                            })
+                            .await;
+                        }
+                        task.worktree = None;
+                    }
                     task.skip_launch = true;
                 } else {
                     task.description = prompt;
