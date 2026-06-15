@@ -55,7 +55,7 @@ connection, session history, tool execution, cron scheduler, and pane /
 resource leases.
 
 See [docs/architecture.md](docs/architecture.md) for file layouts, database
-schemas, and the `/claude` request lifecycle.
+schemas, and the supervised agent request lifecycle.
 
 ## Common Commands
 
@@ -64,6 +64,7 @@ schemas, and the `/claude` request lifecycle.
 | `amaebi ask "<prompt>"` | Send a prompt and stream the reply |
 | `amaebi chat` | Interactive multi-turn session ([docs](docs/chat.md)) |
 | `/claude "<task>"` | Launch a supervised Claude Code subprocess in tmux ([docs](docs/claude.md)) |
+| `/codex "<task>"` | Launch a supervised Codex subprocess in tmux using the same worktree/resource flow |
 | `amaebi dashboard` | Live TUI view of panes, sessions, inbox, cron ([docs](docs/dashboard.md)) |
 | `amaebi memory search <q>` | Full-text search of conversation memory |
 | `amaebi inbox list` | Read results from detached and cron tasks |
@@ -74,7 +75,7 @@ Run `amaebi --help` for the full subcommand list.
 ## Feature Index
 
 - **[chat.md](docs/chat.md)** — `amaebi ask` and `amaebi chat`, session resume, steering, detached runs
-- **[claude.md](docs/claude.md)** — the `/claude` slash command, worktrees, flags (`--tag`, `--resume-pane`, `--resource`, etc.)
+- **[claude.md](docs/claude.md)** — the `/claude` and `/codex` slash commands, worktrees, flags (`--tag`, `--resume-pane`, `--resource`, etc.)
 - **[supervision.md](docs/supervision.md)** — WAIT / STEER / DONE model, timing knobs, release guarantees
 - **[resource-pool.md](docs/resource-pool.md)** — `~/.amaebi/resources.toml`, `--resource` semantics, env injection
 - **[dashboard.md](docs/dashboard.md)** — `amaebi dashboard` TUI

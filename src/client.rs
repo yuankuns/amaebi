@@ -415,6 +415,9 @@ pub(crate) struct ClaudeTask {
     pub(crate) resources: Vec<String>,
     /// Seconds to wait for busy resources.  `None` / `0` → fail fast.
     pub(crate) resource_timeout_secs: Option<u64>,
+    /// Set by pre-launch checks when this parsed task should be omitted from
+    /// the eventual launch request.
+    pub(crate) skip_launch: bool,
 }
 
 /// A parsed `/release` command.
@@ -444,6 +447,8 @@ pub(crate) enum SlashCommand {
     Model(Option<String>),
     /// `/claude "task" ...` — launch parallel Claude sessions.
     Claude(Result<Vec<ClaudeTask>, String>),
+    /// `/codex "task" ...` — launch parallel Codex sessions.
+    Codex(Result<Vec<ClaudeTask>, String>),
     /// `/release %pane [--clean] [--summary "..."]` or `/release all [--clean]`.
     Release(Result<ReleaseCmd, String>),
     /// `/replyreview <PR> [<PR> ...]` — launch one Claude pane per PR,
@@ -453,6 +458,8 @@ pub(crate) enum SlashCommand {
     /// async `gh` / `git` shell-outs).
     ReplyReview(Result<Vec<u32>, String>),
 }
+
+type AgentTaskParseResult = (crate::ipc::AgentKind, Result<Vec<ClaudeTask>, String>);
 
 /// Parse a slash command from user input.
 ///
@@ -471,6 +478,9 @@ pub(crate) fn parse_slash_command(input: &str) -> Option<SlashCommand> {
     }
     if let Some(result) = parse_claude(input) {
         return Some(SlashCommand::Claude(result));
+    }
+    if let Some(result) = parse_codex(input) {
+        return Some(SlashCommand::Codex(result));
     }
     if let Some(result) = parse_release(input) {
         return Some(SlashCommand::Release(result));
@@ -754,40 +764,55 @@ fn parse_model(input: &str) -> Option<Option<String>> {
     }
 }
 
-/// Parse `/claude [--worktree <path>] [--cwd <path>] [--no-enter] "task" ["task2" ...]`.
+/// Parse an agent launch command such as `/claude ...` or `/codex ...`.
 ///
 /// Task splitting rules:
 /// - All tokens quoted → each quoted string is a separate task
-///   (`/claude "fix bug" "add tests"` → two tasks)
+///   (`/claude "fix bug" "add tests"` or `/codex "fix bug" "add tests"` → two tasks)
 /// - Any unquoted token → all tokens joined into one task
-///   (`/claude fix the bug` or `/claude "fix" the bug` → one task)
+///   (`/claude fix the bug` or `/codex "fix" the bug` → one task)
 ///
-/// - `None` → not a `/claude` command
+/// - `None` → not the requested agent command
 /// - `Some(Err(msg))` → parse error
 /// - `Some(Ok(tasks))` → one or more tasks
 fn parse_claude(input: &str) -> Option<Result<Vec<ClaudeTask>, String>> {
-    // Require "/claude" followed by end-of-string or whitespace to avoid
+    parse_agent_tasks(input, "/claude")
+}
+
+fn parse_codex(input: &str) -> Option<Result<Vec<ClaudeTask>, String>> {
+    parse_agent_tasks(input, "/codex")
+}
+
+fn parse_agent_tasks(
+    input: &str,
+    command: &'static str,
+) -> Option<Result<Vec<ClaudeTask>, String>> {
+    // Require the command followed by end-of-string or whitespace to avoid
     // false positives like "/claudefoo" or "/claude--help".  Whitespace
     // handling accepts any Unicode whitespace — Chinese IMEs may insert
     // U+3000 ideographic space.
-    let rest = input.strip_prefix("/claude")?;
+    let rest = input.strip_prefix(command)?;
     if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
         return None;
     }
     let rest = rest.trim_start();
-    let usage = "usage: /claude [--worktree <path> | --resume-pane <pane_id>] \
-                 [--cwd <path>] [--no-enter] \
-                 [--resource <name|class:name>]... [--resource-timeout <secs>] \
-                 [\"task description\" [\"task2\" ...]] \
-                 (--resume-pane supports at most one optional task description; \
-                 omitting the task description is only valid with --resume-pane)";
+    let usage = || {
+        format!(
+            "usage: {command} [--worktree <path> | --resume-pane <pane_id>] \
+         [--cwd <path>] [--no-enter] \
+         [--resource <name|class:name>]... [--resource-timeout <secs>] \
+         [\"task description\" [\"task2\" ...]] \
+         (--resume-pane supports at most one optional task description; \
+         omitting the task description is only valid with --resume-pane)"
+        )
+    };
     if rest.is_empty() {
-        return Some(Err(usage.to_string()));
+        return Some(Err(usage()));
     }
 
     let tokens = parse_quoted_args(rest);
     if tokens.is_empty() {
-        return Some(Err(usage.to_string()));
+        return Some(Err(usage()));
     }
 
     let mut worktree: Option<String> = None;
@@ -929,14 +954,14 @@ fn parse_claude(input: &str) -> Option<Result<Vec<ClaudeTask>, String>> {
     // is process-independent), we just skip env injection and rely on
     // the worktree's AGENTS.md (auto-generated on first launch) to keep
     // the LLM aware of its resource assignment.  See the daemon's
-    // `handle_claude_launch` for the had_claude-branch that skips
+    // `handle_claude_launch` for the had_agent branch that skips
     // env/prompt_hint rendering.
 
     // Description is required in the normal path, but optional with
     // --resume-pane: if omitted, the daemon reuses the description
     // previously persisted on the pane's lease.
     if desc_tokens.is_empty() && resume_pane.is_none() {
-        return Some(Err(usage.to_string()));
+        return Some(Err(usage()));
     }
 
     // Build task list.  Quoted tokens each become a separate task.  Unquoted
@@ -979,6 +1004,7 @@ fn parse_claude(input: &str) -> Option<Result<Vec<ClaudeTask>, String>> {
             resume_pane: resume_pane.clone(),
             resources: resources.clone(),
             resource_timeout_secs,
+            skip_launch: false,
         })
         .collect();
 
@@ -1057,7 +1083,11 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
 
     // Intercept slash commands before session::get_or_create to avoid
     // unnecessary disk I/O for commands that don't use the chat session.
-    if let Some(SlashCommand::Claude(parse_result)) = parse_slash_command(&prompt) {
+    if let Some((agent, parse_result)) = match parse_slash_command(&prompt) {
+        Some(SlashCommand::Claude(r)) => Some((crate::ipc::AgentKind::ClaudeCode, r)),
+        Some(SlashCommand::Codex(r)) => Some((crate::ipc::AgentKind::Codex, r)),
+        _ => None,
+    } {
         let mut tasks = match parse_result {
             Ok(t) => t,
             Err(msg) => {
@@ -1082,6 +1112,7 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
         let mut sink = StderrDistillSink;
         if let Err(e) = distill_claude_tasks(
             &socket,
+            agent,
             &mut tasks,
             &cwd_str,
             &chat_session_for_distill,
@@ -1093,9 +1124,9 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
             eprintln!("[error] distillation pre-flight: {e:#}");
             return Ok(());
         }
-        tasks.retain(|t| !t.description.trim().is_empty());
+        tasks.retain(|t| !t.skip_launch);
         if tasks.is_empty() {
-            eprintln!("[error] all /claude tasks failed distillation");
+            eprintln!("[error] all /{} tasks failed pre-launch", agent.label());
             return Ok(());
         }
         // One-shot `amaebi ask "/claude ..."` never sends SupervisePanes,
@@ -1105,6 +1136,7 @@ pub async fn run(socket: PathBuf, prompt: String, model: Option<String>) -> Resu
         // interactive chat loop (below, in run_chat_loop) supplies both
         // and is where the race-safe acquire actually runs.
         let req = Request::ClaudeLaunch {
+            agent,
             tasks: tasks
                 .into_iter()
                 .map(|t| TaskSpec {
@@ -1708,21 +1740,28 @@ pub async fn run_chat_loop(
         // partial-move borrow error where the later `match slash`
         // would observe a moved-out String from the ReplyReview(Err)
         // arm.
-        let (claude_tasks_result, other_slash): (
-            Option<Result<Vec<ClaudeTask>, String>>,
+        let (agent_tasks_result, other_slash): (
+            Option<AgentTaskParseResult>,
             Option<SlashCommand>,
         ) = match parse_slash_command(&prompt) {
-            Some(SlashCommand::Claude(r)) => (Some(r), None),
-            Some(SlashCommand::ReplyReview(Ok(prs))) => {
-                (Some(resolve_replyreview_tasks(&prs).await), None)
+            Some(SlashCommand::Claude(r)) => (Some((crate::ipc::AgentKind::ClaudeCode, r)), None),
+            Some(SlashCommand::Codex(r)) => (Some((crate::ipc::AgentKind::Codex, r)), None),
+            Some(SlashCommand::ReplyReview(Ok(prs))) => (
+                Some((
+                    crate::ipc::AgentKind::ClaudeCode,
+                    resolve_replyreview_tasks(&prs).await,
+                )),
+                None,
+            ),
+            Some(SlashCommand::ReplyReview(Err(msg))) => {
+                (Some((crate::ipc::AgentKind::ClaudeCode, Err(msg))), None)
             }
-            Some(SlashCommand::ReplyReview(Err(msg))) => (Some(Err(msg)), None),
             other => (None, other),
         };
         // Re-dispatch: if we produced tasks via the normalisation above,
         // run the Claude-launch flow; otherwise fall back to the other
         // slash-command arms.
-        if let Some(parse_result) = claude_tasks_result {
+        if let Some((agent, parse_result)) = agent_tasks_result {
             {
                 let mut tasks = match parse_result {
                     Ok(t) => t,
@@ -1748,6 +1787,7 @@ pub async fn run_chat_loop(
                 let mut sink = StderrDistillSink;
                 if let Err(e) = distill_claude_tasks(
                     &socket,
+                    agent,
                     &mut tasks,
                     &cwd_str,
                     &session_id,
@@ -1761,10 +1801,13 @@ pub async fn run_chat_loop(
                     stdout.flush().await?;
                     continue 'session;
                 }
-                tasks.retain(|t| !t.description.trim().is_empty());
+                tasks.retain(|t| !t.skip_launch);
                 if tasks.is_empty() {
                     stdout
-                        .write_all(b"[error] all /claude tasks failed distillation\n")
+                        .write_all(
+                            format!("[error] all /{} tasks failed pre-launch\n", agent.label())
+                                .as_bytes(),
+                        )
                         .await?;
                     stdout.flush().await?;
                     continue 'session;
@@ -1790,6 +1833,7 @@ pub async fn run_chat_loop(
                     crate::session::canonical_key(std::path::Path::new(&effective_cwd))
                 });
                 let req = Request::ClaudeLaunch {
+                    agent,
                     tasks: tasks
                         .into_iter()
                         .map(|t| TaskSpec {
@@ -1814,6 +1858,7 @@ pub async fn run_chat_loop(
                 // turn below carries the exact context the LLM needs to start
                 // supervising without any additional round-trip.
                 struct Launched {
+                    agent: crate::ipc::AgentKind,
                     pane_id: String,
                     description: String,
                     tag: String,
@@ -1848,6 +1893,7 @@ pub async fn run_chat_loop(
                                 .cloned()
                                 .unwrap_or_else(|| tag.clone());
                             launched.push(Launched {
+                                agent,
                                 pane_id,
                                 description,
                                 tag,
@@ -1888,6 +1934,7 @@ pub async fn run_chat_loop(
                         }
                         synth.push_str(l.description.trim_end());
                         synth.push_str("\n\n[launched]\n");
+                        synth.push_str(&format!("  agent: {}\n", l.agent.label()));
                         synth.push_str(&format!("  pane: {}\n", l.pane_id));
                         if let Some(wt) = l.worktree.as_deref() {
                             synth.push_str(&format!("  worktree: {wt}\n"));
@@ -1907,11 +1954,13 @@ pub async fn run_chat_loop(
             }
         }
         match other_slash {
-            // Both Claude and ReplyReview variants were siphoned off
-            // into `claude_tasks_result` above, so they can never
+            // Agent launch and ReplyReview variants were siphoned off
+            // into `agent_tasks_result` above, so they can never
             // appear here at runtime.
-            Some(SlashCommand::Claude(_)) | Some(SlashCommand::ReplyReview(_)) => {
-                unreachable!("Claude/ReplyReview variants are consumed above")
+            Some(SlashCommand::Claude(_))
+            | Some(SlashCommand::Codex(_))
+            | Some(SlashCommand::ReplyReview(_)) => {
+                unreachable!("agent/ReplyReview variants are consumed above")
             }
             Some(SlashCommand::Model(new_model)) => {
                 match new_model {
@@ -3173,6 +3222,7 @@ async fn resolve_one_replyreview_task(pr: u32) -> Result<ClaudeTask, String> {
         resume_pane: None,
         resources: Vec::new(),
         resource_timeout_secs: None,
+        skip_launch: false,
     })
 }
 
@@ -3206,6 +3256,10 @@ pub(crate) async fn resolve_missing_tags(
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     for t in tasks.iter_mut() {
         if !t.tag.is_empty() {
+            continue;
+        }
+        if t.resume_pane.is_some() && t.description.trim().is_empty() {
+            t.tag = resume_pane_fallback_tag(t.resume_pane.as_deref().unwrap_or_default());
             continue;
         }
         let repo_dir = crate::session::canonical_key(std::path::Path::new(
@@ -3247,9 +3301,38 @@ pub(crate) async fn resolve_missing_tags(
     Ok(())
 }
 
-/// Run the `/claude` pre-launch flow on each task: optionally reserve a
-/// `--resume-pane` slot, then distill the brief into a detailed Claude
-/// Code prompt.  On success replaces `task.description` with the
+fn resume_pane_fallback_tag(pane_id: &str) -> String {
+    let suffix: String = pane_id
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .collect();
+    if suffix.is_empty() {
+        "resume-pane".to_string()
+    } else {
+        format!("resume-pane-{suffix}")
+    }
+}
+
+async fn load_resume_pane_description(pane_id: &str) -> Result<Option<String>> {
+    let pane_id = pane_id.to_string();
+    tokio::task::spawn_blocking(move || {
+        let state = crate::pane_lease::read_state()?;
+        Ok(state.get(&pane_id).and_then(|lease| {
+            lease
+                .task_description
+                .as_deref()
+                .map(str::trim)
+                .filter(|description| !description.is_empty())
+                .map(ToOwned::to_owned)
+        }))
+    })
+    .await
+    .context("joining pane lease description lookup")?
+}
+
+/// Run the agent pre-launch flow on each task: optionally reserve a
+/// `--resume-pane` slot, then distill the brief into a detailed prompt for
+/// the selected agent. On success replaces `task.description` with the
 /// distilled text.  On failure for any task surfaces the error via
 /// `sink.on_status` and skips that task (caller chooses whether to
 /// continue with remaining tasks or abort).  Reserved panes are
@@ -3263,6 +3346,7 @@ pub(crate) async fn resolve_missing_tags(
 /// failure that prevented attempting the next task.
 pub(crate) async fn distill_claude_tasks(
     socket: &std::path::Path,
+    agent: crate::ipc::AgentKind,
     tasks: &mut [ClaudeTask],
     client_cwd: &str,
     chat_session_id: &str,
@@ -3281,6 +3365,7 @@ pub(crate) async fn distill_claude_tasks(
             ));
             match reserve_pane(
                 socket,
+                agent,
                 &pid,
                 &task.tag,
                 chat_session_id,
@@ -3291,6 +3376,7 @@ pub(crate) async fn distill_claude_tasks(
                 Ok(()) => Some(pid),
                 Err(e) => {
                     sink.on_status(&format!("[distill] reserve {pid} failed: {e:#}"));
+                    task.skip_launch = true;
                     continue;
                 }
             }
@@ -3298,8 +3384,35 @@ pub(crate) async fn distill_claude_tasks(
             None
         };
 
+        if task.resume_pane.is_some() && task.description.trim().is_empty() {
+            if let Some(pid) = task.resume_pane.clone() {
+                match load_resume_pane_description(&pid).await {
+                    Ok(Some(description)) => {
+                        task.description = description;
+                        sink.on_status(&format!(
+                            "[distill] tag {} reuses the pane lease description",
+                            task.tag
+                        ));
+                    }
+                    Ok(None) => {
+                        sink.on_status(&format!(
+                            "[distill] tag {} will ask daemon to resolve pane lease description",
+                            task.tag
+                        ));
+                    }
+                    Err(e) => {
+                        sink.on_status(&format!(
+                            "[distill] tag {} could not prefetch pane lease description: {e:#}",
+                            task.tag
+                        ));
+                    }
+                }
+            }
+            continue;
+        }
+
         // Pre-create worktree so distillation investigates the same
-        // starting point the downstream Claude will operate in.
+        // starting point the downstream agent will operate in.
         let mut branch: Option<String> = None;
         let mut created_worktree = false;
         if task.resume_pane.is_none() && task.worktree.is_none() {
@@ -3331,6 +3444,7 @@ pub(crate) async fn distill_claude_tasks(
         ));
         match distill_claude_prompt(
             socket,
+            agent,
             &task.description,
             &distill_cwd,
             model,
@@ -3340,8 +3454,34 @@ pub(crate) async fn distill_claude_tasks(
         .await
         {
             Ok(prompt) => {
-                task.description = prompt;
-                sink.on_status(&format!("[distill] tag {} done", task.tag));
+                if prompt.trim().is_empty() {
+                    sink.on_status(&format!(
+                        "[distill] tag {} produced an empty prompt; skipping launch",
+                        task.tag
+                    ));
+                    if let Some(pid) = reserved_pane.as_deref() {
+                        if let Err(re) = release_reserved_pane(socket, pid).await {
+                            sink.on_status(&format!(
+                                "[distill] also failed to release {pid}: {re:#}"
+                            ));
+                        }
+                    }
+                    if created_worktree {
+                        if let Some(ref wt) = task.worktree {
+                            let wt = wt.clone();
+                            let cwd = task_cwd.clone();
+                            let _ = tokio::task::spawn_blocking(move || {
+                                remove_worktree_and_branch(&wt, &cwd);
+                            })
+                            .await;
+                        }
+                        task.worktree = None;
+                    }
+                    task.skip_launch = true;
+                } else {
+                    task.description = prompt;
+                    sink.on_status(&format!("[distill] tag {} done", task.tag));
+                }
             }
             Err(e) => {
                 sink.on_status(&format!(
@@ -3365,11 +3505,7 @@ pub(crate) async fn distill_claude_tasks(
                     }
                     task.worktree = None;
                 }
-                // Mark the task for skip via empty description; caller
-                // filters those out before ClaudeLaunch.  Empty was
-                // already invalid upstream of parse, so no risk of
-                // accidentally launching an empty task.
-                task.description.clear();
+                task.skip_launch = true;
                 continue;
             }
         }
@@ -3421,6 +3557,7 @@ pub(crate) trait DistillSink {
 /// stream multiplexing.
 pub(crate) async fn distill_claude_prompt(
     socket: &std::path::Path,
+    agent: crate::ipc::AgentKind,
     brief: &str,
     cwd: &str,
     model: &str,
@@ -3433,6 +3570,7 @@ pub(crate) async fn distill_claude_prompt(
         .context("connecting to daemon for DistillClaudePrompt")?;
     let (reader, mut writer) = tokio::io::split(stream);
     let req = Request::DistillClaudePrompt {
+        agent,
         brief: brief.to_string(),
         cwd: cwd.to_string(),
         model: model.to_string(),
@@ -3583,6 +3721,7 @@ fn remove_worktree_and_branch(worktree: &str, repo_cwd: &str) {
 /// `release_reserved_pane` on failure.
 pub(crate) async fn reserve_pane(
     socket: &std::path::Path,
+    agent: crate::ipc::AgentKind,
     pane_id: &str,
     tag: &str,
     session_id: &str,
@@ -3594,6 +3733,7 @@ pub(crate) async fn reserve_pane(
         .context("connecting to daemon for ReservePane")?;
     let (reader, mut writer) = tokio::io::split(stream);
     let req = Request::ReservePane {
+        agent,
         pane_id: pane_id.to_string(),
         tag: tag.to_string(),
         session_id: session_id.to_string(),
@@ -4989,6 +5129,13 @@ mod tests {
         }
     }
 
+    fn codex_tasks(input: &str) -> Vec<ClaudeTask> {
+        match parse_slash_command(input) {
+            Some(SlashCommand::Codex(Ok(tasks))) => tasks,
+            other => panic!("expected Codex tasks, got {other:?}"),
+        }
+    }
+
     fn claude_err(input: &str) -> String {
         match parse_slash_command(input) {
             Some(SlashCommand::Claude(Err(msg))) => msg,
@@ -5007,6 +5154,13 @@ mod tests {
     #[test]
     fn parse_claude_single_quoted_task() {
         let tasks = claude_tasks(r#"/claude "implement something""#);
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].description, "implement something");
+    }
+
+    #[test]
+    fn parse_codex_single_quoted_task() {
+        let tasks = codex_tasks(r#"/codex "implement something""#);
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].description, "implement something");
     }
@@ -5159,10 +5313,10 @@ mod tests {
     #[test]
     fn parse_claude_resume_pane_with_resource_is_allowed() {
         // Regression: the combo used to be rejected at parse time because
-        // env-var injection can't run against an already-launched claude.
+        // env-var injection can't run against an already-launched agent.
         // We now accept it — the daemon acquires the resource lock (which
         // is process-independent) and skips env/prompt_hint rendering on
-        // the had_claude branch.  AGENTS.md carries the constraint forward
+        // the had_agent branch. AGENTS.md carries the constraint forward
         // across /compact.
         let tasks = claude_tasks("/claude --resume-pane %41 --resource sim-9900 \"work\"");
         assert_eq!(tasks.len(), 1);
@@ -5385,6 +5539,13 @@ mod tests {
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].description, "");
         assert_eq!(tasks[0].resume_pane.as_deref(), Some("%41"));
+        assert!(!tasks[0].skip_launch);
+    }
+
+    #[test]
+    fn resume_pane_fallback_tag_uses_pane_id() {
+        assert_eq!(resume_pane_fallback_tag("%41"), "resume-pane-41");
+        assert_eq!(resume_pane_fallback_tag("%pane.1"), "resume-pane-pane1");
     }
 
     #[test]

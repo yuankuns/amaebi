@@ -1,3 +1,29 @@
+/// External coding agent runtime managed in a tmux pane.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AgentKind {
+    #[default]
+    #[serde(rename = "claude", alias = "claude_code")]
+    ClaudeCode,
+    #[serde(rename = "codex")]
+    Codex,
+}
+
+impl AgentKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ClaudeCode => "claude",
+            Self::Codex => "codex",
+        }
+    }
+
+    pub fn command(self) -> &'static str {
+        match self {
+            Self::ClaudeCode => "claude",
+            Self::Codex => "codex",
+        }
+    }
+}
+
 /// A single task specification for [`Request::ClaudeLaunch`].
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct TaskSpec {
@@ -5,29 +31,29 @@ pub struct TaskSpec {
     /// sending: either the user's `--tag <name>` verbatim, or the
     /// result of an earlier [`Request::GenerateTag`] round-trip.  The
     /// tag is used as the pane lease holder id, the worktree directory
-    /// name (`<tag>-<uuid8>`), the tmux window title (`cc-<tag>`), and
-    /// the notebook key in `~/.amaebi/tasks.db`.
+    /// name (`<tag>-<uuid8>`), and the notebook key in
+    /// `~/.amaebi/tasks.db`.
     pub tag: String,
-    /// Description sent to the Claude session as the opening prompt.
+    /// Description sent to the selected agent session as the opening prompt.
     pub description: String,
     /// Optional absolute path to a git worktree for this task.
     /// Enforced as unique across all currently Busy panes.
     pub worktree: Option<String>,
-    /// Absolute path to the client's working directory at the time `/claude`
-    /// was invoked.  Used by the daemon to locate the correct git repository
-    /// for auto-worktree creation, since the daemon may have been started from
-    /// a different directory.
+    /// Absolute path to the client's working directory at the time the
+    /// agent-launch command was invoked. Used by the daemon to locate the
+    /// correct git repository for auto-worktree creation, since the daemon may
+    /// have been started from a different directory.
     pub client_cwd: Option<String>,
     /// If `false`, the command is injected into the pane without a trailing
     /// Enter key (useful for commands the user wants to review first).
     pub auto_enter: bool,
     /// Optional tmux pane id (e.g. `"%41"`) to reuse instead of allocating a
-    /// new one.  When `Some`, the daemon validates the pane exists and has
-    /// `has_claude=true` in the lease map, acquires THAT pane specifically
-    /// (not a scheduler-picked one), inherits its existing worktree, and
-    /// injects `/compact + description` (tier-1 reuse path).  Mutually
-    /// exclusive with `worktree` at the CLI parser; the daemon treats a
-    /// `Some(resume_pane)` as authoritative and ignores any stray `worktree`.
+    /// new one. When `Some`, the daemon validates the pane exists, is marked
+    /// with the selected active agent in the lease map, inherits its existing
+    /// worktree, and injects the description into that running agent session.
+    /// Mutually exclusive with `worktree` at the CLI parser; the daemon treats
+    /// a `Some(resume_pane)` as authoritative and ignores any stray
+    /// `worktree`.
     #[serde(default)]
     pub resume_pane: Option<String>,
     /// Resource specs to acquire for this task.
@@ -168,7 +194,7 @@ pub enum Request {
     /// The daemon responds with zero or more [`Response::MemoryEntry`] frames
     /// followed by a single [`Response::Done`] frame.
     RetrieveContext { prompt: String },
-    /// Launch one or more independent `chat ↔ Claude` pairs in separate tmux
+    /// Launch one or more independent `chat ↔ agent` pairs in separate tmux
     /// panes.
     ///
     /// The daemon acquires pane leases (auto-expanding tmux panes if needed),
@@ -176,6 +202,10 @@ pub enum Request {
     /// per task followed by [`Response::Done`].  If the pane capacity limit
     /// would be exceeded it responds with [`Response::CapacityError`] instead.
     ClaudeLaunch {
+        /// Agent runtime to launch.  Defaults to Claude Code for backwards
+        /// compatibility with clients that predate `/codex`.
+        #[serde(default)]
+        agent: AgentKind,
         /// The tasks to launch in parallel.
         tasks: Vec<TaskSpec>,
         /// Chat session UUID issuing this launch.  Used together with
@@ -214,8 +244,8 @@ pub enum Request {
         #[serde(default)]
         summary: Option<String>,
     },
-    /// Ask the daemon to expand the user's brief `/claude` description into
-    /// a fully-detailed Claude Code prompt.
+    /// Ask the daemon to expand the user's brief agent-launch description into
+    /// a fully-detailed prompt for the downstream coding agent.
     ///
     /// Daemon spins up a bounded agentic loop with a read-only tool subset
     /// plus the `emit_distilled_prompt` terminator.  The LLM investigates
@@ -226,15 +256,19 @@ pub enum Request {
     /// [`Response::Done`].  Failure modes (tool errors, model timeouts) end
     /// the stream with [`Response::Error`].
     DistillClaudePrompt {
-        /// The user's original short description (`/claude "..."` argument).
+        /// Agent runtime that will consume the distilled prompt.
+        #[serde(default)]
+        agent: AgentKind,
+        /// The user's original short description (`/claude "..."` or
+        /// `/codex "..."` argument).
         brief: String,
         /// Working directory the distillation should reason about — the
-        /// repo / worktree the downstream Claude pane will run in.
+        /// repo / worktree the downstream agent pane will run in.
         cwd: String,
         /// Chat model to use for the distillation loop.  Caller passes the
         /// outer chat's current model so /model state is honoured.
         model: String,
-        /// Feature branch name the downstream Claude session will operate on.
+        /// Feature branch name the downstream agent session will operate on.
         /// Injected into the distillation system prompt so the distilled
         /// output can reference the correct branch.
         #[serde(default)]
@@ -257,7 +291,8 @@ pub enum Request {
     },
     /// Reserve a tmux pane up-front so a long-running pre-launch flow
     /// (notably `Request::DistillClaudePrompt` for `/claude --resume-pane
-    /// %N`) can hold the slot before the actual `Request::ClaudeLaunch`.
+    /// %N` or `/codex --resume-pane %N`) can hold the slot before the actual
+    /// `Request::ClaudeLaunch`.
     ///
     /// Mirrors the lease shape `acquire_lease` would set in `ClaudeLaunch`,
     /// so the eventual launch call is a no-op rather than a contention.
@@ -265,6 +300,11 @@ pub enum Request {
     /// real launch on success.  Daemon responds with [`Response::PaneReserved`]
     /// or [`Response::Error`].
     ReservePane {
+        /// Agent runtime expected to be active in the reserved pane. Defaults
+        /// to Claude Code for backwards compatibility with clients that
+        /// predate `/codex`.
+        #[serde(default)]
+        agent: AgentKind,
         pane_id: String,
         tag: String,
         session_id: String,
@@ -794,6 +834,15 @@ mod tests {
     // ---- ClaudeLaunch / TaskSpec ------------------------------------------
 
     #[test]
+    fn agent_kind_serializes_claude_code_as_claude() {
+        let json = serde_json::to_string(&AgentKind::ClaudeCode).unwrap();
+        assert_eq!(json, r#""claude""#);
+
+        let alias: AgentKind = serde_json::from_str(r#""claude_code""#).unwrap();
+        assert_eq!(alias, AgentKind::ClaudeCode);
+    }
+
+    #[test]
     fn task_spec_round_trip() {
         let spec = TaskSpec {
             tag: "pr-123".into(),
@@ -900,6 +949,7 @@ mod tests {
     #[test]
     fn request_claude_launch_round_trip() {
         let req = Request::ClaudeLaunch {
+            agent: AgentKind::ClaudeCode,
             tasks: vec![
                 TaskSpec {
                     tag: "t1".into(),
@@ -928,6 +978,7 @@ mod tests {
         let json = serde_json::to_string(&req).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["type"], "claude_launch");
+        assert_eq!(v["agent"], "claude");
         assert_eq!(v["tasks"][0]["tag"], "t1");
         assert_eq!(v["tasks"][1]["worktree"], "/wt/b");
         assert_eq!(v["session_id"], "sess-123");
@@ -935,6 +986,7 @@ mod tests {
 
         let back: Request = serde_json::from_str(&json).unwrap();
         let Request::ClaudeLaunch {
+            agent,
             tasks,
             session_id,
             repo_dir,
@@ -942,9 +994,36 @@ mod tests {
         else {
             panic!("expected ClaudeLaunch");
         };
+        assert_eq!(agent, AgentKind::ClaudeCode);
         assert_eq!(tasks.len(), 2);
         assert_eq!(session_id.as_deref(), Some("sess-123"));
         assert_eq!(repo_dir.as_deref(), Some("/home/user/repo"));
+    }
+
+    #[test]
+    fn request_claude_launch_legacy_without_agent_field() {
+        let legacy = r#"{
+            "type":"claude_launch",
+            "tasks":[{
+                "tag":"t1",
+                "description":"do A",
+                "worktree":null,
+                "client_cwd":"/home/user/repo",
+                "auto_enter":true,
+                "resume_pane":null,
+                "resources":[],
+                "resource_timeout_secs":null
+            }],
+            "session_id":"sess-123",
+            "repo_dir":"/home/user/repo"
+        }"#;
+        let back: Request = serde_json::from_str(legacy).expect("legacy must parse");
+        let Request::ClaudeLaunch { agent, tasks, .. } = back else {
+            panic!("expected ClaudeLaunch");
+        };
+        assert_eq!(agent, AgentKind::ClaudeCode);
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].tag, "t1");
     }
 
     #[test]
@@ -1256,6 +1335,7 @@ mod tests {
         let legacy = r#"{"type":"distill_claude_prompt","brief":"fix the bug","cwd":"/tmp/repo","model":"sonnet"}"#;
         let back: Request = serde_json::from_str(legacy).expect("legacy must parse");
         let Request::DistillClaudePrompt {
+            agent,
             brief,
             cwd,
             model,
@@ -1267,12 +1347,14 @@ mod tests {
         assert_eq!(brief, "fix the bug");
         assert_eq!(cwd, "/tmp/repo");
         assert_eq!(model, "sonnet");
+        assert_eq!(agent, AgentKind::ClaudeCode);
         assert!(branch.is_none(), "branch must default to None");
     }
 
     #[test]
     fn distill_claude_prompt_with_branch_round_trip() {
         let req = Request::DistillClaudePrompt {
+            agent: AgentKind::ClaudeCode,
             brief: "add feature".into(),
             cwd: "/wt/feat-xyz".into(),
             model: "opus".into(),
@@ -1288,6 +1370,54 @@ mod tests {
             panic!("expected DistillClaudePrompt");
         };
         assert_eq!(branch.as_deref(), Some("feat-xyz-ab12cd34"));
+    }
+
+    #[test]
+    fn reserve_pane_legacy_without_agent_field() {
+        let legacy = r#"{
+            "type":"reserve_pane",
+            "pane_id":"%7",
+            "tag":"task",
+            "session_id":"sess",
+            "worktree":"/tmp/wt"
+        }"#;
+        let back: Request = serde_json::from_str(legacy).expect("legacy must parse");
+        let Request::ReservePane {
+            agent,
+            pane_id,
+            tag,
+            session_id,
+            worktree,
+        } = back
+        else {
+            panic!("expected ReservePane");
+        };
+        assert_eq!(agent, AgentKind::ClaudeCode);
+        assert_eq!(pane_id, "%7");
+        assert_eq!(tag, "task");
+        assert_eq!(session_id, "sess");
+        assert_eq!(worktree.as_deref(), Some("/tmp/wt"));
+    }
+
+    #[test]
+    fn reserve_pane_with_agent_round_trip() {
+        let req = Request::ReservePane {
+            agent: AgentKind::Codex,
+            pane_id: "%8".into(),
+            tag: "task".into(),
+            session_id: "sess".into(),
+            worktree: None,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["type"], "reserve_pane");
+        assert_eq!(v["agent"], "codex");
+
+        let back: Request = serde_json::from_str(&json).unwrap();
+        let Request::ReservePane { agent, .. } = back else {
+            panic!("expected ReservePane");
+        };
+        assert_eq!(agent, AgentKind::Codex);
     }
 
     #[test]
