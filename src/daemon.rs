@@ -9045,7 +9045,13 @@ mod tests {
             "prompt must instruct verification commands: {p}"
         );
         assert!(
-            p.contains("target about 10 lines") && p.contains("HARD MAXIMUM 20 lines"),
+            p.contains(&format!(
+                "target about {} lines",
+                tools::DISTILLED_PROMPT_TARGET_LINES
+            )) && p.contains(&format!(
+                "HARD MAXIMUM {} lines",
+                tools::MAX_DISTILLED_PROMPT_LINES
+            )),
             "prompt must bound distilled prompt line count: {p}"
         );
     }
