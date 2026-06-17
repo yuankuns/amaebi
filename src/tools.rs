@@ -7,6 +7,9 @@ use tokio::process::Command;
 
 use crate::sandbox::{docker::DockerSandboxConfig, DockerSandbox, NoopSandbox, Sandbox};
 
+pub(crate) const DISTILLED_PROMPT_TARGET_LINES: usize = 10;
+pub(crate) const MAX_DISTILLED_PROMPT_LINES: usize = 20;
+
 // ---------------------------------------------------------------------------
 // SpawnContext — shared state injected by the daemon for spawn_agent support
 // ---------------------------------------------------------------------------
@@ -595,6 +598,14 @@ fn emit_distilled_prompt(args: serde_json::Value) -> Result<String> {
     if prompt.trim().is_empty() {
         anyhow::bail!("emit_distilled_prompt: 'prompt' must be non-empty");
     }
+    let line_count = prompt.lines().count();
+    if line_count > MAX_DISTILLED_PROMPT_LINES {
+        anyhow::bail!(
+            "emit_distilled_prompt: 'prompt' has {line_count} lines; target about \
+             {DISTILLED_PROMPT_TARGET_LINES} lines and hard maximum is \
+             {MAX_DISTILLED_PROMPT_LINES}"
+        );
+    }
     Ok(format!("[distilled prompt emitted, len={}]", prompt.len()))
 }
 
@@ -909,23 +920,29 @@ fn distill_tool_schemas() -> Vec<serde_json::Value> {
         "type": "function",
         "function": {
             "name": "emit_distilled_prompt",
-            "description": "Emit the FINAL distilled prompt that will be injected into the \
-                            downstream Claude Code pane.  Call this exactly ONCE, after you \
-                            have finished investigating the codebase and decided what \
-                            Claude should actually do.  The string you pass becomes the \
-                            opening user message for that Claude session — write it as a \
-                            self-contained instruction (file paths, key functions, \
-                            verification commands, hard constraints).  Do NOT call this \
-                            speculatively before reading code; do NOT call it more than \
-                            once per session — the first call ends the distillation loop.",
+            "description": format!(
+                "Emit the FINAL distilled prompt that will be injected into the \
+                 downstream Claude Code pane. Call this exactly ONCE, after you \
+                 have finished investigating the codebase and decided what \
+                 Claude should actually do. Keep the prompt concise: target \
+                 about {DISTILLED_PROMPT_TARGET_LINES} lines, hard maximum \
+                 {MAX_DISTILLED_PROMPT_LINES} newline-separated lines. The \
+                 string you pass becomes the opening user message for that \
+                 Claude session. Do NOT call this speculatively before reading \
+                 code; do NOT call it more than once per session."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "prompt": {
                         "type": "string",
-                        "description": "The full prompt to inject into Claude Code.  No \
-                                        preamble, no meta-commentary — Claude will read \
-                                        this verbatim as its first user turn."
+                        "description": format!(
+                            "The concise prompt to inject into Claude Code. Target about \
+                             {DISTILLED_PROMPT_TARGET_LINES} lines; hard maximum \
+                             {MAX_DISTILLED_PROMPT_LINES} lines. No preamble, no \
+                             meta-commentary; Claude will read this verbatim as its \
+                             first user turn."
+                        )
                     }
                 },
                 "required": ["prompt"]
@@ -2141,5 +2158,21 @@ mod tests {
         assert!(r.is_ok());
         let s = r.unwrap();
         assert!(s.contains("len=11"), "result should report length: {s}");
+
+        // Exactly the hard line limit is allowed.
+        let max_line_prompt = (1..=MAX_DISTILLED_PROMPT_LINES)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let r = emit_distilled_prompt(serde_json::json!({"prompt": max_line_prompt}));
+        assert!(r.is_ok(), "prompt at line limit should be accepted");
+
+        // One line over the hard limit is rejected so the downstream paste stays bounded.
+        let too_long_prompt = (1..=(MAX_DISTILLED_PROMPT_LINES + 1))
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let r = emit_distilled_prompt(serde_json::json!({"prompt": too_long_prompt}));
+        assert!(r.is_err(), "prompt over line limit should error");
     }
 }

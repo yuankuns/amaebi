@@ -1272,11 +1272,14 @@ async fn handle_distill_claude_prompt(
         crate::ipc::AgentKind::Codex => "/codex",
     };
     let agent_name = agent_display_name(agent);
+    let target_lines = tools::DISTILLED_PROMPT_TARGET_LINES;
+    let max_lines = tools::MAX_DISTILLED_PROMPT_LINES;
     let user_msg = format!(
         "User's brief description for {command}:\n\n{brief}\n\n\
          Working directory: {cwd}\n\n\
          Investigate the codebase, then call `emit_distilled_prompt` exactly once \
-         with the full {agent_name} prompt."
+         with the concise {agent_name} prompt (target about {target_lines} lines, \
+         hard maximum {max_lines} lines)."
     );
     let messages = vec![Message::system(system_prompt), Message::user(user_msg)];
 
@@ -1397,6 +1400,8 @@ fn build_distillation_system_prompt(
                  merging is the user's responsibility."
         ),
     };
+    let target_lines = tools::DISTILLED_PROMPT_TARGET_LINES;
+    let max_lines = tools::MAX_DISTILLED_PROMPT_LINES;
     format!(
         "You are amaebi's prompt distiller.  The user typed `{command} \"<brief>\"` and your \
          job is to convert that brief into a self-contained prompt that a downstream {agent_name} \
@@ -1415,6 +1420,9 @@ fn build_distillation_system_prompt(
          3. Call `emit_distilled_prompt` EXACTLY ONCE with the final prompt as a single \
             string.  That call ends your work — no further turns will run after it.\n\n\
          Output requirements for the distilled prompt:\n\
+         - Length: target about {target_lines} lines; HARD MAXIMUM {max_lines} lines.  \
+           If you exceed {max_lines} lines, the tool call will fail.  Compress details \
+           instead of adding paragraphs.\n\
          - Self-contained: the downstream {agent_name} session does NOT see this conversation.\n\
          - Concrete: name file paths and functions, not vague areas.\n\
          - Action-oriented: numbered steps the inner {agent_name} can follow.\n\
@@ -6131,8 +6139,10 @@ where
                             None
                         };
 
+                        let mut tool_succeeded = false;
                         let result = match state.executor.execute(&tc.name, args).await {
                             Ok(output) => {
+                                tool_succeeded = true;
                                 tracing::debug!(
                                     tool = %tc.name,
                                     model = %current_model,
@@ -6175,7 +6185,7 @@ where
                         // (handle_distill_claude_prompt) reads it from final_text.
                         // Only triggered when the schema is exposed, i.e. when
                         // ToolMode::Distill was passed in.
-                        if let Some(prompt) = distilled_prompt {
+                        if let Some(prompt) = distilled_prompt.filter(|_| tool_succeeded) {
                             distilled_capture = Some(prompt);
                             break 'outer;
                         }
@@ -9033,6 +9043,16 @@ mod tests {
         assert!(
             p.to_lowercase().contains("verification"),
             "prompt must instruct verification commands: {p}"
+        );
+        assert!(
+            p.contains(&format!(
+                "target about {} lines",
+                tools::DISTILLED_PROMPT_TARGET_LINES
+            )) && p.contains(&format!(
+                "HARD MAXIMUM {} lines",
+                tools::MAX_DISTILLED_PROMPT_LINES
+            )),
+            "prompt must bound distilled prompt line count: {p}"
         );
     }
 
