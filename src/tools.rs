@@ -594,9 +594,131 @@ fn task_done(args: serde_json::Value) -> Result<String> {
     if validation_evidence.is_empty() {
         anyhow::bail!("task_done: 'validation_evidence' must be non-empty");
     }
+    validate_task_done_evidence(validation_evidence)?;
     Ok(format!(
         "[task_done signalled pane={pane_id}]\n{summary}\n\nvalidation evidence:\n{validation_evidence}"
     ))
+}
+
+fn validate_task_done_evidence(validation_evidence: &str) -> Result<()> {
+    let evidence = validation_evidence.to_ascii_lowercase();
+    let explicit_missing_validation = [
+        "did not run",
+        "didn't run",
+        "has not run",
+        "have not run",
+        "not run",
+        "not yet run",
+        "not tested",
+        "tests were not run",
+        "no functional test",
+        "no functionality test",
+        "no simulator test",
+        "without running test",
+        "without running the test",
+    ];
+    if explicit_missing_validation
+        .iter()
+        .any(|needle| evidence.contains(needle))
+    {
+        anyhow::bail!(
+            "task_done: validation_evidence says required validation is missing; \
+             steer the pane to run the required validation before task_done"
+        );
+    }
+
+    let has_validation_command = evidence.lines().any(line_has_downstream_validation_command);
+    let has_validation_result = evidence.lines().any(line_has_validation_result);
+    if has_validation_command && has_validation_result {
+        return Ok(());
+    }
+
+    let has_insufficient_only_marker = [
+        "cmake --build",
+        "cargo build",
+        "bash -n",
+        "git diff --check",
+        "git status",
+        "git push",
+        "clean diff",
+        "build-only",
+        "build only",
+        "added test",
+        "committed test",
+        "test script",
+        "test list",
+        "test coverage",
+        "script syntax",
+        "syntax validation",
+        "whitespace check",
+        "push verification",
+    ]
+    .iter()
+    .any(|needle| evidence.contains(needle));
+    if has_insufficient_only_marker {
+        anyhow::bail!(
+            "task_done: validation_evidence only shows build/syntax/diff/push checks; \
+             include downstream test, simulator, benchmark, or accuracy/performance \
+             command output before task_done"
+        );
+    }
+
+    Ok(())
+}
+
+fn line_has_downstream_validation_command(line: &str) -> bool {
+    let line = line.trim();
+    if line.contains("bash -n")
+        || line.contains("cmake --build")
+        || line.contains("cargo build")
+        || line.contains("git diff --check")
+        || line.contains("git push")
+    {
+        return false;
+    }
+
+    [
+        "scripts/test.sh",
+        "cargo test",
+        "cargo nextest",
+        "pytest",
+        "go test",
+        "npm test",
+        "pnpm test",
+        "yarn test",
+        "ctest",
+        "run_tests.sh --",
+        "run_tests.sh --filter",
+        "run_matrix.sh --",
+        "benchmark",
+        "bench ",
+        "accuracy",
+        "performance",
+        "simulator",
+        "coralsim",
+        "xesim",
+    ]
+    .iter()
+    .any(|needle| line.contains(needle))
+}
+
+fn line_has_validation_result(line: &str) -> bool {
+    [
+        "passed",
+        "pass:",
+        "test result: ok",
+        "0 failed",
+        "exit 0",
+        "exit code 0",
+        "mismatch=0",
+        "mismatch 0/",
+        "disposition: passed",
+        "cosine=1",
+        "no regression",
+        "within tolerance",
+    ]
+    .iter()
+    .any(|needle| line.contains(needle))
 }
 
 /// `emit_distilled_prompt` is the distillation analogue of `task_done`:
@@ -2158,6 +2280,74 @@ mod tests {
             err.contains("non-empty"),
             "error should mention non-empty evidence: {err}"
         );
+    }
+
+    #[test]
+    fn task_done_rejects_build_only_validation_evidence() {
+        let err = task_done(serde_json::json!({
+            "pane_id": "%11",
+            "summary": "implemented and pushed",
+            "validation_evidence": "\
+Build validation on sim-9900 container:
+- Command: `cmake --build build --target xe4_fmha4_paged_fwd -j$(nproc)`
+- Result: Build completed successfully
+
+Script syntax validation:
+- Command: `bash -n examples/xe4/fmha4_paged/run_tests.sh`
+- Result: No output
+
+Whitespace check:
+- Command: `git diff --check`
+- Result: No output
+
+Push verification:
+- Command: `git push -u origin HEAD`
+- Result: Successfully pushed"
+        }))
+        .expect_err("task_done should reject build/syntax/diff/push-only evidence")
+        .to_string();
+        assert!(
+            err.contains("build/syntax/diff/push"),
+            "error should explain insufficient evidence: {err}"
+        );
+    }
+
+    #[test]
+    fn task_done_rejects_self_report_that_tests_were_not_run() {
+        let err = task_done(serde_json::json!({
+            "pane_id": "%11",
+            "summary": "implemented",
+            "validation_evidence": "I did not run the functional tests; build passed."
+        }))
+        .expect_err("task_done should reject self-reported missing validation")
+        .to_string();
+        assert!(
+            err.contains("required validation is missing"),
+            "error should explain missing validation: {err}"
+        );
+    }
+
+    #[test]
+    fn task_done_accepts_project_test_command_with_result() {
+        task_done(serde_json::json!({
+            "pane_id": "%11",
+            "summary": "implemented",
+            "validation_evidence": "Command: ./scripts/test.sh\nResult: passed, exit code 0"
+        }))
+        .expect("project test command and passing result should be valid evidence");
+    }
+
+    #[test]
+    fn task_done_accepts_fmha4_simulator_functional_evidence() {
+        task_done(serde_json::json!({
+            "pane_id": "%11",
+            "summary": "implemented",
+            "validation_evidence": "\
+Command: examples/xe4/fmha4_paged/run_tests.sh --filter=LEFTPAD_K --port=9900
+Result: Disposition: Passed
+Numeric check: Cosine=1, Mismatch=0/4194304"
+        }))
+        .expect("simulator command and numeric pass result should be valid evidence");
     }
 
     #[tokio::test]
