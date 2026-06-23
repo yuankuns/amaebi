@@ -657,7 +657,8 @@ fn validate_task_done_evidence(validation_evidence: &str) -> Result<()> {
     .any(|needle| evidence.contains(needle));
     if has_insufficient_only_marker {
         anyhow::bail!(
-            "task_done: validation_evidence only shows build/syntax/diff/push checks; \
+            "task_done: validation_evidence only shows build/syntax/diff/push checks \
+             or test script/list/change-only evidence; \
              include downstream test, simulator, benchmark, or accuracy/performance \
              command output before task_done"
         );
@@ -671,10 +672,11 @@ fn validate_task_done_evidence(validation_evidence: &str) -> Result<()> {
 
 fn line_has_downstream_validation_command(line: &str) -> bool {
     let line = line.trim();
-    [
+    let has_explicit_command = [
         "scripts/test.sh",
         "cargo test",
         "cargo nextest",
+        "cargo bench",
         "pytest",
         "go test",
         "npm test",
@@ -684,16 +686,43 @@ fn line_has_downstream_validation_command(line: &str) -> bool {
         "run_tests.sh --",
         "run_tests.sh --filter",
         "run_matrix.sh --",
-        "benchmark",
-        "bench ",
-        "accuracy",
-        "performance",
-        "simulator",
-        "coralsim",
-        "xesim",
     ]
     .iter()
-    .any(|needle| line.contains(needle))
+    .any(|needle| line.contains(needle));
+    if has_explicit_command {
+        return true;
+    }
+
+    is_commandish_line(line)
+        && [
+            "benchmark",
+            "bench ",
+            "accuracy",
+            "performance",
+            "simulator",
+            "coralsim",
+            "xesim",
+        ]
+        .iter()
+        .any(|needle| line.contains(needle))
+}
+
+fn is_commandish_line(line: &str) -> bool {
+    let line = line.trim_start();
+    let line = line
+        .strip_prefix("- ")
+        .or_else(|| line.strip_prefix("* "))
+        .unwrap_or(line);
+    line.starts_with("command:")
+        || line.starts_with("cmd:")
+        || line.starts_with("run:")
+        || line.starts_with("running:")
+        || line.starts_with("ran:")
+        || line.starts_with("executed:")
+        || line.starts_with("$ ")
+        || line.starts_with("> ")
+        || line.starts_with("./")
+        || line.contains(" --")
 }
 
 fn line_has_validation_result(line: &str) -> bool {
@@ -2322,6 +2351,21 @@ Push verification:
     }
 
     #[test]
+    fn task_done_rejects_narrative_performance_result_without_command() {
+        let err = task_done(serde_json::json!({
+            "pane_id": "%11",
+            "summary": "implemented",
+            "validation_evidence": "Performance within tolerance.\nResult: passed"
+        }))
+        .expect_err("task_done should reject narrative result without command evidence")
+        .to_string();
+        assert!(
+            err.contains("validation command") && err.contains("passing result"),
+            "error should require command and result: {err}"
+        );
+    }
+
+    #[test]
     fn task_done_rejects_test_command_without_passing_result() {
         let err = task_done(serde_json::json!({
             "pane_id": "%11",
@@ -2352,6 +2396,21 @@ Push verification:
     }
 
     #[test]
+    fn task_done_rejects_test_change_only_evidence_with_accurate_message() {
+        let err = task_done(serde_json::json!({
+            "pane_id": "%11",
+            "summary": "implemented",
+            "validation_evidence": "Added test coverage for task_done validation."
+        }))
+        .expect_err("task_done should reject test-change-only evidence")
+        .to_string();
+        assert!(
+            err.contains("test script/list/change-only"),
+            "error should mention test-change-only evidence: {err}"
+        );
+    }
+
+    #[test]
     fn task_done_accepts_project_test_command_with_result() {
         task_done(serde_json::json!({
             "pane_id": "%11",
@@ -2369,6 +2428,16 @@ Push verification:
             "validation_evidence": "Command: cargo build && cargo test\nResult: passed, 0 failed"
         }))
         .expect("combined build plus test command should count as validation evidence");
+    }
+
+    #[test]
+    fn task_done_accepts_commandish_benchmark_evidence_with_result() {
+        task_done(serde_json::json!({
+            "pane_id": "%11",
+            "summary": "implemented",
+            "validation_evidence": "Command: benchmark regression suite\nResult: passed, no regression"
+        }))
+        .expect("commandish benchmark evidence and passing result should be valid evidence");
     }
 
     #[test]
