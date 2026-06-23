@@ -677,8 +677,11 @@ fn validate_task_done_evidence(validation_evidence: &str) -> Result<()> {
 }
 
 fn line_has_downstream_validation_command(line: &str) -> bool {
+    let raw_line = line.trim();
+    let commandish = is_commandish_line(raw_line);
+    let line = line_without_syntax_check_segments(raw_line);
     let line = line.trim();
-    if line.contains("bash -n") {
+    if line.is_empty() {
         return false;
     }
 
@@ -703,7 +706,6 @@ fn line_has_downstream_validation_command(line: &str) -> bool {
         return true;
     }
 
-    let commandish = is_commandish_line(line);
     if commandish
         && ["run_tests.sh", "run_matrix.sh"]
             .iter()
@@ -724,6 +726,15 @@ fn line_has_downstream_validation_command(line: &str) -> bool {
         ]
         .iter()
         .any(|needle| line.contains(needle))
+}
+
+fn line_without_syntax_check_segments(line: &str) -> String {
+    line.split("&&")
+        .flat_map(|part| part.split(';'))
+        .map(str::trim)
+        .filter(|segment| !segment.contains("bash -n"))
+        .collect::<Vec<_>>()
+        .join(" && ")
 }
 
 fn is_commandish_line(line: &str) -> bool {
@@ -748,23 +759,59 @@ fn line_has_validation_result(line: &str) -> bool {
     if line == "pass" || line.starts_with("ok ") {
         return true;
     }
+    if line.contains("0 failed") {
+        return true;
+    }
+    if [
+        "not passed",
+        "not pass",
+        "failed",
+        "failure",
+        "exit 1",
+        "exit code 1",
+        "error:",
+    ]
+    .iter()
+    .any(|needle| line.contains(needle))
+    {
+        return false;
+    }
+    if line.starts_with("exit ") || line.starts_with("exit code ") {
+        return line.contains("exit 0") || line.contains("exit code 0");
+    }
 
-    [
+    let structured_result = [
+        "result:",
+        "- result:",
+        "status:",
+        "- status:",
+        "test result:",
+        "disposition:",
+        "numeric check:",
+    ]
+    .iter()
+    .any(|prefix| line.starts_with(prefix));
+    let structured_success = [
         "passed",
         "pass:",
-        "test result: ok",
-        "0 failed",
+        "ok",
         "exit 0",
         "exit code 0",
         "mismatch=0",
         "mismatch 0/",
-        "disposition: passed",
         "cosine=1",
         "no regression",
         "within tolerance",
     ]
     .iter()
-    .any(|needle| line.contains(needle))
+    .any(|needle| line.contains(needle));
+    if structured_result && structured_success {
+        return true;
+    }
+
+    ["mismatch=0", "mismatch 0/", "cosine=1", "no regression"]
+        .iter()
+        .any(|needle| line.contains(needle))
 }
 
 /// `emit_distilled_prompt` is the distillation analogue of `task_done`:
@@ -2449,6 +2496,46 @@ Push verification:
         assert!(
             err.contains("build/syntax/diff/push"),
             "error should explain syntax-only evidence is insufficient: {err}"
+        );
+    }
+
+    #[test]
+    fn task_done_accepts_chained_syntax_check_and_test_command() {
+        task_done(serde_json::json!({
+            "pane_id": "%11",
+            "summary": "implemented",
+            "validation_evidence": "Command: bash -n scripts/test.sh && cargo test\nResult: passed"
+        }))
+        .expect("syntax check chained with test command and passing result should be valid");
+    }
+
+    #[test]
+    fn task_done_rejects_negative_passed_result() {
+        let err = task_done(serde_json::json!({
+            "pane_id": "%11",
+            "summary": "implemented",
+            "validation_evidence": "Command: cargo test\nResult: not passed"
+        }))
+        .expect_err("task_done should reject negative passing result")
+        .to_string();
+        assert!(
+            err.contains("validation command") && err.contains("passing result"),
+            "error should require a passing result: {err}"
+        );
+    }
+
+    #[test]
+    fn task_done_rejects_unstructured_build_passed_result() {
+        let err = task_done(serde_json::json!({
+            "pane_id": "%11",
+            "summary": "implemented",
+            "validation_evidence": "Command: cargo test\nbuild passed"
+        }))
+        .expect_err("task_done should reject unstructured build-passed summaries")
+        .to_string();
+        assert!(
+            err.contains("validation command") && err.contains("passing result"),
+            "error should require a passing result: {err}"
         );
     }
 
