@@ -693,7 +693,16 @@ fn line_has_downstream_validation_command(line: &str) -> bool {
         return true;
     }
 
-    is_commandish_line(line)
+    let commandish = is_commandish_line(line);
+    if commandish
+        && ["run_tests.sh", "run_matrix.sh"]
+            .iter()
+            .any(|needle| line.contains(needle))
+    {
+        return true;
+    }
+
+    commandish
         && [
             "benchmark",
             "bench ",
@@ -2477,6 +2486,31 @@ Push verification:
             "validation_evidence": "Command: benchmark regression suite\nResult: passed, no regression"
         }))
         .expect("commandish benchmark evidence and passing result should be valid evidence");
+    }
+
+    #[test]
+    fn task_done_accepts_commandish_run_tests_without_args() {
+        task_done(serde_json::json!({
+            "pane_id": "%11",
+            "summary": "implemented",
+            "validation_evidence": "Command: run_tests.sh\nResult: passed"
+        }))
+        .expect("commandish run_tests.sh evidence and passing result should be valid evidence");
+    }
+
+    #[test]
+    fn task_done_rejects_run_tests_script_change_without_command() {
+        let err = task_done(serde_json::json!({
+            "pane_id": "%11",
+            "summary": "implemented",
+            "validation_evidence": "Updated run_tests.sh coverage.\nResult: passed"
+        }))
+        .expect_err("task_done should reject run_tests.sh mentions without command evidence")
+        .to_string();
+        assert!(
+            err.contains("validation command") && err.contains("passing result"),
+            "error should require command and result: {err}"
+        );
     }
 
     #[test]
