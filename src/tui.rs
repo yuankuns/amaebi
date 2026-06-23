@@ -3296,15 +3296,17 @@ mod tests {
 
     #[test]
     fn shorten_cwd_replaces_home_prefix() {
-        // We can't poke HOME safely from a test (it's process-wide),
-        // but we can at least call shorten_cwd and assert that a
+        let _home_lock = crate::test_utils::HOME_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        // HOME is process-wide, so hold the shared test lock while
+        // reading it. We can at least call shorten_cwd and assert that a
         // path beneath the current HOME picks up the ~.  If HOME is
-        // unset (CI quirks) the function falls through and returns
-        // input verbatim — this test then becomes vacuous, which is
-        // acceptable as it can't fail.
+        // unset or `/` (CI/container quirks) the outside-HOME checks are
+        // not meaningful, so this test becomes vacuous.
         if let Ok(home) = std::env::var("HOME") {
-            if !home.is_empty() {
-                let home_trimmed = home.trim_end_matches('/');
+            let home_trimmed = home.trim_end_matches('/');
+            if !home_trimmed.is_empty() {
                 let inside = format!("{home_trimmed}/projects/foo");
                 let short = shorten_cwd(&inside);
                 assert_eq!(short, "~/projects/foo");
@@ -3317,10 +3319,10 @@ mod tests {
                 // stay verbatim, not become ~an/project).
                 let sibling = format!("{home_trimmed}sibling/project");
                 assert_eq!(shorten_cwd(&sibling), sibling);
+                // Outside-HOME path stays verbatim.
+                assert_eq!(shorten_cwd("/etc/hosts"), "/etc/hosts");
             }
         }
-        // Outside-HOME path stays verbatim.
-        assert_eq!(shorten_cwd("/etc/hosts"), "/etc/hosts");
     }
 
     #[test]

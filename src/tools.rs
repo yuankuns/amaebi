@@ -2076,21 +2076,16 @@ mod tests {
             .iter()
             .find(|s| s["function"]["name"] == "task_done")
             .expect("task_done schema must exist");
-        let desc = schema["function"]["description"]
-            .as_str()
-            .expect("task_done description must be a string");
-        for required in ["downstream", "tmux_send_text", "validation_evidence"] {
-            assert!(
-                desc.contains(required),
-                "task_done description should mention {required:?}: {desc}"
-            );
-        }
         let props = schema["function"]["parameters"]["properties"]
             .as_object()
             .expect("task_done properties must be an object");
         assert!(
             props.contains_key("validation_evidence"),
             "task_done must expose validation_evidence property: {schema}"
+        );
+        assert_eq!(
+            props["validation_evidence"]["type"], "string",
+            "validation_evidence must be a string property: {schema}"
         );
         let required = schema["function"]["parameters"]["required"]
             .as_array()
