@@ -2043,6 +2043,9 @@ fn shorten_cwd(cwd: &str) -> String {
     // /home/al exactly (and is still treated as a boundary on
     // /home/al/foo).
     let home_trimmed = home.trim_end_matches('/');
+    if home_trimmed.is_empty() {
+        return cwd.to_string();
+    }
     if cwd == home_trimmed {
         return "~".to_string();
     }
@@ -3296,15 +3299,17 @@ mod tests {
 
     #[test]
     fn shorten_cwd_replaces_home_prefix() {
-        // We can't poke HOME safely from a test (it's process-wide),
-        // but we can at least call shorten_cwd and assert that a
+        let _home_lock = crate::test_utils::HOME_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        // HOME is process-wide, so hold the shared test lock while
+        // reading it. We can at least call shorten_cwd and assert that a
         // path beneath the current HOME picks up the ~.  If HOME is
-        // unset (CI quirks) the function falls through and returns
-        // input verbatim — this test then becomes vacuous, which is
-        // acceptable as it can't fail.
+        // unset or `/` (CI/container quirks), the inside-HOME checks are
+        // not meaningful and are skipped.
         if let Ok(home) = std::env::var("HOME") {
-            if !home.is_empty() {
-                let home_trimmed = home.trim_end_matches('/');
+            let home_trimmed = home.trim_end_matches('/');
+            if !home_trimmed.is_empty() {
                 let inside = format!("{home_trimmed}/projects/foo");
                 let short = shorten_cwd(&inside);
                 assert_eq!(short, "~/projects/foo");
@@ -3319,7 +3324,7 @@ mod tests {
                 assert_eq!(shorten_cwd(&sibling), sibling);
             }
         }
-        // Outside-HOME path stays verbatim.
+        // Outside-HOME path stays verbatim even when HOME is `/`.
         assert_eq!(shorten_cwd("/etc/hosts"), "/etc/hosts");
     }
 

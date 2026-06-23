@@ -657,7 +657,13 @@ pub(crate) fn format_task_released(
         ));
     }
     if let Some(s) = summary {
-        out.push_str(&format!("  summary: {s}\n"));
+        let mut lines = s.lines();
+        if let Some(first) = lines.next() {
+            out.push_str(&format!("  summary: {first}\n"));
+            for line in lines {
+                out.push_str(&format!("           {line}\n"));
+            }
+        }
     }
     if !pane_tail.trim().is_empty() {
         out.push_str("  --- pane tail ---\n");
@@ -5705,6 +5711,23 @@ mod tests {
         let out =
             format_task_released("%54", &[], None, Some("all tests pass"), None, false, "", 0);
         assert!(out.contains("  summary: all tests pass\n"));
+    }
+
+    #[test]
+    fn format_task_released_indents_multiline_summary() {
+        let out = format_task_released(
+            "%54",
+            &[],
+            None,
+            Some("all tests pass\n\nvalidation evidence:\ncargo test passed"),
+            None,
+            false,
+            "",
+            0,
+        );
+        assert!(out.contains(
+            "  summary: all tests pass\n           \n           validation evidence:\n           cargo test passed\n"
+        ));
     }
 
     #[test]

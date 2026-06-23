@@ -5162,8 +5162,9 @@ fn format_pane_alive_reminder(panes: &[(String, Option<String>)]) -> String {
          feasible path forward and keep Claude working (see the next \
          section).\n\
          3. **Verify** — only call `task_done` when the user's goal is \
-         FULLY met.  \"Mostly done\" / \"next session\" / \"handed off\" \
-         is NOT done.\n\
+         FULLY met and the downstream Claude/Codex pane has actually run \
+         the required validation.  \"Mostly done\" / \"next session\" / \
+         \"handed off\" / \"I only built it\" is NOT done.\n\
          \n\
          You must NOT do the task yourself.  `edit_file` is FORBIDDEN.  \
          Running builds, compilers, or long-running commands yourself is \
@@ -5247,28 +5248,44 @@ fn format_pane_alive_reminder(panes: &[(String, Option<String>)]) -> String {
          is `tmux_send_text`.\n\
          - `task_done` — declare the task goal verified and release the \
          pane.  Requires `pane_id` + a short `summary` of what Claude \
-         accomplished.  Only call it AFTER you have actually observed \
-         Claude's output (via `tmux_capture_pane`) and judged the work \
-         complete — do not call it on the first turn just to exit.  See \
-         anti-pattern #3 above for when NOT to call it.  Once ALL panes \
-         are released, this reminder disappears and you can reply with \
-         plain text again.  This is the ONLY way to exit supervision \
-         cleanly.\n\
+         accomplished + `validation_evidence` copied or summarized from \
+         the downstream pane's validation commands and results.  Only \
+         call it AFTER you have actually observed Claude's output (via \
+         `tmux_capture_pane`) and judged the work complete — do not call \
+         it on the first turn just to exit.  See anti-pattern #3 above \
+         for when NOT to call it.  Once ALL panes are released, this \
+         reminder disappears and you can reply with plain text again.  \
+         This is the ONLY way to exit supervision cleanly.\n\
          \n\
-         **Acceptance-driven verification.**  The task description above \
+         **Downstream-validated acceptance.**  The task description above \
          contains acceptance criteria (tests to pass, performance / \
          correctness invariants, numeric thresholds).  You MUST judge \
          `task_done` against THOSE criteria — not against Claude's \
-         self-reported summary.  Concretely:\n\
-         - Observe (via `tmux_capture_pane`) that the specified tests / \
-         benchmarks actually ran AND passed.\n\
-         - If the task specifies no-regression, compare the numbers you \
-         see in the pane against any baseline mentioned in the task.\n\
-         - If you cannot confirm the criteria from pane output alone, use \
-         `shell_command` (read-only: `git diff`, `grep`, run the test \
-         command yourself) to independently verify.\n\
-         - If criteria are NOT met, do NOT call `task_done`.  Instead \
-         steer Claude toward fixing the remaining failures.\n\
+         self-reported summary, not against a clean diff, and not against \
+         build success alone.  Verification must be performed by the \
+         downstream Claude/Codex pane you are supervising.\n\
+         \n\
+         Before `task_done`, the pane transcript must show:\n\
+         - The exact validation commands Claude/Codex ran (tests, simulator \
+         cases, benchmarks, accuracy checks, etc.).\n\
+         - Their pass/fail output and relevant numeric results.\n\
+         - For no-regression requests, both the new numbers and the \
+         baseline/comparison you used to judge regression risk.\n\
+         \n\
+         A changed test list, a committed test script, a build-only check, \
+         or a statement like \"I did not run the functional tests\" means \
+         validation is missing.  If validation evidence is missing or \
+         incomplete, do NOT run the tests yourself and do NOT call \
+         `task_done`.  Use `tmux_send_text` to tell Claude/Codex exactly \
+         which accuracy/performance/regression checks to run, then \
+         `tmux_wait` and inspect the pane output.  You may use read-only \
+         `shell_command` only to cross-check artifacts or parse existing \
+         outputs after the downstream pane has produced them; never use it \
+         to substitute for the downstream agent's validation run.\n\
+         \n\
+         If criteria are NOT met, do NOT call `task_done`.  Instead steer \
+         Claude/Codex toward fixing the remaining failures and rerunning \
+         the required validation.\n\
          \n\
          **Multi-step plan (≥3 steps).**  For tasks with three or more \
          distinct steps, maintain a plan as a markdown checklist inside \
@@ -6120,8 +6137,22 @@ where
                         // echo has gone into messages.  Extracted even when conn_id
                         // is None so validation errors surface the usual way.
                         let task_done_args: Option<(String, String)> = if tc.name == "task_done" {
-                            match (args["pane_id"].as_str(), args["summary"].as_str()) {
-                                (Some(p), Some(s)) => Some((p.to_string(), s.to_string())),
+                            match (
+                                args["pane_id"].as_str(),
+                                args["summary"].as_str(),
+                                args["validation_evidence"].as_str(),
+                            ) {
+                                (Some(p), Some(s), Some(v)) => {
+                                    let pane_id = p.trim();
+                                    let summary = s.trim();
+                                    let validation_evidence = v.trim();
+                                    Some((
+                                        pane_id.to_string(),
+                                        format!(
+                                            "{summary}\n\nvalidation evidence:\n{validation_evidence}"
+                                        ),
+                                    ))
+                                }
                                 _ => None,
                             }
                         } else {
@@ -6195,7 +6226,9 @@ where
                         // happens here.  Runs only when a live conn holds panes
                         // (SubmitDetach / cron have conn_id=None and no held
                         // entries, so the release would be a no-op anyway).
-                        if let (Some((pane_id, summary)), Some(cid)) = (task_done_args, conn_id) {
+                        if let (Some((pane_id, summary)), Some(cid)) =
+                            (task_done_args.filter(|_| tool_succeeded), conn_id)
+                        {
                             if let Some(released) = release_held_entry(
                                 state,
                                 cid,

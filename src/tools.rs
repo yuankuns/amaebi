@@ -575,11 +575,28 @@ fn subagent_default_model() -> String {
 fn task_done(args: serde_json::Value) -> Result<String> {
     let pane_id = args["pane_id"]
         .as_str()
-        .context("task_done: missing string argument 'pane_id'")?;
+        .context("task_done: missing string argument 'pane_id'")?
+        .trim();
+    if pane_id.is_empty() {
+        anyhow::bail!("task_done: 'pane_id' must be non-empty");
+    }
     let summary = args["summary"]
         .as_str()
-        .context("task_done: missing string argument 'summary'")?;
-    Ok(format!("[task_done signalled pane={pane_id}]\n{summary}"))
+        .context("task_done: missing string argument 'summary'")?
+        .trim();
+    if summary.is_empty() {
+        anyhow::bail!("task_done: 'summary' must be non-empty");
+    }
+    let validation_evidence = args["validation_evidence"]
+        .as_str()
+        .context("task_done: missing string argument 'validation_evidence'")?
+        .trim();
+    if validation_evidence.is_empty() {
+        anyhow::bail!("task_done: 'validation_evidence' must be non-empty");
+    }
+    Ok(format!(
+        "[task_done signalled pane={pane_id}]\n{summary}\n\nvalidation evidence:\n{validation_evidence}"
+    ))
 }
 
 /// `emit_distilled_prompt` is the distillation analogue of `task_done`:
@@ -1182,9 +1199,15 @@ fn chat_tool_schemas(include_spawn_agent: bool) -> Vec<serde_json::Value> {
             "type": "function",
             "function": {
                 "name": "task_done",
-                "description": "Declare a /claude-launched pane's task complete.  Call this when \
-                                you have verified the task goal is met (tests pass, diff reviewed, \
-                                etc.) — NOT on speculation.  The daemon then releases amaebi's \
+                "description": "Declare a /claude-launched pane's task complete.  Call this only \
+                                after you have observed the downstream Claude/Codex pane run the \
+                                required validation (tests, benchmarks, accuracy/performance \
+                                checks) and pass the task's acceptance criteria.  A clean diff, \
+                                committed test script, build-only check, or self-report without \
+                                validation output is not enough.  If validation is missing, steer \
+                                the pane with tmux_send_text instead of calling task_done.  The \
+                                required validation_evidence argument must cite the downstream \
+                                pane's validation commands and results.  The daemon then releases amaebi's \
                                 ownership of the pane (pane lease, resource lease, task-notebook \
                                 lease) and streams a TaskReleased frame to the user with the pane \
                                 tail + worktree status + your summary.  The tmux pane and the \
@@ -1204,9 +1227,21 @@ fn chat_tool_schemas(include_spawn_agent: bool) -> Vec<serde_json::Value> {
                             "description": "Your final summary of what was accomplished.  \
                                             Stream-rendered to the user AND archived to the \
                                             inbox for later review."
+                        },
+                        "validation_evidence": {
+                            "type": "string",
+                            "description": "Evidence copied or summarized from the downstream \
+                                            Claude/Codex pane output before release: exact \
+                                            validation commands it ran, pass/fail output, relevant \
+                                            accuracy/performance results, and baseline/no-regression \
+                                            comparison when applicable.  A build-only check, clean \
+                                            diff, committed test script, or self-report that tests \
+                                            were not run is not valid evidence.  If this evidence is \
+                                            missing, do not call task_done; use tmux_send_text to ask \
+                                            the pane to run the required validation."
                         }
                     },
-                    "required": ["pane_id", "summary"]
+                    "required": ["pane_id", "summary", "validation_evidence"]
                 }
             }
         }),
@@ -2037,6 +2072,91 @@ mod tests {
                 .iter()
                 .all(|s| s["function"]["name"] != "tmux_send_keys"),
             "legacy tmux_send_keys schema must be removed"
+        );
+    }
+
+    #[test]
+    fn task_done_schema_requires_downstream_validation_evidence() {
+        let schemas = tool_schemas(ToolMode::Chat {
+            include_spawn_agent: true,
+        });
+        let schema = schemas
+            .iter()
+            .find(|s| s["function"]["name"] == "task_done")
+            .expect("task_done schema must exist");
+        let props = schema["function"]["parameters"]["properties"]
+            .as_object()
+            .expect("task_done properties must be an object");
+        assert!(
+            props.contains_key("validation_evidence"),
+            "task_done must expose validation_evidence property: {schema}"
+        );
+        assert_eq!(
+            props["validation_evidence"]["type"], "string",
+            "validation_evidence must be a string property: {schema}"
+        );
+        let required = schema["function"]["parameters"]["required"]
+            .as_array()
+            .expect("task_done required fields must be an array");
+        assert!(
+            required.iter().any(|v| v == "validation_evidence"),
+            "task_done must require validation_evidence: {schema}"
+        );
+    }
+
+    #[test]
+    fn task_done_rejects_empty_pane_id() {
+        let err = task_done(serde_json::json!({
+            "pane_id": "   ",
+            "summary": "implemented",
+            "validation_evidence": "cargo test passed"
+        }))
+        .expect_err("task_done should reject empty pane_id")
+        .to_string();
+        assert!(
+            err.contains("pane_id") && err.contains("non-empty"),
+            "error should mention non-empty pane_id: {err}"
+        );
+    }
+
+    #[test]
+    fn task_done_rejects_empty_summary() {
+        let err = task_done(serde_json::json!({
+            "pane_id": "%1",
+            "summary": "   ",
+            "validation_evidence": "cargo test passed"
+        }))
+        .expect_err("task_done should reject empty summary")
+        .to_string();
+        assert!(
+            err.contains("summary") && err.contains("non-empty"),
+            "error should mention non-empty summary: {err}"
+        );
+    }
+
+    #[test]
+    fn task_done_rejects_missing_validation_evidence() {
+        let err = task_done(serde_json::json!({
+            "pane_id": "%1",
+            "summary": "implemented"
+        }))
+        .expect_err("task_done should require validation evidence")
+        .to_string();
+        assert!(
+            err.contains("validation_evidence"),
+            "error should mention validation_evidence: {err}"
+        );
+
+        let err = task_done(serde_json::json!({
+            "pane_id": "%1",
+            "summary": "implemented",
+            "validation_evidence": "   "
+        }))
+        .expect_err("task_done should reject empty validation evidence")
+        .to_string();
+        assert!(
+            err.contains("non-empty"),
+            "error should mention non-empty evidence: {err}"
         );
     }
 
