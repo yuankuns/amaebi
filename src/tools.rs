@@ -632,6 +632,12 @@ fn validate_task_done_evidence(validation_evidence: &str) -> Result<()> {
     if has_validation_command && has_validation_result {
         return Ok(());
     }
+    if has_validation_command {
+        anyhow::bail!(
+            "task_done: validation_evidence must include both a downstream validation \
+             command and its passing result before task_done"
+        );
+    }
 
     let has_insufficient_only_marker = [
         "cmake --build",
@@ -672,6 +678,10 @@ fn validate_task_done_evidence(validation_evidence: &str) -> Result<()> {
 
 fn line_has_downstream_validation_command(line: &str) -> bool {
     let line = line.trim();
+    if line.contains("bash -n") {
+        return false;
+    }
+
     let has_explicit_command = [
         "scripts/test.sh",
         "cargo test",
@@ -2405,6 +2415,40 @@ Push verification:
         assert!(
             err.contains("validation command") && err.contains("passing result"),
             "error should require command and result: {err}"
+        );
+    }
+
+    #[test]
+    fn task_done_rejects_combined_build_and_test_without_passing_result() {
+        let err = task_done(serde_json::json!({
+            "pane_id": "%11",
+            "summary": "implemented",
+            "validation_evidence": "Command: cargo build && cargo test"
+        }))
+        .expect_err("task_done should reject combined command without result")
+        .to_string();
+        assert!(
+            err.contains("validation command") && err.contains("passing result"),
+            "error should require command and result: {err}"
+        );
+        assert!(
+            !err.contains("only shows build/syntax/diff/push"),
+            "error should not misclassify a validation command as build-only evidence: {err}"
+        );
+    }
+
+    #[test]
+    fn task_done_rejects_bash_syntax_check_of_test_script_as_insufficient() {
+        let err = task_done(serde_json::json!({
+            "pane_id": "%11",
+            "summary": "implemented",
+            "validation_evidence": "Command: bash -n scripts/test.sh\nResult: exit code 0"
+        }))
+        .expect_err("task_done should reject syntax-only script checks")
+        .to_string();
+        assert!(
+            err.contains("build/syntax/diff/push"),
+            "error should explain syntax-only evidence is insufficient: {err}"
         );
     }
 
