@@ -575,7 +575,11 @@ fn subagent_default_model() -> String {
 fn task_done(args: serde_json::Value) -> Result<String> {
     let pane_id = args["pane_id"]
         .as_str()
-        .context("task_done: missing string argument 'pane_id'")?;
+        .context("task_done: missing string argument 'pane_id'")?
+        .trim();
+    if pane_id.is_empty() {
+        anyhow::bail!("task_done: 'pane_id' must be non-empty");
+    }
     let summary = args["summary"]
         .as_str()
         .context("task_done: missing string argument 'summary'")?
@@ -2097,6 +2101,21 @@ mod tests {
         assert!(
             required.iter().any(|v| v == "validation_evidence"),
             "task_done must require validation_evidence: {schema}"
+        );
+    }
+
+    #[test]
+    fn task_done_rejects_empty_pane_id() {
+        let err = task_done(serde_json::json!({
+            "pane_id": "   ",
+            "summary": "implemented",
+            "validation_evidence": "cargo test passed"
+        }))
+        .expect_err("task_done should reject empty pane_id")
+        .to_string();
+        assert!(
+            err.contains("pane_id") && err.contains("non-empty"),
+            "error should mention non-empty pane_id: {err}"
         );
     }
 

@@ -6142,10 +6142,17 @@ where
                                 args["summary"].as_str(),
                                 args["validation_evidence"].as_str(),
                             ) {
-                                (Some(p), Some(s), Some(v)) => Some((
-                                    p.to_string(),
-                                    format!("{s}\n\nvalidation evidence:\n{}", v.trim()),
-                                )),
+                                (Some(p), Some(s), Some(v)) => {
+                                    let pane_id = p.trim();
+                                    let summary = s.trim();
+                                    let validation_evidence = v.trim();
+                                    Some((
+                                        pane_id.to_string(),
+                                        format!(
+                                            "{summary}\n\nvalidation evidence:\n{validation_evidence}"
+                                        ),
+                                    ))
+                                }
                                 _ => None,
                             }
                         } else {
