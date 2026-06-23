@@ -663,20 +663,14 @@ fn validate_task_done_evidence(validation_evidence: &str) -> Result<()> {
         );
     }
 
-    Ok(())
+    anyhow::bail!(
+        "task_done: validation_evidence must include both a downstream validation \
+         command and its passing result before task_done"
+    );
 }
 
 fn line_has_downstream_validation_command(line: &str) -> bool {
     let line = line.trim();
-    if line.contains("bash -n")
-        || line.contains("cmake --build")
-        || line.contains("cargo build")
-        || line.contains("git diff --check")
-        || line.contains("git push")
-    {
-        return false;
-    }
-
     [
         "scripts/test.sh",
         "cargo test",
@@ -2313,6 +2307,36 @@ Push verification:
     }
 
     #[test]
+    fn task_done_rejects_evidence_without_validation_command_and_result() {
+        let err = task_done(serde_json::json!({
+            "pane_id": "%11",
+            "summary": "implemented",
+            "validation_evidence": "Reviewed the diff and the implementation looks correct."
+        }))
+        .expect_err("task_done should reject generic evidence")
+        .to_string();
+        assert!(
+            err.contains("validation command") && err.contains("passing result"),
+            "error should require command and result: {err}"
+        );
+    }
+
+    #[test]
+    fn task_done_rejects_test_command_without_passing_result() {
+        let err = task_done(serde_json::json!({
+            "pane_id": "%11",
+            "summary": "implemented",
+            "validation_evidence": "Command: cargo test task_done"
+        }))
+        .expect_err("task_done should reject command-only evidence")
+        .to_string();
+        assert!(
+            err.contains("validation command") && err.contains("passing result"),
+            "error should require command and result: {err}"
+        );
+    }
+
+    #[test]
     fn task_done_rejects_self_report_that_tests_were_not_run() {
         let err = task_done(serde_json::json!({
             "pane_id": "%11",
@@ -2335,6 +2359,16 @@ Push verification:
             "validation_evidence": "Command: ./scripts/test.sh\nResult: passed, exit code 0"
         }))
         .expect("project test command and passing result should be valid evidence");
+    }
+
+    #[test]
+    fn task_done_accepts_combined_build_and_test_command_with_result() {
+        task_done(serde_json::json!({
+            "pane_id": "%11",
+            "summary": "implemented",
+            "validation_evidence": "Command: cargo build && cargo test\nResult: passed, 0 failed"
+        }))
+        .expect("combined build plus test command should count as validation evidence");
     }
 
     #[test]
