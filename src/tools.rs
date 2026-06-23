@@ -578,7 +578,11 @@ fn task_done(args: serde_json::Value) -> Result<String> {
         .context("task_done: missing string argument 'pane_id'")?;
     let summary = args["summary"]
         .as_str()
-        .context("task_done: missing string argument 'summary'")?;
+        .context("task_done: missing string argument 'summary'")?
+        .trim();
+    if summary.is_empty() {
+        anyhow::bail!("task_done: 'summary' must be non-empty");
+    }
     let validation_evidence = args["validation_evidence"]
         .as_str()
         .context("task_done: missing string argument 'validation_evidence'")?
@@ -2093,6 +2097,21 @@ mod tests {
         assert!(
             required.iter().any(|v| v == "validation_evidence"),
             "task_done must require validation_evidence: {schema}"
+        );
+    }
+
+    #[test]
+    fn task_done_rejects_empty_summary() {
+        let err = task_done(serde_json::json!({
+            "pane_id": "%1",
+            "summary": "   ",
+            "validation_evidence": "cargo test passed"
+        }))
+        .expect_err("task_done should reject empty summary")
+        .to_string();
+        assert!(
+            err.contains("summary") && err.contains("non-empty"),
+            "error should mention non-empty summary: {err}"
         );
     }
 
