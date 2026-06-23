@@ -722,10 +722,14 @@ fn is_commandish_line(line: &str) -> bool {
         || line.starts_with("$ ")
         || line.starts_with("> ")
         || line.starts_with("./")
-        || line.contains(" --")
 }
 
 fn line_has_validation_result(line: &str) -> bool {
+    let line = line.trim();
+    if line == "pass" || line.starts_with("ok ") {
+        return true;
+    }
+
     [
         "passed",
         "pass:",
@@ -2366,6 +2370,21 @@ Push verification:
     }
 
     #[test]
+    fn task_done_rejects_dash_dash_narrative_performance_result_without_command() {
+        let err = task_done(serde_json::json!({
+            "pane_id": "%11",
+            "summary": "implemented",
+            "validation_evidence": "Performance within tolerance -- passed"
+        }))
+        .expect_err("task_done should reject narrative dash-dash result without command evidence")
+        .to_string();
+        assert!(
+            err.contains("validation command") && err.contains("passing result"),
+            "error should require command and result: {err}"
+        );
+    }
+
+    #[test]
     fn task_done_rejects_test_command_without_passing_result() {
         let err = task_done(serde_json::json!({
             "pane_id": "%11",
@@ -2428,6 +2447,26 @@ Push verification:
             "validation_evidence": "Command: cargo build && cargo test\nResult: passed, 0 failed"
         }))
         .expect("combined build plus test command should count as validation evidence");
+    }
+
+    #[test]
+    fn task_done_accepts_go_test_ok_output() {
+        task_done(serde_json::json!({
+            "pane_id": "%11",
+            "summary": "implemented",
+            "validation_evidence": "Command: go test ./...\nok example.com/project/pkg 0.012s"
+        }))
+        .expect("go test command and ok output should be valid evidence");
+    }
+
+    #[test]
+    fn task_done_accepts_go_test_pass_output() {
+        task_done(serde_json::json!({
+            "pane_id": "%11",
+            "summary": "implemented",
+            "validation_evidence": "Command: go test ./pkg\nPASS"
+        }))
+        .expect("go test command and PASS output should be valid evidence");
     }
 
     #[test]
