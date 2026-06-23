@@ -594,9 +594,224 @@ fn task_done(args: serde_json::Value) -> Result<String> {
     if validation_evidence.is_empty() {
         anyhow::bail!("task_done: 'validation_evidence' must be non-empty");
     }
+    validate_task_done_evidence(validation_evidence)?;
     Ok(format!(
         "[task_done signalled pane={pane_id}]\n{summary}\n\nvalidation evidence:\n{validation_evidence}"
     ))
+}
+
+fn validate_task_done_evidence(validation_evidence: &str) -> Result<()> {
+    let evidence = validation_evidence.to_ascii_lowercase();
+    let explicit_missing_validation = [
+        "did not run",
+        "didn't run",
+        "has not run",
+        "have not run",
+        "not run",
+        "not yet run",
+        "not tested",
+        "tests were not run",
+        "no functional test",
+        "no functionality test",
+        "no simulator test",
+        "without running test",
+        "without running the test",
+    ];
+    if explicit_missing_validation
+        .iter()
+        .any(|needle| evidence.contains(needle))
+    {
+        anyhow::bail!(
+            "task_done: validation_evidence says required validation is missing; \
+             steer the pane to run the required validation before task_done"
+        );
+    }
+
+    let has_validation_command = evidence.lines().any(line_has_downstream_validation_command);
+    let has_validation_result = evidence.lines().any(line_has_validation_result);
+    if has_validation_command && has_validation_result {
+        return Ok(());
+    }
+    if has_validation_command {
+        anyhow::bail!(
+            "task_done: validation_evidence must include both a downstream validation \
+             command and its passing result before task_done"
+        );
+    }
+
+    let has_insufficient_only_marker = [
+        "cmake --build",
+        "cargo build",
+        "bash -n",
+        "git diff --check",
+        "git status",
+        "git push",
+        "clean diff",
+        "build-only",
+        "build only",
+        "added test",
+        "committed test",
+        "test script",
+        "test list",
+        "test coverage",
+        "script syntax",
+        "syntax validation",
+        "whitespace check",
+        "push verification",
+    ]
+    .iter()
+    .any(|needle| evidence.contains(needle));
+    if has_insufficient_only_marker {
+        anyhow::bail!(
+            "task_done: validation_evidence only shows build/syntax/diff/push checks \
+             or test script/list/change-only evidence; \
+             include downstream test, simulator, benchmark, or accuracy/performance \
+             command output before task_done"
+        );
+    }
+
+    anyhow::bail!(
+        "task_done: validation_evidence must include both a downstream validation \
+         command and its passing result before task_done"
+    );
+}
+
+fn line_has_downstream_validation_command(line: &str) -> bool {
+    let raw_line = line.trim();
+    let commandish = is_commandish_line(raw_line);
+    let line = line_without_syntax_check_segments(raw_line);
+    let line = line.trim();
+    if line.is_empty() {
+        return false;
+    }
+
+    let has_explicit_command = [
+        "scripts/test.sh",
+        "cargo test",
+        "cargo nextest",
+        "cargo bench",
+        "pytest",
+        "go test",
+        "npm test",
+        "pnpm test",
+        "yarn test",
+        "ctest",
+        "run_tests.sh --",
+        "run_tests.sh --filter",
+        "run_matrix.sh --",
+    ]
+    .iter()
+    .any(|needle| line.contains(needle));
+    if has_explicit_command {
+        return true;
+    }
+
+    if commandish
+        && ["run_tests.sh", "run_matrix.sh"]
+            .iter()
+            .any(|needle| line.contains(needle))
+    {
+        return true;
+    }
+
+    commandish
+        && [
+            "benchmark",
+            "bench ",
+            "accuracy",
+            "performance",
+            "simulator",
+            "coralsim",
+            "xesim",
+        ]
+        .iter()
+        .any(|needle| line.contains(needle))
+}
+
+fn line_without_syntax_check_segments(line: &str) -> String {
+    line.split("&&")
+        .flat_map(|part| part.split(';'))
+        .map(str::trim)
+        .filter(|segment| !segment.contains("bash -n"))
+        .collect::<Vec<_>>()
+        .join(" && ")
+}
+
+fn is_commandish_line(line: &str) -> bool {
+    let line = line.trim_start();
+    let line = line
+        .strip_prefix("- ")
+        .or_else(|| line.strip_prefix("* "))
+        .unwrap_or(line);
+    line.starts_with("command:")
+        || line.starts_with("cmd:")
+        || line.starts_with("run:")
+        || line.starts_with("running:")
+        || line.starts_with("ran:")
+        || line.starts_with("executed:")
+        || line.starts_with("$ ")
+        || line.starts_with("> ")
+        || line.starts_with("./")
+}
+
+fn line_has_validation_result(line: &str) -> bool {
+    let line = line.trim();
+    if line == "pass" || line.starts_with("ok ") {
+        return true;
+    }
+    if line.contains("0 failed") {
+        return true;
+    }
+    if [
+        "not passed",
+        "not pass",
+        "failed",
+        "failure",
+        "exit 1",
+        "exit code 1",
+        "error:",
+    ]
+    .iter()
+    .any(|needle| line.contains(needle))
+    {
+        return false;
+    }
+    if line.starts_with("exit ") || line.starts_with("exit code ") {
+        return line.contains("exit 0") || line.contains("exit code 0");
+    }
+
+    let structured_result = [
+        "result:",
+        "- result:",
+        "status:",
+        "- status:",
+        "test result:",
+        "disposition:",
+        "numeric check:",
+    ]
+    .iter()
+    .any(|prefix| line.starts_with(prefix));
+    let structured_success = [
+        "passed",
+        "pass:",
+        "ok",
+        "exit 0",
+        "exit code 0",
+        "mismatch=0",
+        "mismatch 0/",
+        "cosine=1",
+        "no regression",
+        "within tolerance",
+    ]
+    .iter()
+    .any(|needle| line.contains(needle));
+    if structured_result && structured_success {
+        return true;
+    }
+
+    ["mismatch=0", "mismatch 0/", "cosine=1", "no regression"]
+        .iter()
+        .any(|needle| line.contains(needle))
 }
 
 /// `emit_distilled_prompt` is the distillation analogue of `task_done`:
@@ -2158,6 +2373,288 @@ mod tests {
             err.contains("non-empty"),
             "error should mention non-empty evidence: {err}"
         );
+    }
+
+    #[test]
+    fn task_done_rejects_build_only_validation_evidence() {
+        let err = task_done(serde_json::json!({
+            "pane_id": "%11",
+            "summary": "implemented and pushed",
+            "validation_evidence": "\
+Build validation on sim-9900 container:
+- Command: `cmake --build build --target xe4_fmha4_paged_fwd -j$(nproc)`
+- Result: Build completed successfully
+
+Script syntax validation:
+- Command: `bash -n examples/xe4/fmha4_paged/run_tests.sh`
+- Result: No output
+
+Whitespace check:
+- Command: `git diff --check`
+- Result: No output
+
+Push verification:
+- Command: `git push -u origin HEAD`
+- Result: Successfully pushed"
+        }))
+        .expect_err("task_done should reject build/syntax/diff/push-only evidence")
+        .to_string();
+        assert!(
+            err.contains("build/syntax/diff/push"),
+            "error should explain insufficient evidence: {err}"
+        );
+    }
+
+    #[test]
+    fn task_done_rejects_evidence_without_validation_command_and_result() {
+        let err = task_done(serde_json::json!({
+            "pane_id": "%11",
+            "summary": "implemented",
+            "validation_evidence": "Reviewed the diff and the implementation looks correct."
+        }))
+        .expect_err("task_done should reject generic evidence")
+        .to_string();
+        assert!(
+            err.contains("validation command") && err.contains("passing result"),
+            "error should require command and result: {err}"
+        );
+    }
+
+    #[test]
+    fn task_done_rejects_narrative_performance_result_without_command() {
+        let err = task_done(serde_json::json!({
+            "pane_id": "%11",
+            "summary": "implemented",
+            "validation_evidence": "Performance within tolerance.\nResult: passed"
+        }))
+        .expect_err("task_done should reject narrative result without command evidence")
+        .to_string();
+        assert!(
+            err.contains("validation command") && err.contains("passing result"),
+            "error should require command and result: {err}"
+        );
+    }
+
+    #[test]
+    fn task_done_rejects_dash_dash_narrative_performance_result_without_command() {
+        let err = task_done(serde_json::json!({
+            "pane_id": "%11",
+            "summary": "implemented",
+            "validation_evidence": "Performance within tolerance -- passed"
+        }))
+        .expect_err("task_done should reject narrative dash-dash result without command evidence")
+        .to_string();
+        assert!(
+            err.contains("validation command") && err.contains("passing result"),
+            "error should require command and result: {err}"
+        );
+    }
+
+    #[test]
+    fn task_done_rejects_test_command_without_passing_result() {
+        let err = task_done(serde_json::json!({
+            "pane_id": "%11",
+            "summary": "implemented",
+            "validation_evidence": "Command: cargo test task_done"
+        }))
+        .expect_err("task_done should reject command-only evidence")
+        .to_string();
+        assert!(
+            err.contains("validation command") && err.contains("passing result"),
+            "error should require command and result: {err}"
+        );
+    }
+
+    #[test]
+    fn task_done_rejects_combined_build_and_test_without_passing_result() {
+        let err = task_done(serde_json::json!({
+            "pane_id": "%11",
+            "summary": "implemented",
+            "validation_evidence": "Command: cargo build && cargo test"
+        }))
+        .expect_err("task_done should reject combined command without result")
+        .to_string();
+        assert!(
+            err.contains("validation command") && err.contains("passing result"),
+            "error should require command and result: {err}"
+        );
+        assert!(
+            !err.contains("only shows build/syntax/diff/push"),
+            "error should not misclassify a validation command as build-only evidence: {err}"
+        );
+    }
+
+    #[test]
+    fn task_done_rejects_bash_syntax_check_of_test_script_as_insufficient() {
+        let err = task_done(serde_json::json!({
+            "pane_id": "%11",
+            "summary": "implemented",
+            "validation_evidence": "Command: bash -n scripts/test.sh\nResult: exit code 0"
+        }))
+        .expect_err("task_done should reject syntax-only script checks")
+        .to_string();
+        assert!(
+            err.contains("build/syntax/diff/push"),
+            "error should explain syntax-only evidence is insufficient: {err}"
+        );
+    }
+
+    #[test]
+    fn task_done_accepts_chained_syntax_check_and_test_command() {
+        task_done(serde_json::json!({
+            "pane_id": "%11",
+            "summary": "implemented",
+            "validation_evidence": "Command: bash -n scripts/test.sh && cargo test\nResult: passed"
+        }))
+        .expect("syntax check chained with test command and passing result should be valid");
+    }
+
+    #[test]
+    fn task_done_rejects_negative_passed_result() {
+        let err = task_done(serde_json::json!({
+            "pane_id": "%11",
+            "summary": "implemented",
+            "validation_evidence": "Command: cargo test\nResult: not passed"
+        }))
+        .expect_err("task_done should reject negative passing result")
+        .to_string();
+        assert!(
+            err.contains("validation command") && err.contains("passing result"),
+            "error should require a passing result: {err}"
+        );
+    }
+
+    #[test]
+    fn task_done_rejects_unstructured_build_passed_result() {
+        let err = task_done(serde_json::json!({
+            "pane_id": "%11",
+            "summary": "implemented",
+            "validation_evidence": "Command: cargo test\nbuild passed"
+        }))
+        .expect_err("task_done should reject unstructured build-passed summaries")
+        .to_string();
+        assert!(
+            err.contains("validation command") && err.contains("passing result"),
+            "error should require a passing result: {err}"
+        );
+    }
+
+    #[test]
+    fn task_done_rejects_self_report_that_tests_were_not_run() {
+        let err = task_done(serde_json::json!({
+            "pane_id": "%11",
+            "summary": "implemented",
+            "validation_evidence": "I did not run the functional tests; build passed."
+        }))
+        .expect_err("task_done should reject self-reported missing validation")
+        .to_string();
+        assert!(
+            err.contains("required validation is missing"),
+            "error should explain missing validation: {err}"
+        );
+    }
+
+    #[test]
+    fn task_done_rejects_test_change_only_evidence_with_accurate_message() {
+        let err = task_done(serde_json::json!({
+            "pane_id": "%11",
+            "summary": "implemented",
+            "validation_evidence": "Added test coverage for task_done validation."
+        }))
+        .expect_err("task_done should reject test-change-only evidence")
+        .to_string();
+        assert!(
+            err.contains("test script/list/change-only"),
+            "error should mention test-change-only evidence: {err}"
+        );
+    }
+
+    #[test]
+    fn task_done_accepts_project_test_command_with_result() {
+        task_done(serde_json::json!({
+            "pane_id": "%11",
+            "summary": "implemented",
+            "validation_evidence": "Command: ./scripts/test.sh\nResult: passed, exit code 0"
+        }))
+        .expect("project test command and passing result should be valid evidence");
+    }
+
+    #[test]
+    fn task_done_accepts_combined_build_and_test_command_with_result() {
+        task_done(serde_json::json!({
+            "pane_id": "%11",
+            "summary": "implemented",
+            "validation_evidence": "Command: cargo build && cargo test\nResult: passed, 0 failed"
+        }))
+        .expect("combined build plus test command should count as validation evidence");
+    }
+
+    #[test]
+    fn task_done_accepts_go_test_ok_output() {
+        task_done(serde_json::json!({
+            "pane_id": "%11",
+            "summary": "implemented",
+            "validation_evidence": "Command: go test ./...\nok example.com/project/pkg 0.012s"
+        }))
+        .expect("go test command and ok output should be valid evidence");
+    }
+
+    #[test]
+    fn task_done_accepts_go_test_pass_output() {
+        task_done(serde_json::json!({
+            "pane_id": "%11",
+            "summary": "implemented",
+            "validation_evidence": "Command: go test ./pkg\nPASS"
+        }))
+        .expect("go test command and PASS output should be valid evidence");
+    }
+
+    #[test]
+    fn task_done_accepts_commandish_benchmark_evidence_with_result() {
+        task_done(serde_json::json!({
+            "pane_id": "%11",
+            "summary": "implemented",
+            "validation_evidence": "Command: benchmark regression suite\nResult: passed, no regression"
+        }))
+        .expect("commandish benchmark evidence and passing result should be valid evidence");
+    }
+
+    #[test]
+    fn task_done_accepts_commandish_run_tests_without_args() {
+        task_done(serde_json::json!({
+            "pane_id": "%11",
+            "summary": "implemented",
+            "validation_evidence": "Command: run_tests.sh\nResult: passed"
+        }))
+        .expect("commandish run_tests.sh evidence and passing result should be valid evidence");
+    }
+
+    #[test]
+    fn task_done_rejects_run_tests_script_change_without_command() {
+        let err = task_done(serde_json::json!({
+            "pane_id": "%11",
+            "summary": "implemented",
+            "validation_evidence": "Updated run_tests.sh coverage.\nResult: passed"
+        }))
+        .expect_err("task_done should reject run_tests.sh mentions without command evidence")
+        .to_string();
+        assert!(
+            err.contains("validation command") && err.contains("passing result"),
+            "error should require command and result: {err}"
+        );
+    }
+
+    #[test]
+    fn task_done_accepts_fmha4_simulator_functional_evidence() {
+        task_done(serde_json::json!({
+            "pane_id": "%11",
+            "summary": "implemented",
+            "validation_evidence": "\
+Command: examples/xe4/fmha4_paged/run_tests.sh --filter=LEFTPAD_K --port=9900
+Result: Disposition: Passed
+Numeric check: Cosine=1, Mismatch=0/4194304"
+        }))
+        .expect("simulator command and numeric pass result should be valid evidence");
     }
 
     #[tokio::test]
