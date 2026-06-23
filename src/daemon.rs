@@ -5248,13 +5248,14 @@ fn format_pane_alive_reminder(panes: &[(String, Option<String>)]) -> String {
          is `tmux_send_text`.\n\
          - `task_done` — declare the task goal verified and release the \
          pane.  Requires `pane_id` + a short `summary` of what Claude \
-         accomplished.  Only call it AFTER you have actually observed \
-         Claude's output (via `tmux_capture_pane`) and judged the work \
-         complete — do not call it on the first turn just to exit.  See \
-         anti-pattern #3 above for when NOT to call it.  Once ALL panes \
-         are released, this reminder disappears and you can reply with \
-         plain text again.  This is the ONLY way to exit supervision \
-         cleanly.\n\
+         accomplished + `validation_evidence` copied or summarized from \
+         the downstream pane's validation commands and results.  Only \
+         call it AFTER you have actually observed Claude's output (via \
+         `tmux_capture_pane`) and judged the work complete — do not call \
+         it on the first turn just to exit.  See anti-pattern #3 above \
+         for when NOT to call it.  Once ALL panes are released, this \
+         reminder disappears and you can reply with plain text again.  \
+         This is the ONLY way to exit supervision cleanly.\n\
          \n\
          **Downstream-validated acceptance.**  The task description above \
          contains acceptance criteria (tests to pass, performance / \
