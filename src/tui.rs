@@ -2544,10 +2544,9 @@ fn assistant_heading(text: &str) -> Option<(String, Style)> {
         ("###", r)
     } else if let Some(r) = trimmed.strip_prefix("## ") {
         ("##", r)
-    } else if let Some(r) = trimmed.strip_prefix("# ") {
-        ("#", r)
     } else {
-        return None;
+        let r = trimmed.strip_prefix("# ")?;
+        ("#", r)
     };
     let style = match hashes {
         "#" => Style::default()
