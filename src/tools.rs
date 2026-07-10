@@ -658,13 +658,25 @@ async fn read_file_tail(path: &str, lines: usize, max_bytes: u64) -> Result<Stri
     let mut file = tokio::fs::File::open(path).await?;
     let len = file.metadata().await?.len();
     let start = len.saturating_sub(max_bytes);
-    file.seek(SeekFrom::Start(start)).await?;
+    let read_start = start.saturating_sub(1);
+    file.seek(SeekFrom::Start(read_start)).await?;
 
-    let mut limited = (&mut file).take(max_bytes);
+    let read_limit = if start > 0 {
+        max_bytes.saturating_add(1)
+    } else {
+        max_bytes
+    };
+    let mut limited = (&mut file).take(read_limit);
     let mut buf = Vec::new();
     limited.read_to_end(&mut buf).await?;
-    let mut text = String::from_utf8_lossy(&buf).into_owned();
-    if start > 0 {
+    let starts_at_line_boundary = start == 0 || buf.first() == Some(&b'\n');
+    let window = if start > 0 && !buf.is_empty() {
+        &buf[1..]
+    } else {
+        &buf
+    };
+    let mut text = String::from_utf8_lossy(window).into_owned();
+    if start > 0 && !starts_at_line_boundary {
         text = match text.find('\n') {
             Some(pos) => text[pos + 1..].to_owned(),
             // The sampled window can be entirely inside one very long line.
@@ -2487,6 +2499,17 @@ mod tests {
         let tail = read_file_tail(log.to_str().unwrap(), 1, 8).await.unwrap();
 
         assert_eq!(tail, "stuvwxyz");
+    }
+
+    #[tokio::test]
+    async fn read_file_tail_keeps_full_line_when_window_starts_at_line_boundary() {
+        let tmp = TempDir::new().unwrap();
+        let log = tmp.path().join("line-boundary.log");
+        std::fs::write(&log, "0123456789\nabcdef\n").unwrap();
+
+        let tail = read_file_tail(log.to_str().unwrap(), 1, 7).await.unwrap();
+
+        assert_eq!(tail, "abcdef\n");
     }
 
     // ---- tmux_wait normalize_for_idle_check --------------------------------
