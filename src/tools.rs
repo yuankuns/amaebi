@@ -666,7 +666,9 @@ async fn read_file_tail(path: &str, lines: usize, max_bytes: u64) -> Result<Stri
     if start > 0 {
         text = match text.find('\n') {
             Some(pos) => text[pos + 1..].to_owned(),
-            None => String::new(),
+            // The sampled window can be entirely inside one very long line.
+            // Keep that partial line rather than reporting an empty tail.
+            None => text,
         };
     }
 
@@ -1557,7 +1559,7 @@ fn chat_tool_schemas(include_spawn_agent: bool) -> Vec<serde_json::Value> {
                     "properties": {
                         "events": {
                             "type": "array",
-                            "description": "Sentinel files to watch. The first file that appears wakes the supervisor.",
+                            "description": "Sentinel files to watch. On each poll, the first listed event whose file exists wakes the supervisor; order events by priority if multiple files may exist.",
                             "items": {
                                 "type": "object",
                                 "properties": {
@@ -2473,6 +2475,17 @@ mod tests {
             err.contains("'events' must not be empty"),
             "unexpected error: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn read_file_tail_keeps_partial_long_line_when_no_newline_boundary() {
+        let tmp = TempDir::new().unwrap();
+        let log = tmp.path().join("single-line.log");
+        std::fs::write(&log, "abcdefghijklmnopqrstuvwxyz").unwrap();
+
+        let tail = read_file_tail(log.to_str().unwrap(), 1, 8).await.unwrap();
+
+        assert_eq!(tail, "stuvwxyz");
     }
 
     // ---- tmux_wait normalize_for_idle_check --------------------------------
