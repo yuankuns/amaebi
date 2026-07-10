@@ -517,7 +517,7 @@ async fn wait_for_task_event(args: serde_json::Value) -> Result<String> {
     let log_path = args["log_path"].as_str().map(str::to_owned);
     let tail_lines = args["tail_lines"]
         .as_u64()
-        .map(|v| (v as usize).min(MAX_TASK_EVENT_TAIL_LINES))
+        .map(|v| v.min(MAX_TASK_EVENT_TAIL_LINES as u64) as usize)
         .unwrap_or(DEFAULT_TASK_EVENT_TAIL_LINES);
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
 
