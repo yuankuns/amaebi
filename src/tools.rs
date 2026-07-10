@@ -660,8 +660,9 @@ async fn read_file_tail(path: &str, lines: usize, max_bytes: u64) -> Result<Stri
     let start = len.saturating_sub(max_bytes);
     file.seek(SeekFrom::Start(start)).await?;
 
+    let mut limited = (&mut file).take(max_bytes);
     let mut buf = Vec::new();
-    file.read_to_end(&mut buf).await?;
+    limited.read_to_end(&mut buf).await?;
     let mut text = String::from_utf8_lossy(&buf).into_owned();
     if start > 0 {
         text = match text.find('\n') {
