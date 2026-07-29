@@ -111,6 +111,79 @@ async fn test_tool_call_roundtrip() {
     );
 }
 
+/// Mock returns a wait_for_task_event tool call → daemon blocks until a
+/// sentinel appears → tool result is sent back to the model with event details.
+#[tokio::test]
+async fn test_wait_for_task_event_tool_roundtrip() {
+    let tmp = tempfile::TempDir::new().expect("temp event dir");
+    let log_path = tmp.path().join("task.log");
+    let passed_path = tmp.path().join("passed.event");
+    let failed_path = tmp.path().join("failed.event");
+
+    let log_for_writer = log_path.clone();
+    let passed_for_writer = passed_path.clone();
+    tokio::spawn(async move {
+        tokio::fs::write(&log_for_writer, "line 1\n")
+            .await
+            .expect("write initial log");
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        tokio::fs::write(&log_for_writer, "line 1\nline 2\nline 3\n")
+            .await
+            .expect("write final log");
+        tokio::fs::write(&passed_for_writer, "exit_code=0\nsource=mock-integration\n")
+            .await
+            .expect("write passed event");
+    });
+
+    let server = MockLlmServer::start().await;
+    let args = serde_json::json!({
+        "events": [
+            {"name": "failed", "path": failed_path},
+            {"name": "passed", "path": passed_path}
+        ],
+        "timeout_secs": 5,
+        "poll_interval_ms": 20,
+        "log_path": log_path,
+        "tail_lines": 2
+    });
+    server.enqueue(ScriptedResponse::tool_call(
+        "call-event-001",
+        "wait_for_task_event",
+        args.to_string(),
+    ));
+    server.enqueue(ScriptedResponse::text_chunks(vec!["event observed"]));
+
+    let daemon = start_daemon(&server.url()).await.expect("start_daemon");
+    let client = connect_client(&daemon.socket);
+
+    let responses = send_message(&client, "wait for task event")
+        .await
+        .expect("send_message");
+    let text = collect_text(&responses);
+    assert!(
+        text.contains("event observed"),
+        "expected final text in response, got: {text:?}"
+    );
+
+    let reqs = server.take_requests();
+    assert_eq!(
+        reqs.len(),
+        2,
+        "expected initial request and tool-result follow-up, got {}",
+        reqs.len()
+    );
+    let follow_up = serde_json::to_string(&reqs[1].body).expect("serialize request body");
+    assert!(follow_up.contains("event: passed"), "{follow_up}");
+    assert!(follow_up.contains("exit_code=0"), "{follow_up}");
+    assert!(follow_up.contains("source=mock-integration"), "{follow_up}");
+    assert!(follow_up.contains("line 2"), "{follow_up}");
+    assert!(follow_up.contains("line 3"), "{follow_up}");
+    assert!(
+        !follow_up.contains("line 1\\nline 2\\nline 3"),
+        "tool result should include only the requested tail, got: {follow_up}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 3. max_completion_tokens sent correctly
 // ---------------------------------------------------------------------------

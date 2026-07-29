@@ -1,8 +1,10 @@
 use std::collections::{HashMap, HashSet};
+use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::process::Command;
 
 use crate::sandbox::{docker::DockerSandboxConfig, DockerSandbox, NoopSandbox, Sandbox};
@@ -122,6 +124,7 @@ impl ToolExecutor for LocalExecutor {
             "tmux_send_key" => tmux_send_key(args).await,
             "tmux_wait" => tmux_wait(args).await,
             "wait_for_file" => wait_for_file(args).await,
+            "wait_for_task_event" => wait_for_task_event(args).await,
             "tmux_rename_pane" => tmux_rename_pane(args).await,
             "read_file" => read_file(args).await,
             "edit_file" => edit_file(args).await,
@@ -488,6 +491,206 @@ async fn wait_for_file(args: serde_json::Value) -> Result<String> {
         }
         tokio::time::sleep(std::time::Duration::from_millis(poll_ms).min(remaining)).await;
     }
+}
+
+const DEFAULT_TASK_EVENT_TAIL_LINES: usize = 80;
+const MAX_TASK_EVENT_TAIL_LINES: usize = 1_000;
+const MAX_TASK_EVENT_PAYLOAD_BYTES: u64 = 16 * 1024;
+const MAX_TASK_EVENT_LOG_TAIL_BYTES: u64 = 256 * 1024;
+
+#[derive(Debug, Clone)]
+struct TaskEventSpec {
+    name: String,
+    path: String,
+}
+
+/// Block until one of several task event sentinel files appears.
+///
+/// This is intentionally a mechanical wake-up primitive: scripts or downstream
+/// panes decide when to create event files, but the LLM still decides what the
+/// event means and what to do next. Full logs remain on disk; this tool returns
+/// only the event metadata plus an optional tail for fast triage.
+async fn wait_for_task_event(args: serde_json::Value) -> Result<String> {
+    let events = parse_task_event_specs(&args)?;
+    let timeout_secs = args["timeout_secs"].as_u64().unwrap_or(300).min(86_400);
+    let poll_ms = args["poll_interval_ms"].as_u64().unwrap_or(500).max(1);
+    let log_path = args["log_path"].as_str().map(str::to_owned);
+    let tail_lines = args["tail_lines"]
+        .as_u64()
+        .map(|v| v.min(MAX_TASK_EVENT_TAIL_LINES as u64) as usize)
+        .unwrap_or(DEFAULT_TASK_EVENT_TAIL_LINES);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+
+    loop {
+        for event in &events {
+            match tokio::fs::metadata(&event.path).await {
+                Ok(m) if m.is_file() => {
+                    return format_task_event_result(event, log_path.as_deref(), tail_lines).await;
+                }
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(anyhow::anyhow!(
+                        "wait_for_task_event: error checking '{}': {e}",
+                        event.path
+                    ));
+                }
+            }
+        }
+
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return format_task_event_timeout(
+                &events,
+                timeout_secs,
+                log_path.as_deref(),
+                tail_lines,
+            )
+            .await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(poll_ms).min(remaining)).await;
+    }
+}
+
+fn parse_task_event_specs(args: &serde_json::Value) -> Result<Vec<TaskEventSpec>> {
+    let raw = args["events"]
+        .as_array()
+        .context("wait_for_task_event: missing array argument 'events'")?;
+    if raw.is_empty() {
+        anyhow::bail!("wait_for_task_event: 'events' must not be empty");
+    }
+
+    let mut events = Vec::with_capacity(raw.len());
+    for (idx, event) in raw.iter().enumerate() {
+        let name = event["name"]
+            .as_str()
+            .with_context(|| format!("wait_for_task_event: events[{idx}].name must be a string"))?;
+        let path = event["path"]
+            .as_str()
+            .with_context(|| format!("wait_for_task_event: events[{idx}].path must be a string"))?;
+        if name.trim().is_empty() {
+            anyhow::bail!("wait_for_task_event: events[{idx}].name must be non-empty");
+        }
+        if path.trim().is_empty() {
+            anyhow::bail!("wait_for_task_event: events[{idx}].path must be non-empty");
+        }
+        events.push(TaskEventSpec {
+            name: name.to_owned(),
+            path: path.to_owned(),
+        });
+    }
+
+    Ok(events)
+}
+
+async fn format_task_event_result(
+    event: &TaskEventSpec,
+    log_path: Option<&str>,
+    tail_lines: usize,
+) -> Result<String> {
+    let mut out = format!(
+        "event: {}\nevent_path: {}\nevent_payload:\n{}",
+        event.name,
+        event.path,
+        read_task_event_payload(&event.path).await?
+    );
+    append_optional_log_tail(&mut out, log_path, tail_lines).await?;
+    Ok(out)
+}
+
+async fn format_task_event_timeout(
+    events: &[TaskEventSpec],
+    timeout_secs: u64,
+    log_path: Option<&str>,
+    tail_lines: usize,
+) -> Result<String> {
+    let mut out =
+        format!("timeout: no task event appeared within {timeout_secs}s\nwatched_events:");
+    for event in events {
+        out.push_str(&format!("\n- {}: {}", event.name, event.path));
+    }
+    append_optional_log_tail(&mut out, log_path, tail_lines).await?;
+    Ok(out)
+}
+
+async fn read_task_event_payload(path: &str) -> Result<String> {
+    read_file_prefix(path, MAX_TASK_EVENT_PAYLOAD_BYTES)
+        .await
+        .with_context(|| format!("wait_for_task_event: reading event payload '{path}'"))
+}
+
+async fn append_optional_log_tail(
+    out: &mut String,
+    log_path: Option<&str>,
+    tail_lines: usize,
+) -> Result<()> {
+    let Some(path) = log_path else {
+        return Ok(());
+    };
+    out.push_str(&format!("\nlog_path: {path}\nlog_tail:\n"));
+    match read_file_tail(path, tail_lines, MAX_TASK_EVENT_LOG_TAIL_BYTES).await {
+        Ok(tail) => out.push_str(&tail),
+        Err(e) => out.push_str(&format!("[unable to read log tail: {e}]")),
+    }
+    Ok(())
+}
+
+async fn read_file_prefix(path: &str, max_bytes: u64) -> Result<String> {
+    let mut file = tokio::fs::File::open(path).await?;
+    let mut limited = (&mut file).take(max_bytes + 1);
+    let mut buf = Vec::new();
+    limited.read_to_end(&mut buf).await?;
+    let truncated = buf.len() as u64 > max_bytes;
+    if truncated {
+        buf.truncate(max_bytes as usize);
+    }
+    let mut text = String::from_utf8_lossy(&buf).into_owned();
+    if truncated {
+        text.push_str("\n[truncated]");
+    }
+    Ok(text)
+}
+
+async fn read_file_tail(path: &str, lines: usize, max_bytes: u64) -> Result<String> {
+    if lines == 0 {
+        return Ok(String::new());
+    }
+    let mut file = tokio::fs::File::open(path).await?;
+    let len = file.metadata().await?.len();
+    let start = len.saturating_sub(max_bytes);
+    let read_start = start.saturating_sub(1);
+    file.seek(SeekFrom::Start(read_start)).await?;
+
+    let read_limit = if start > 0 {
+        max_bytes.saturating_add(1)
+    } else {
+        max_bytes
+    };
+    let mut limited = (&mut file).take(read_limit);
+    let mut buf = Vec::new();
+    limited.read_to_end(&mut buf).await?;
+    let starts_at_line_boundary = start == 0 || buf.first() == Some(&b'\n');
+    let window = if start > 0 && !buf.is_empty() {
+        &buf[1..]
+    } else {
+        &buf
+    };
+    let mut text = String::from_utf8_lossy(window).into_owned();
+    if start > 0 && !starts_at_line_boundary {
+        text = match text.find('\n') {
+            Some(pos) => text[pos + 1..].to_owned(),
+            // The sampled window can be entirely inside one very long line.
+            // Keep that partial line rather than reporting an empty tail.
+            None => text,
+        };
+    }
+
+    let collected: Vec<&str> = text.lines().rev().take(lines).collect();
+    let mut tail = collected.into_iter().rev().collect::<Vec<_>>().join("\n");
+    if text.ends_with('\n') && !tail.is_empty() {
+        tail.push('\n');
+    }
+    Ok(tail)
 }
 
 /// Rename a tmux pane by setting its title.
@@ -1353,6 +1556,67 @@ fn chat_tool_schemas(include_spawn_agent: bool) -> Vec<serde_json::Value> {
         serde_json::json!({
             "type": "function",
             "function": {
+                "name": "wait_for_task_event",
+                "description": "Block until one of several task-event sentinel files appears, \
+                                then return the event name, event file payload, and optional \
+                                tail of a full log file. Use this for an LLM wake-up protocol: \
+                                first steer the downstream pane to run a long build/test/simulator \
+                                command with stdout/stderr tee'd to a log file and to write \
+                                sentinel files for decision points such as passed, failed, \
+                                anomaly, or no_progress; then call this tool once instead of \
+                                repeatedly polling tmux_capture_pane. This tool does not judge \
+                                the event or summarize the task; the supervisor still decides \
+                                the next action and can read the full log_path when needed.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "events": {
+                            "type": "array",
+                            "description": "Sentinel files to watch. On each poll, the first listed event whose file exists wakes the supervisor; order events by priority if multiple files may exist.",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "name": {
+                                        "type": "string",
+                                        "description": "Event label to return, e.g. 'passed', 'failed', 'anomaly', 'no_progress'."
+                                    },
+                                    "path": {
+                                        "type": "string",
+                                        "description": "Absolute or relative path to the sentinel file."
+                                    }
+                                },
+                                "required": ["name", "path"]
+                            }
+                        },
+                        "timeout_secs": {
+                            "type": "integer",
+                            "description": "Hard timeout in seconds before returning a timeout status. Default: 300. Maximum: 86400.",
+                            "minimum": 0,
+                            "maximum": 86400
+                        },
+                        "poll_interval_ms": {
+                            "type": "integer",
+                            "description": "How often to check sentinel files, in milliseconds. Minimum: 1. Default: 500.",
+                            "minimum": 1
+                        },
+                        "log_path": {
+                            "type": "string",
+                            "description": "Optional path to the full log file for the running task. The full log remains on disk."
+                        },
+                        "tail_lines": {
+                            "type": "integer",
+                            "description": "Optional number of log tail lines to return for triage. Default: 80. Maximum: 1000.",
+                            "minimum": 0,
+                            "maximum": 1000
+                        }
+                    },
+                    "required": ["events"]
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
                 "name": "tmux_rename_pane",
                 "description": "Set the title of a tmux pane using 'tmux select-pane -T'. \
                                 Useful for labelling panes with the current task.",
@@ -1625,6 +1889,7 @@ mod tests {
             "tmux_send_key",
             "tmux_wait",
             "wait_for_file",
+            "wait_for_task_event",
             "read_file",
             "edit_file",
             "spawn_agent",
@@ -2156,6 +2421,95 @@ mod tests {
         .await
         .unwrap();
         assert!(result.starts_with("timeout:"), "got: {result}");
+    }
+
+    // ---- wait_for_task_event -------------------------------------------
+
+    #[tokio::test]
+    async fn wait_for_task_event_returns_event_payload_and_log_tail() {
+        let tmp = TempDir::new().unwrap();
+        let passed = tmp.path().join("passed.event");
+        let failed = tmp.path().join("failed.event");
+        let log = tmp.path().join("task.log");
+        std::fs::write(&passed, "exit_code=0\n").unwrap();
+        std::fs::write(&log, "line 1\nline 2\nline 3\n").unwrap();
+
+        let result = wait_for_task_event(serde_json::json!({
+            "events": [
+                {"name": "failed", "path": failed.to_str().unwrap()},
+                {"name": "passed", "path": passed.to_str().unwrap()}
+            ],
+            "log_path": log.to_str().unwrap(),
+            "tail_lines": 2,
+            "timeout_secs": 5
+        }))
+        .await
+        .unwrap();
+
+        assert!(result.contains("event: passed"), "got: {result}");
+        assert!(result.contains("exit_code=0"), "got: {result}");
+        assert!(result.contains("log_path:"), "got: {result}");
+        assert!(!result.contains("line 1"), "got: {result}");
+        assert!(result.contains("line 2\nline 3"), "got: {result}");
+    }
+
+    #[tokio::test]
+    async fn wait_for_task_event_times_out_with_watched_events() {
+        let tmp = TempDir::new().unwrap();
+        let passed = tmp.path().join("passed.event");
+        let result = wait_for_task_event(serde_json::json!({
+            "events": [
+                {"name": "passed", "path": passed.to_str().unwrap()}
+            ],
+            "timeout_secs": 0,
+            "poll_interval_ms": 10
+        }))
+        .await
+        .unwrap();
+
+        assert!(
+            result.starts_with("timeout: no task event appeared within 0s"),
+            "got: {result}"
+        );
+        assert!(result.contains("watched_events:"), "got: {result}");
+        assert!(result.contains("passed:"), "got: {result}");
+    }
+
+    #[tokio::test]
+    async fn wait_for_task_event_rejects_empty_event_list() {
+        let err = wait_for_task_event(serde_json::json!({
+            "events": []
+        }))
+        .await
+        .expect_err("empty event list should be rejected")
+        .to_string();
+
+        assert!(
+            err.contains("'events' must not be empty"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_file_tail_keeps_partial_long_line_when_no_newline_boundary() {
+        let tmp = TempDir::new().unwrap();
+        let log = tmp.path().join("single-line.log");
+        std::fs::write(&log, "abcdefghijklmnopqrstuvwxyz").unwrap();
+
+        let tail = read_file_tail(log.to_str().unwrap(), 1, 8).await.unwrap();
+
+        assert_eq!(tail, "stuvwxyz");
+    }
+
+    #[tokio::test]
+    async fn read_file_tail_keeps_full_line_when_window_starts_at_line_boundary() {
+        let tmp = TempDir::new().unwrap();
+        let log = tmp.path().join("line-boundary.log");
+        std::fs::write(&log, "0123456789\nabcdef\n").unwrap();
+
+        let tail = read_file_tail(log.to_str().unwrap(), 1, 7).await.unwrap();
+
+        assert_eq!(tail, "abcdef\n");
     }
 
     // ---- tmux_wait normalize_for_idle_check --------------------------------

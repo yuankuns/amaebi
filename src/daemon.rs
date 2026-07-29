@@ -5233,11 +5233,31 @@ fn format_pane_alive_reminder(panes: &[(String, Option<String>)]) -> String {
          tool in every turn — do NOT reply with text only, except for \
          the three named escalation cases above.\n\
          \n\
+         **LLM wake-up protocol for long waits.**  Do not spend repeated \
+         turns merely confirming that a build, test suite, or simulator is \
+         still running.  When the downstream pane can run a long command \
+         under a small wrapper, steer it to tee stdout/stderr to a full log \
+         file and create explicit sentinel files for decision points such \
+         as `passed`, `failed`, `anomaly`, or `no_progress`.  Then use \
+         `wait_for_task_event` once to block until a sentinel appears or a \
+         timeout occurs.  The full log remains on disk; after wake-up, use \
+         the returned event/tail plus `read_file` or `tmux_capture_pane` \
+         as needed to make the decision yourself.  This preserves \
+         supervision context while avoiding no-decision polling turns.\n\
+         \n\
          Your supervision vocabulary:\n\
          - `tmux_capture_pane` — read the pane to see what Claude is doing.\n\
          - `tmux_wait` — pause until the pane falls idle.  This is the \
          correct way to \"wait and see\"; a text reply saying \"I'll wait\" \
-         is forbidden.\n\
+         is forbidden.  Prefer `wait_for_task_event` for long wrapped \
+         build/test/simulator waits that can write sentinel files.\n\
+         - `wait_for_task_event` — block until one of several sentinel \
+         files appears, returning the event label, event payload, and an \
+         optional log tail.  Use it as the LLM wake-up protocol after you \
+         have steered Claude/Codex to keep the complete log in a file and \
+         write sentinel files at decision points.  This tool does NOT \
+         replace your judgment; it only wakes you when there is something \
+         to judge.\n\
          - `tmux_send_text` — paste a correction / new instruction into \
          Claude (e.g. \"try the other branch\", \"also run the benchmarks\").  \
          This is how you STEER Claude without killing and restarting.\n\
